@@ -1,0 +1,8 @@
+node_modules
+dist
+build
+.expo
+.expo-shared
+logs
+sync-data
+pnpm-lock.yaml

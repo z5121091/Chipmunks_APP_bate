@@ -1,0 +1,391 @@
+import { StyleSheet } from 'react-native';
+import { BorderRadius, BorderWidth, Spacing, Theme } from '@/constants/theme';
+import { withAlpha } from '@/utils/colors';
+import { rf, rs } from '@/utils/responsive';
+
+export const createStyles = (theme: Theme) =>
+  StyleSheet.create({
+    container: {
+      flex: 1,
+      backgroundColor: theme.backgroundRoot,
+    },
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: Spacing.md,
+      paddingVertical: Spacing.sm + 2,
+      backgroundColor: theme.backgroundDefault,
+      borderBottomWidth: BorderWidth.normal,
+      borderBottomColor: theme.border,
+    },
+    backButton: {
+      width: rs(44),
+      height: rs(44),
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+    },
+    title: {
+      flex: 1,
+      fontSize: rf(20),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      letterSpacing: -0.4,
+    },
+    listContent: {
+      padding: Spacing.md,
+      paddingBottom: Spacing['5xl'],
+      gap: Spacing.sm,
+    },
+    ruleInfoCard: {
+      padding: Spacing.md,
+      marginBottom: Spacing.sm,
+      borderRadius: BorderRadius.xl,
+      backgroundColor: theme.backgroundDefault,
+      borderWidth: BorderWidth.thick,
+      borderColor: theme.border,
+    },
+    ruleTitleRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+    },
+    ruleIconBadge: {
+      width: rs(42),
+      height: rs(42),
+      borderRadius: BorderRadius.lg,
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+      backgroundColor: withAlpha(theme.success, 0.12),
+    },
+    ruleTitleContent: {
+      flex: 1,
+    },
+    ruleName: {
+      fontSize: rf(18),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      marginBottom: 4,
+    },
+    ruleDescription: {
+      fontSize: rf(13),
+      lineHeight: rf(19),
+      color: theme.textMuted,
+    },
+    summaryRow: {
+      flexDirection: 'row',
+      gap: Spacing.sm,
+      marginTop: Spacing.md,
+    },
+    summaryPill: {
+      flex: 1,
+      minHeight: rs(60),
+      justifyContent: 'center',
+      alignItems: 'center',
+      borderRadius: BorderRadius.lg,
+      backgroundColor: theme.backgroundTertiary,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+    },
+    summaryPillValue: {
+      fontSize: rf(18),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      marginBottom: 2,
+    },
+    summaryPillLabel: {
+      fontSize: rf(11),
+      fontWeight: '600',
+      color: theme.textMuted,
+    },
+    fieldCard: {
+      padding: Spacing.md,
+      borderRadius: BorderRadius.xl,
+      backgroundColor: theme.backgroundDefault,
+      borderWidth: BorderWidth.thick,
+      borderColor: theme.border,
+    },
+    fieldCardConfigured: {
+      borderColor: withAlpha(theme.success, 0.28),
+      backgroundColor: withAlpha(theme.success, 0.05),
+    },
+    fieldTopRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+    },
+    fieldIdentity: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+    },
+    fieldIndex: {
+      width: rs(34),
+      height: rs(34),
+      borderRadius: BorderRadius.full,
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+      backgroundColor: theme.backgroundTertiary,
+    },
+    fieldIndexConfigured: {
+      backgroundColor: theme.success,
+    },
+    fieldIndexText: {
+      fontSize: rf(13),
+      fontWeight: '800',
+      color: theme.textSecondary,
+    },
+    fieldIndexTextConfigured: {
+      color: theme.buttonPrimaryText,
+    },
+    fieldTitleWrap: {
+      flex: 1,
+    },
+    fieldLabel: {
+      fontSize: rf(15),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      marginBottom: 2,
+    },
+    fieldSubtitle: {
+      fontSize: rf(11),
+      color: theme.textMuted,
+    },
+    fieldActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.xs,
+    },
+    statusBadge: {
+      paddingHorizontal: Spacing.sm,
+      paddingVertical: 6,
+      borderRadius: BorderRadius.full,
+      borderWidth: BorderWidth.normal,
+    },
+    statusBadgeConfigured: {
+      backgroundColor: withAlpha(theme.success, 0.12),
+      borderColor: withAlpha(theme.success, 0.26),
+    },
+    statusBadgeEmpty: {
+      backgroundColor: theme.backgroundTertiary,
+      borderColor: theme.border,
+    },
+    statusBadgeText: {
+      fontSize: rf(11),
+      fontWeight: '700',
+    },
+    statusBadgeTextConfigured: {
+      color: theme.success,
+    },
+    statusBadgeTextEmpty: {
+      color: theme.textMuted,
+    },
+    prefixPreview: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.xs,
+      marginTop: Spacing.md,
+      minHeight: rs(44),
+      paddingHorizontal: Spacing.md,
+      borderRadius: BorderRadius.lg,
+      backgroundColor: theme.backgroundTertiary,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+    },
+    prefixPreviewConfigured: {
+      backgroundColor: withAlpha(theme.success, 0.1),
+      borderColor: withAlpha(theme.success, 0.24),
+    },
+    prefixPreviewText: {
+      flex: 1,
+      fontSize: rf(13),
+      color: theme.textMuted,
+    },
+    prefixPreviewTextConfigured: {
+      color: theme.textPrimary,
+      fontWeight: '600',
+    },
+    emptyContainer: {
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingVertical: Spacing['4xl'],
+      gap: Spacing.sm,
+    },
+    emptyIcon: {
+      width: rs(60),
+      height: rs(60),
+      borderRadius: BorderRadius.xl,
+      justifyContent: 'center',
+      alignItems: 'center',
+      backgroundColor: theme.backgroundTertiary,
+    },
+    emptyTitle: {
+      fontSize: rf(16),
+      fontWeight: '800',
+      color: theme.textPrimary,
+    },
+    emptyText: {
+      fontSize: rf(13),
+      color: theme.textMuted,
+    },
+    footer: {
+      flexDirection: 'row',
+      gap: Spacing.sm,
+      paddingTop: Spacing.sm,
+      paddingHorizontal: Spacing.md,
+      paddingBottom: Spacing.sm,
+      backgroundColor: theme.backgroundDefault,
+      borderTopWidth: BorderWidth.normal,
+      borderTopColor: theme.border,
+    },
+    clearAllButton: {
+      flex: 1,
+      minHeight: rs(50),
+      justifyContent: 'center',
+      alignItems: 'center',
+      borderRadius: BorderRadius.lg,
+      backgroundColor: theme.backgroundTertiary,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+    },
+    clearAllButtonText: {
+      fontSize: rf(15),
+      fontWeight: '700',
+      color: theme.textPrimary,
+    },
+    saveButton: {
+      flex: 1,
+      minHeight: rs(50),
+      justifyContent: 'center',
+      alignItems: 'center',
+      borderRadius: BorderRadius.lg,
+      backgroundColor: theme.success,
+    },
+    saveButtonText: {
+      fontSize: rf(15),
+      fontWeight: '800',
+      color: theme.buttonPrimaryText,
+    },
+    editorScreen: {
+      flex: 1,
+      backgroundColor: theme.backgroundRoot,
+    },
+    editorHeader: {
+      paddingHorizontal: Spacing.md,
+      paddingTop: Spacing.md,
+      paddingBottom: Spacing.sm,
+    },
+    editorScrollContent: {
+      padding: Spacing.md,
+      paddingTop: 0,
+      gap: Spacing.sm,
+    },
+    editorInfoCard: {
+      padding: Spacing.md,
+      borderRadius: BorderRadius.xl,
+      backgroundColor: theme.backgroundElevated,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+    },
+    editorInfoTopRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginBottom: Spacing.md,
+    },
+    editorFieldBadge: {
+      width: rs(38),
+      height: rs(38),
+      borderRadius: BorderRadius.full,
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+      backgroundColor: withAlpha(theme.success, 0.14),
+    },
+    editorFieldBadgeText: {
+      fontSize: rf(14),
+      fontWeight: '800',
+      color: theme.success,
+    },
+    editorFieldTextWrap: {
+      flex: 1,
+    },
+    editorFieldLabel: {
+      fontSize: rf(16),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      marginBottom: 2,
+    },
+    editorFieldSubtitle: {
+      fontSize: rf(11),
+      color: theme.textMuted,
+    },
+    editorStatusBadge: {
+      paddingHorizontal: Spacing.sm,
+      paddingVertical: 6,
+      borderRadius: BorderRadius.full,
+      borderWidth: BorderWidth.normal,
+    },
+    editorStatusBadgeConfigured: {
+      backgroundColor: withAlpha(theme.success, 0.12),
+      borderColor: withAlpha(theme.success, 0.26),
+    },
+    editorStatusBadgeEmpty: {
+      backgroundColor: theme.backgroundTertiary,
+      borderColor: theme.border,
+    },
+    editorStatusText: {
+      fontSize: rf(11),
+      fontWeight: '700',
+    },
+    editorStatusTextConfigured: {
+      color: theme.success,
+    },
+    editorStatusTextEmpty: {
+      color: theme.textMuted,
+    },
+    editorInputCard: {
+      padding: Spacing.md,
+      borderRadius: BorderRadius.xl,
+      backgroundColor: theme.backgroundElevated,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+    },
+    editorInputLabel: {
+      fontSize: rf(14),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      marginBottom: Spacing.sm,
+    },
+    editorInputWrap: {
+      minHeight: rs(52),
+      justifyContent: 'center',
+      paddingHorizontal: Spacing.md,
+      borderRadius: BorderRadius.lg,
+      backgroundColor: theme.backgroundTertiary,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+    },
+    editorInput: {
+      fontSize: rf(16),
+      color: theme.textPrimary,
+      paddingVertical: Spacing.sm + 2,
+    },
+    editorHint: {
+      marginTop: Spacing.sm,
+      fontSize: rf(12),
+      lineHeight: rf(18),
+      color: theme.textMuted,
+    },
+    editorFooter: {
+      paddingHorizontal: Spacing.md,
+      paddingTop: Spacing.sm,
+      backgroundColor: withAlpha(theme.backgroundTertiary, theme.isDark ? 0.26 : 0.42),
+      borderTopWidth: BorderWidth.normal,
+      borderTopColor: theme.border,
+    },
+    editorActions: {
+      marginTop: 0,
+    },
+  });

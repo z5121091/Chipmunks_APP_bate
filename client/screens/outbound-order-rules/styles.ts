@@ -1,0 +1,302 @@
+import { StyleSheet } from 'react-native';
+import { BorderRadius, BorderWidth, Spacing, Theme } from '@/constants/theme';
+import { withAlpha } from '@/utils/colors';
+import { rf, rs } from '@/utils/responsive';
+
+export const createStyles = (theme: Theme) =>
+  StyleSheet.create({
+    container: {
+      flex: 1,
+      backgroundColor: theme.backgroundRoot,
+    },
+    editorScreen: {
+      flex: 1,
+      backgroundColor: theme.backgroundRoot,
+    },
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: Spacing.md,
+      paddingVertical: Spacing.sm + 2,
+      backgroundColor: theme.backgroundDefault,
+      borderBottomWidth: BorderWidth.normal,
+      borderBottomColor: theme.border,
+    },
+    backButton: {
+      width: rs(44),
+      height: rs(44),
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+    },
+    title: {
+      flex: 1,
+      fontSize: rf(20),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      letterSpacing: 0,
+    },
+    listContent: {
+      padding: Spacing.md,
+      gap: Spacing.sm,
+    },
+    emptyListContent: {
+      flexGrow: 1,
+    },
+    configCard: {
+      padding: Spacing.md,
+      marginBottom: Spacing.md,
+      borderRadius: BorderRadius.xl,
+      backgroundColor: theme.backgroundDefault,
+      borderWidth: BorderWidth.thick,
+      borderColor: theme.border,
+    },
+    configHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginBottom: Spacing.md,
+    },
+    configIcon: {
+      width: rs(42),
+      height: rs(42),
+      borderRadius: BorderRadius.lg,
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+    },
+    configTitleWrap: {
+      flex: 1,
+    },
+    configTitle: {
+      fontSize: rf(16),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      marginBottom: 3,
+    },
+    configSubtitle: {
+      fontSize: rf(12),
+      lineHeight: rf(18),
+      color: theme.textMuted,
+    },
+    sampleInputCard: {
+      padding: Spacing.md,
+      borderRadius: BorderRadius.lg,
+      backgroundColor: theme.backgroundTertiary,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+    },
+    summaryGrid: {
+      flexDirection: 'row',
+      flexWrap: 'nowrap',
+      gap: Spacing.xs,
+      marginTop: Spacing.md,
+    },
+    summaryPill: {
+      flex: 1,
+      minHeight: rs(54),
+      justifyContent: 'center',
+      alignItems: 'center',
+      paddingHorizontal: 2,
+      borderRadius: BorderRadius.lg,
+      backgroundColor: withAlpha(theme.primary, 0.08),
+      borderWidth: BorderWidth.normal,
+      borderColor: withAlpha(theme.primary, 0.18),
+    },
+    summaryValue: {
+      fontSize: rf(14),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      marginBottom: 3,
+    },
+    summaryLabel: {
+      fontSize: rf(10),
+      fontWeight: '700',
+      color: theme.textMuted,
+    },
+    errorHint: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.xs,
+      marginTop: Spacing.md,
+      paddingHorizontal: Spacing.md,
+      paddingVertical: Spacing.sm,
+      borderRadius: BorderRadius.lg,
+      backgroundColor: withAlpha(theme.error, 0.1),
+      borderWidth: BorderWidth.normal,
+      borderColor: withAlpha(theme.error, 0.22),
+    },
+    errorHintText: {
+      flex: 1,
+      fontSize: rf(12),
+      lineHeight: rf(18),
+      fontWeight: '600',
+      color: theme.error,
+    },
+    cardActions: {
+      marginTop: Spacing.md,
+    },
+    sectionHeader: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'flex-end',
+      marginBottom: Spacing.xs,
+    },
+    sectionTitle: {
+      fontSize: rf(16),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      letterSpacing: 0,
+    },
+    sectionDesc: {
+      marginTop: 2,
+      fontSize: rf(12),
+      color: theme.textMuted,
+    },
+    warehouseCard: {
+      padding: Spacing.md,
+      borderRadius: BorderRadius.xl,
+      backgroundColor: theme.backgroundDefault,
+      borderWidth: BorderWidth.thick,
+      borderColor: theme.border,
+    },
+    warehouseCardConfigured: {
+      borderColor: withAlpha(theme.success, 0.28),
+      backgroundColor: withAlpha(theme.success, 0.05),
+    },
+    warehouseTopRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+    },
+    warehouseNameWrap: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+    },
+    warehouseIcon: {
+      width: rs(36),
+      height: rs(36),
+      borderRadius: BorderRadius.full,
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+      backgroundColor: theme.backgroundTertiary,
+    },
+    warehouseIconConfigured: {
+      backgroundColor: theme.success,
+    },
+    warehouseTextWrap: {
+      flex: 1,
+    },
+    warehouseTitleRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.xs,
+      marginBottom: 3,
+    },
+    warehouseName: {
+      flexShrink: 1,
+      fontSize: rf(15),
+      fontWeight: '800',
+      color: theme.textPrimary,
+    },
+    warehouseDesc: {
+      fontSize: rf(12),
+      color: theme.textMuted,
+    },
+    defaultBadge: {
+      paddingHorizontal: Spacing.xs,
+      paddingVertical: 3,
+      borderRadius: BorderRadius.full,
+      backgroundColor: withAlpha(theme.primary, 0.12),
+    },
+    defaultBadgeText: {
+      fontSize: rf(10),
+      fontWeight: '800',
+      color: theme.primary,
+    },
+    itemGap: {
+      height: Spacing.sm,
+    },
+    emptyContainer: {
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingVertical: Spacing['4xl'],
+    },
+    editorContent: {
+      padding: Spacing.md,
+      gap: Spacing.sm,
+    },
+    editorInfoCard: {
+      padding: Spacing.md,
+      borderRadius: BorderRadius.xl,
+      backgroundColor: theme.backgroundDefault,
+      borderWidth: BorderWidth.thick,
+      borderColor: theme.border,
+    },
+    editorInfoTopRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+    },
+    editorBadge: {
+      width: rs(42),
+      height: rs(42),
+      borderRadius: BorderRadius.full,
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginRight: Spacing.sm,
+      backgroundColor: withAlpha(theme.primary, 0.12),
+    },
+    editorTitleWrap: {
+      flex: 1,
+    },
+    editorTitle: {
+      fontSize: rf(17),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      marginBottom: 3,
+    },
+    editorSubtitle: {
+      fontSize: rf(12),
+      lineHeight: rf(18),
+      color: theme.textMuted,
+    },
+    editorInputCard: {
+      padding: Spacing.md,
+      borderRadius: BorderRadius.xl,
+      backgroundColor: theme.backgroundDefault,
+      borderWidth: BorderWidth.thick,
+      borderColor: theme.border,
+    },
+    editorInputLabel: {
+      fontSize: rf(14),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      marginBottom: Spacing.sm,
+    },
+    editorInputWrap: {
+      minHeight: rs(52),
+      justifyContent: 'center',
+      paddingHorizontal: Spacing.md,
+      borderRadius: BorderRadius.lg,
+      backgroundColor: theme.backgroundTertiary,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+    },
+    editorInput: {
+      fontSize: rf(16),
+      color: theme.textPrimary,
+      paddingVertical: Spacing.sm + 2,
+    },
+    editorHint: {
+      marginTop: Spacing.sm,
+      fontSize: rf(12),
+      lineHeight: rf(18),
+      color: theme.textMuted,
+    },
+    editorActions: {
+      marginTop: Spacing.sm,
+    },
+  });

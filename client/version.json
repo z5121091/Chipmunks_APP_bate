@@ -1,0 +1,63 @@
+{
+  "version": "V1.05",
+  "versionCode": 6,
+  "buildNumber": 6,
+  "downloadUrl": "https://zx5121091:zx5121091Z..@dav.zx5121091.fnos.net:443/AppUpdate/app-release.apk",
+  "forceUpdate": false,
+  "appName": "掌上仓库",
+  "companyName": "上海花栗鼠科技有限公司",
+  "companyWebsite": "http://www.chipmunks.com.cn/",
+  "author": "zx5121091",
+  "changelog": [
+    {
+      "version": "V1.05",
+      "date": "2026-05-28",
+      "changes": [
+        {
+          "type": "feat",
+          "text": "增加仓库排序功能（sort_order 字段 + 手动上移/下移）；增加出库单号规则配置（按仓库逐个配置样例，扫码自动匹配仓库并切换）；修复全局仓库缓存旧对象问题；修复仓库 ID 类型不一致问题；修复已删除仓库规则残留问题；追溯码唯一性改为全仓库全局唯一（入库/盘点/拆包/出库）。"
+        }
+      ]
+    },
+    {
+      "version": "V1.04",
+      "date": "2026-05-26",
+      "changes": [
+        {
+          "type": "feat",
+          "text": "修复 WAL 备份/导出数据一致性（checkpoint + 侧写文件清理）；修复出库已拆包追溯码防重复写入；修复 Android 构建元数据读取 version.json；修复设置页滑动与布局异常；优化 UI 字体截断与窄屏 PDA 适配。"
+        }
+      ]
+    },
+    {
+      "version": "V1.03",
+      "date": "2026-05-25",
+      "changes": [
+        {
+          "type": "feat",
+          "text": "修复入库保存漏最后一批扫码记录；增加入库/盘点追踪码重复防线；优化拆包校验与序号生成；修复出库跨订单重复判断；修复出库/盘点聚合混批问题；增加出库队列掉电恢复；优化导出卡顿；收紧扫码数量与规则解析。"
+        }
+      ]
+    },
+    {
+      "version": "V1.02",
+      "date": "2026-05-24",
+      "changes": [
+        {
+          "type": "feat",
+          "text": "系统优化与稳定性提升。"
+        }
+      ]
+    },
+    {
+      "version": "V1.01",
+      "date": "2026-05-23",
+      "changes": [
+        {
+          "type": "feat",
+          "text": "掌上仓库正式发布，支持仓库现场扫码入库、扫码出库、库存盘点和订单追溯。"
+        }
+      ]
+    }
+  ]
+}
