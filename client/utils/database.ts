@@ -1789,6 +1789,83 @@ const migrateInboundAndInventoryRecordTables = async (
   }
 };
 
+const ensureTableColumns = async (
+  database: SQLite.SQLiteDatabase,
+  tableName: string,
+  columns: Record<string, string>
+): Promise<void> => {
+  const tableInfo = await database.getAllAsync<{ name: string }>(`PRAGMA table_info(${tableName})`);
+  const existingColumns = new Set(tableInfo.map((column) => column.name));
+
+  for (const [columnName, definition] of Object.entries(columns)) {
+    if (!existingColumns.has(columnName)) {
+      await database.execAsync(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+    }
+  }
+};
+
+const ensureLegacyOutboundTableColumns = async (
+  database: SQLite.SQLiteDatabase
+): Promise<void> => {
+  await ensureTableColumns(database, 'orders', {
+    customer_name: 'TEXT',
+    warehouse_id: 'TEXT',
+    warehouse_name: 'TEXT',
+    created_at: 'TEXT',
+  });
+
+  await ensureTableColumns(database, 'materials', {
+    order_no: "TEXT DEFAULT ''",
+    customer_name: 'TEXT',
+    operation_type: "TEXT NOT NULL DEFAULT 'inbound'",
+    model: "TEXT NOT NULL DEFAULT ''",
+    batch: "TEXT DEFAULT ''",
+    quantity: 'INTEGER NOT NULL DEFAULT 0',
+    package: "TEXT DEFAULT ''",
+    version: "TEXT DEFAULT ''",
+    productionDate: "TEXT DEFAULT ''",
+    traceNo: "TEXT DEFAULT ''",
+    sourceNo: "TEXT DEFAULT ''",
+    scanned_at: 'TEXT',
+    raw_content: 'TEXT',
+    customFields: 'TEXT',
+    isUnpacked: 'INTEGER DEFAULT 0',
+    original_quantity: 'TEXT',
+    remaining_quantity: 'TEXT',
+    warehouse_id: 'TEXT',
+    warehouse_name: 'TEXT',
+    inventory_code: 'TEXT',
+    rule_id: 'INTEGER',
+    rule_name: 'TEXT',
+  });
+
+  await ensureTableColumns(database, 'unpack_records', {
+    order_no: 'TEXT',
+    customer_name: 'TEXT',
+    model: 'TEXT',
+    batch: 'TEXT',
+    package: 'TEXT',
+    version: 'TEXT',
+    warehouse_id: 'TEXT',
+    warehouse_name: 'TEXT',
+    inventory_code: 'TEXT',
+    original_quantity: 'TEXT',
+    new_quantity: 'TEXT',
+    productionDate: 'TEXT',
+    traceNo: 'TEXT',
+    new_traceNo: 'TEXT',
+    sourceNo: 'TEXT',
+    label_type: 'TEXT',
+    pair_id: 'TEXT',
+    status: "TEXT DEFAULT 'pending'",
+    notes: 'TEXT',
+    unpacked_at: 'TEXT',
+    printed_at: 'TEXT',
+    created_at: 'TEXT',
+    updated_at: 'TEXT',
+  });
+};
+
 const migrateOrdersTableWarehouseScope = async (
   database: SQLite.SQLiteDatabase
 ): Promise<void> => {
@@ -1891,7 +1968,59 @@ const ensureDeletionArchiveTablesAndTriggers = async (
       sort_order INTEGER,
       created_at TEXT
     );
+  `);
 
+  await ensureTableColumns(database, 'deleted_materials_archive', {
+    archive_id: 'TEXT',
+    deleted_at: 'TEXT',
+    id: 'TEXT',
+    order_no: 'TEXT',
+    customer_name: 'TEXT',
+    operation_type: 'TEXT',
+    model: 'TEXT',
+    batch: 'TEXT',
+    quantity: 'INTEGER',
+    package: 'TEXT',
+    version: 'TEXT',
+    productionDate: 'TEXT',
+    traceNo: 'TEXT',
+    sourceNo: 'TEXT',
+    scanned_at: 'TEXT',
+    raw_content: 'TEXT',
+    customFields: 'TEXT',
+    isUnpacked: 'INTEGER',
+    original_quantity: 'TEXT',
+    remaining_quantity: 'TEXT',
+    warehouse_id: 'TEXT',
+    warehouse_name: 'TEXT',
+    inventory_code: 'TEXT',
+    rule_id: 'INTEGER',
+    rule_name: 'TEXT',
+  });
+
+  await ensureTableColumns(database, 'deleted_orders_archive', {
+    archive_id: 'TEXT',
+    deleted_at: 'TEXT',
+    id: 'TEXT',
+    order_no: 'TEXT',
+    customer_name: 'TEXT',
+    warehouse_id: 'TEXT',
+    warehouse_name: 'TEXT',
+    created_at: 'TEXT',
+  });
+
+  await ensureTableColumns(database, 'deleted_warehouses_archive', {
+    archive_id: 'TEXT',
+    deleted_at: 'TEXT',
+    id: 'TEXT',
+    name: 'TEXT',
+    description: 'TEXT',
+    is_default: 'INTEGER',
+    sort_order: 'INTEGER',
+    created_at: 'TEXT',
+  });
+
+  await database.execAsync(`
     CREATE TRIGGER IF NOT EXISTS trg_archive_deleted_materials
     AFTER DELETE ON materials
     BEGIN
@@ -2532,6 +2661,7 @@ const performDatabaseInitialization = async (): Promise<void> => {
     `);
 
   await migrateInboundAndInventoryRecordTables(db);
+  await ensureLegacyOutboundTableColumns(db);
   await migrateOrdersTableWarehouseScope(db);
   await ensureDocumentSyncColumns(db);
   await ensureRuleFieldPrefixesColumn(db);
