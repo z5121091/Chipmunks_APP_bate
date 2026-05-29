@@ -67,6 +67,11 @@ type QueryTimeFilterType = 'today' | 'all';
 const getQueryTimeFilter = (filter: TimeFilterType): QueryTimeFilterType =>
   filter === 'all' ? 'all' : 'today';
 
+type OutboundWorkDraft = {
+  orderNo?: unknown;
+  warehouseId?: unknown;
+};
+
 // 自定义弹窗配置
 interface CustomAlertConfig {
   visible: boolean;
@@ -846,6 +851,45 @@ export default function OrdersScreen() {
     }
   };
 
+  const shouldClearOutboundDraftForDeletedOrder = useCallback(
+    async (order: Order) => {
+      const [savedOrderNo, savedDraftText] = await Promise.all([
+        AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_ORDER_NO),
+        AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT),
+      ]);
+
+      const normalizedOrderNo = order.order_no.trim();
+      const normalizedWarehouseId =
+        typeof order.warehouse_id === 'string' && order.warehouse_id.trim() !== ''
+          ? order.warehouse_id.trim()
+          : null;
+
+      if (currentOrderNo === normalizedOrderNo || savedOrderNo?.trim() === normalizedOrderNo) {
+        return true;
+      }
+
+      const draft = safeJsonParseNullable<OutboundWorkDraft>(
+        savedDraftText,
+        'orders.outboundWorkDraftForDelete'
+      );
+      if (!draft || typeof draft.orderNo !== 'string') {
+        return false;
+      }
+
+      if (draft.orderNo.trim() !== normalizedOrderNo) {
+        return false;
+      }
+
+      const draftWarehouseId =
+        typeof draft.warehouseId === 'string' && draft.warehouseId.trim() !== ''
+          ? draft.warehouseId.trim()
+          : null;
+
+      return normalizedWarehouseId ? draftWarehouseId === normalizedWarehouseId : draftWarehouseId === null;
+    },
+    [currentOrderNo]
+  );
+
   // 删除订单
   const handleDeleteOrder = (order: Order) => {
     showCustomAlert(
@@ -858,6 +902,7 @@ export default function OrdersScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
+              const shouldClearOutboundDraft = await shouldClearOutboundDraftForDeletedOrder(order);
               await deleteOrder(order.order_no, order.warehouse_id);
               if (expandedOrderId === order.id) {
                 expandedMaterialsRequestRef.current += 1;
@@ -866,14 +911,16 @@ export default function OrdersScreen() {
                 setExpandedMaterials([]);
                 setExpandedMaterialsLoadingId(null);
               }
-              if (currentOrderNo === order.order_no) {
+              if (shouldClearOutboundDraft) {
                 await Promise.all([
                   AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_ORDER_NO),
                   AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT),
                 ]);
-                setCurrentOrderNo('');
-                setCurrentOrder(null);
-                setCurrentOrderMaterials([]);
+                if (currentOrderNo === order.order_no) {
+                  setCurrentOrderNo('');
+                  setCurrentOrder(null);
+                  setCurrentOrderMaterials([]);
+                }
               }
               await loadData();
               showCustomAlert('成功', '订单已删除', [{ text: '确定' }], 'success');

@@ -25,6 +25,7 @@ export { STORAGE_KEYS };
 
 const INSTALL_ID_DB_KEY = 'install_id';
 const INSTALL_ID_PREFIX = 'install_';
+const OUTBOUND_WORK_DRAFT_DB_KEY = 'outbound_work_draft_v1';
 
 let db: SQLite.SQLiteDatabase | null = null;
 let isInitializing = false;
@@ -1960,6 +1961,36 @@ const ensureDeletionArchiveTablesAndTriggers = async (
       created_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS deleted_unpack_records_archive (
+      archive_id TEXT PRIMARY KEY,
+      deleted_at TEXT NOT NULL,
+      id TEXT,
+      original_material_id TEXT,
+      order_no TEXT,
+      customer_name TEXT,
+      model TEXT,
+      batch TEXT,
+      package TEXT,
+      version TEXT,
+      warehouse_id TEXT,
+      warehouse_name TEXT,
+      inventory_code TEXT,
+      original_quantity TEXT,
+      new_quantity TEXT,
+      productionDate TEXT,
+      traceNo TEXT,
+      new_traceNo TEXT,
+      sourceNo TEXT,
+      label_type TEXT,
+      pair_id TEXT,
+      status TEXT,
+      notes TEXT,
+      unpacked_at TEXT,
+      printed_at TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS deleted_warehouses_archive (
       archive_id TEXT PRIMARY KEY,
       deleted_at TEXT NOT NULL,
@@ -2011,6 +2042,36 @@ const ensureDeletionArchiveTablesAndTriggers = async (
     created_at: 'TEXT',
   });
 
+  await ensureTableColumns(database, 'deleted_unpack_records_archive', {
+    archive_id: 'TEXT',
+    deleted_at: 'TEXT',
+    id: 'TEXT',
+    original_material_id: 'TEXT',
+    order_no: 'TEXT',
+    customer_name: 'TEXT',
+    model: 'TEXT',
+    batch: 'TEXT',
+    package: 'TEXT',
+    version: 'TEXT',
+    warehouse_id: 'TEXT',
+    warehouse_name: 'TEXT',
+    inventory_code: 'TEXT',
+    original_quantity: 'TEXT',
+    new_quantity: 'TEXT',
+    productionDate: 'TEXT',
+    traceNo: 'TEXT',
+    new_traceNo: 'TEXT',
+    sourceNo: 'TEXT',
+    label_type: 'TEXT',
+    pair_id: 'TEXT',
+    status: 'TEXT',
+    notes: 'TEXT',
+    unpacked_at: 'TEXT',
+    printed_at: 'TEXT',
+    created_at: 'TEXT',
+    updated_at: 'TEXT',
+  });
+
   await ensureTableColumns(database, 'deleted_warehouses_archive', {
     archive_id: 'TEXT',
     deleted_at: 'TEXT',
@@ -2052,6 +2113,24 @@ const ensureDeletionArchiveTablesAndTriggers = async (
       );
     END;
 
+    CREATE TRIGGER IF NOT EXISTS trg_archive_deleted_unpack_records
+    AFTER DELETE ON unpack_records
+    BEGIN
+      INSERT INTO deleted_unpack_records_archive (
+        archive_id, deleted_at, id, original_material_id, order_no, customer_name, model,
+        batch, package, version, warehouse_id, warehouse_name, inventory_code,
+        original_quantity, new_quantity, productionDate, traceNo, new_traceNo, sourceNo,
+        label_type, pair_id, status, notes, unpacked_at, printed_at, created_at, updated_at
+      ) VALUES (
+        lower(hex(randomblob(16))), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+        OLD.id, OLD.original_material_id, OLD.order_no, OLD.customer_name, OLD.model,
+        OLD.batch, OLD.package, OLD.version, OLD.warehouse_id, OLD.warehouse_name,
+        OLD.inventory_code, OLD.original_quantity, OLD.new_quantity, OLD.productionDate,
+        OLD.traceNo, OLD.new_traceNo, OLD.sourceNo, OLD.label_type, OLD.pair_id,
+        OLD.status, OLD.notes, OLD.unpacked_at, OLD.printed_at, OLD.created_at, OLD.updated_at
+      );
+    END;
+
     CREATE TRIGGER IF NOT EXISTS trg_archive_deleted_warehouses
     AFTER DELETE ON warehouses
     BEGIN
@@ -2068,6 +2147,9 @@ const ensureDeletionArchiveTablesAndTriggers = async (
 
     CREATE INDEX IF NOT EXISTS idx_deleted_orders_archive_lookup
     ON deleted_orders_archive (warehouse_id, order_no, deleted_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_deleted_unpack_records_archive_lookup
+    ON deleted_unpack_records_archive (warehouse_id, order_no, deleted_at DESC);
   `);
 };
 
@@ -3211,6 +3293,31 @@ export const getFilteredOrders = async (params: {
 };
 
 // 删除订单及其所有物料记录
+const doesOutboundWorkDraftMatchOrder = (
+  draftText: string | null | undefined,
+  orderNo: string,
+  warehouseId: string | null
+): boolean => {
+  const draft = safeJsonParseNullable<{
+    orderNo?: unknown;
+    warehouseId?: unknown;
+  }>(draftText || null, 'database.outboundWorkDraftForDelete');
+  if (!draft || typeof draft.orderNo !== 'string') {
+    return false;
+  }
+
+  if (draft.orderNo.trim() !== orderNo) {
+    return false;
+  }
+
+  const draftWarehouseId =
+    typeof draft.warehouseId === 'string' && draft.warehouseId.trim() !== ''
+      ? draft.warehouseId.trim()
+      : null;
+
+  return warehouseId ? draftWarehouseId === warehouseId : draftWarehouseId === null;
+};
+
 export const deleteOrder = async (orderNo: string, warehouseId?: string | null): Promise<void> => {
   try {
     if (!orderNo || typeof orderNo !== 'string' || orderNo.trim() === '') {
@@ -3232,6 +3339,11 @@ export const deleteOrder = async (orderNo: string, warehouseId?: string | null):
     await database.execAsync('BEGIN TRANSACTION');
 
     try {
+      const activeDraft = await database.getFirstAsync<{ value: string }>(
+        'SELECT value FROM system_config WHERE key = ?',
+        [OUTBOUND_WORK_DRAFT_DB_KEY]
+      );
+
       // 删除关联的拆包记录，避免留下孤儿数据
       await database.runAsync(`DELETE FROM unpack_records WHERE order_no = ?${warehouseClause}`, params);
 
@@ -3240,6 +3352,12 @@ export const deleteOrder = async (orderNo: string, warehouseId?: string | null):
 
       // 最后删除订单
       await database.runAsync(`DELETE FROM orders WHERE order_no = ?${warehouseClause}`, params);
+
+      if (doesOutboundWorkDraftMatchOrder(activeDraft?.value, trimmedOrderNo, normalizedWarehouseId)) {
+        await database.runAsync('DELETE FROM system_config WHERE key = ?', [
+          OUTBOUND_WORK_DRAFT_DB_KEY,
+        ]);
+      }
 
       await database.execAsync('COMMIT');
     } catch (error) {
