@@ -2541,6 +2541,7 @@ const performDatabaseInitialization = async (): Promise<void> => {
       -- 可靠性与性能配置
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
+      PRAGMA wal_autocheckpoint = 1;
       PRAGMA cache_size = -64000;
       PRAGMA temp_store = MEMORY;
       -- 保持 mmap 在低端/32 位设备也更稳，避免超大映射导致初始化失败
@@ -3583,6 +3584,35 @@ const insertMaterialWithDatabase = async (
   return newMaterialId;
 };
 
+const checkpointAfterCriticalWrite = async (
+  database: SQLite.SQLiteDatabase,
+  label: string
+): Promise<void> => {
+  let lastCheckpoint: { busy?: number; log?: number; checkpointed?: number } | null = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const checkpoint = await database.getFirstAsync<{
+      busy?: number;
+      log?: number;
+      checkpointed?: number;
+    }>('PRAGMA wal_checkpoint(FULL)');
+
+    if (checkpoint && Number(checkpoint.busy || 0) === 0) {
+      return;
+    }
+
+    lastCheckpoint = checkpoint || null;
+    if (attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+  }
+
+  logger.warn(
+    `${label} 已提交，但 WAL FULL checkpoint 未完全完成:`,
+    lastCheckpoint || 'no checkpoint result'
+  );
+};
+
 // 添加物料记录（完整版）
 export const addMaterial = async (material: MaterialWritePayload): Promise<string> => {
   try {
@@ -3627,7 +3657,7 @@ export const addMaterialWithOrder = async (
       await database.execAsync('COMMIT');
       if (material.operation_type === 'outbound') {
         try {
-          await database.getFirstAsync('PRAGMA wal_checkpoint(PASSIVE)');
+          await checkpointAfterCriticalWrite(database, '[addMaterialWithOrder]');
         } catch (checkpointError) {
           logger.warn('[addMaterialWithOrder] 出库物料已提交，但 WAL checkpoint 未完成:', checkpointError);
         }
