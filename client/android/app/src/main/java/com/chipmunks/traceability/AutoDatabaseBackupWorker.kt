@@ -36,10 +36,12 @@ import androidx.work.WorkManager
 object AutoDatabaseBackupScheduler {
   private const val UNIQUE_WORK_NAME = "auto_database_backup"
   private const val PERIODIC_WORK_NAME = "auto_database_backup_periodic"
-  private const val PERIODIC_BACKUP_INTERVAL_MINUTES = 30L
+  private const val PERIODIC_BACKUP_INTERVAL_MINUTES = 6L * 60L
+  private const val MIN_CHANGED_BACKUP_INTERVAL_MINUTES = 6L * 60L
   private const val REQUEST_CODE = 5121091
   private const val PREFS_NAME = "auto_database_backup"
   private const val LAST_SUCCESS_DATE_KEY = "last_success_date"
+  private const val LAST_SUCCESS_AT_MS_KEY = "last_success_at_ms"
   private const val LAST_SUCCESS_DATABASE_MODIFIED_KEY = "last_success_database_modified"
   private const val LAST_SUCCESS_DATABASE_SIZE_KEY = "last_success_database_size"
   private const val LAST_SUCCESS_DATABASE_SIGNATURE_KEY = "last_success_database_signature"
@@ -57,7 +59,11 @@ object AutoDatabaseBackupScheduler {
     }
 
     val databaseFile = getDatabaseFile(context)
-    if (databaseFile.exists() && hasDatabaseChangedSinceLastSuccess(context, databaseFile)) {
+    if (
+      databaseFile.exists() &&
+      hasDatabaseChangedSinceLastSuccess(context, databaseFile) &&
+      hasChangedBackupIntervalElapsed(context)
+    ) {
       enqueueBackup(context)
     }
   }
@@ -106,6 +112,7 @@ object AutoDatabaseBackupScheduler {
     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
       .edit()
       .putString(LAST_SUCCESS_DATE_KEY, date)
+      .putLong(LAST_SUCCESS_AT_MS_KEY, System.currentTimeMillis())
       .putLong(LAST_SUCCESS_DATABASE_MODIFIED_KEY, databaseFile.lastModified())
       .putLong(LAST_SUCCESS_DATABASE_SIZE_KEY, databaseFile.length())
       .putString(LAST_SUCCESS_DATABASE_SIGNATURE_KEY, buildDatabaseSignature(databaseFile))
@@ -139,6 +146,18 @@ object AutoDatabaseBackupScheduler {
     }
 
     return databaseFile.lastModified() != lastModified || databaseFile.length() != lastSize
+  }
+
+  fun hasChangedBackupIntervalElapsed(context: Context): Boolean {
+    val lastSuccessAt = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      .getLong(LAST_SUCCESS_AT_MS_KEY, -1L)
+
+    if (lastSuccessAt < 0L) {
+      return true
+    }
+
+    return System.currentTimeMillis() - lastSuccessAt >=
+      TimeUnit.MINUTES.toMillis(MIN_CHANGED_BACKUP_INTERVAL_MINUTES)
   }
 
   private fun buildDatabaseSignature(databaseFile: File): String {
@@ -237,6 +256,14 @@ class AutoDatabaseBackupWorker(
         )
       ) {
         Log.i(TAG, "Auto database backup already completed for current database today, skip")
+        return Result.success()
+      }
+
+      if (
+        AutoDatabaseBackupScheduler.getLastSuccessDate(applicationContext) == today &&
+        !AutoDatabaseBackupScheduler.hasChangedBackupIntervalElapsed(applicationContext)
+      ) {
+        Log.i(TAG, "Auto database backup changed too recently, skip until interval elapses")
         return Result.success()
       }
 
