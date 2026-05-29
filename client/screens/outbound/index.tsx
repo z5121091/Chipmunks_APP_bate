@@ -301,6 +301,8 @@ export default function PDAScanScreen() {
   const lastScanTimeRef = useRef(0);
   const scannerFocusBlockedRef = useRef(false);
   const orderNoRef = useRef(''); // 🔥 添加 orderNoRef，用于批量写入时判断是否需要刷新
+  const customerNameRef = useRef('');
+  const currentWarehouseRef = useRef<Warehouse | null>(null);
 
   // 仓库
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
@@ -315,10 +317,32 @@ export default function PDAScanScreen() {
   // 当前订单
   const [orderNo, setOrderNo] = useState('');
   const [customerName, setCustomerName] = useState('');
-  // 🔥 同步 orderNo 到 orderNoRef（避免闭包问题）
+
+  const setActiveOrderNo = useCallback((nextOrderNo: string) => {
+    orderNoRef.current = nextOrderNo;
+    setOrderNo(nextOrderNo);
+  }, []);
+
+  const setActiveCustomerName = useCallback((nextCustomerName: string) => {
+    customerNameRef.current = nextCustomerName;
+    setCustomerName(nextCustomerName);
+  }, []);
+
+  const setActiveWarehouse = useCallback((nextWarehouse: Warehouse | null) => {
+    currentWarehouseRef.current = nextWarehouse;
+    setCurrentWarehouse(nextWarehouse);
+  }, []);
+
+  // 同步 ref，避免扫码队列连续处理时读到旧闭包
   useEffect(() => {
     orderNoRef.current = orderNo;
   }, [orderNo]);
+  useEffect(() => {
+    customerNameRef.current = customerName;
+  }, [customerName]);
+  useEffect(() => {
+    currentWarehouseRef.current = currentWarehouse;
+  }, [currentWarehouse]);
 
   // 扫码记录（参考入库实现）
   const [scanRecords, setScanRecords] = useState<MaterialItem[]>([]);
@@ -617,7 +641,7 @@ export default function PDAScanScreen() {
         }
 
         // 7. 设置当前仓库
-        setCurrentWarehouse(warehouse);
+        setActiveWarehouse(warehouse);
 
         // 8. 加载扫码出库持久化状态（显式传入仓库，避免读取旧闭包）
         await loadOutboundState(list, warehouse);
@@ -690,7 +714,7 @@ export default function PDAScanScreen() {
               activeWarehouseId: activeWarehouse.id,
             });
             activeWarehouse = draftWarehouse;
-            setCurrentWarehouse(draftWarehouse);
+            setActiveWarehouse(draftWarehouse);
             await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(draftWarehouse));
           }
 
@@ -705,8 +729,8 @@ export default function PDAScanScreen() {
             ''
           ).trim();
 
-          setOrderNo(draftOrderNo);
-          setCustomerName(restoredCustomerName);
+          setActiveOrderNo(draftOrderNo);
+          setActiveCustomerName(restoredCustomerName);
           await saveOutboundWorkDraft(draftOrderNo, restoredCustomerName, draftWarehouse);
           await loadOrderMaterials(draftOrderNo, savedDraft.warehouseId);
           return;
@@ -733,8 +757,8 @@ export default function PDAScanScreen() {
           logger.log('[loadOutboundState] 订单不存在，清空订单号:', savedOrderNo);
           await AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_ORDER_NO);
           if (screenActiveRef.current) {
-            setOrderNo('');
-            setCustomerName('');
+            setActiveOrderNo('');
+            setActiveCustomerName('');
           }
           return;
         }
@@ -745,8 +769,8 @@ export default function PDAScanScreen() {
           showAlertIfActive('当前出库作业已清空', '上次暂存订单所属仓库已不存在。已保存的历史订单不会删除，请重新扫描当前仓库订单。');
           await clearOutboundWorkDraft();
           if (screenActiveRef.current) {
-            setOrderNo('');
-            setCustomerName('');
+            setActiveOrderNo('');
+            setActiveCustomerName('');
           }
           return;
         }
@@ -758,7 +782,7 @@ export default function PDAScanScreen() {
             currentWarehouseId: activeWarehouse.id,
           });
           activeWarehouse = warehouse;
-          setCurrentWarehouse(warehouse);
+          setActiveWarehouse(warehouse);
           await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(warehouse));
         }
 
@@ -766,8 +790,8 @@ export default function PDAScanScreen() {
           return;
         }
 
-        setOrderNo(savedOrderNo);
-        setCustomerName((order.customer_name || '').trim());
+        setActiveOrderNo(savedOrderNo);
+        setActiveCustomerName((order.customer_name || '').trim());
         await saveOutboundWorkDraft(savedOrderNo, (order.customer_name || '').trim(), warehouse);
         await loadOrderMaterials(savedOrderNo, order.warehouse_id);
       }
@@ -779,12 +803,12 @@ export default function PDAScanScreen() {
   // 切换仓库
   const handleWarehouseChange = async (warehouse: Warehouse) => {
     // 切换仓库
-    setCurrentWarehouse(warehouse);
+    setActiveWarehouse(warehouse);
     await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(warehouse));
 
     // 清空当前扫码记录（新仓库从零开始）
-    setOrderNo('');
-    setCustomerName('');
+    setActiveOrderNo('');
+    setActiveCustomerName('');
     setScanRecords([]);
 
     await clearOutboundWorkDraft();
@@ -824,10 +848,37 @@ export default function PDAScanScreen() {
       return;
     }
 
-    const list = await searchMaterials({
+    let list = await searchMaterials({
+      operation_type: 'outbound',
       exactOrderNo: no.trim(),
       warehouse_id: warehouseId.trim(),
     });
+
+    if (list.length === 0 && explicitWarehouseId) {
+      const fallbackList = await searchMaterials({
+        operation_type: 'outbound',
+        exactOrderNo: no.trim(),
+      });
+      const fallbackWarehouseId = fallbackList[0]?.warehouse_id?.trim();
+      if (fallbackList.length > 0 && fallbackWarehouseId && fallbackWarehouseId !== warehouseId.trim()) {
+        const fallbackWarehouse = warehouses.find((warehouse) => warehouse.id === fallbackWarehouseId);
+        if (fallbackWarehouse) {
+          logger.warn('[loadOrderMaterials] 当前仓库无物料，已找到同订单的其他仓库物料:', {
+            orderNo: no.trim(),
+            requestedWarehouseId: warehouseId.trim(),
+            fallbackWarehouseId,
+          });
+          setActiveWarehouse(fallbackWarehouse);
+          await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(fallbackWarehouse));
+          await saveOutboundWorkDraft(no.trim(), customerNameRef.current.trim(), fallbackWarehouse);
+          showAlertIfActive(
+            '已切回订单仓库',
+            `当前订单的物料记录在【${fallbackWarehouse.name}】，已自动切回该仓库显示。`
+          );
+          list = fallbackList;
+        }
+      }
+    }
     if (!screenActiveRef.current) {
       return;
     }
@@ -859,10 +910,13 @@ export default function PDAScanScreen() {
   // 处理扫描（带参数版本）
   const processScan = useCallback(
     async (code: string) => {
+      const activeOrderNo = orderNoRef.current;
+      const activeCustomerName = customerNameRef.current;
+      const activeWarehouse = currentWarehouseRef.current;
       logger.log('[processScan] 开始处理扫码:', code);
-      logger.log('[processScan] 当前订单号:', orderNo);
-      logger.log('[processScan] 当前客户名称:', customerName);
-      logger.log('[processScan] 当前仓库:', currentWarehouse ? currentWarehouse.name : 'null');
+      logger.log('[processScan] 当前订单号:', activeOrderNo);
+      logger.log('[processScan] 当前客户名称:', activeCustomerName);
+      logger.log('[processScan] 当前仓库:', activeWarehouse ? activeWarehouse.name : 'null');
 
       if (!code || processingRef.current) return;
 
@@ -880,11 +934,11 @@ export default function PDAScanScreen() {
         ? null
         : parseOutboundOrderNo(normalizedOrderCode, outboundOrderRule);
       const isOrderNoScan = matchedAvailableWarehouseRules.length > 0 || legacyParsedOrderNo !== null;
-      const hasCustomerBound = customerName.trim().length > 0;
-      const waitingForCustomer = !!orderNo && !hasCustomerBound;
+      const hasCustomerBound = activeCustomerName.trim().length > 0;
+      const waitingForCustomer = !!activeOrderNo && !hasCustomerBound;
 
       // 如果当前没有订单号，扫描内容必须是订单号格式
-      if (!orderNo && !isOrderNoScan) {
+      if (!activeOrderNo && !isOrderNoScan) {
         showToast(
           hasWarehouseSampleRules
             ? '请先扫描已配置仓库样例结构的出库单号'
@@ -900,7 +954,7 @@ export default function PDAScanScreen() {
       try {
         // 判断是否是订单号格式
         if (isOrderNoScan) {
-          let activeWarehouse = currentWarehouse;
+          let matchedWarehouse = activeWarehouse;
           if (hasWarehouseSampleRules) {
             if (matchedAvailableWarehouseRules.length > 1) {
               showToast('出库单号匹配多个仓库，请检查样例规则', 'error');
@@ -918,9 +972,9 @@ export default function PDAScanScreen() {
               return;
             }
 
-            activeWarehouse = boundWarehouse;
-            if (!currentWarehouse || currentWarehouse.id !== boundWarehouse.id) {
-              setCurrentWarehouse(boundWarehouse);
+            matchedWarehouse = boundWarehouse;
+            if (!activeWarehouse || activeWarehouse.id !== boundWarehouse.id) {
+              setActiveWarehouse(boundWarehouse);
               await AsyncStorage.setItem(
                 STORAGE_KEYS.GLOBAL_WAREHOUSE,
                 JSON.stringify(boundWarehouse)
@@ -929,7 +983,7 @@ export default function PDAScanScreen() {
           }
 
           // 确保仓库已加载
-          if (!activeWarehouse) {
+          if (!matchedWarehouse) {
             showToast('请先选择仓库', 'error');
             feedbackError();
             return;
@@ -937,9 +991,9 @@ export default function PDAScanScreen() {
 
           // 确保仓库ID有效
           if (
-            !activeWarehouse.id ||
-            typeof activeWarehouse.id !== 'string' ||
-            activeWarehouse.id.trim() === ''
+            !matchedWarehouse.id ||
+            typeof matchedWarehouse.id !== 'string' ||
+            matchedWarehouse.id.trim() === ''
           ) {
             showToast('仓库信息无效，请重新选择仓库', 'error');
             feedbackError();
@@ -947,24 +1001,24 @@ export default function PDAScanScreen() {
           }
 
           // 切换/新建当前出库作业。草稿只恢复现场，不直接创建空订单。
-          const isSwitchingOrder = !!orderNo && orderNo !== normalizedOrderCode;
-          const isSameOrder = orderNo === normalizedOrderCode;
-          const existing = await getOrder(normalizedOrderCode, activeWarehouse.id);
+          const isSwitchingOrder = !!activeOrderNo && activeOrderNo !== normalizedOrderCode;
+          const isSameOrder = activeOrderNo === normalizedOrderCode;
+          const existing = await getOrder(normalizedOrderCode, matchedWarehouse.id);
 
           setScanRecords([]); // 清空当前列表
           expandedGroupsRef.current = new Set();
           setExpandedGroups(new Set());
           const nextCustomerName = (
             existing?.customer_name ||
-            (isSameOrder ? customerName : '') ||
+            (isSameOrder ? activeCustomerName : '') ||
             ''
           ).trim();
-          setOrderNo(normalizedOrderCode);
-          setCustomerName(nextCustomerName);
-          await saveOutboundWorkDraft(normalizedOrderCode, nextCustomerName, activeWarehouse);
+          setActiveOrderNo(normalizedOrderCode);
+          setActiveCustomerName(nextCustomerName);
+          await saveOutboundWorkDraft(normalizedOrderCode, nextCustomerName, matchedWarehouse);
 
           if (existing) {
-            await loadOrderMaterials(normalizedOrderCode, activeWarehouse.id);
+            await loadOrderMaterials(normalizedOrderCode, matchedWarehouse.id);
 
             if (nextCustomerName) {
               showToast(
@@ -992,7 +1046,8 @@ export default function PDAScanScreen() {
         }
 
         if (waitingForCustomer) {
-          if (!currentWarehouse) {
+          const workWarehouse = currentWarehouseRef.current;
+          if (!workWarehouse) {
             showToast('请选择仓库', 'warning');
             feedbackWarning();
             setShowWarehousePicker(true);
@@ -1006,28 +1061,29 @@ export default function PDAScanScreen() {
           }
 
           const normalizedCustomerName = normalizeCustomerNameScan(code);
-          const existingOrder = await getOrder(orderNo, currentWarehouse.id);
+          const existingOrder = await getOrder(activeOrderNo, workWarehouse.id);
           if (existingOrder) {
-            await upsertOrder(orderNo, normalizedCustomerName, {
-              id: currentWarehouse.id,
-              name: currentWarehouse.name,
+            await upsertOrder(activeOrderNo, normalizedCustomerName, {
+              id: workWarehouse.id,
+              name: workWarehouse.name,
             });
           }
-          setCustomerName(normalizedCustomerName);
-          await saveOutboundWorkDraft(orderNo, normalizedCustomerName, currentWarehouse);
+          setActiveCustomerName(normalizedCustomerName);
+          await saveOutboundWorkDraft(activeOrderNo, normalizedCustomerName, workWarehouse);
           showToast(`客户已识别：${normalizedCustomerName}`, 'success');
           feedbackCustomerSuccess();
           return;
         }
 
         // 物料扫描
-        if (!orderNo) {
+        if (!activeOrderNo) {
           showToast('请先扫描订单', 'warning');
           feedbackWarning();
           return;
         }
 
-        if (!currentWarehouse) {
+        const workWarehouse = currentWarehouseRef.current;
+        if (!workWarehouse) {
           showToast('请选择仓库', 'warning');
           feedbackWarning();
           setShowWarehousePicker(true);
@@ -1036,9 +1092,9 @@ export default function PDAScanScreen() {
 
         // 确保仓库ID有效
         if (
-          !currentWarehouse.id ||
-          typeof currentWarehouse.id !== 'string' ||
-          currentWarehouse.id.trim() === ''
+          !workWarehouse.id ||
+          typeof workWarehouse.id !== 'string' ||
+          workWarehouse.id.trim() === ''
         ) {
           showToast('仓库信息无效，请重新选择仓库', 'error');
           feedbackError();
@@ -1135,7 +1191,7 @@ export default function PDAScanScreen() {
 
         // 检查重复 + 查找存货编码（并行查询，性能优化）
         logger.log('[扫码出库] 开始检查重复和查找存货编码，参数:', {
-          orderNo,
+          orderNo: activeOrderNo,
           model: normalizedModel,
           batch: parsed.batch,
           traceNo: parsed.traceNo,
@@ -1143,13 +1199,13 @@ export default function PDAScanScreen() {
         });
         const [check, inventoryCode] = await Promise.all([
           checkMaterialExists(
-            orderNo,
+            activeOrderNo,
             normalizedModel,
             parsed.batch,
             parsed.sourceNo,
             parsed.traceNo,
             normalizedQuantity.toString(),
-            currentWarehouse.id
+            workWarehouse.id
           ),
           getInventoryCodeByModel(normalizedModel),
         ]);
@@ -1163,10 +1219,10 @@ export default function PDAScanScreen() {
         }
 
         // 扫码出库必须在数据库提交成功后再提示成功，避免“已扫码”但实际未落库。
-        await saveOutboundWorkDraft(orderNo, customerName.trim(), currentWarehouse);
+        await saveOutboundWorkDraft(activeOrderNo, activeCustomerName.trim(), workWarehouse);
         const savedPayload: QueueItemParsedPayload = {
-          orderNo,
-          customerName: customerName.trim(),
+          orderNo: activeOrderNo,
+          customerName: activeCustomerName.trim(),
           model: normalizedModel,
           batch: parsed.batch || '',
           quantity: normalizedQuantity.toString(),
@@ -1179,11 +1235,11 @@ export default function PDAScanScreen() {
           ruleName,
           customFields,
           inventoryCode: inventoryCode || '',
-          warehouseId: currentWarehouse.id,
-          warehouseName: currentWarehouse.name,
+          warehouseId: workWarehouse.id,
+          warehouseName: workWarehouse.name,
         };
         const materialId = await addMaterialWithOrder({
-          order_no: orderNo,
+          order_no: activeOrderNo,
           customer_name: savedPayload.customerName || '',
           operation_type: 'outbound',
           model: savedPayload.model || '',
@@ -1207,7 +1263,7 @@ export default function PDAScanScreen() {
           name: savedPayload.warehouseName,
         });
 
-        if (orderNo === orderNoRef.current) {
+        if (activeOrderNo === orderNoRef.current) {
           const savedItem = mapQueueItemToMaterialItem(materialId, savedPayload);
           setScanRecords((prev) => {
             const preservedItems = prev.filter((item) => item.id !== savedItem.id);
@@ -1245,13 +1301,13 @@ export default function PDAScanScreen() {
       }
     },
     [
-      currentWarehouse,
-      customerName,
       focusScannerInput,
-      orderNo,
       outboundOrderRule,
       outboundWarehouseOrderRules,
       saveOutboundWorkDraft,
+      setActiveCustomerName,
+      setActiveOrderNo,
+      setActiveWarehouse,
       showToast,
       warehouses,
     ]
@@ -1466,28 +1522,42 @@ export default function PDAScanScreen() {
 
   // 选择仓库
   const selectWarehouse = async (wh: Warehouse) => {
+    if (processingRef.current) {
+      showToast('正在处理扫码，请稍后切换仓库', 'warning');
+      return;
+    }
+
     // 如果选择的是当前仓库，直接关闭弹窗
     if (wh.id === currentWarehouse?.id) {
       setShowWarehousePicker(false);
       return;
     }
 
-    // B: 清空当前页面数据（订单号与仓库绑定，不同仓库序号位数不同）
-    setOrderNo('');
+    const switchWarehouse = async () => {
+      await handleWarehouseChange(wh);
+      setShowWarehousePicker(false);
+      showToast(`仓库已切换：${wh.name}`, 'success');
+      focusScannerInput(100);
+    };
 
-    setScanRecords([]);
-    expandedGroupsRef.current = new Set();
-    setExpandedGroups(new Set());
+    const hasActiveOutboundWork =
+      !!orderNoRef.current ||
+      customerNameRef.current.trim().length > 0 ||
+      scanRecords.length > 0;
 
-    // 清理持久化存储
-    await clearOutboundWorkDraft();
-    await clearScanRecords();
+    if (hasActiveOutboundWork) {
+      alert.showConfirm(
+        '确认切换仓库',
+        '当前出库订单、客户和本单物料显示会被清空。已落库的历史物料不会删除，确定切换吗？',
+        () => {
+          void switchWarehouse();
+        },
+        true
+      );
+      return;
+    }
 
-    // 切换到新仓库
-    await handleWarehouseChange(wh);
-    setShowWarehousePicker(false);
-    showToast(`仓库已切换：${wh.name}`, 'success');
-    focusScannerInput(100);
+    await switchWarehouse();
   };
 
   return (
