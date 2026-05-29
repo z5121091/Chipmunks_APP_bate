@@ -26,13 +26,17 @@ import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
+import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 
 object AutoDatabaseBackupScheduler {
   private const val UNIQUE_WORK_NAME = "auto_database_backup"
+  private const val PERIODIC_WORK_NAME = "auto_database_backup_periodic"
+  private const val PERIODIC_BACKUP_INTERVAL_MINUTES = 30L
   private const val REQUEST_CODE = 5121091
   private const val PREFS_NAME = "auto_database_backup"
   private const val LAST_SUCCESS_DATE_KEY = "last_success_date"
@@ -44,6 +48,7 @@ object AutoDatabaseBackupScheduler {
 
   fun schedule(context: Context) {
     scheduleDailyAlarm(context)
+    enqueuePeriodicBackup(context)
     val today = todayBeijing()
     if (getLastSuccessDate(context) != today) {
       enqueueBackup(context)
@@ -57,12 +62,8 @@ object AutoDatabaseBackupScheduler {
   }
 
   fun enqueueBackup(context: Context) {
-    val constraints = Constraints.Builder()
-      .setRequiredNetworkType(NetworkType.CONNECTED)
-      .build()
-
     val request = OneTimeWorkRequestBuilder<AutoDatabaseBackupWorker>()
-      .setConstraints(constraints)
+      .setConstraints(backupConstraints())
       .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.MINUTES)
       .build()
 
@@ -71,6 +72,28 @@ object AutoDatabaseBackupScheduler {
       ExistingWorkPolicy.REPLACE,
       request
     )
+  }
+
+  private fun enqueuePeriodicBackup(context: Context) {
+    val request = PeriodicWorkRequestBuilder<AutoDatabaseBackupWorker>(
+      PERIODIC_BACKUP_INTERVAL_MINUTES,
+      TimeUnit.MINUTES
+    )
+      .setConstraints(backupConstraints())
+      .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.MINUTES)
+      .build()
+
+    WorkManager.getInstance(context.applicationContext).enqueueUniquePeriodicWork(
+      PERIODIC_WORK_NAME,
+      ExistingPeriodicWorkPolicy.UPDATE,
+      request
+    )
+  }
+
+  private fun backupConstraints(): Constraints {
+    return Constraints.Builder()
+      .setRequiredNetworkType(NetworkType.CONNECTED)
+      .build()
   }
 
   fun getLastSuccessDate(context: Context): String? {
