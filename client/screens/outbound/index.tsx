@@ -29,6 +29,9 @@ import {
   Warehouse,
   getAllWarehouses,
   getDefaultWarehouse,
+  getSystemConfigValue,
+  setSystemConfigValue,
+  removeSystemConfigValue,
 } from '@/utils/database';
 import {
   scanQueue,
@@ -69,7 +72,8 @@ import {
 
 const CUSTOMER_NAME_HAS_CHINESE_REGEX = /[\u3400-\u9fff\uf900-\ufaff]/;
 const CUSTOMER_NAME_ALLOWED_REGEX = /^[\u3400-\u9fff\uf900-\ufaffA-Za-z0-9（）()【】\[\]·•&\-—_.、，,．。\s]+$/;
-const OUTBOUND_WORK_DRAFT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const OUTBOUND_WORK_DRAFT_DB_KEY = 'outbound_work_draft_v1';
+const LEGACY_OUTBOUND_SCAN_RECORDS_KEY = 'outbound_scan_records';
 
 const normalizeOrderNoCandidate = (value: string) => value.trim().replace(/\s+/g, '').toUpperCase();
 
@@ -149,11 +153,6 @@ const isOutboundWorkDraft = (value: unknown): value is OutboundWorkDraft => {
     typeof draft.warehouseName === 'string' &&
     typeof draft.updatedAt === 'string'
   );
-};
-
-const isFreshOutboundWorkDraft = (draft: OutboundWorkDraft) => {
-  const updatedAt = new Date(draft.updatedAt).getTime();
-  return Number.isFinite(updatedAt) && Date.now() - updatedAt <= OUTBOUND_WORK_DRAFT_MAX_AGE_MS;
 };
 
 const createOutboundWorkDraft = (
@@ -397,15 +396,14 @@ export default function PDAScanScreen() {
     }
   }, [focusScannerInput, showWarehousePicker]);
 
-  // AsyncStorage Key
-  const OUTBOUND_SCAN_RECORDS_KEY = 'outbound_scan_records';
-
   const saveOutboundWorkDraft = useCallback(
     async (nextOrderNo: string, nextCustomerName: string, warehouse: Warehouse) => {
       const draft = createOutboundWorkDraft(nextOrderNo, nextCustomerName, warehouse);
+      const serializedDraft = JSON.stringify(draft);
       await Promise.all([
-        AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT, JSON.stringify(draft)),
+        AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT, serializedDraft),
         AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_ORDER_NO, draft.orderNo),
+        setSystemConfigValue(OUTBOUND_WORK_DRAFT_DB_KEY, serializedDraft),
       ]);
     },
     []
@@ -415,7 +413,35 @@ export default function PDAScanScreen() {
     await Promise.all([
       AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT),
       AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_ORDER_NO),
+      removeSystemConfigValue(OUTBOUND_WORK_DRAFT_DB_KEY),
     ]);
+  }, []);
+
+  const loadSavedOutboundWorkDraft = useCallback(async (): Promise<OutboundWorkDraft | null> => {
+    const [asyncDraftText, databaseDraftText] = await Promise.all([
+      AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT),
+      getSystemConfigValue(OUTBOUND_WORK_DRAFT_DB_KEY).catch((error) => {
+        logger.warn('[loadOutboundState] 读取数据库出库草稿失败:', error);
+        return null;
+      }),
+    ]);
+
+    const asyncDraft = asyncDraftText
+      ? safeJsonParseNullable<OutboundWorkDraft>(
+          asyncDraftText,
+          'outbound.workDraft.asyncStorage',
+          isOutboundWorkDraft
+        )
+      : null;
+    const databaseDraft = databaseDraftText
+      ? safeJsonParseNullable<OutboundWorkDraft>(
+          databaseDraftText,
+          'outbound.workDraft.database',
+          isOutboundWorkDraft
+        )
+      : null;
+
+    return asyncDraft || databaseDraft;
   }, []);
 
   // 自动清理震动和提示音
@@ -643,51 +669,47 @@ export default function PDAScanScreen() {
   ) => {
     try {
       const list = warehouseList || warehouses;
-      const activeWarehouse = explicitWarehouse ?? currentWarehouse;
+      let activeWarehouse = explicitWarehouse ?? currentWarehouse;
 
-      // 1. 优先恢复新的出库作业草稿。草稿只恢复作业现场，不负责创建正式订单。
-      const savedDraftText = await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT);
-      const savedDraft = savedDraftText
-        ? safeJsonParseNullable<OutboundWorkDraft>(
-            savedDraftText,
-            'outbound.workDraft',
-            isOutboundWorkDraft
-          )
-        : null;
+      // 1. 优先恢复新的出库作业草稿。草稿同步保存在 AsyncStorage 和 SQLite，避免覆盖安装后丢现场。
+      const savedDraft = await loadSavedOutboundWorkDraft();
 
       if (savedDraft) {
-        if (!isFreshOutboundWorkDraft(savedDraft)) {
-          logger.log('[loadOutboundState] 出库作业草稿已过期，清空草稿');
+        const draftOrderNo = savedDraft.orderNo.trim();
+        const draftWarehouse = list.find((w) => w.id === savedDraft.warehouseId);
+        if (!draftOrderNo) {
+          logger.log('[loadOutboundState] 草稿订单号为空，清空草稿');
+          await clearOutboundWorkDraft();
+        } else if (!draftWarehouse) {
+          logger.log('[loadOutboundState] 草稿仓库不存在，清空草稿');
           await clearOutboundWorkDraft();
         } else {
-          const draftWarehouse = list.find((w) => w.id === savedDraft.warehouseId);
-          if (!draftWarehouse) {
-            logger.log('[loadOutboundState] 草稿仓库不存在，清空草稿');
-            await clearOutboundWorkDraft();
-          } else if (activeWarehouse && savedDraft.warehouseId !== activeWarehouse.id) {
-            logger.log('[loadOutboundState] 草稿仓库与当前仓库不一致，清空草稿:', {
+          if (activeWarehouse && savedDraft.warehouseId !== activeWarehouse.id) {
+            logger.log('[loadOutboundState] 草稿仓库与当前仓库不一致，切回草稿仓库:', {
               draftWarehouseId: savedDraft.warehouseId,
               activeWarehouseId: activeWarehouse.id,
             });
-            await clearOutboundWorkDraft();
-          } else {
-            const order = await getOrder(savedDraft.orderNo, savedDraft.warehouseId);
-            if (!screenActiveRef.current) {
-              return;
-            }
+            activeWarehouse = draftWarehouse;
+            setCurrentWarehouse(draftWarehouse);
+            await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(draftWarehouse));
+          }
 
-            const restoredCustomerName = (
-              order?.customer_name ||
-              savedDraft.customerName ||
-              ''
-            ).trim();
-
-            setOrderNo(savedDraft.orderNo);
-            setCustomerName(restoredCustomerName);
-            await saveOutboundWorkDraft(savedDraft.orderNo, restoredCustomerName, draftWarehouse);
-            await loadOrderMaterials(savedDraft.orderNo, savedDraft.warehouseId);
+          const order = await getOrder(draftOrderNo, savedDraft.warehouseId);
+          if (!screenActiveRef.current) {
             return;
           }
+
+          const restoredCustomerName = (
+            order?.customer_name ||
+            savedDraft.customerName ||
+            ''
+          ).trim();
+
+          setOrderNo(draftOrderNo);
+          setCustomerName(restoredCustomerName);
+          await saveOutboundWorkDraft(draftOrderNo, restoredCustomerName, draftWarehouse);
+          await loadOrderMaterials(draftOrderNo, savedDraft.warehouseId);
+          return;
         }
       }
 
@@ -698,8 +720,11 @@ export default function PDAScanScreen() {
       }
 
       if (savedOrderNo) {
-        // 验证订单是否存在
-        const order = await getOrder(savedOrderNo, activeWarehouse?.id);
+        // 验证订单是否存在；如果全局仓库被其他页面改过，不要直接把当前出库作业清掉。
+        let order = await getOrder(savedOrderNo, activeWarehouse?.id);
+        if (!order && activeWarehouse) {
+          order = await getOrder(savedOrderNo);
+        }
         if (!screenActiveRef.current) {
           return;
         }
@@ -727,18 +752,14 @@ export default function PDAScanScreen() {
         }
 
         if (activeWarehouse && order.warehouse_id !== activeWarehouse.id) {
-          logger.log('[loadOutboundState] 订单仓库不匹配，清空订单号:', {
+          logger.log('[loadOutboundState] 订单仓库不匹配，切回订单仓库:', {
             savedOrderNo,
             orderWarehouseId: order.warehouse_id,
             currentWarehouseId: activeWarehouse.id,
           });
-          showAlertIfActive('当前出库作业已清空', `上次暂存订单属于【${warehouse.name}】，当前仓库是【${activeWarehouse.name}】。已保存的历史订单不会删除，请重新扫描当前仓库订单。`);
-          await clearOutboundWorkDraft();
-          if (screenActiveRef.current) {
-            setOrderNo('');
-            setCustomerName('');
-          }
-          return;
+          activeWarehouse = warehouse;
+          setCurrentWarehouse(warehouse);
+          await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(warehouse));
         }
 
         if (!screenActiveRef.current) {
@@ -777,7 +798,10 @@ export default function PDAScanScreen() {
   // 清空扫描记录
   const clearScanRecords = async () => {
     try {
-      await AsyncStorage.removeItem(OUTBOUND_SCAN_RECORDS_KEY);
+      await AsyncStorage.multiRemove([
+        STORAGE_KEYS.OUTBOUND_SCAN_RECORDS,
+        LEGACY_OUTBOUND_SCAN_RECORDS_KEY,
+      ]);
     } catch (error) {
       logger.error('清空扫描记录失败:', error);
     }
@@ -1457,7 +1481,7 @@ export default function PDAScanScreen() {
 
     // 清理持久化存储
     await clearOutboundWorkDraft();
-    await AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_SCAN_RECORDS);
+    await clearScanRecords();
 
     // 切换到新仓库
     await handleWarehouseChange(wh);

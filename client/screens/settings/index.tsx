@@ -35,6 +35,7 @@ import {
   getConfigStats,
   incrementExportCount,
   exportDatabaseFile,
+  checkpointDatabaseToDisk,
   importDatabaseFile,
   BackupData,
   isBackupDataShape,
@@ -960,6 +961,24 @@ export default function SettingsScreen() {
         const apkInfo = await FileSystem.getInfoAsync(result.uri);
         if (!apkInfo.exists || !('size' in apkInfo) || (apkInfo as { size?: number }).size === 0) {
           alert.showError('安装包下载失败：文件为空，请检查更新服务器');
+          setDownloading(false);
+          return;
+        }
+
+        try {
+          const outboundQueueStats = await scanQueue.flushPendingWrites({
+            timeoutMs: 15000,
+            retryFailed: true,
+          });
+          if (outboundQueueStats.failed > 0) {
+            alert.showError(`仍有 ${outboundQueueStats.failed} 条出库扫码记录写入失败，请回到扫码出库页确认后再更新`);
+            setDownloading(false);
+            return;
+          }
+          await checkpointDatabaseToDisk();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error || '未知错误');
+          alert.showError(`安装前数据固化失败：${message}。请稍后再试，避免覆盖安装时丢失当前出库数据。`);
           setDownloading(false);
           return;
         }

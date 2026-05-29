@@ -7585,6 +7585,64 @@ const checkpointDatabaseForFileBackup = async (
   );
 };
 
+export const checkpointDatabaseToDisk = async (): Promise<void> => {
+  if (isWebPlatform) {
+    return;
+  }
+
+  if (!db) {
+    await initDatabase();
+  }
+
+  await checkpointDatabaseForFileBackup(getDb());
+};
+
+export const getSystemConfigValue = async (key: string): Promise<string | null> => {
+  const trimmedKey = key.trim();
+  if (!trimmedKey) {
+    return null;
+  }
+
+  if (!db) {
+    await initDatabase();
+  }
+
+  const result = await getDb().getFirstAsync<{ value: string }>(
+    'SELECT value FROM system_config WHERE key = ?',
+    [trimmedKey]
+  );
+  return result?.value ?? null;
+};
+
+export const setSystemConfigValue = async (key: string, value: string): Promise<void> => {
+  const trimmedKey = key.trim();
+  if (!trimmedKey) {
+    throw new Error('system_config key 不能为空');
+  }
+
+  if (!db) {
+    await initDatabase();
+  }
+
+  await getDb().runAsync('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)', [
+    trimmedKey,
+    value,
+  ]);
+};
+
+export const removeSystemConfigValue = async (key: string): Promise<void> => {
+  const trimmedKey = key.trim();
+  if (!trimmedKey) {
+    return;
+  }
+
+  if (!db) {
+    await initDatabase();
+  }
+
+  await getDb().runAsync('DELETE FROM system_config WHERE key = ?', [trimmedKey]);
+};
+
 const deleteDatabaseSidecarFiles = async (dbFilePath: string): Promise<void> => {
   await Promise.all(
     ['-wal', '-shm'].map((suffix) =>
