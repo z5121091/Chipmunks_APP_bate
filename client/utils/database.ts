@@ -2538,9 +2538,9 @@ const performDatabaseInitialization = async (): Promise<void> => {
 
   // 创建所有表
   await db.execAsync(`
-      -- 性能优化配置
+      -- 可靠性与性能配置
       PRAGMA journal_mode = WAL;
-      PRAGMA synchronous = NORMAL;
+      PRAGMA synchronous = FULL;
       PRAGMA cache_size = -64000;
       PRAGMA temp_store = MEMORY;
       -- 保持 mmap 在低端/32 位设备也更稳，避免超大映射导致初始化失败
@@ -3625,6 +3625,13 @@ export const addMaterialWithOrder = async (
       await upsertOrderWithDatabase(database, material.order_no, customerName, warehouse);
       const materialId = await insertMaterialWithDatabase(database, material);
       await database.execAsync('COMMIT');
+      if (material.operation_type === 'outbound') {
+        try {
+          await database.getFirstAsync('PRAGMA wal_checkpoint(PASSIVE)');
+        } catch (checkpointError) {
+          logger.warn('[addMaterialWithOrder] 出库物料已提交，但 WAL checkpoint 未完成:', checkpointError);
+        }
+      }
       return materialId;
     } catch (error) {
       await rollbackTransaction(database, 'addMaterialWithOrder');
