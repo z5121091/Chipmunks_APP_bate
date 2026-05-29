@@ -42,6 +42,7 @@ object AutoDatabaseBackupScheduler {
   private const val LAST_SUCCESS_DATE_KEY = "last_success_date"
   private const val LAST_SUCCESS_DATABASE_MODIFIED_KEY = "last_success_database_modified"
   private const val LAST_SUCCESS_DATABASE_SIZE_KEY = "last_success_database_size"
+  private const val LAST_SUCCESS_DATABASE_SIGNATURE_KEY = "last_success_database_signature"
   private const val LAST_NO_DATA_DATE_KEY = "last_no_data_date"
   const val ACTION_RUN_BACKUP = "com.chipmunks.traceability.AUTO_DATABASE_BACKUP"
   private val BEIJING_TIME_ZONE: TimeZone = TimeZone.getTimeZone("Asia/Shanghai")
@@ -107,6 +108,7 @@ object AutoDatabaseBackupScheduler {
       .putString(LAST_SUCCESS_DATE_KEY, date)
       .putLong(LAST_SUCCESS_DATABASE_MODIFIED_KEY, databaseFile.lastModified())
       .putLong(LAST_SUCCESS_DATABASE_SIZE_KEY, databaseFile.length())
+      .putString(LAST_SUCCESS_DATABASE_SIGNATURE_KEY, buildDatabaseSignature(databaseFile))
       .commit()
   }
 
@@ -125,6 +127,11 @@ object AutoDatabaseBackupScheduler {
 
   private fun hasDatabaseChangedSinceLastSuccess(context: Context, databaseFile: File): Boolean {
     val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val lastSignature = prefs.getString(LAST_SUCCESS_DATABASE_SIGNATURE_KEY, null)
+    if (lastSignature != null) {
+      return buildDatabaseSignature(databaseFile) != lastSignature
+    }
+
     val lastModified = prefs.getLong(LAST_SUCCESS_DATABASE_MODIFIED_KEY, -1L)
     val lastSize = prefs.getLong(LAST_SUCCESS_DATABASE_SIZE_KEY, -1L)
     if (lastModified < 0L || lastSize < 0L) {
@@ -132,6 +139,20 @@ object AutoDatabaseBackupScheduler {
     }
 
     return databaseFile.lastModified() != lastModified || databaseFile.length() != lastSize
+  }
+
+  private fun buildDatabaseSignature(databaseFile: File): String {
+    return listOf(
+      databaseFile,
+      File("${databaseFile.absolutePath}-wal"),
+      File("${databaseFile.absolutePath}-shm")
+    ).joinToString("|") { file ->
+      if (file.exists()) {
+        "${file.name}:${file.lastModified()}:${file.length()}"
+      } else {
+        "${file.name}:missing"
+      }
+    }
   }
 
   fun getLastNoDataDate(context: Context): String? {
