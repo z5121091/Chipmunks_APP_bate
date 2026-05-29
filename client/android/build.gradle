@@ -1,5 +1,28 @@
 // Top-level build file where you can add configuration options common to all sub-projects/modules.
 
+def resolveNodePackageFile = { packageName, basePackage = null, required = true ->
+  def resolveScript = basePackage == null
+    ? "const path = require('path'); process.stdout.write(path.relative(process.cwd(), require.resolve('${packageName}/package.json')))"
+    : "const path = require('path'); process.stdout.write(path.relative(process.cwd(), require.resolve('${packageName}/package.json', { paths: [require.resolve('${basePackage}/package.json')] })))"
+
+  def stdout = new ByteArrayOutputStream()
+  def stderr = new ByteArrayOutputStream()
+  def result = exec {
+    workingDir(rootDir)
+    commandLine("node", "-e", resolveScript)
+    standardOutput = stdout
+    errorOutput = stderr
+    ignoreExitValue = true
+  }
+  if (result.exitValue != 0) {
+    if (required) {
+      throw new GradleException("Unable to resolve ${packageName}: ${stderr.toString('UTF-8')}")
+    }
+    return null
+  }
+  return new File(rootDir, stdout.toString('UTF-8').trim())
+}
+
 buildscript {
   ext {
     buildToolsVersion = findProperty('android.buildToolsVersion') ?: '36.0.0'
@@ -24,11 +47,14 @@ allprojects {
   repositories {
     maven {
       // All of React Native (JS, Obj-C sources, Android binaries) is installed from npm.
-      url(new File(['node', '--print', "require.resolve('react-native/package.json')"].execute(null, rootDir).text.trim(), '../android'))
+      url(new File(resolveNodePackageFile('react-native'), '../android'))
     }
-    maven {
-      // Android JSC is installed from npm.
-      url(new File(['node', '--print', "require.resolve('jsc-android/package.json', { paths: [require.resolve('react-native/package.json')] })"].execute(null, rootDir).text.trim(), '../dist'))
+    def jscAndroidPackage = resolveNodePackageFile('jsc-android', 'react-native', false)
+    if (jscAndroidPackage != null) {
+      maven {
+        // Android JSC is installed from npm when the package is present.
+        url(new File(jscAndroidPackage, '../dist'))
+      }
     }
 
     google()
