@@ -67,6 +67,7 @@ import { parseAuthFromUrl, base64Encode, compareVersions } from '@/utils/update'
 import { parseQuantity } from '@/utils/quantity';
 import { useToast } from '@/utils/toast';
 import { scanQueue } from '@/utils/scanQueue';
+import { uploadDatabaseBackupToNas } from '@/utils/nasBackup';
 
 // 使用 any 绕过类型检查
 const FileSystem = FileSystemLegacy as any;
@@ -1225,6 +1226,17 @@ export default function SettingsScreen() {
 
           const result = await exportDatabaseFile();
           if (result.success && result.filePath) {
+            let nasBackupFileName: string | null = null;
+            let nasBackupError: string | null = null;
+
+            try {
+              const nasBackupResult = await uploadDatabaseBackupToNas(result.filePath);
+              nasBackupFileName = nasBackupResult.fileName;
+            } catch (error) {
+              nasBackupError = error instanceof Error ? error.message : 'NAS 云端备份失败';
+              logger.error('NAS 数据库备份失败:', error);
+            }
+
             // 使用 expo-sharing 分享文件
             if (await Sharing.isAvailableAsync()) {
               await Sharing.shareAsync(result.filePath, {
@@ -1234,7 +1246,15 @@ export default function SettingsScreen() {
             } else {
               alert.showError('您的设备不支持文件分享');
             }
-            alert.showSuccess('数据库文件备份成功');
+            if (nasBackupError) {
+              alert.showWarning(`数据库文件已本地备份，但 NAS 云端备份失败：${nasBackupError}`);
+            } else {
+              alert.showSuccess(
+                nasBackupFileName
+                  ? `数据库文件备份成功\nNAS 云端备份：${nasBackupFileName}`
+                  : '数据库文件备份成功'
+              );
+            }
           } else {
             alert.showError(result.message);
           }

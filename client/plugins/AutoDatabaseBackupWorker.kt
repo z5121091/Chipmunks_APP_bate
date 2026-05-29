@@ -204,9 +204,7 @@ class AutoDatabaseBackupWorker(
 
       checkpointWal(databaseFile)
 
-      val backupFile = copyDatabaseSnapshot(databaseFile, today)
-      Log.i(TAG, "Database snapshot created: ${backupFile.absolutePath}, size=${backupFile.length()}")
-      uploadBackup(backupFile)
+      val backupFile = uploadBackup(databaseFile, today)
       AutoDatabaseBackupScheduler.markSuccess(applicationContext, today, databaseFile)
       Log.i(TAG, "Auto database backup completed: ${backupFile.name}")
       Result.success()
@@ -283,45 +281,74 @@ class AutoDatabaseBackupWorker(
     }
   }
 
-  private fun copyDatabaseSnapshot(databaseFile: File, date: String): File {
+  private fun copyDatabaseSnapshot(databaseFile: File, backupFileName: String): File {
     val backupDir = File(applicationContext.cacheDir, "auto-db-backup").apply {
       mkdirs()
     }
-    val backupFile = File(backupDir, "${safeFileName(applicationContext.getString(R.string.app_name))}_$date.db")
+    val backupFile = File(backupDir, backupFileName)
     databaseFile.copyTo(backupFile, overwrite = true)
     return backupFile
   }
 
-  private fun uploadBackup(backupFile: File) {
+  private fun uploadBackup(databaseFile: File, date: String): File {
     val server = WebDavServer.from(DEFAULT_UPDATE_SERVER)
     val backupDirectoryUrl = "${server.cleanBaseUrl}/backup/"
-    val backupFileUrl = "$backupDirectoryUrl${urlEncode(backupFile.name)}"
 
-    Log.i(TAG, "Uploading database backup to: $backupFileUrl")
     ensureRemoteDirectory(server, backupDirectoryUrl)
-    putFile(server, backupFileUrl, backupFile)
+
+    for (sequence in 1..999) {
+      val backupFileName = buildBackupFileName(date, sequence)
+      val backupFileUrl = "$backupDirectoryUrl${urlEncode(backupFileName)}"
+      if (remoteFileExists(server, backupFileUrl)) {
+        continue
+      }
+
+      val backupFile = copyDatabaseSnapshot(databaseFile, backupFileName)
+      Log.i(TAG, "Database snapshot created: ${backupFile.absolutePath}, size=${backupFile.length()}")
+      Log.i(TAG, "Uploading database backup to: $backupFileUrl")
+      if (putFile(server, backupFileUrl, backupFile)) {
+        return backupFile
+      }
+    }
+
+    throw IllegalStateException("No available WebDAV backup file name for $date")
   }
 
   private fun ensureRemoteDirectory(server: WebDavServer, directoryUrl: String) {
-    val connection = openConnection(server, directoryUrl, "MKCOL")
+    val connection = openConnection(server, directoryUrl, "HEAD")
     try {
       val responseCode = connection.responseCode
-      if (
-        responseCode !in 200..299 &&
-        responseCode != HttpURLConnection.HTTP_BAD_METHOD &&
-        responseCode != HttpURLConnection.HTTP_CONFLICT
-      ) {
-        throw IllegalStateException("WebDAV MKCOL failed: $responseCode ${connection.responseMessage}")
+      if (responseCode in 200..399 || responseCode == HttpURLConnection.HTTP_BAD_METHOD) {
+        Log.i(TAG, "WebDAV backup directory ready: $responseCode")
+        return
       }
-      Log.i(TAG, "WebDAV backup directory ready: $responseCode")
+      if (responseCode == HttpURLConnection.HTTP_NOT_FOUND) {
+        throw IllegalStateException("WebDAV backup directory not found: $directoryUrl")
+      }
+      throw IllegalStateException("WebDAV backup directory check failed: $responseCode ${connection.responseMessage}")
     } finally {
       connection.disconnect()
     }
   }
 
-  private fun putFile(server: WebDavServer, targetUrl: String, file: File) {
+  private fun remoteFileExists(server: WebDavServer, targetUrl: String): Boolean {
+    val connection = openConnection(server, targetUrl, "HEAD")
+    try {
+      val responseCode = connection.responseCode
+      return when {
+        responseCode in 200..299 -> true
+        responseCode == HttpURLConnection.HTTP_NOT_FOUND -> false
+        else -> throw IllegalStateException("WebDAV HEAD failed: $responseCode ${connection.responseMessage}")
+      }
+    } finally {
+      connection.disconnect()
+    }
+  }
+
+  private fun putFile(server: WebDavServer, targetUrl: String, file: File): Boolean {
     val connection = openConnection(server, targetUrl, "PUT")
     connection.setRequestProperty("Content-Type", "application/octet-stream")
+    connection.setRequestProperty("If-None-Match", "*")
     connection.setFixedLengthStreamingMode(file.length())
     connection.doOutput = true
 
@@ -333,10 +360,18 @@ class AutoDatabaseBackupWorker(
       }
 
       val responseCode = connection.responseCode
+      if (
+        responseCode == HttpURLConnection.HTTP_CONFLICT ||
+        responseCode == HttpURLConnection.HTTP_PRECON_FAILED
+      ) {
+        Log.w(TAG, "WebDAV target already exists, try next file name: $responseCode")
+        return false
+      }
       if (responseCode !in 200..299) {
         throw IllegalStateException("WebDAV PUT failed: $responseCode ${connection.responseMessage}")
       }
       Log.i(TAG, "WebDAV PUT completed: $responseCode")
+      return true
     } finally {
       connection.disconnect()
     }
@@ -357,6 +392,11 @@ class AutoDatabaseBackupWorker(
   private fun safeFileName(value: String): String {
     val sanitized = value.replace(Regex("""[\\/:*?"<>|\p{Cntrl}]"""), "_").trim('_', ' ')
     return sanitized.ifBlank { "warehouse" }
+  }
+
+  private fun buildBackupFileName(date: String, sequence: Int): String {
+    val appName = safeFileName(applicationContext.getString(R.string.app_name))
+    return "${appName}_${date}_${sequence.toString().padStart(2, '0')}.db"
   }
 
   private fun urlEncode(value: String): String {

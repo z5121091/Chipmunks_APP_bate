@@ -9,11 +9,13 @@ import { getISODateTime, getTodayLocal } from './time';
 import { parseQuantity } from './quantity';
 import { safeJsonParseNullable } from './json';
 import { logger } from './logger';
+import { getDatabaseBackupDateString, sanitizeBackupFileName } from './backupNaming';
 import {
   isOutboundOrderRuleConfig,
   loadOutboundWarehouseOrderRules,
   type OutboundWarehouseSampleRuleMap,
 } from './outboundOrderRule';
+import { APP_NAME } from '@/constants/version';
 
 // 使用 any 绕过类型检查
 const FS = FileSystem as any;
@@ -7664,11 +7666,7 @@ export const exportDatabaseFile = async (): Promise<{
     }
 
     // 生成按天归档并自动递增序号的备份文件名
-    const now = new Date();
-    const year = String(now.getFullYear());
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
-    const timestamp = `${year}${month}${day}`;
+    const timestamp = getDatabaseBackupDateString();
     const backupDir = `${FS.documentDirectory}backups`;
 
     // 确保备份目录存在
@@ -7679,7 +7677,7 @@ export const exportDatabaseFile = async (): Promise<{
 
     const backupFileName = await getNextDatedBackupFileName(
       backupDir,
-      '掌上仓库_backup',
+      sanitizeBackupFileName(APP_NAME),
       timestamp,
       'db'
     );
