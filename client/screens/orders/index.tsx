@@ -942,9 +942,15 @@ export default function OrdersScreen() {
 
   // 删除物料
   const handleDeleteMaterial = (material: MaterialRecord) => {
+    const materialSummary = [
+      `型号：${material.model || '-'}`,
+      `批次：${material.batch || '-'}`,
+      `数量：${material.quantity || 0}`,
+    ].join('\n');
+
     showCustomAlert(
       '确认删除',
-      `确定要删除这条物料记录吗？`,
+      `确定要删除这条物料记录吗？\n${materialSummary}`,
       [
         { text: '取消', style: 'cancel' },
         {
@@ -960,6 +966,12 @@ export default function OrdersScreen() {
               const materials = await getMaterialsByOrder(material.order_no, currentWarehouse?.id);
               setExpandedMaterials(materials);
               await loadData();
+              showCustomAlert(
+                '删除成功',
+                `物料记录已删除\n${materialSummary}`,
+                [{ text: '确定' }],
+                'success'
+              );
             } catch (error) {
               logger.error('删除物料失败:', error);
               showCustomAlert(

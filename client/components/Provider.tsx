@@ -1,24 +1,26 @@
 import { AuthProvider } from '@/contexts/AuthContext';
 import { type ReactNode } from 'react';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
-import { WebOnlyColorSchemeUpdater } from './ColorSchemeUpdater';
-import { WebOnlyPrettyScrollbar } from './PrettyScrollbar'
+import { ColorSchemeProvider } from '@/hooks/useColorScheme';
+import { WebOnlyPrettyScrollbar } from './PrettyScrollbar';
 import { HeroUINativeProvider } from '@/heroui';
 
 function Provider({ children }: { children: ReactNode }) {
-  return <WebOnlyColorSchemeUpdater>
-    <WebOnlyPrettyScrollbar>
-      <AuthProvider>
-        <GestureHandlerRootView style={{ flex: 1 }}>
-          <HeroUINativeProvider>
-            {children}
-          </HeroUINativeProvider>
-        </GestureHandlerRootView>
-      </AuthProvider>
-    </WebOnlyPrettyScrollbar>
-  </WebOnlyColorSchemeUpdater>
+  return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <ColorSchemeProvider>
+        <WebOnlyPrettyScrollbar>
+          <AuthProvider>
+            <HeroUINativeProvider>
+              {children}
+            </HeroUINativeProvider>
+          </AuthProvider>
+        </WebOnlyPrettyScrollbar>
+      </ColorSchemeProvider>
+    </GestureHandlerRootView>
+  );
 }
 
 export {
   Provider,
-}
+};

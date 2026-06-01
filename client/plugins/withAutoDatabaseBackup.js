@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const updateServerConfig = require('../update-server.json');
 const {
   AndroidConfig,
   withAndroidManifest,
@@ -10,6 +11,10 @@ const {
 const WORK_MANAGER_DEPENDENCY = 'implementation("androidx.work:work-runtime-ktx:2.9.1")';
 const RECEIVER_NAME = '.AutoDatabaseBackupReceiver';
 const BOOT_ACTION = 'android.intent.action.BOOT_COMPLETED';
+const SHUTDOWN_ACTION = 'android.intent.action.ACTION_SHUTDOWN';
+const REBOOT_ACTION = 'android.intent.action.REBOOT';
+const QUICKBOOT_POWEROFF_ACTION = 'android.intent.action.QUICKBOOT_POWEROFF';
+const DEFAULT_UPDATE_SERVER = updateServerConfig.defaultServer;
 
 function ensurePermission(androidManifest, permissionName) {
   const permissions = androidManifest.manifest['uses-permission'] || [];
@@ -36,7 +41,12 @@ function ensureReceiver(androidManifest) {
 
   receiver['intent-filter'] = [
     {
-      action: [{ $: { 'android:name': BOOT_ACTION } }],
+      action: [
+        { $: { 'android:name': BOOT_ACTION } },
+        { $: { 'android:name': SHUTDOWN_ACTION } },
+        { $: { 'android:name': REBOOT_ACTION } },
+        { $: { 'android:name': QUICKBOOT_POWEROFF_ACTION } },
+      ],
     },
   ];
 
@@ -75,7 +85,11 @@ function ensureMainApplicationSchedulesBackup(mainApplicationPath) {
   fs.writeFileSync(mainApplicationPath, updated);
 }
 
-function writeBackupWorker(projectRoot, packageName) {
+function toKotlinStringLiteral(value) {
+  return JSON.stringify(value).replace(/\$/g, '\\$');
+}
+
+function writeBackupWorker(projectRoot, packageName, updateServerUrl) {
   const packagePath = packageName.split('.').join(path.sep);
   const targetPath = path.join(
     projectRoot,
@@ -89,9 +103,12 @@ function writeBackupWorker(projectRoot, packageName) {
   );
   const templatePath = path.join(__dirname, 'AutoDatabaseBackupWorker.kt');
   const template = fs.readFileSync(templatePath, 'utf8');
+  const source = template
+    .replace('__PACKAGE_NAME__', packageName)
+    .replace('__DEFAULT_UPDATE_SERVER__', toKotlinStringLiteral(updateServerUrl));
 
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-  fs.writeFileSync(targetPath, template.replace('__PACKAGE_NAME__', packageName));
+  fs.writeFileSync(targetPath, source);
 }
 
 module.exports = function withAutoDatabaseBackup(config) {
@@ -115,7 +132,11 @@ module.exports = function withAutoDatabaseBackup(config) {
       if (!packageName) {
         throw new Error('android.package is required for withAutoDatabaseBackup');
       }
-      writeBackupWorker(config.modRequest.projectRoot, packageName);
+      const updateServerUrl =
+        config.extra?.updateServerUrl ||
+        process.env.EXPO_PUBLIC_UPDATE_SERVER_URL ||
+        DEFAULT_UPDATE_SERVER;
+      writeBackupWorker(config.modRequest.projectRoot, packageName, updateServerUrl);
 
       const mainApplicationPath = path.join(
         config.modRequest.projectRoot,

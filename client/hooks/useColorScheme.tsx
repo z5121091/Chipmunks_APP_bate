@@ -1,23 +1,56 @@
-import { createContext, ReactNode, useContext, useEffect, useState } from 'react';
-import { ColorSchemeName, useColorScheme as useReactNativeColorScheme, Platform } from 'react-native';
+import { createContext, ReactNode, useContext, useEffect, useMemo, useState } from 'react';
+import {
+  ColorSchemeName,
+  Platform,
+  useColorScheme as useReactNativeColorScheme,
+} from 'react-native';
+import { Uniwind } from 'uniwind';
+import { DEFAULT_THEME, type AppThemePreference } from '@/components/ColorSchemeUpdater';
 
-const ColorSchemeContext = createContext<'light' | 'dark' | null | undefined>(null);
+type AppColorScheme = 'light' | 'dark';
+
+const ColorSchemeContext = createContext<AppColorScheme>('light');
+
+const normalizeColorScheme = (value: ColorSchemeName): AppColorScheme | null => {
+  return value === 'light' || value === 'dark' ? value : null;
+};
+
+const resolveColorScheme = (
+  themePreference: AppThemePreference,
+  systemColorScheme: ColorSchemeName,
+  workbenchColorScheme: ColorSchemeName
+): AppColorScheme => {
+  const normalizedWorkbenchColorScheme = normalizeColorScheme(workbenchColorScheme);
+  if (normalizedWorkbenchColorScheme) {
+    return normalizedWorkbenchColorScheme;
+  }
+
+  if (themePreference === 'light' || themePreference === 'dark') {
+    return themePreference;
+  }
+
+  return normalizeColorScheme(systemColorScheme) || 'light';
+};
 
 const ColorSchemeProvider = function ({ children }: { children?: ReactNode }) {
   const systemColorScheme = useReactNativeColorScheme();
-  const [colorScheme, setColorScheme] = useState(systemColorScheme);
+  const [workbenchColorScheme, setWorkbenchColorScheme] = useState<ColorSchemeName>(null);
+
+  const colorScheme = useMemo(
+    () => resolveColorScheme(DEFAULT_THEME, systemColorScheme, workbenchColorScheme),
+    [systemColorScheme, workbenchColorScheme]
+  );
 
   useEffect(() => {
-    setColorScheme(systemColorScheme);
-  }, [systemColorScheme]);
+    Uniwind.setTheme(workbenchColorScheme || DEFAULT_THEME);
+  }, [workbenchColorScheme]);
 
   useEffect(() => {
-    function handleMessage(e: MessageEvent<{ event: string; colorScheme: ColorSchemeName; } | undefined>) {
+    function handleMessage(
+      e: MessageEvent<{ event: string; colorScheme: ColorSchemeName } | undefined>
+    ) {
       if (e.data?.event === 'coze.workbench.colorScheme') {
-        const cs = e.data.colorScheme;
-        if (typeof cs === 'string' && typeof setColorScheme === 'function') {
-          setColorScheme(cs);
-        }
+        setWorkbenchColorScheme(normalizeColorScheme(e.data.colorScheme));
       }
     }
 
@@ -29,20 +62,14 @@ const ColorSchemeProvider = function ({ children }: { children?: ReactNode }) {
       if (Platform.OS === 'web') {
         window.removeEventListener('message', handleMessage, false);
       }
-    }
-  }, [setColorScheme]);
+    };
+  }, []);
 
-  return <ColorSchemeContext.Provider value={colorScheme}>
-    {children}
-  </ColorSchemeContext.Provider>
+  return <ColorSchemeContext.Provider value={colorScheme}>{children}</ColorSchemeContext.Provider>;
 };
 
 function useColorScheme() {
-  const colorScheme = useContext(ColorSchemeContext);
-  return colorScheme;
+  return useContext(ColorSchemeContext);
 }
 
-export {
-  ColorSchemeProvider,
-  useColorScheme,
-}
+export { ColorSchemeProvider, useColorScheme };

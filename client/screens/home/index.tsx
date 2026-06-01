@@ -24,61 +24,60 @@ interface Module {
   action: string;
 }
 
-const HomeModuleCard = React.memo<{
+interface HomeModuleCardProps {
   module: Module;
   variant: 'primary' | 'secondary';
   styles: ReturnType<typeof createStyles>;
   screenWidth: number;
   onPress: () => void;
-}>(
-  ({ module, variant, styles, screenWidth, onPress }) => {
-    const isPrimary = variant === 'primary';
-    const iconSize = isPrimary ? (screenWidth <= 410 ? 38 : 42) : screenWidth <= 410 ? 25 : 28;
+}
 
-    return (
-      <AnimatedButton
-        containerStyle={isPrimary ? styles.primaryCardWrapper : styles.secondaryCardWrapper}
-        style={
-          isPrimary ? [styles.primaryCard, { borderColor: module.color }] : styles.secondaryCard
-        }
-        activeScale={0.975}
-        activeOpacity={0.92}
-        onPress={onPress}
-      >
-        <View style={isPrimary ? styles.primaryCardInner : styles.secondaryCardInner}>
-          <View
-            style={[
-              isPrimary ? styles.primaryIconContainer : styles.secondaryIconContainer,
-              { backgroundColor: `${module.color}18` },
-            ]}
-          >
-            <Feather name={module.icon} size={iconSize} color={module.color} />
-          </View>
+function HomeModuleCardComponent({
+  module,
+  variant,
+  styles,
+  screenWidth,
+  onPress,
+}: HomeModuleCardProps) {
+  const isPrimary = variant === 'primary';
+  const iconSize = isPrimary ? (screenWidth <= 410 ? 38 : 42) : screenWidth <= 410 ? 25 : 28;
 
-          <Text style={isPrimary ? styles.primaryTitle : styles.secondaryTitle} numberOfLines={1}>
-            {module.name}
-          </Text>
-
-          <View style={isPrimary ? styles.primaryFooter : styles.secondaryFooter}>
-            <Text style={isPrimary ? styles.primaryAction : styles.secondaryAction}>
-              {module.action}
-            </Text>
-            <Feather name="arrow-up-right" size={isPrimary ? 16 : 14} color={module.color} />
-          </View>
-
-          {isPrimary && <View style={[styles.primaryAccent, { backgroundColor: module.color }]} />}
+  return (
+    <AnimatedButton
+      containerStyle={isPrimary ? styles.primaryCardWrapper : styles.secondaryCardWrapper}
+      style={isPrimary ? [styles.primaryCard, { borderColor: module.color }] : styles.secondaryCard}
+      activeScale={0.975}
+      activeOpacity={0.92}
+      onPress={onPress}
+    >
+      <View style={isPrimary ? styles.primaryCardInner : styles.secondaryCardInner}>
+        <View
+          style={[
+            isPrimary ? styles.primaryIconContainer : styles.secondaryIconContainer,
+            { backgroundColor: `${module.color}18` },
+          ]}
+        >
+          <Feather name={module.icon} size={iconSize} color={module.color} />
         </View>
-      </AnimatedButton>
-    );
-  },
-  (prevProps, nextProps) =>
-    prevProps.module.id === nextProps.module.id &&
-    prevProps.module.route === nextProps.module.route &&
-    prevProps.module.name === nextProps.module.name &&
-    prevProps.module.action === nextProps.module.action &&
-    prevProps.variant === nextProps.variant &&
-    prevProps.screenWidth === nextProps.screenWidth
-);
+
+        <Text style={isPrimary ? styles.primaryTitle : styles.secondaryTitle} numberOfLines={1}>
+          {module.name}
+        </Text>
+
+        <View style={isPrimary ? styles.primaryFooter : styles.secondaryFooter}>
+          <Text style={isPrimary ? styles.primaryAction : styles.secondaryAction}>
+            {module.action}
+          </Text>
+          <Feather name="arrow-up-right" size={isPrimary ? 16 : 14} color={module.color} />
+        </View>
+
+        {isPrimary && <View style={[styles.primaryAccent, { backgroundColor: module.color }]} />}
+      </View>
+    </AnimatedButton>
+  );
+}
+
+const HomeModuleCard = React.memo(HomeModuleCardComponent);
 
 export default function HomeScreen() {
   const { theme, isDark } = useTheme();

@@ -12,6 +12,16 @@ import { logger } from './logger';
 
 // 使用 any 绕过类型检查
 const FileSystem = FileSystemLegacy as any;
+const LEGACY_UPDATE_SERVER_HOSTS = new Set(['zx5121091.pw']);
+
+const isLegacyUpdateServerUrl = (url: string): boolean => {
+  try {
+    const parsed = new URL(url);
+    return LEGACY_UPDATE_SERVER_HOSTS.has(parsed.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+};
 
 /**
  * 从 URL 中提取不含认证信息的显示用 URL
@@ -82,9 +92,18 @@ export const saveUpdateServer = async (url: string): Promise<void> => {
  * 获取更新服务器地址
  */
 export const getUpdateServer = async (): Promise<string> => {
-  return (
-    (await AsyncStorage.getItem(STORAGE_KEYS.UPDATE_SERVER_URL)) || UPDATE_CONFIG.DEFAULT_SERVER
-  );
+  const savedServer = (await AsyncStorage.getItem(STORAGE_KEYS.UPDATE_SERVER_URL))?.trim();
+  if (!savedServer) {
+    return UPDATE_CONFIG.DEFAULT_SERVER;
+  }
+
+  if (isLegacyUpdateServerUrl(savedServer)) {
+    logger.warn('[update] 检测到旧更新服务器地址，已迁移到默认 NAS 地址:', savedServer);
+    await AsyncStorage.setItem(STORAGE_KEYS.UPDATE_SERVER_URL, UPDATE_CONFIG.DEFAULT_SERVER);
+    return UPDATE_CONFIG.DEFAULT_SERVER;
+  }
+
+  return savedServer;
 };
 
 /**

@@ -1,3 +1,5 @@
+import updateServerConfig from '../update-server.json';
+
 /**
  * 应用配置常量
  * 
@@ -59,8 +61,8 @@ export const NETWORK_CONFIG = {
 
 // ============== 更新服务器配置 ==============
 export const UPDATE_CONFIG = {
-  DEFAULT_SERVER: 'https://zx5121091:zx5121091Z..@dav.zx5121091.fnos.net:443/AppUpdate',
-  DEFAULT_DOWNLOAD_URL: 'https://zx5121091:zx5121091Z..@dav.zx5121091.fnos.net:443/AppUpdate/app-release.apk',
+  DEFAULT_SERVER: updateServerConfig.defaultServer.replace(/\/+$/, ''),
+  DEFAULT_DOWNLOAD_URL: `${updateServerConfig.defaultServer.replace(/\/+$/, '')}/app-release.apk`,
   APK_FILE_NAME: 'app-release.apk',
 };
 

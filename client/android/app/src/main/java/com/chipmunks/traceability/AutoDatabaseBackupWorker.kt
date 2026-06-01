@@ -45,6 +45,7 @@ object AutoDatabaseBackupScheduler {
   private const val LAST_SUCCESS_DATABASE_MODIFIED_KEY = "last_success_database_modified"
   private const val LAST_SUCCESS_DATABASE_SIZE_KEY = "last_success_database_size"
   private const val LAST_SUCCESS_DATABASE_SIGNATURE_KEY = "last_success_database_signature"
+  private const val FORCE_NEXT_BACKUP_KEY = "force_next_backup"
   private const val LAST_NO_DATA_DATE_KEY = "last_no_data_date"
   const val ACTION_RUN_BACKUP = "com.chipmunks.traceability.AUTO_DATABASE_BACKUP"
   private val BEIJING_TIME_ZONE: TimeZone = TimeZone.getTimeZone("Asia/Shanghai")
@@ -52,6 +53,11 @@ object AutoDatabaseBackupScheduler {
   fun schedule(context: Context) {
     scheduleDailyAlarm(context)
     enqueuePeriodicBackup(context)
+    if (shouldForceNextBackup(context)) {
+      enqueueBackup(context)
+      return
+    }
+
     val today = todayBeijing()
     if (getLastSuccessDate(context) != today) {
       enqueueBackup(context)
@@ -76,7 +82,7 @@ object AutoDatabaseBackupScheduler {
 
     WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
       UNIQUE_WORK_NAME,
-      ExistingWorkPolicy.REPLACE,
+      ExistingWorkPolicy.KEEP,
       request
     )
   }
@@ -116,6 +122,30 @@ object AutoDatabaseBackupScheduler {
       .putLong(LAST_SUCCESS_DATABASE_MODIFIED_KEY, databaseFile.lastModified())
       .putLong(LAST_SUCCESS_DATABASE_SIZE_KEY, databaseFile.length())
       .putString(LAST_SUCCESS_DATABASE_SIGNATURE_KEY, buildDatabaseSignature(databaseFile))
+      .remove(FORCE_NEXT_BACKUP_KEY)
+      .commit()
+  }
+
+  fun requestBackup(context: Context, force: Boolean = false) {
+    if (force) {
+      markForceNextBackup(context)
+    }
+    enqueueBackup(context)
+  }
+
+  fun requestBackupOnNextSchedule(context: Context) {
+    markForceNextBackup(context)
+  }
+
+  fun shouldForceNextBackup(context: Context): Boolean {
+    return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      .getBoolean(FORCE_NEXT_BACKUP_KEY, false)
+  }
+
+  private fun markForceNextBackup(context: Context) {
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      .edit()
+      .putBoolean(FORCE_NEXT_BACKUP_KEY, true)
       .commit()
   }
 
@@ -183,6 +213,7 @@ object AutoDatabaseBackupScheduler {
     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
       .edit()
       .putString(LAST_NO_DATA_DATE_KEY, date)
+      .remove(FORCE_NEXT_BACKUP_KEY)
       .commit()
   }
 
@@ -222,11 +253,15 @@ object AutoDatabaseBackupScheduler {
 
 class AutoDatabaseBackupReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
-    if (
-      intent.action == AutoDatabaseBackupScheduler.ACTION_RUN_BACKUP ||
-      intent.action == Intent.ACTION_BOOT_COMPLETED
-    ) {
-      AutoDatabaseBackupScheduler.schedule(context)
+    when (intent.action) {
+      AutoDatabaseBackupScheduler.ACTION_RUN_BACKUP,
+      Intent.ACTION_BOOT_COMPLETED -> AutoDatabaseBackupScheduler.schedule(context)
+      Intent.ACTION_SHUTDOWN,
+      "android.intent.action.REBOOT",
+      "android.intent.action.QUICKBOOT_POWEROFF" -> {
+        Log.i("AutoDbBackup", "Device shutdown/reboot detected, force backup on next schedule")
+        AutoDatabaseBackupScheduler.requestBackupOnNextSchedule(context)
+      }
     }
   }
 }
@@ -248,7 +283,9 @@ class AutoDatabaseBackupWorker(
       }
       Log.i(TAG, "SQLite database file found: ${databaseFile.absolutePath}, size=${databaseFile.length()}")
 
+      val forceBackup = AutoDatabaseBackupScheduler.shouldForceNextBackup(applicationContext)
       if (
+        !forceBackup &&
         AutoDatabaseBackupScheduler.hasSuccessfulBackupForCurrentDatabase(
           applicationContext,
           today,
@@ -260,6 +297,7 @@ class AutoDatabaseBackupWorker(
       }
 
       if (
+        !forceBackup &&
         AutoDatabaseBackupScheduler.getLastSuccessDate(applicationContext) == today &&
         !AutoDatabaseBackupScheduler.hasChangedBackupIntervalElapsed(applicationContext)
       ) {
@@ -267,13 +305,13 @@ class AutoDatabaseBackupWorker(
         return Result.success()
       }
 
+      checkpointWal(databaseFile)
+
       if (!hasBusinessData(databaseFile)) {
         Log.w(TAG, "SQLite database has no business data, skip auto backup to avoid overwriting a valid remote file")
         AutoDatabaseBackupScheduler.markNoData(applicationContext, today)
         return Result.success()
       }
-
-      checkpointWal(databaseFile)
 
       val backupFile = uploadBackup(databaseFile, today)
       AutoDatabaseBackupScheduler.markSuccess(applicationContext, today, databaseFile)
@@ -386,17 +424,42 @@ class AutoDatabaseBackupWorker(
   }
 
   private fun ensureRemoteDirectory(server: WebDavServer, directoryUrl: String) {
-    val connection = openConnection(server, directoryUrl, "HEAD")
+    val connection = openConnection(server, directoryUrl, "MKCOL")
     try {
       val responseCode = connection.responseCode
-      if (responseCode in 200..399 || responseCode == HttpURLConnection.HTTP_BAD_METHOD) {
-        Log.i(TAG, "WebDAV backup directory ready: $responseCode")
+      if (
+        responseCode in 200..299 ||
+        responseCode == HttpURLConnection.HTTP_BAD_METHOD ||
+        responseCode == HttpURLConnection.HTTP_CONFLICT
+      ) {
+        Log.i(TAG, "WebDAV backup directory ready after MKCOL: $responseCode")
         return
       }
-      if (responseCode == HttpURLConnection.HTTP_NOT_FOUND) {
-        throw IllegalStateException("WebDAV backup directory not found: $directoryUrl")
+      if (
+        responseCode == HttpURLConnection.HTTP_FORBIDDEN ||
+        responseCode == HttpURLConnection.HTTP_NOT_IMPLEMENTED
+      ) {
+        Log.w(TAG, "WebDAV MKCOL unavailable: $responseCode, fallback to PROPFIND")
+        if (remoteDirectoryExistsByPropfind(server, directoryUrl)) {
+          return
+        }
       }
-      throw IllegalStateException("WebDAV backup directory check failed: $responseCode ${connection.responseMessage}")
+      throw IllegalStateException("WebDAV backup directory create/check failed: $responseCode ${connection.responseMessage}")
+    } finally {
+      connection.disconnect()
+    }
+  }
+
+  private fun remoteDirectoryExistsByPropfind(server: WebDavServer, directoryUrl: String): Boolean {
+    val connection = openConnection(server, directoryUrl, "PROPFIND")
+    connection.setRequestProperty("Depth", "0")
+    try {
+      val responseCode = connection.responseCode
+      return when {
+        responseCode in 200..299 -> true
+        responseCode == HttpURLConnection.HTTP_NOT_FOUND -> false
+        else -> throw IllegalStateException("WebDAV directory PROPFIND failed: $responseCode ${connection.responseMessage}")
+      }
     } finally {
       connection.disconnect()
     }
@@ -409,7 +472,28 @@ class AutoDatabaseBackupWorker(
       return when {
         responseCode in 200..299 -> true
         responseCode == HttpURLConnection.HTTP_NOT_FOUND -> false
+        responseCode == HttpURLConnection.HTTP_FORBIDDEN ||
+          responseCode == HttpURLConnection.HTTP_BAD_METHOD ||
+          responseCode == HttpURLConnection.HTTP_NOT_IMPLEMENTED -> {
+          Log.w(TAG, "WebDAV HEAD unsupported for existence check: $responseCode, fallback to PROPFIND")
+          remoteFileExistsByPropfind(server, targetUrl)
+        }
         else -> throw IllegalStateException("WebDAV HEAD failed: $responseCode ${connection.responseMessage}")
+      }
+    } finally {
+      connection.disconnect()
+    }
+  }
+
+  private fun remoteFileExistsByPropfind(server: WebDavServer, targetUrl: String): Boolean {
+    val connection = openConnection(server, targetUrl, "PROPFIND")
+    connection.setRequestProperty("Depth", "0")
+    try {
+      val responseCode = connection.responseCode
+      return when {
+        responseCode in 200..299 -> true
+        responseCode == HttpURLConnection.HTTP_NOT_FOUND -> false
+        else -> throw IllegalStateException("WebDAV PROPFIND failed: $responseCode ${connection.responseMessage}")
       }
     } finally {
       connection.disconnect()

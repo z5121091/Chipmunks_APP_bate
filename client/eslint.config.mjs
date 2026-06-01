@@ -77,9 +77,25 @@ export default [
       "no-useless-escape": "warn",
       'import/no-unresolved': 'error',
       '@typescript-eslint/no-require-imports': 'off',
-      '@typescript-eslint/no-unused-vars': 'off',
-      '@typescript-eslint/no-explicit-any': 'off',
-      '@typescript-eslint/ban-ts-comment': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'warn',
+        {
+          argsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          ignoreRestSiblings: true,
+        },
+      ],
+      '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/ban-ts-comment': [
+        'error',
+        {
+          'ts-check': false,
+          'ts-expect-error': false,
+          'ts-ignore': true,
+          'ts-nocheck': true,
+        },
+      ],
       '@typescript-eslint/no-empty-object-type': 'off',
       'no-prototype-builtins': 'off',
       'react/react-in-jsx-scope': 'off',

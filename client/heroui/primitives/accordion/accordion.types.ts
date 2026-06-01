@@ -15,9 +15,7 @@ type RootContext = {
   /** Currently expanded item(s) - string for single, array for multiple */
   value: (string | undefined) | string[];
   /** Callback when expanded items change */
-  onValueChange: (
-    value: string | undefined
-  ) => void | ((value: string[]) => void);
+  onValueChange: (value: string | string[] | undefined) => void;
   /** Whether expanded items can be collapsed */
   isCollapsible: boolean;
   /** Whether all accordion items are disabled */

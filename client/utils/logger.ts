@@ -1,10 +1,24 @@
 type LoggerMethod = (...args: unknown[]) => void;
+type LoggerLevel = 'log' | 'warn' | 'error';
 
-const isLoggingEnabled = __DEV__;
+const RELEASE_MIN_LEVEL: LoggerLevel = 'warn';
+const LOG_LEVEL_WEIGHT: Record<LoggerLevel, number> = {
+  log: 10,
+  warn: 20,
+  error: 30,
+};
 
-const createMethod = (method: 'log' | 'warn' | 'error'): LoggerMethod => {
+const shouldLog = (level: LoggerLevel): boolean => {
+  if (__DEV__) {
+    return true;
+  }
+
+  return LOG_LEVEL_WEIGHT[level] >= LOG_LEVEL_WEIGHT[RELEASE_MIN_LEVEL];
+};
+
+const createMethod = (method: LoggerLevel): LoggerMethod => {
   return (...args: unknown[]) => {
-    if (!isLoggingEnabled) {
+    if (!shouldLog(method)) {
       return;
     }
 
@@ -17,4 +31,3 @@ export const logger = {
   warn: createMethod('warn'),
   error: createMethod('error'),
 };
-

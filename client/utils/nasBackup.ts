@@ -1,8 +1,10 @@
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import { UPDATE_CONFIG } from '@/constants/config';
+import { exportDatabaseFile } from './database';
 import { buildDatabaseBackupFileName, getDatabaseBackupDateString } from './backupNaming';
 import { base64Encode, getUpdateServer, parseAuthFromUrl } from './update';
 import { logger } from './logger';
+import { scanQueue } from './scanQueue';
 
 const FileSystem = FileSystemLegacy as any;
 
@@ -14,6 +16,14 @@ type WebDavServer = {
 export type NasDatabaseBackupResult = {
   fileName: string;
   remoteUrl: string;
+};
+
+export type RealtimeDatabaseBackupFileResult = {
+  localFilePath: string;
+};
+
+export type RealtimeNasDatabaseBackupResult = NasDatabaseBackupResult & {
+  localFilePath: string;
 };
 
 const joinUrl = (baseUrl: string, path: string): string => {
@@ -40,6 +50,10 @@ const getWebDavServer = async (): Promise<WebDavServer> => {
 const getResponseMessage = async (response: Response): Promise<string> => {
   const body = await response.text().catch(() => '');
   return `${response.status} ${response.statusText}${body ? ` - ${body.slice(0, 200)}` : ''}`;
+};
+
+const shouldFallbackFromHead = (status: number): boolean => {
+  return status === 403 || status === 405 || status === 501;
 };
 
 const ensureRemoteBackupDirectory = async (
@@ -74,7 +88,34 @@ const remoteFileExists = async (
     return false;
   }
 
+  if (shouldFallbackFromHead(response.status)) {
+    logger.warn('NAS WebDAV HEAD unavailable, fallback to PROPFIND:', response.status);
+    return remoteFileExistsByPropfind(fileUrl, headers);
+  }
+
   throw new Error(`NAS 备份文件检查失败：${await getResponseMessage(response)}`);
+};
+
+const remoteFileExistsByPropfind = async (
+  fileUrl: string,
+  headers: Record<string, string>
+): Promise<boolean> => {
+  const response = await fetch(fileUrl, {
+    method: 'PROPFIND',
+    headers: {
+      ...headers,
+      Depth: '0',
+    },
+  });
+
+  if (response.ok) {
+    return true;
+  }
+  if (response.status === 404) {
+    return false;
+  }
+
+  throw new Error(`NAS WebDAV PROPFIND 检查备份文件失败：${await getResponseMessage(response)}`);
 };
 
 const uploadToWebDav = async (
@@ -125,4 +166,38 @@ export const uploadDatabaseBackupToNas = async (
   }
 
   throw new Error(`NAS 当日数据库备份序号已超过 999：${dateStr}`);
+};
+
+export const createRealtimeDatabaseBackupFile = async (
+  options: { timeoutMs?: number } = {}
+): Promise<RealtimeDatabaseBackupFileResult> => {
+  const outboundQueueStats = await scanQueue.flushPendingWrites({
+    timeoutMs: options.timeoutMs ?? 15000,
+    retryFailed: true,
+  });
+
+  if (outboundQueueStats.failed > 0) {
+    throw new Error(
+      `仍有 ${outboundQueueStats.failed} 条出库扫码记录写入失败，请回到扫码出库页确认后再备份`
+    );
+  }
+
+  const result = await exportDatabaseFile();
+  if (!result.success || !result.filePath) {
+    throw new Error(result.message || '数据库文件导出失败');
+  }
+
+  return { localFilePath: result.filePath };
+};
+
+export const createRealtimeDatabaseBackupToNas = async (
+  options: { timeoutMs?: number } = {}
+): Promise<RealtimeNasDatabaseBackupResult> => {
+  const { localFilePath } = await createRealtimeDatabaseBackupFile(options);
+  const nasResult = await uploadDatabaseBackupToNas(localFilePath);
+
+  return {
+    ...nasResult,
+    localFilePath,
+  };
 };

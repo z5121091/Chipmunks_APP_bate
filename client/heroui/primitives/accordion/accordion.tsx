@@ -186,7 +186,6 @@ const Trigger = forwardRef<TriggerRef, TriggerProps>(
             ? rootToArray.filter((val) => val !== value)
             : rootToArray.concat(value)
           : [...new Set(rootToArray.concat(value))];
-        // @ts-ignore - `newValue` is of type `string[]` which is OK
         onValueChange(newValue);
       }
 

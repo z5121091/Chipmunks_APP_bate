@@ -34,8 +34,6 @@ import {
   importBackupData,
   getConfigStats,
   incrementExportCount,
-  exportDatabaseFile,
-  checkpointDatabaseToDisk,
   importDatabaseFile,
   BackupData,
   isBackupDataShape,
@@ -63,12 +61,16 @@ import { formatSyncErrorMessage, syncExcelToComputer } from '@/utils/excel';
 import { buildInventorySheets } from '@/utils/inventoryExport';
 import { safeJsonParseNullable } from '@/utils/json';
 import { testConnection } from '@/utils/heartbeat';
-import { UPDATE_CONFIG, NETWORK_CONFIG, SyncConfig, ConnectionStatus } from '@/constants/config';
-import { parseAuthFromUrl, base64Encode, compareVersions } from '@/utils/update';
+import { NETWORK_CONFIG, SyncConfig, ConnectionStatus } from '@/constants/config';
+import { parseAuthFromUrl, base64Encode, compareVersions, getUpdateServer } from '@/utils/update';
 import { parseQuantity } from '@/utils/quantity';
 import { useToast } from '@/utils/toast';
 import { scanQueue } from '@/utils/scanQueue';
-import { uploadDatabaseBackupToNas } from '@/utils/nasBackup';
+import {
+  createRealtimeDatabaseBackupFile,
+  createRealtimeDatabaseBackupToNas,
+  uploadDatabaseBackupToNas,
+} from '@/utils/nasBackup';
 
 // 使用 any 绕过类型检查
 const FileSystem = FileSystemLegacy as any;
@@ -82,8 +84,6 @@ const isSyncConfig = (value: unknown): value is SyncConfig => {
   );
 };
 
-// 更新服务器配置（完整 URL，包含认证信息和 AppUpdate 路径）
-const DEFAULT_UPDATE_SERVER = UPDATE_CONFIG.DEFAULT_SERVER;
 const UPDATE_RETRY_DELAYS = [1000, 2000, 4000];
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -107,6 +107,61 @@ const getUpdateRequestErrorMessage = (error: unknown): string => {
 const withUpdateCacheBuster = (url: string): string => {
   const separator = url.includes('?') ? '&' : '?';
   return `${url}${separator}t=${Date.now()}`;
+};
+
+const normalizeUpdateDownloadUrl = (
+  downloadUrl: unknown,
+  downloadBaseUrl: string
+): string | null => {
+  if (typeof downloadUrl !== 'string' || !downloadUrl.trim()) {
+    return null;
+  }
+
+  try {
+    const resolvedUrl = new URL(downloadUrl.trim(), `${downloadBaseUrl.replace(/\/+$/, '')}/`);
+    if (!['http:', 'https:'].includes(resolvedUrl.protocol)) {
+      return null;
+    }
+
+    return resolvedUrl.toString();
+  } catch (error) {
+    logger.warn('[checkForUpdate] version.json 下载地址无效，已跳过:', error);
+    return null;
+  }
+};
+
+const resolveUpdateDownloadUrls = (
+  downloadUrl: unknown,
+  downloadUrls: unknown,
+  downloadBaseUrl: string
+): string[] => {
+  const fallbackUrl = `${downloadBaseUrl.replace(/\/+$/, '')}/app-release.apk`;
+  const candidates = [
+    ...(Array.isArray(downloadUrls) ? downloadUrls : []),
+    downloadUrl,
+    fallbackUrl,
+  ];
+  const seen = new Set<string>();
+  const resolvedUrls: string[] = [];
+
+  for (const candidate of candidates) {
+    const resolvedUrl = normalizeUpdateDownloadUrl(candidate, downloadBaseUrl);
+
+    if (resolvedUrl && !seen.has(resolvedUrl)) {
+      seen.add(resolvedUrl);
+      resolvedUrls.push(resolvedUrl);
+    }
+  }
+
+  return resolvedUrls.length > 0 ? resolvedUrls : [fallbackUrl];
+};
+
+const backupDatabaseToNasForUpdate = async (stage: string) => {
+  const backupResult = await createRealtimeDatabaseBackupToNas({
+    timeoutMs: 15000,
+  });
+  logger.log(`[update] ${stage} 数据库已备份到 NAS:`, backupResult.fileName);
+  return backupResult;
 };
 
 const getNextDatedFileName = async (
@@ -208,7 +263,7 @@ export default function SettingsScreen() {
   const [downloading, setDownloading] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<{
     version: string;
-    downloadUrl: string;
+    downloadUrls: string[];
     changelog: string;
     forceUpdate: boolean;
   } | null>(null);
@@ -783,7 +838,7 @@ export default function SettingsScreen() {
     setCheckingUpdate(true);
     setDownloadProgress(0);
     try {
-      const baseUrl = DEFAULT_UPDATE_SERVER.trim().replace(/\/+$/, '');
+      const baseUrl = (await getUpdateServer()).trim().replace(/\/+$/, '');
 
       // 解析URL中的认证信息
       const authInfo = parseAuthFromUrl(baseUrl);
@@ -876,9 +931,22 @@ export default function SettingsScreen() {
           // 旧格式：字符串
           changelogText = data.changelog;
         }
+
+        try {
+          await backupDatabaseToNasForUpdate('检测到新版本');
+        } catch (backupError) {
+          const backupMessage =
+            backupError instanceof Error ? backupError.message : String(backupError || '未知错误');
+          logger.error('[checkForUpdate] 新版本更新前 NAS 数据库备份失败:', backupError);
+          alert.showError(
+            `检测到新版本，但更新前数据库备份到 NAS 失败：${backupMessage}。请先备份成功后再更新，避免覆盖安装后数据丢失。`
+          );
+          return;
+        }
+
         setUpdateInfo({
           version: data.version || latestVersion,
-          downloadUrl: data.downloadUrl || `${requestBaseUrl}/app-release.apk`,
+          downloadUrls: resolveUpdateDownloadUrls(data.downloadUrl, data.downloadUrls, baseUrl),
           changelog: changelogText,
           forceUpdate: data.forceUpdate || false,
         });
@@ -922,91 +990,125 @@ export default function SettingsScreen() {
         return;
       }
 
-      // 清理之前的下载
-      await FileSystem.deleteAsync(apkUri, { idempotent: true });
-
       // 创建下载回调
       const downloadCallback = (downloadProgressData: {
         totalBytesWritten: number;
         totalBytesExpectedToWrite: number;
       }) => {
+        if (downloadProgressData.totalBytesExpectedToWrite <= 0) {
+          return;
+        }
+
         const progress =
           downloadProgressData.totalBytesWritten / downloadProgressData.totalBytesExpectedToWrite;
-        setDownloadProgress(Math.round(progress * 100));
+        setDownloadProgress(Math.min(99, Math.round(progress * 100)));
       };
 
-      // 解析URL中的认证信息
-      const downloadUrl = updateInfo.downloadUrl;
-      const authInfo = parseAuthFromUrl(downloadUrl);
-      const requestDownloadUrl = authInfo?.baseUrl || downloadUrl;
-      const downloadHeaders: Record<string, string> = {};
+      let downloadedApkUri: string | null = null;
+      let lastDownloadErrorMessage = '';
 
-      if (authInfo) {
-        const authString = `${authInfo.username}:${authInfo.password}`;
-        const authBase64 = base64Encode(authString);
-        downloadHeaders['Authorization'] = `Basic ${authBase64}`;
-      }
+      for (let index = 0; index < updateInfo.downloadUrls.length; index += 1) {
+        const downloadUrl = updateInfo.downloadUrls[index];
+        await FileSystem.deleteAsync(apkUri, { idempotent: true });
+        setDownloadProgress(0);
 
-      // 开始下载
-      const downloadResumable = FileSystem.createDownloadResumable(
-        requestDownloadUrl,
-        apkUri,
-        { headers: downloadHeaders },
-        downloadCallback
-      );
+        // 解析URL中的认证信息
+        const authInfo = parseAuthFromUrl(downloadUrl);
+        const requestDownloadUrl = authInfo?.baseUrl || downloadUrl;
+        const downloadHeaders: Record<string, string> = {};
 
-      const result = await downloadResumable.downloadAsync();
+        if (authInfo) {
+          const authString = `${authInfo.username}:${authInfo.password}`;
+          const authBase64 = base64Encode(authString);
+          downloadHeaders['Authorization'] = `Basic ${authBase64}`;
+        }
 
-      if (result && result.uri && result.status >= 200 && result.status < 300) {
+        logger.log(
+          `[update] 开始下载安装包线路 ${index + 1}/${updateInfo.downloadUrls.length}:`,
+          requestDownloadUrl
+        );
+
+        // 开始下载
+        const downloadResumable = FileSystem.createDownloadResumable(
+          requestDownloadUrl,
+          apkUri,
+          { headers: downloadHeaders },
+          downloadCallback
+        );
+
+        let result: { uri: string; status: number } | null;
+        try {
+          result = await downloadResumable.downloadAsync();
+        } catch (downloadError) {
+          const message =
+            downloadError instanceof Error ? downloadError.message : String(downloadError || '未知错误');
+          lastDownloadErrorMessage = message;
+          logger.warn(
+            `[update] 安装包下载线路 ${index + 1}/${updateInfo.downloadUrls.length} 失败:`,
+            message
+          );
+          continue;
+        }
+
+        if (!result || !result.uri || result.status < 200 || result.status >= 300) {
+          const statusText = result?.status ? `HTTP ${result.status}` : '无下载结果';
+          lastDownloadErrorMessage = statusText;
+          logger.warn(
+            `[update] 安装包下载线路 ${index + 1}/${updateInfo.downloadUrls.length} 状态异常:`,
+            statusText
+          );
+          continue;
+        }
+
         const apkInfo = await FileSystem.getInfoAsync(result.uri);
         if (!apkInfo.exists || !('size' in apkInfo) || (apkInfo as { size?: number }).size === 0) {
-          alert.showError('安装包下载失败：文件为空，请检查更新服务器');
-          setDownloading(false);
-          return;
+          lastDownloadErrorMessage = '文件为空';
+          logger.warn(
+            `[update] 安装包下载线路 ${index + 1}/${updateInfo.downloadUrls.length} 文件为空`
+          );
+          continue;
         }
 
-        try {
-          const outboundQueueStats = await scanQueue.flushPendingWrites({
-            timeoutMs: 15000,
-            retryFailed: true,
-          });
-          if (outboundQueueStats.failed > 0) {
-            alert.showError(`仍有 ${outboundQueueStats.failed} 条出库扫码记录写入失败，请回到扫码出库页确认后再更新`);
-            setDownloading(false);
-            return;
-          }
-          await checkpointDatabaseToDisk();
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error || '未知错误');
-          alert.showError(`安装前数据固化失败：${message}。请稍后再试，避免覆盖安装时丢失当前出库数据。`);
-          setDownloading(false);
-          return;
-        }
-
-        // 下载完成
-        setDownloadProgress(100);
-
-        const installUri =
-          typeof FileSystem.getContentUriAsync === 'function'
-            ? await FileSystem.getContentUriAsync(result.uri)
-            : result.uri;
-
-        await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
-          data: installUri,
-          type: 'application/vnd.android.package-archive',
-          flags: 1,
-        });
-
-        alert.showSuccess('安装程序已打开，请按提示完成更新');
-
-        setDownloading(false);
-      } else {
-        const statusText = result?.status ? `（${result.status}）` : '';
-        alert.showError(`安装包下载失败${statusText}，请检查更新服务器地址或账号密码`);
-        setDownloading(false);
+        downloadedApkUri = result.uri;
+        break;
       }
+
+      if (!downloadedApkUri) {
+        alert.showError(
+          `安装包下载失败：${lastDownloadErrorMessage || '所有下载地址均不可用'}。请检查 version.json 中的 downloadUrl/downloadUrls 或网络后重试。`
+        );
+        setDownloading(false);
+        return;
+      }
+
+      try {
+        await backupDatabaseToNasForUpdate('安装前');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || '未知错误');
+        alert.showError(`安装前 NAS 数据库备份失败：${message}。请稍后再试，避免覆盖安装时丢失当前出库数据。`);
+        setDownloading(false);
+        return;
+      }
+
+      // 下载完成
+      setDownloadProgress(100);
+
+      const installUri =
+        typeof FileSystem.getContentUriAsync === 'function'
+          ? await FileSystem.getContentUriAsync(downloadedApkUri)
+          : downloadedApkUri;
+
+      await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
+        data: installUri,
+        type: 'application/vnd.android.package-archive',
+        flags: 1,
+      });
+
+      alert.showSuccess('安装程序已打开，请按提示完成更新');
+
+      setDownloading(false);
     } catch (error) {
-      logger.error('下载失败:', error);
+      logger.error('安装程序打开失败:', error);
       const message = error instanceof Error ? error.message : String(error || '');
       const installHint = message
         ? `\n原因：${message}`
@@ -1234,52 +1336,43 @@ export default function SettingsScreen() {
       async () => {
         setDbBackupLoading(true);
         try {
-          const outboundQueueStats = await scanQueue.flushPendingWrites({
+          const { localFilePath } = await createRealtimeDatabaseBackupFile({
             timeoutMs: 15000,
-            retryFailed: true,
           });
-          if (outboundQueueStats.failed > 0) {
-            alert.showError(`仍有 ${outboundQueueStats.failed} 条出库扫码记录写入失败，请回到扫码出库页确认后再备份`);
-            return;
+
+          let nasBackupFileName: string | null = null;
+          let nasBackupError: string | null = null;
+
+          try {
+            const nasBackupResult = await uploadDatabaseBackupToNas(localFilePath);
+            nasBackupFileName = nasBackupResult.fileName;
+          } catch (error) {
+            nasBackupError = error instanceof Error ? error.message : 'NAS 云端备份失败';
+            logger.error('NAS 数据库备份失败:', error);
           }
 
-          const result = await exportDatabaseFile();
-          if (result.success && result.filePath) {
-            let nasBackupFileName: string | null = null;
-            let nasBackupError: string | null = null;
-
-            try {
-              const nasBackupResult = await uploadDatabaseBackupToNas(result.filePath);
-              nasBackupFileName = nasBackupResult.fileName;
-            } catch (error) {
-              nasBackupError = error instanceof Error ? error.message : 'NAS 云端备份失败';
-              logger.error('NAS 数据库备份失败:', error);
-            }
-
-            // 使用 expo-sharing 分享文件
-            if (await Sharing.isAvailableAsync()) {
-              await Sharing.shareAsync(result.filePath, {
-                mimeType: 'application/x-sqlite3',
-                dialogTitle: '保存数据库备份',
-              });
-            } else {
-              alert.showError('您的设备不支持文件分享');
-            }
-            if (nasBackupError) {
-              alert.showWarning(`数据库文件已本地备份，但 NAS 云端备份失败：${nasBackupError}`);
-            } else {
-              alert.showSuccess(
-                nasBackupFileName
-                  ? `数据库文件备份成功\nNAS 云端备份：${nasBackupFileName}`
-                  : '数据库文件备份成功'
-              );
-            }
+          // 使用 expo-sharing 分享文件
+          if (await Sharing.isAvailableAsync()) {
+            await Sharing.shareAsync(localFilePath, {
+              mimeType: 'application/x-sqlite3',
+              dialogTitle: '保存数据库备份',
+            });
           } else {
-            alert.showError(result.message);
+            alert.showError('您的设备不支持文件分享');
+          }
+          if (nasBackupError) {
+            alert.showWarning(`数据库文件已本地备份，但 NAS 云端备份失败：${nasBackupError}`);
+          } else {
+            alert.showSuccess(
+              nasBackupFileName
+                ? `数据库文件备份成功\nNAS 云端备份：${nasBackupFileName}`
+                : '数据库文件备份成功'
+            );
           }
         } catch (error) {
           logger.error('数据库备份失败:', error);
-          alert.showError('备份失败，请重试');
+          const message = error instanceof Error ? error.message : '备份失败，请重试';
+          alert.showError(message);
         } finally {
           setDbBackupLoading(false);
         }

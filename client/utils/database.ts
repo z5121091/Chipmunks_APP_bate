@@ -31,6 +31,8 @@ let db: SQLite.SQLiteDatabase | null = null;
 let isInitializing = false;
 let initPromise: Promise<void> | null = null;
 let idCounter = 0;
+let pendingCriticalWriteCheckpointLabel: string | null = null;
+let serializedDatabaseOperationQueue: Promise<void> = Promise.resolve();
 
 // 检测是否为 Web 平台
 const isWebPlatform = Platform.OS === 'web';
@@ -752,6 +754,176 @@ const rollbackTransaction = async (database: SQLite.SQLiteDatabase, context: str
   } catch (rollbackError) {
     logger.error(`[${context}] 回滚失败:`, rollbackError);
   }
+};
+
+type WalCheckpointResult = {
+  busy?: number;
+  log?: number;
+  checkpointed?: number;
+};
+
+const runFullWalCheckpoint = async (
+  database: SQLite.SQLiteDatabase,
+  attempts = 3,
+  delayMs = 120
+): Promise<{
+  completed: boolean;
+  lastCheckpoint: WalCheckpointResult | null;
+  error?: unknown;
+}> => {
+  let lastCheckpoint: WalCheckpointResult | null = null;
+
+  try {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const checkpoint = await database.getFirstAsync<WalCheckpointResult>(
+        'PRAGMA wal_checkpoint(FULL)'
+      );
+
+      if (checkpoint && Number(checkpoint.busy || 0) === 0) {
+        return {
+          completed: true,
+          lastCheckpoint: checkpoint,
+        };
+      }
+
+      lastCheckpoint = checkpoint || null;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    return {
+      completed: false,
+      lastCheckpoint,
+    };
+  } catch (error) {
+    return {
+      completed: false,
+      lastCheckpoint,
+      error,
+    };
+  }
+};
+
+const waitForDatabaseRetry = (delayMs: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+
+const isTransientDatabaseWriteError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error || '');
+  const normalizedMessage = message.toLowerCase();
+
+  return (
+    normalizedMessage.includes('nativedatabase.execasync') ||
+    normalizedMessage.includes('database is locked') ||
+    normalizedMessage.includes('database locked') ||
+    normalizedMessage.includes('database is busy') ||
+    normalizedMessage.includes('sqlite_busy') ||
+    normalizedMessage.includes('cannot start a transaction')
+  );
+};
+
+const runWithTransientDatabaseRetry = async <T>(
+  context: string,
+  task: () => Promise<T>,
+  retryDelays = [120, 300, 700]
+): Promise<T> => {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+    try {
+      return await task();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientDatabaseWriteError(error) || attempt >= retryDelays.length) {
+        throw error;
+      }
+
+      logger.warn(
+        `[${context}] 数据库写入被占用，${retryDelays[attempt]}ms 后重试第 ${attempt + 2} 次:`,
+        error
+      );
+      await waitForDatabaseRetry(retryDelays[attempt]);
+    }
+  }
+
+  throw lastError;
+};
+
+const retryPendingCriticalWriteCheckpoint = async (
+  database: SQLite.SQLiteDatabase,
+  context: string
+): Promise<void> => {
+  if (isWebPlatform || !pendingCriticalWriteCheckpointLabel) {
+    return;
+  }
+
+  const pendingLabel = pendingCriticalWriteCheckpointLabel;
+  const checkpoint = await runFullWalCheckpoint(database, 2, 80);
+
+  if (checkpoint.completed) {
+    pendingCriticalWriteCheckpointLabel = null;
+    logger.log(`${context} 已补做 WAL checkpoint: ${pendingLabel}`);
+    return;
+  }
+
+  logger.warn(
+    `${context} WAL checkpoint 补做仍未完成，继续保留待重试状态: ${pendingLabel}`,
+    checkpoint.error || checkpoint.lastCheckpoint || 'no checkpoint result'
+  );
+};
+
+const runSerializedDatabaseOperation = async <T>(
+  context: string,
+  task: () => Promise<T>
+): Promise<T> => {
+  const previousOperation = serializedDatabaseOperationQueue;
+  let releaseCurrentOperation!: () => void;
+  const currentOperation = new Promise<void>((resolve) => {
+    releaseCurrentOperation = resolve;
+  });
+
+  serializedDatabaseOperationQueue = previousOperation
+    .catch(() => undefined)
+    .then(() => currentOperation);
+
+  await previousOperation.catch(() => undefined);
+
+  try {
+    return await task();
+  } finally {
+    releaseCurrentOperation();
+  }
+};
+
+const runExclusiveWriteTransaction = async <T>(
+  database: SQLite.SQLiteDatabase,
+  context: string,
+  task: (transactionDatabase: SQLite.SQLiteDatabase) => Promise<T>
+): Promise<T> => {
+  return runSerializedDatabaseOperation(context, async () => {
+    await retryPendingCriticalWriteCheckpoint(database, `[${context}] 写入前`);
+
+    let result: T;
+    if (!isWebPlatform && typeof database.withExclusiveTransactionAsync === 'function') {
+      let transactionResult: T | undefined;
+      await database.withExclusiveTransactionAsync(async (transactionDatabase) => {
+        transactionResult = await task(transactionDatabase as SQLite.SQLiteDatabase);
+      });
+      result = transactionResult as T;
+    } else {
+      await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
+      try {
+        result = await task(database);
+        await database.execAsync('COMMIT');
+      } catch (error) {
+        await rollbackTransaction(database, context);
+        throw error;
+      }
+    }
+
+    await checkpointAfterCriticalWrite(database, `[${context}]`);
+    return result;
+  });
 };
 
 type OrderWarehouseInfo = {
@@ -1669,6 +1841,20 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
 // 数据库版本号（当表结构变化时递增）
 const DB_VERSION = 4;
 
+const getTableColumnSet = async (
+  database: SQLite.SQLiteDatabase,
+  tableName: string
+): Promise<Set<string>> => {
+  const columns = await database.getAllAsync<{ name: string }>(`PRAGMA table_info(${tableName})`);
+  return new Set(columns.map((column) => column.name));
+};
+
+const selectColumnOrSqlDefault = (
+  existingColumns: Set<string>,
+  columnName: string,
+  defaultSql: string
+): string => (existingColumns.has(columnName) ? columnName : defaultSql);
+
 const migrateInboundAndInventoryRecordTables = async (
   database: SQLite.SQLiteDatabase
 ): Promise<void> => {
@@ -1691,102 +1877,146 @@ const migrateInboundAndInventoryRecordTables = async (
   }
 
   logger.log('[DB Migration] 修复入库/盘点记录表的单号唯一约束...');
-  await database.execAsync('BEGIN TRANSACTION');
 
   try {
-    if (inboundNeedsMigration) {
-      await database.execAsync(`
-        CREATE TABLE IF NOT EXISTS inbound_records_new (
-          id TEXT PRIMARY KEY,
-          inbound_no TEXT NOT NULL,
-          warehouse_id TEXT NOT NULL,
-          warehouse_name TEXT NOT NULL,
-          inventory_code TEXT,
-          scan_model TEXT NOT NULL,
-          batch TEXT,
-          quantity INTEGER NOT NULL,
-          in_date TEXT NOT NULL,
-          notes TEXT,
-          raw_content TEXT,
-          created_at TEXT NOT NULL,
-          package TEXT,
-          version TEXT,
-          productionDate TEXT,
-          traceNo TEXT,
-          sourceNo TEXT,
-          customFields TEXT,
-          sync_status TEXT DEFAULT 'pending',
-          sync_file_name TEXT,
-          synced_at TEXT,
-          sync_message TEXT
-        );
-      `);
-      await database.execAsync(`
-        INSERT INTO inbound_records_new (
-          id, inbound_no, warehouse_id, warehouse_name, inventory_code, scan_model, batch,
-          quantity, in_date, notes, raw_content, created_at, package, version,
-          productionDate, traceNo, sourceNo, customFields
-        )
-        SELECT
-          id, inbound_no, warehouse_id, warehouse_name, inventory_code, scan_model, batch,
-          quantity, in_date, notes, raw_content, created_at, package, version,
-          productionDate, traceNo, sourceNo, customFields
-        FROM inbound_records;
-      `);
-      await database.execAsync('DROP TABLE inbound_records');
-      await database.execAsync('ALTER TABLE inbound_records_new RENAME TO inbound_records');
-    }
+    await runExclusiveWriteTransaction(
+      database,
+      'migrateInboundAndInventoryRecordTables',
+      async (transactionDatabase) => {
+        if (inboundNeedsMigration) {
+          const inboundColumns = await getTableColumnSet(transactionDatabase, 'inbound_records');
+          const inboundSyncStatusSelect = inboundColumns.has('sync_status')
+            ? "COALESCE(sync_status, 'pending')"
+            : "'pending'";
+          const inboundSyncFileNameSelect = selectColumnOrSqlDefault(
+            inboundColumns,
+            'sync_file_name',
+            'NULL'
+          );
+          const inboundSyncedAtSelect = selectColumnOrSqlDefault(inboundColumns, 'synced_at', 'NULL');
+          const inboundSyncMessageSelect = selectColumnOrSqlDefault(
+            inboundColumns,
+            'sync_message',
+            'NULL'
+          );
 
-    if (inventoryNeedsMigration) {
-      await database.execAsync(`
-        CREATE TABLE IF NOT EXISTS inventory_check_records_new (
-          id TEXT PRIMARY KEY,
-          check_no TEXT NOT NULL,
-          warehouse_id TEXT NOT NULL,
-          warehouse_name TEXT NOT NULL,
-          inventory_code TEXT,
-          scan_model TEXT NOT NULL,
-          batch TEXT,
-          quantity INTEGER,
-          check_type TEXT NOT NULL,
-          actual_quantity INTEGER,
-          check_date TEXT NOT NULL,
-          notes TEXT,
-          created_at TEXT NOT NULL,
-          package TEXT,
-          version TEXT,
-          productionDate TEXT,
-          traceNo TEXT,
-          sourceNo TEXT,
-          customFields TEXT,
-          sync_status TEXT DEFAULT 'pending',
-          sync_file_name TEXT,
-          synced_at TEXT,
-          sync_message TEXT
-        );
-      `);
-      await database.execAsync(`
-        INSERT INTO inventory_check_records_new (
-          id, check_no, warehouse_id, warehouse_name, inventory_code, scan_model, batch,
-          quantity, check_type, actual_quantity, check_date, notes, created_at, package,
-          version, productionDate, traceNo, sourceNo, customFields
-        )
-        SELECT
-          id, check_no, warehouse_id, warehouse_name, inventory_code, scan_model, batch,
-          quantity, check_type, actual_quantity, check_date, notes, created_at, package,
-          version, productionDate, traceNo, sourceNo, customFields
-        FROM inventory_check_records;
-      `);
-      await database.execAsync('DROP TABLE inventory_check_records');
-      await database.execAsync(
-        'ALTER TABLE inventory_check_records_new RENAME TO inventory_check_records'
-      );
-    }
+          await transactionDatabase.execAsync('DROP TABLE IF EXISTS inbound_records_new');
+          await transactionDatabase.execAsync(`
+            CREATE TABLE inbound_records_new (
+              id TEXT PRIMARY KEY,
+              inbound_no TEXT NOT NULL,
+              warehouse_id TEXT NOT NULL,
+              warehouse_name TEXT NOT NULL,
+              inventory_code TEXT,
+              scan_model TEXT NOT NULL,
+              batch TEXT,
+              quantity INTEGER NOT NULL,
+              in_date TEXT NOT NULL,
+              notes TEXT,
+              raw_content TEXT,
+              created_at TEXT NOT NULL,
+              package TEXT,
+              version TEXT,
+              productionDate TEXT,
+              traceNo TEXT,
+              sourceNo TEXT,
+              customFields TEXT,
+              sync_status TEXT DEFAULT 'pending',
+              sync_file_name TEXT,
+              synced_at TEXT,
+              sync_message TEXT
+            );
+          `);
+          await transactionDatabase.execAsync(`
+            INSERT INTO inbound_records_new (
+              id, inbound_no, warehouse_id, warehouse_name, inventory_code, scan_model, batch,
+              quantity, in_date, notes, raw_content, created_at, package, version,
+              productionDate, traceNo, sourceNo, customFields, sync_status, sync_file_name,
+              synced_at, sync_message
+            )
+            SELECT
+              id, inbound_no, warehouse_id, warehouse_name, inventory_code, scan_model, batch,
+              quantity, in_date, notes, raw_content, created_at, package, version,
+              productionDate, traceNo, sourceNo, customFields, ${inboundSyncStatusSelect},
+              ${inboundSyncFileNameSelect}, ${inboundSyncedAtSelect}, ${inboundSyncMessageSelect}
+            FROM inbound_records;
+          `);
+          await transactionDatabase.execAsync('DROP TABLE inbound_records');
+          await transactionDatabase.execAsync('ALTER TABLE inbound_records_new RENAME TO inbound_records');
+        }
 
-    await database.execAsync('COMMIT');
+        if (inventoryNeedsMigration) {
+          const inventoryColumns = await getTableColumnSet(transactionDatabase, 'inventory_check_records');
+          const inventorySyncStatusSelect = inventoryColumns.has('sync_status')
+            ? "COALESCE(sync_status, 'pending')"
+            : "'pending'";
+          const inventorySyncFileNameSelect = selectColumnOrSqlDefault(
+            inventoryColumns,
+            'sync_file_name',
+            'NULL'
+          );
+          const inventorySyncedAtSelect = selectColumnOrSqlDefault(
+            inventoryColumns,
+            'synced_at',
+            'NULL'
+          );
+          const inventorySyncMessageSelect = selectColumnOrSqlDefault(
+            inventoryColumns,
+            'sync_message',
+            'NULL'
+          );
+
+          await transactionDatabase.execAsync('DROP TABLE IF EXISTS inventory_check_records_new');
+          await transactionDatabase.execAsync(`
+            CREATE TABLE inventory_check_records_new (
+              id TEXT PRIMARY KEY,
+              check_no TEXT NOT NULL,
+              warehouse_id TEXT NOT NULL,
+              warehouse_name TEXT NOT NULL,
+              inventory_code TEXT,
+              scan_model TEXT NOT NULL,
+              batch TEXT,
+              quantity INTEGER,
+              check_type TEXT NOT NULL,
+              actual_quantity INTEGER,
+              check_date TEXT NOT NULL,
+              notes TEXT,
+              created_at TEXT NOT NULL,
+              package TEXT,
+              version TEXT,
+              productionDate TEXT,
+              traceNo TEXT,
+              sourceNo TEXT,
+              customFields TEXT,
+              sync_status TEXT DEFAULT 'pending',
+              sync_file_name TEXT,
+              synced_at TEXT,
+              sync_message TEXT
+            );
+          `);
+          await transactionDatabase.execAsync(`
+            INSERT INTO inventory_check_records_new (
+              id, check_no, warehouse_id, warehouse_name, inventory_code, scan_model, batch,
+              quantity, check_type, actual_quantity, check_date, notes, created_at, package,
+              version, productionDate, traceNo, sourceNo, customFields, sync_status,
+              sync_file_name, synced_at, sync_message
+            )
+            SELECT
+              id, check_no, warehouse_id, warehouse_name, inventory_code, scan_model, batch,
+              quantity, check_type, actual_quantity, check_date, notes, created_at, package,
+              version, productionDate, traceNo, sourceNo, customFields, ${inventorySyncStatusSelect},
+              ${inventorySyncFileNameSelect}, ${inventorySyncedAtSelect}, ${inventorySyncMessageSelect}
+            FROM inventory_check_records;
+          `);
+          await transactionDatabase.execAsync('DROP TABLE inventory_check_records');
+          await transactionDatabase.execAsync(
+            'ALTER TABLE inventory_check_records_new RENAME TO inventory_check_records'
+          );
+        }
+      }
+    );
     logger.log('[DB Migration] 入库/盘点记录表约束修复完成');
   } catch (error) {
-    await database.execAsync('ROLLBACK');
     logger.error('[DB Migration] 入库/盘点记录表约束修复失败:', error);
     throw error;
   }
@@ -1885,34 +2115,37 @@ const migrateOrdersTableWarehouseScope = async (
   }
 
   logger.log('[DB Migration] 修复出库订单表的订单号全局唯一约束...');
-  await database.execAsync('BEGIN TRANSACTION');
 
   try {
-    await database.execAsync('DROP TABLE IF EXISTS orders_new');
-    await database.execAsync(`
-      CREATE TABLE orders_new (
-        id TEXT PRIMARY KEY,
-        order_no TEXT NOT NULL,
-        customer_name TEXT,
-        warehouse_id TEXT,
-        warehouse_name TEXT,
-        created_at TEXT NOT NULL
-      );
-    `);
-    await database.execAsync(`
-      INSERT INTO orders_new (
-        id, order_no, customer_name, warehouse_id, warehouse_name, created_at
-      )
-      SELECT
-        id, order_no, customer_name, warehouse_id, warehouse_name, created_at
-      FROM orders;
-    `);
-    await database.execAsync('DROP TABLE orders');
-    await database.execAsync('ALTER TABLE orders_new RENAME TO orders');
-    await database.execAsync('COMMIT');
+    await runExclusiveWriteTransaction(
+      database,
+      'migrateOrdersTableWarehouseScope',
+      async (transactionDatabase) => {
+        await transactionDatabase.execAsync('DROP TABLE IF EXISTS orders_new');
+        await transactionDatabase.execAsync(`
+          CREATE TABLE orders_new (
+            id TEXT PRIMARY KEY,
+            order_no TEXT NOT NULL,
+            customer_name TEXT,
+            warehouse_id TEXT,
+            warehouse_name TEXT,
+            created_at TEXT NOT NULL
+          );
+        `);
+        await transactionDatabase.execAsync(`
+          INSERT INTO orders_new (
+            id, order_no, customer_name, warehouse_id, warehouse_name, created_at
+          )
+          SELECT
+            id, order_no, customer_name, warehouse_id, warehouse_name, created_at
+          FROM orders;
+        `);
+        await transactionDatabase.execAsync('DROP TABLE orders');
+        await transactionDatabase.execAsync('ALTER TABLE orders_new RENAME TO orders');
+      }
+    );
     logger.log('[DB Migration] 出库订单表约束修复完成');
   } catch (error) {
-    await database.execAsync('ROLLBACK');
     logger.error('[DB Migration] 出库订单表约束修复失败:', error);
     throw error;
   }
@@ -2084,6 +2317,13 @@ const ensureDeletionArchiveTablesAndTriggers = async (
   });
 
   await database.execAsync(`
+    DROP TRIGGER IF EXISTS trg_archive_deleted_materials;
+    DROP TRIGGER IF EXISTS trg_archive_deleted_orders;
+    DROP TRIGGER IF EXISTS trg_archive_deleted_unpack_records;
+    DROP TRIGGER IF EXISTS trg_archive_deleted_warehouses;
+  `);
+
+  await database.execAsync(`
     CREATE TRIGGER IF NOT EXISTS trg_archive_deleted_materials
     AFTER DELETE ON materials
     BEGIN
@@ -2218,6 +2458,16 @@ const ensureWarehouseSortOrderColumn = async (database: SQLite.SQLiteDatabase): 
   logger.log('[DB Migration] 仓库排序列添加完成');
 };
 
+const normalizeCustomFieldTypes = async (database: SQLite.SQLiteDatabase): Promise<void> => {
+  const result = await database.runAsync(
+    "UPDATE custom_fields SET type = 'text' WHERE type NOT IN ('text', 'select')"
+  );
+
+  if (result.changes > 0) {
+    logger.log(`[DB Migration] 已修复 ${result.changes} 个历史自定义字段类型`);
+  }
+};
+
 const normalizeDateTimeColumns = async (
   database: SQLite.SQLiteDatabase,
   tableName: string,
@@ -2260,29 +2510,46 @@ const normalizeDateTimeColumns = async (
 
 const normalizeLegacyDateTimeColumns = async (database: SQLite.SQLiteDatabase): Promise<void> => {
   logger.log('[DB Migration] 规范化历史时间字段格式...');
-  await database.execAsync('BEGIN TRANSACTION');
 
   try {
-    await normalizeDateTimeColumns(database, 'orders', 'id', ['created_at']);
-    await normalizeDateTimeColumns(database, 'materials', 'id', ['scanned_at']);
-    await normalizeDateTimeColumns(database, 'unpack_records', 'id', [
-      'unpacked_at',
-      'printed_at',
-      'created_at',
-      'updated_at',
-    ]);
-    await normalizeDateTimeColumns(database, 'print_history', 'id', ['printed_at', 'created_at']);
-    await normalizeDateTimeColumns(database, 'qr_code_rules', 'id', ['created_at', 'updated_at']);
-    await normalizeDateTimeColumns(database, 'custom_fields', 'id', ['created_at', 'updated_at']);
-    await normalizeDateTimeColumns(database, 'warehouses', 'id', ['created_at']);
-    await normalizeDateTimeColumns(database, 'inventory_bindings', 'id', ['created_at']);
-    await normalizeDateTimeColumns(database, 'inbound_records', 'id', ['created_at']);
-    await normalizeDateTimeColumns(database, 'inbound_summary', 'id', ['created_at', 'updated_at']);
-    await normalizeDateTimeColumns(database, 'inventory_check_records', 'id', ['created_at']);
-    await database.execAsync('COMMIT');
+    await runExclusiveWriteTransaction(
+      database,
+      'normalizeLegacyDateTimeColumns',
+      async (transactionDatabase) => {
+        await normalizeDateTimeColumns(transactionDatabase, 'orders', 'id', ['created_at']);
+        await normalizeDateTimeColumns(transactionDatabase, 'materials', 'id', ['scanned_at']);
+        await normalizeDateTimeColumns(transactionDatabase, 'unpack_records', 'id', [
+          'unpacked_at',
+          'printed_at',
+          'created_at',
+          'updated_at',
+        ]);
+        await normalizeDateTimeColumns(transactionDatabase, 'print_history', 'id', [
+          'printed_at',
+          'created_at',
+        ]);
+        await normalizeDateTimeColumns(transactionDatabase, 'qr_code_rules', 'id', [
+          'created_at',
+          'updated_at',
+        ]);
+        await normalizeDateTimeColumns(transactionDatabase, 'custom_fields', 'id', [
+          'created_at',
+          'updated_at',
+        ]);
+        await normalizeDateTimeColumns(transactionDatabase, 'warehouses', 'id', ['created_at']);
+        await normalizeDateTimeColumns(transactionDatabase, 'inventory_bindings', 'id', ['created_at']);
+        await normalizeDateTimeColumns(transactionDatabase, 'inbound_records', 'id', ['created_at']);
+        await normalizeDateTimeColumns(transactionDatabase, 'inbound_summary', 'id', [
+          'created_at',
+          'updated_at',
+        ]);
+        await normalizeDateTimeColumns(transactionDatabase, 'inventory_check_records', 'id', [
+          'created_at',
+        ]);
+      }
+    );
     logger.log('[DB Migration] 历史时间字段规范化完成');
   } catch (error) {
-    await rollbackTransaction(database, 'normalizeLegacyDateTimeColumns');
     logger.error('[DB Migration] 历史时间字段规范化失败:', error);
     throw error;
   }
@@ -2524,10 +2791,22 @@ const performDatabaseInitialization = async (): Promise<void> => {
     'SELECT value FROM system_config WHERE key = ?',
     ['db_version']
   );
-  const currentVersion = versionResult ? parseInt(versionResult.value, 10) : 0;
+  const configVersion = versionResult ? parseInt(versionResult.value, 10) : 0;
+  const userVersionResult = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
+  const pragmaUserVersion = Number(userVersionResult?.user_version || 0);
+  const currentVersion = Math.max(configVersion || 0, pragmaUserVersion || 0);
   const targetDbVersion = currentVersion > DB_VERSION ? currentVersion : DB_VERSION;
 
-  logger.log('[DB Version] 当前数据库版本:', currentVersion, '期望版本:', DB_VERSION);
+  logger.log(
+    '[DB Version] 当前数据库版本:',
+    currentVersion,
+    'system_config:',
+    configVersion,
+    'user_version:',
+    pragmaUserVersion,
+    '期望版本:',
+    DB_VERSION
+  );
 
   // 版本不一致时只做非破坏性迁移，绝不因版本号变化直接删库。
   if (currentVersion > DB_VERSION) {
@@ -2541,6 +2820,7 @@ const performDatabaseInitialization = async (): Promise<void> => {
       -- 可靠性与性能配置
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
+      PRAGMA busy_timeout = 5000;
       PRAGMA wal_autocheckpoint = 1;
       PRAGMA cache_size = -64000;
       PRAGMA temp_store = MEMORY;
@@ -2751,6 +3031,7 @@ const performDatabaseInitialization = async (): Promise<void> => {
   await ensureDocumentSyncColumns(db);
   await ensureRuleFieldPrefixesColumn(db);
   await ensureWarehouseSortOrderColumn(db);
+  await runExclusiveWriteTransaction(db, 'normalizeCustomFieldTypes', normalizeCustomFieldTypes);
   if (currentVersion < 3) {
     await normalizeLegacyDateTimeColumns(db);
   }
@@ -2846,6 +3127,7 @@ const performDatabaseInitialization = async (): Promise<void> => {
     'db_version',
     targetDbVersion.toString(),
   ]);
+  await db.execAsync(`PRAGMA user_version = ${targetDbVersion}`);
   logger.log('[initDatabase] 数据库版本已设置为:', targetDbVersion);
 
   logger.log('[initDatabase] SQLite 数据库初始化成功');
@@ -3016,7 +3298,11 @@ export const upsertOrder = async (
     }
 
     const database = getDb();
-    await upsertOrderWithDatabase(database, orderNo, customerName, warehouse);
+    await runWithTransientDatabaseRetry('upsertOrder', () =>
+      runExclusiveWriteTransaction(database, 'upsertOrder', async (transactionDatabase) => {
+        await upsertOrderWithDatabase(transactionDatabase, orderNo, customerName, warehouse);
+      })
+    );
   } catch (error) {
     logger.error('保存订单失败:', error);
     throw error;
@@ -3337,34 +3623,27 @@ export const deleteOrder = async (orderNo: string, warehouseId?: string | null):
       : " AND (warehouse_id IS NULL OR warehouse_id = '')";
     const params = normalizedWarehouseId ? [trimmedOrderNo, normalizedWarehouseId] : [trimmedOrderNo];
 
-    await database.execAsync('BEGIN TRANSACTION');
-
-    try {
-      const activeDraft = await database.getFirstAsync<{ value: string }>(
+    await runExclusiveWriteTransaction(database, 'deleteOrder', async (transactionDatabase) => {
+      const activeDraft = await transactionDatabase.getFirstAsync<{ value: string }>(
         'SELECT value FROM system_config WHERE key = ?',
         [OUTBOUND_WORK_DRAFT_DB_KEY]
       );
 
       // 删除关联的拆包记录，避免留下孤儿数据
-      await database.runAsync(`DELETE FROM unpack_records WHERE order_no = ?${warehouseClause}`, params);
+      await transactionDatabase.runAsync(`DELETE FROM unpack_records WHERE order_no = ?${warehouseClause}`, params);
 
       // 删除关联的物料记录
-      await database.runAsync(`DELETE FROM materials WHERE order_no = ?${warehouseClause}`, params);
+      await transactionDatabase.runAsync(`DELETE FROM materials WHERE order_no = ?${warehouseClause}`, params);
 
       // 最后删除订单
-      await database.runAsync(`DELETE FROM orders WHERE order_no = ?${warehouseClause}`, params);
+      await transactionDatabase.runAsync(`DELETE FROM orders WHERE order_no = ?${warehouseClause}`, params);
 
       if (doesOutboundWorkDraftMatchOrder(activeDraft?.value, trimmedOrderNo, normalizedWarehouseId)) {
-        await database.runAsync('DELETE FROM system_config WHERE key = ?', [
+        await transactionDatabase.runAsync('DELETE FROM system_config WHERE key = ?', [
           OUTBOUND_WORK_DRAFT_DB_KEY,
         ]);
       }
-
-      await database.execAsync('COMMIT');
-    } catch (error) {
-      await database.execAsync('ROLLBACK');
-      throw error;
-    }
+    });
   } catch (error) {
     logger.error('删除订单失败:', error);
     throw error;
@@ -3409,77 +3688,65 @@ export const addMaterialsBatch = async (
     const database = getDb();
     logger.log('[addMaterialsBatch] 开始批量添加，数量:', materials.length);
 
-    // 🔥 使用事务，速度提升 10 倍
-    await database.execAsync('BEGIN TRANSACTION');
-
     const materialIds: string[] = [];
 
-    for (const material of materials) {
-      // 参数验证
-      if (!material.order_no || typeof material.order_no !== 'string') {
-        throw new Error('无效的 order_no');
+    await runExclusiveWriteTransaction(database, 'addMaterialsBatch', async (transactionDatabase) => {
+      for (const material of materials) {
+        // 参数验证
+        if (!material.order_no || typeof material.order_no !== 'string') {
+          throw new Error('无效的 order_no');
+        }
+        if (!material.model || typeof material.model !== 'string') {
+          throw new Error('无效的 model');
+        }
+        if (!material.raw_content || typeof material.raw_content !== 'string') {
+          throw new Error('无效的 raw_content');
+        }
+
+        const newMaterialId = generateId();
+
+        await transactionDatabase.runAsync(
+          `INSERT INTO materials (
+            id, order_no, customer_name, operation_type, model, batch, quantity,
+            package, version, productionDate, traceNo, sourceNo, scanned_at, raw_content,
+            customFields, isUnpacked, original_quantity, remaining_quantity,
+            warehouse_id, warehouse_name, inventory_code, rule_id, rule_name
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            newMaterialId,
+            material.order_no || '',
+            material.customer_name || '',
+            material.operation_type || 'inbound',
+            material.model || '',
+            material.batch || '',
+            parseQuantity(material.quantity, { min: 0 }) ?? 0,
+            material.package || '',
+            material.version || '',
+            material.productionDate || '',
+            material.traceNo || '',
+            material.sourceNo || '',
+            material.scanned_at || getISODateTime(),
+            material.raw_content,
+            material.customFields ? jsonToString(material.customFields) : null,
+            0,
+            null,
+            null,
+            material.warehouse_id || null,
+            material.warehouse_name || null,
+            material.inventory_code || null,
+            material.rule_id || null,
+            material.rule_name || null,
+          ]
+        );
+
+        materialIds.push(newMaterialId);
       }
-      if (!material.model || typeof material.model !== 'string') {
-        throw new Error('无效的 model');
-      }
-      if (!material.raw_content || typeof material.raw_content !== 'string') {
-        throw new Error('无效的 raw_content');
-      }
-
-      const newMaterialId = generateId();
-
-      await database.runAsync(
-        `INSERT INTO materials (
-          id, order_no, customer_name, operation_type, model, batch, quantity,
-          package, version, productionDate, traceNo, sourceNo, scanned_at, raw_content,
-          customFields, isUnpacked, original_quantity, remaining_quantity,
-          warehouse_id, warehouse_name, inventory_code, rule_id, rule_name
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          newMaterialId,
-          material.order_no || '',
-          material.customer_name || '',
-          material.operation_type || 'inbound',
-          material.model || '',
-          material.batch || '',
-          parseQuantity(material.quantity, { min: 0 }) ?? 0,
-          material.package || '',
-          material.version || '',
-          material.productionDate || '',
-          material.traceNo || '',
-          material.sourceNo || '',
-          material.scanned_at || getISODateTime(),
-          material.raw_content,
-          material.customFields ? jsonToString(material.customFields) : null,
-          0,
-          null,
-          null,
-          material.warehouse_id || null,
-          material.warehouse_name || null,
-          material.inventory_code || null,
-          material.rule_id || null,
-          material.rule_name || null,
-        ]
-      );
-
-      materialIds.push(newMaterialId);
-    }
-
-    // 🔥 提交事务
-    await database.execAsync('COMMIT');
+    });
 
     logger.log('[addMaterialsBatch] 批量添加完成，成功:', materialIds.length);
     return materialIds;
   } catch (error) {
-    logger.error('[addMaterialsBatch] 批量添加失败，执行回滚:', error);
-    // 🔥 回滚事务
-    try {
-      if (db) {
-        await db.execAsync('ROLLBACK');
-      }
-    } catch (rollbackError) {
-      logger.error('[addMaterialsBatch] 回滚失败:', rollbackError);
-    }
+    logger.error('[addMaterialsBatch] 批量添加失败:', error);
     throw error;
   }
 };
@@ -3588,28 +3855,22 @@ const checkpointAfterCriticalWrite = async (
   database: SQLite.SQLiteDatabase,
   label: string
 ): Promise<void> => {
-  let lastCheckpoint: { busy?: number; log?: number; checkpointed?: number } | null = null;
-
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    const checkpoint = await database.getFirstAsync<{
-      busy?: number;
-      log?: number;
-      checkpointed?: number;
-    }>('PRAGMA wal_checkpoint(FULL)');
-
-    if (checkpoint && Number(checkpoint.busy || 0) === 0) {
-      return;
-    }
-
-    lastCheckpoint = checkpoint || null;
-    if (attempt < 3) {
-      await new Promise((resolve) => setTimeout(resolve, 120));
-    }
+  if (isWebPlatform) {
+    logger.log(`${label} Web 预览环境跳过 WAL checkpoint`);
+    return;
   }
 
+  const checkpoint = await runFullWalCheckpoint(database);
+  if (checkpoint.completed) {
+    pendingCriticalWriteCheckpointLabel = null;
+    return;
+  }
+
+  const checkpointMessage = `${label} 已提交，但 WAL FULL checkpoint 未完全完成，无法确认主数据库文件已合并到最新状态`;
+  pendingCriticalWriteCheckpointLabel = label;
   logger.warn(
-    `${label} 已提交，但 WAL FULL checkpoint 未完全完成:`,
-    lastCheckpoint || 'no checkpoint result'
+    `${checkpointMessage}，将在下一次关键写入前重试`,
+    checkpoint.error || checkpoint.lastCheckpoint || 'no checkpoint result'
   );
 };
 
@@ -3629,7 +3890,9 @@ export const addMaterial = async (material: MaterialWritePayload): Promise<strin
 
     const database = getDb();
     logger.log('[addMaterial] 获取数据库连接成功');
-    return await insertMaterialWithDatabase(database, material);
+    return await runExclusiveWriteTransaction(database, 'addMaterial', async (transactionDatabase) => {
+      return insertMaterialWithDatabase(transactionDatabase, material);
+    });
   } catch (error) {
     logger.error('[addMaterial] 添加物料记录失败:', error);
     throw error;
@@ -3648,28 +3911,19 @@ export const addMaterialWithOrder = async (
       logger.log('[addMaterialWithOrder] 数据库初始化完成');
     }
 
-    const database = getDb();
-    await database.execAsync('BEGIN TRANSACTION');
-
-    try {
-      await upsertOrderWithDatabase(database, material.order_no, customerName, warehouse);
-      const materialId = await insertMaterialWithDatabase(database, material);
-      await database.execAsync('COMMIT');
-      if (material.operation_type === 'outbound') {
-        try {
-          await checkpointAfterCriticalWrite(database, '[addMaterialWithOrder]');
-        } catch (checkpointError) {
-          logger.warn('[addMaterialWithOrder] 出库物料已提交，但 WAL checkpoint 未完成:', checkpointError);
+      const database = getDb();
+      const materialId = await runExclusiveWriteTransaction(
+        database,
+        'addMaterialWithOrder',
+        async (transactionDatabase) => {
+          await upsertOrderWithDatabase(transactionDatabase, material.order_no, customerName, warehouse);
+          return insertMaterialWithDatabase(transactionDatabase, material);
         }
-      }
+      );
       return materialId;
     } catch (error) {
-      await rollbackTransaction(database, 'addMaterialWithOrder');
+      logger.error('[addMaterialWithOrder] 保存出库物料失败:', error);
       throw error;
-    }
-  } catch (error) {
-    logger.error('[addMaterialWithOrder] 保存出库物料失败:', error);
-    throw error;
   }
 };
 
@@ -4039,43 +4293,37 @@ export const deleteMaterial = async (id: string): Promise<void> => {
 
     const database = getDb();
     const trimmedId = id.trim();
-    await database.execAsync('BEGIN TRANSACTION');
-    try {
-      const materialRow = await database.getFirstAsync<{
+    await runExclusiveWriteTransaction(database, 'deleteMaterial', async (transactionDatabase) => {
+      const materialRow = await transactionDatabase.getFirstAsync<{
         order_no: string | null;
         warehouse_id: string | null;
       }>('SELECT order_no, warehouse_id FROM materials WHERE id = ?', [trimmedId]);
-      const unpackRows = await database.getAllAsync<{ id: string }>(
+      const unpackRows = await transactionDatabase.getAllAsync<{ id: string }>(
         'SELECT id FROM unpack_records WHERE original_material_id = ?',
         [trimmedId]
       );
-      await prunePrintHistoryByUnpackIds(database, unpackRows.map((row) => row.id));
-      await database.runAsync('DELETE FROM unpack_records WHERE original_material_id = ?', [trimmedId]);
-      await database.runAsync('DELETE FROM materials WHERE id = ?', [trimmedId]);
+      await prunePrintHistoryByUnpackIds(transactionDatabase, unpackRows.map((row) => row.id));
+      await transactionDatabase.runAsync('DELETE FROM unpack_records WHERE original_material_id = ?', [trimmedId]);
+      await transactionDatabase.runAsync('DELETE FROM materials WHERE id = ?', [trimmedId]);
 
       if (materialRow?.order_no) {
-        const remainingMaterial = await database.getFirstAsync<{ count: number }>(
+        const remainingMaterial = await transactionDatabase.getFirstAsync<{ count: number }>(
           materialRow.warehouse_id
             ? 'SELECT COUNT(*) as count FROM materials WHERE order_no = ? AND warehouse_id = ?'
-            : 'SELECT COUNT(*) as count FROM materials WHERE order_no = ? AND warehouse_id IS NULL',
+            : "SELECT COUNT(*) as count FROM materials WHERE order_no = ? AND (warehouse_id IS NULL OR warehouse_id = '')",
           materialRow.warehouse_id ? [materialRow.order_no, materialRow.warehouse_id] : [materialRow.order_no]
         );
 
         if ((remainingMaterial?.count || 0) === 0) {
-          await database.runAsync(
+          await transactionDatabase.runAsync(
             materialRow.warehouse_id
               ? 'DELETE FROM orders WHERE order_no = ? AND warehouse_id = ?'
-              : 'DELETE FROM orders WHERE order_no = ? AND warehouse_id IS NULL',
+              : "DELETE FROM orders WHERE order_no = ? AND (warehouse_id IS NULL OR warehouse_id = '')",
             materialRow.warehouse_id ? [materialRow.order_no, materialRow.warehouse_id] : [materialRow.order_no]
           );
         }
       }
-
-      await database.execAsync('COMMIT');
-    } catch (error) {
-      await rollbackTransaction(database, 'deleteMaterial');
-      throw error;
-    }
+    });
   } catch (error) {
     logger.error('[deleteMaterial] 删除物料记录失败:', error);
     throw error;
@@ -4099,10 +4347,12 @@ export const updateMaterialCustomFields = async (
     }
 
     const database = getDb();
-    await database.runAsync('UPDATE materials SET customFields = ? WHERE id = ?', [
-      jsonToString(customFields),
-      id.trim(),
-    ]);
+    await runExclusiveWriteTransaction(database, 'updateMaterialCustomFields', async (transactionDatabase) => {
+      await transactionDatabase.runAsync('UPDATE materials SET customFields = ? WHERE id = ?', [
+        jsonToString(customFields),
+        id.trim(),
+      ]);
+    });
   } catch (error) {
     logger.error('[updateMaterialCustomFields] 更新物料自定义字段失败:', error);
     throw error;
@@ -4124,10 +4374,12 @@ export const updateMaterialQuantity = async (id: string, newQuantity: number): P
     }
 
     const database = getDb();
-    await database.runAsync('UPDATE materials SET quantity = ? WHERE id = ?', [
-      parsedQuantity,
-      id.trim(),
-    ]);
+    await runExclusiveWriteTransaction(database, 'updateMaterialQuantity', async (transactionDatabase) => {
+      await transactionDatabase.runAsync('UPDATE materials SET quantity = ? WHERE id = ?', [
+        parsedQuantity,
+        id.trim(),
+      ]);
+    });
   } catch (error) {
     logger.error('[updateMaterialQuantity] 更新物料数量失败:', error);
     throw error;
@@ -4235,7 +4487,9 @@ const updateMaterialWithDatabase = async (
 export const updateMaterial = async (id: string, updates: MaterialUpdatePayload): Promise<void> => {
   try {
     const database = getDb();
-    await updateMaterialWithDatabase(database, id, updates);
+    await runExclusiveWriteTransaction(database, 'updateMaterial', async (transactionDatabase) => {
+      await updateMaterialWithDatabase(transactionDatabase, id, updates);
+    });
   } catch (error) {
     logger.error('更新物料信息失败:', error);
     throw error;
@@ -4526,125 +4780,129 @@ export const saveUnpackOperation = async (params: {
   const notes = params.notes || '';
   const timestamp = getISODateTime();
 
-  await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
   try {
-    const currentMaterial = await database.getFirstAsync<any>(
-      'SELECT * FROM materials WHERE id = ? LIMIT 1',
-      [params.material.id]
-    );
-    if (!currentMaterial) {
-      throw new Error('原物料不存在，无法拆包');
-    }
-
-    const currentAvailableValue =
-      currentMaterial.remaining_quantity !== undefined &&
-      currentMaterial.remaining_quantity !== null &&
-      currentMaterial.remaining_quantity !== ''
-        ? currentMaterial.remaining_quantity
-        : currentMaterial.quantity ?? 0;
-    const availableQuantity = parseQuantity(currentAvailableValue, { min: 1 });
-    if (availableQuantity === null) {
-      throw new Error('当前可拆数量无效，无法拆包');
-    }
-
-    const shippedQuantity = parseQuantity(params.shippedQuantity, {
-      min: 1,
-      max: availableQuantity,
-    });
-    const remainingQuantity = parseQuantity(params.remainingQuantity, {
-      min: 0,
-      max: availableQuantity,
-    });
-    if (shippedQuantity === null || remainingQuantity === null) {
-      throw new Error(`拆包数量无效，当前可拆数量为 ${availableQuantity}`);
-    }
-    if (shippedQuantity + remainingQuantity !== availableQuantity) {
-      throw new Error('拆出数量与剩余数量之和必须等于当前可拆数量');
-    }
-
-    if (trimmedNewTraceNo) {
-      await assertUnpackTraceNoAvailable(
-        database,
-        trimmedNewTraceNo,
-        params.material.id
-      );
-    }
-
-    const previouslyShippedQuantity =
-      currentMaterial.isUnpacked === 1
-        ? parseQuantity(currentMaterial.quantity, { min: 0 }) ?? 0
-        : 0;
-    const updatedShippedQuantity = previouslyShippedQuantity + shippedQuantity;
-    const materialOriginalQuantity =
-      currentMaterial.original_quantity !== undefined &&
-      currentMaterial.original_quantity !== null &&
-      currentMaterial.original_quantity !== ''
-        ? currentMaterial.original_quantity.toString()
-        : (currentMaterial.quantity ?? availableQuantity).toString();
-    const splitOriginalQuantity = availableQuantity.toString();
-
-    const baseRecord = {
-      original_material_id: params.material.id,
-      order_no: currentMaterial.order_no,
-      customer_name: currentMaterial.customer_name || '',
-      model: currentMaterial.model,
-      batch: currentMaterial.batch || '',
-      package: currentMaterial.package || '',
-      version: currentMaterial.version || '',
-      warehouse_id: currentMaterial.warehouse_id,
-      warehouse_name: currentMaterial.warehouse_name,
-      inventory_code: currentMaterial.inventory_code,
-      original_quantity: splitOriginalQuantity,
-      productionDate: currentMaterial.productionDate || '',
-      traceNo: currentMaterial.traceNo || '',
-      new_traceNo: trimmedNewTraceNo,
-      sourceNo: currentMaterial.sourceNo || '',
-      pair_id: pairId,
-      status: 'pending' as const,
-      notes,
-      unpacked_at: timestamp,
-    };
-
-    const shippedRecord = await insertUnpackRecord(
+    const result = await runExclusiveWriteTransaction(
       database,
-      {
-        ...baseRecord,
-        new_quantity: shippedQuantity.toString(),
-        label_type: 'shipped',
-      },
-      {
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        unpackedAt: timestamp,
+      'saveUnpackOperation',
+      async (transactionDatabase) => {
+        const currentMaterial = await transactionDatabase.getFirstAsync<any>(
+          'SELECT * FROM materials WHERE id = ? LIMIT 1',
+          [params.material.id]
+        );
+        if (!currentMaterial) {
+          throw new Error('原物料不存在，无法拆包');
+        }
+
+        const currentAvailableValue =
+          currentMaterial.remaining_quantity !== undefined &&
+          currentMaterial.remaining_quantity !== null &&
+          currentMaterial.remaining_quantity !== ''
+            ? currentMaterial.remaining_quantity
+            : currentMaterial.quantity ?? 0;
+        const availableQuantity = parseQuantity(currentAvailableValue, { min: 1 });
+        if (availableQuantity === null) {
+          throw new Error('当前可拆数量无效，无法拆包');
+        }
+
+        const shippedQuantity = parseQuantity(params.shippedQuantity, {
+          min: 1,
+          max: availableQuantity,
+        });
+        const remainingQuantity = parseQuantity(params.remainingQuantity, {
+          min: 0,
+          max: availableQuantity,
+        });
+        if (shippedQuantity === null || remainingQuantity === null) {
+          throw new Error(`拆包数量无效，当前可拆数量为 ${availableQuantity}`);
+        }
+        if (shippedQuantity + remainingQuantity !== availableQuantity) {
+          throw new Error('拆出数量与剩余数量之和必须等于当前可拆数量');
+        }
+
+        if (trimmedNewTraceNo) {
+          await assertUnpackTraceNoAvailable(
+            transactionDatabase,
+            trimmedNewTraceNo,
+            params.material.id
+          );
+        }
+
+        const previouslyShippedQuantity =
+          currentMaterial.isUnpacked === 1
+            ? parseQuantity(currentMaterial.quantity, { min: 0 }) ?? 0
+            : 0;
+        const updatedShippedQuantity = previouslyShippedQuantity + shippedQuantity;
+        const materialOriginalQuantity =
+          currentMaterial.original_quantity !== undefined &&
+          currentMaterial.original_quantity !== null &&
+          currentMaterial.original_quantity !== ''
+            ? currentMaterial.original_quantity.toString()
+            : (currentMaterial.quantity ?? availableQuantity).toString();
+        const splitOriginalQuantity = availableQuantity.toString();
+
+        const baseRecord = {
+          original_material_id: params.material.id,
+          order_no: currentMaterial.order_no,
+          customer_name: currentMaterial.customer_name || '',
+          model: currentMaterial.model,
+          batch: currentMaterial.batch || '',
+          package: currentMaterial.package || '',
+          version: currentMaterial.version || '',
+          warehouse_id: currentMaterial.warehouse_id,
+          warehouse_name: currentMaterial.warehouse_name,
+          inventory_code: currentMaterial.inventory_code,
+          original_quantity: splitOriginalQuantity,
+          productionDate: currentMaterial.productionDate || '',
+          traceNo: currentMaterial.traceNo || '',
+          new_traceNo: trimmedNewTraceNo,
+          sourceNo: currentMaterial.sourceNo || '',
+          pair_id: pairId,
+          status: 'pending' as const,
+          notes,
+          unpacked_at: timestamp,
+        };
+
+        const shippedRecord = await insertUnpackRecord(
+          transactionDatabase,
+          {
+            ...baseRecord,
+            new_quantity: shippedQuantity.toString(),
+            label_type: 'shipped',
+          },
+          {
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            unpackedAt: timestamp,
+          }
+        );
+
+        const remainingRecord = await insertUnpackRecord(
+          transactionDatabase,
+          {
+            ...baseRecord,
+            new_quantity: remainingQuantity.toString(),
+            label_type: 'remaining',
+          },
+          {
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            unpackedAt: timestamp,
+          }
+        );
+
+        await updateMaterialWithDatabase(transactionDatabase, params.material.id, {
+          traceNo: trimmedNewTraceNo || currentMaterial.traceNo || '',
+          quantity: updatedShippedQuantity,
+          original_quantity: materialOriginalQuantity,
+          remaining_quantity: remainingQuantity.toString(),
+          isUnpacked: true,
+        });
+
+        return { pairId, shippedRecord, remainingRecord };
       }
     );
-
-    const remainingRecord = await insertUnpackRecord(
-      database,
-      {
-        ...baseRecord,
-        new_quantity: remainingQuantity.toString(),
-        label_type: 'remaining',
-      },
-      {
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        unpackedAt: timestamp,
-      }
-    );
-
-    await updateMaterialWithDatabase(database, params.material.id, {
-      traceNo: trimmedNewTraceNo || currentMaterial.traceNo || '',
-      quantity: updatedShippedQuantity,
-      original_quantity: materialOriginalQuantity,
-      remaining_quantity: remainingQuantity.toString(),
-      isUnpacked: true,
-    });
-
-    await database.execAsync('COMMIT');
-    return { pairId, shippedRecord, remainingRecord };
+    return result;
   } catch (error) {
-    await rollbackTransaction(database, 'saveUnpackOperation');
     logger.error('保存拆包操作失败:', error);
     throw error;
   }
@@ -4653,12 +4911,18 @@ export const saveUnpackOperation = async (params: {
 // 标记拆包记录为已打印
 export const markUnpackRecordsAsPrinted = async (ids: string[]): Promise<void> => {
   try {
+    if (ids.length === 0) {
+      return;
+    }
+
     const database = getDb();
     const placeholders = ids.map(() => '?').join(',');
-    await database.runAsync(
-      `UPDATE unpack_records SET status = 'printed', printed_at = ? WHERE id IN (${placeholders})`,
-      [getISODateTime(), ...ids]
-    );
+    await runExclusiveWriteTransaction(database, 'markUnpackRecordsAsPrinted', async (transactionDatabase) => {
+      await transactionDatabase.runAsync(
+        `UPDATE unpack_records SET status = 'printed', printed_at = ? WHERE id IN (${placeholders})`,
+        [getISODateTime(), ...ids]
+      );
+    });
   } catch (error) {
     logger.error('标记拆包记录失败:', error);
     throw error;
@@ -4676,15 +4940,10 @@ export const deleteUnpackRecord = async (id: string): Promise<void> => {
 
     const database = getDb();
     const trimmedId = id.trim();
-    await database.execAsync('BEGIN TRANSACTION');
-    try {
-      await prunePrintHistoryByUnpackIds(database, [trimmedId]);
-      await database.runAsync('DELETE FROM unpack_records WHERE id = ?', [trimmedId]);
-      await database.execAsync('COMMIT');
-    } catch (error) {
-      await rollbackTransaction(database, 'deleteUnpackRecord');
-      throw error;
-    }
+    await runExclusiveWriteTransaction(database, 'deleteUnpackRecord', async (transactionDatabase) => {
+      await prunePrintHistoryByUnpackIds(transactionDatabase, [trimmedId]);
+      await transactionDatabase.runAsync('DELETE FROM unpack_records WHERE id = ?', [trimmedId]);
+    });
   } catch (error) {
     logger.error('[deleteUnpackRecord] 删除拆包记录失败:', error);
     throw error;
@@ -4701,18 +4960,13 @@ export const deleteUnpackRecords = async (ids: string[]): Promise<void> => {
     }
 
     const placeholders = normalizedIds.map(() => '?').join(',');
-    await database.execAsync('BEGIN TRANSACTION');
-    try {
-      await prunePrintHistoryByUnpackIds(database, normalizedIds);
-      await database.runAsync(
+    await runExclusiveWriteTransaction(database, 'deleteUnpackRecords', async (transactionDatabase) => {
+      await prunePrintHistoryByUnpackIds(transactionDatabase, normalizedIds);
+      await transactionDatabase.runAsync(
         `DELETE FROM unpack_records WHERE id IN (${placeholders})`,
         normalizedIds
       );
-      await database.execAsync('COMMIT');
-    } catch (error) {
-      await rollbackTransaction(database, 'deleteUnpackRecords');
-      throw error;
-    }
+    });
   } catch (error) {
     logger.error('删除拆包记录失败:', error);
     throw error;
@@ -4851,20 +5105,22 @@ export const addPrintHistory = async (history: {
     const database = getDb();
     const id = generateId();
 
-    await database.runAsync(
-      `INSERT INTO print_history (
-        id, unpack_record_ids, export_format, export_file_path, printed_at, print_count, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        jsonToString(history.unpack_record_ids),
-        history.export_format,
-        history.export_file_path,
-        history.printed_at || getISODateTime(),
-        history.print_count || 1,
-        getISODateTime(),
-      ]
-    );
+    await runExclusiveWriteTransaction(database, 'addPrintHistory', async (transactionDatabase) => {
+      await transactionDatabase.runAsync(
+        `INSERT INTO print_history (
+          id, unpack_record_ids, export_format, export_file_path, printed_at, print_count, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          jsonToString(history.unpack_record_ids),
+          history.export_format,
+          history.export_file_path,
+          history.printed_at || getISODateTime(),
+          history.print_count || 1,
+          getISODateTime(),
+        ]
+      );
+    });
 
     return id;
   } catch (error) {
@@ -4971,20 +5227,20 @@ export const addWarehouse = async (
     const database = getDb();
     const id = generateId();
     const isoDateTime = getISODateTime();
-    const sortOrderResult = await database.getFirstAsync<{ max_sort_order: number | null }>(
-      'SELECT MAX(sort_order) as max_sort_order FROM warehouses'
-    );
-    const sortOrder =
-      typeof sortOrderResult?.max_sort_order === 'number' ? sortOrderResult.max_sort_order + 1 : 0;
 
-    await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
-    try {
+    await runExclusiveWriteTransaction(database, 'addWarehouse', async (transactionDatabase) => {
+      const sortOrderResult = await transactionDatabase.getFirstAsync<{ max_sort_order: number | null }>(
+        'SELECT MAX(sort_order) as max_sort_order FROM warehouses'
+      );
+      const sortOrder =
+        typeof sortOrderResult?.max_sort_order === 'number' ? sortOrderResult.max_sort_order + 1 : 0;
+
       // 如果设置为默认仓库，先取消其他仓库的默认状态
       if (warehouse.is_default) {
-        await database.runAsync('UPDATE warehouses SET is_default = 0');
+        await transactionDatabase.runAsync('UPDATE warehouses SET is_default = 0');
       }
 
-      await database.runAsync(
+      await transactionDatabase.runAsync(
         'INSERT INTO warehouses (id, name, description, is_default, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?)',
         [
           id,
@@ -4995,12 +5251,7 @@ export const addWarehouse = async (
           isoDateTime,
         ]
       );
-
-      await database.execAsync('COMMIT');
-    } catch (error) {
-      await rollbackTransaction(database, 'addWarehouse');
-      throw error;
-    }
+    });
 
     return id;
   } catch (error) {
@@ -5014,19 +5265,14 @@ export const reorderWarehouses = async (warehouseIds: string[]): Promise<void> =
     const database = getDb();
     const orderedIds = warehouseIds.map((id) => id.trim()).filter(Boolean);
 
-    await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
-    try {
+    await runExclusiveWriteTransaction(database, 'reorderWarehouses', async (transactionDatabase) => {
       for (let index = 0; index < orderedIds.length; index += 1) {
-        await database.runAsync('UPDATE warehouses SET sort_order = ? WHERE id = ?', [
+        await transactionDatabase.runAsync('UPDATE warehouses SET sort_order = ? WHERE id = ?', [
           index,
           orderedIds[index],
         ]);
       }
-      await database.execAsync('COMMIT');
-    } catch (error) {
-      await rollbackTransaction(database, 'reorderWarehouses');
-      throw error;
-    }
+    });
   } catch (error) {
     logger.error('仓库排序失败:', error);
     throw error;
@@ -5051,23 +5297,18 @@ export const updateWarehouse = async (id: string, updates: Partial<Warehouse>): 
     });
 
     if (updateFields.length > 0) {
-      await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
-      try {
+      await runExclusiveWriteTransaction(database, 'updateWarehouse', async (transactionDatabase) => {
         // 如果设置为默认仓库，先取消其他仓库的默认状态
         if (updates.is_default) {
-          await database.runAsync('UPDATE warehouses SET is_default = 0 WHERE id != ?', [id]);
+          await transactionDatabase.runAsync('UPDATE warehouses SET is_default = 0 WHERE id != ?', [id]);
         }
 
         values.push(id);
-        await database.runAsync(
+        await transactionDatabase.runAsync(
           `UPDATE warehouses SET ${updateFields.join(', ')} WHERE id = ?`,
           values
         );
-        await database.execAsync('COMMIT');
-      } catch (error) {
-        await rollbackTransaction(database, 'updateWarehouse');
-        throw error;
-      }
+      });
     }
   } catch (error) {
     logger.error('更新仓库失败:', error);
@@ -5085,58 +5326,51 @@ export const deleteWarehouse = async (id: string): Promise<void> => {
     }
 
     const database = getDb();
-    await database.execAsync('BEGIN TRANSACTION');
+    const trimmedId = id.trim();
 
-    try {
-      const trimmedId = id.trim();
-      const countRows = await Promise.all([
-        database.getFirstAsync<{ count: number }>(
+    await runExclusiveWriteTransaction(database, 'deleteWarehouse', async (transactionDatabase) => {
+      const countRows = [
+        await transactionDatabase.getFirstAsync<{ count: number }>(
           'SELECT COUNT(*) as count FROM inbound_records WHERE warehouse_id = ?',
           [trimmedId]
         ),
-        database.getFirstAsync<{ count: number }>(
+        await transactionDatabase.getFirstAsync<{ count: number }>(
           'SELECT COUNT(*) as count FROM inbound_summary WHERE warehouse_id = ?',
           [trimmedId]
         ),
-        database.getFirstAsync<{ count: number }>(
+        await transactionDatabase.getFirstAsync<{ count: number }>(
           'SELECT COUNT(*) as count FROM inventory_check_records WHERE warehouse_id = ?',
           [trimmedId]
         ),
-        database.getFirstAsync<{ count: number }>(
+        await transactionDatabase.getFirstAsync<{ count: number }>(
           'SELECT COUNT(*) as count FROM materials WHERE warehouse_id = ?',
           [trimmedId]
         ),
-        database.getFirstAsync<{ count: number }>(
+        await transactionDatabase.getFirstAsync<{ count: number }>(
           'SELECT COUNT(*) as count FROM orders WHERE warehouse_id = ?',
           [trimmedId]
         ),
-        database.getFirstAsync<{ count: number }>(
+        await transactionDatabase.getFirstAsync<{ count: number }>(
           'SELECT COUNT(*) as count FROM unpack_records WHERE warehouse_id = ?',
           [trimmedId]
         ),
-      ]);
+      ];
       const referencedCount = countRows.reduce((sum, row) => sum + (row?.count || 0), 0);
 
       if (referencedCount > 0) {
         throw new Error('该仓库已有业务数据，不能删除。请先备份数据库；如确需清理，请使用对应业务记录页面逐项删除。');
       }
 
-      const unpackRows = await database.getAllAsync<{ id: string }>(
+      const unpackRows = await transactionDatabase.getAllAsync<{ id: string }>(
         'SELECT id FROM unpack_records WHERE warehouse_id = ?',
         [trimmedId]
       );
-      await prunePrintHistoryByUnpackIds(database, unpackRows.map((row) => row.id));
+      await prunePrintHistoryByUnpackIds(transactionDatabase, unpackRows.map((row) => row.id));
 
       // 仅允许删除无业务数据引用的空仓库，避免误删整仓历史记录。
-      await database.runAsync('DELETE FROM warehouses WHERE id = ?', [trimmedId]);
-
-      await database.execAsync('COMMIT');
-      logger.log(`[deleteWarehouse] 空仓库 ${trimmedId} 已删除`);
-    } catch (error) {
-      await database.execAsync('ROLLBACK');
-      logger.error('[deleteWarehouse] 删除仓库数据失败，已回滚:', error);
-      throw error;
-    }
+      await transactionDatabase.runAsync('DELETE FROM warehouses WHERE id = ?', [trimmedId]);
+    });
+    logger.log(`[deleteWarehouse] 空仓库 ${trimmedId} 已删除`);
   } catch (error) {
     logger.error('删除仓库失败:', error);
     throw error;
@@ -5265,7 +5499,8 @@ export const getSupplierByModel = async (scanModel: string): Promise<string | nu
   }
 };
 
-const syncInventoryCodeToHistoricalRecords = async (
+const syncInventoryCodeToHistoricalRecordsWithDatabase = async (
+  database: SQLite.SQLiteDatabase,
   scanModel: string,
   inventoryCode: string | null | undefined
 ): Promise<void> => {
@@ -5276,8 +5511,6 @@ const syncInventoryCodeToHistoricalRecords = async (
 
   const normalizedInventoryCode =
     typeof inventoryCode === 'string' && inventoryCode.trim() ? inventoryCode.trim() : null;
-
-  const database = getDb();
 
   await database.runAsync('UPDATE materials SET inventory_code = ? WHERE TRIM(model) = ?', [
     normalizedInventoryCode,
@@ -5306,7 +5539,7 @@ const syncInventoryCodeToHistoricalRecords = async (
 
   for (const row of inboundWarehouses) {
     if (row.warehouse_id) {
-      await updateInboundSummary(row.warehouse_id);
+      await rebuildInboundSummary(database, row.warehouse_id);
     }
   }
 };
@@ -5320,19 +5553,25 @@ export const addInventoryBinding = async (
     const id = generateId();
     const isoDateTime = getISODateTime();
 
-    await database.runAsync(
-      'INSERT INTO inventory_bindings (id, scan_model, inventory_code, supplier, description, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [
-        id,
-        binding.scan_model,
-        binding.inventory_code,
-        binding.supplier || null,
-        binding.description || null,
-        isoDateTime,
-      ]
-    );
+    await runExclusiveWriteTransaction(database, 'addInventoryBinding', async (transactionDatabase) => {
+      await transactionDatabase.runAsync(
+        'INSERT INTO inventory_bindings (id, scan_model, inventory_code, supplier, description, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        [
+          id,
+          binding.scan_model,
+          binding.inventory_code,
+          binding.supplier || null,
+          binding.description || null,
+          isoDateTime,
+        ]
+      );
 
-    await syncInventoryCodeToHistoricalRecords(binding.scan_model, binding.inventory_code);
+      await syncInventoryCodeToHistoricalRecordsWithDatabase(
+        transactionDatabase,
+        binding.scan_model,
+        binding.inventory_code
+      );
+    });
 
     return id;
   } catch (error) {
@@ -5369,17 +5608,20 @@ export const updateInventoryBinding = async (
 
     if (updateFields.length > 0) {
       values.push(id);
-      await database.runAsync(
-        `UPDATE inventory_bindings SET ${updateFields.join(', ')} WHERE id = ?`,
-        values
-      );
+      await runExclusiveWriteTransaction(database, 'updateInventoryBinding', async (transactionDatabase) => {
+        await transactionDatabase.runAsync(
+          `UPDATE inventory_bindings SET ${updateFields.join(', ')} WHERE id = ?`,
+          values
+        );
 
-      await syncInventoryCodeToHistoricalRecords(
-        typeof updates.scan_model === 'string' ? updates.scan_model : existingBinding.scan_model,
-        typeof updates.inventory_code === 'string'
-          ? updates.inventory_code
-          : existingBinding.inventory_code
-      );
+        await syncInventoryCodeToHistoricalRecordsWithDatabase(
+          transactionDatabase,
+          typeof updates.scan_model === 'string' ? updates.scan_model : existingBinding.scan_model,
+          typeof updates.inventory_code === 'string'
+            ? updates.inventory_code
+            : existingBinding.inventory_code
+        );
+      });
     }
   } catch (error) {
     logger.error('更新物料绑定失败:', error);
@@ -5397,7 +5639,9 @@ export const deleteInventoryBinding = async (id: string): Promise<void> => {
     }
 
     const database = getDb();
-    await database.runAsync('DELETE FROM inventory_bindings WHERE id = ?', [id.trim()]);
+    await runExclusiveWriteTransaction(database, 'deleteInventoryBinding', async (transactionDatabase) => {
+      await transactionDatabase.runAsync('DELETE FROM inventory_bindings WHERE id = ?', [id.trim()]);
+    });
   } catch (error) {
     logger.error('[deleteInventoryBinding] 删除物料绑定失败:', error);
     throw error;
@@ -5418,46 +5662,52 @@ export const importInventoryBindings = async (
     let importedCount = 0;
     const skippedCodes: string[] = [];
 
-    for (const binding of bindings) {
-      // 检查是否已存在（存货编码唯一）
-      const existing = await database.getFirstAsync<{ id: string }>(
-        'SELECT id FROM inventory_bindings WHERE inventory_code = ?',
-        [binding.inventory_code]
-      );
+    await runExclusiveWriteTransaction(database, 'importInventoryBindings', async (transactionDatabase) => {
+      for (const binding of bindings) {
+        // 检查是否已存在（存货编码唯一）
+        const existing = await transactionDatabase.getFirstAsync<{ id: string }>(
+          'SELECT id FROM inventory_bindings WHERE inventory_code = ?',
+          [binding.inventory_code]
+        );
 
-      if (existing) {
-        skippedCodes.push(binding.inventory_code);
-        continue;
-      }
+        if (existing) {
+          skippedCodes.push(binding.inventory_code);
+          continue;
+        }
 
-      // 检查扫描型号是否已存在
-      const existingModel = await database.getFirstAsync<{ id: string }>(
-        'SELECT id FROM inventory_bindings WHERE scan_model = ?',
-        [binding.scan_model]
-      );
+        // 检查扫描型号是否已存在
+        const existingModel = await transactionDatabase.getFirstAsync<{ id: string }>(
+          'SELECT id FROM inventory_bindings WHERE scan_model = ?',
+          [binding.scan_model]
+        );
 
-      if (existingModel) {
-        skippedCodes.push(binding.scan_model);
-        continue;
-      }
+        if (existingModel) {
+          skippedCodes.push(binding.scan_model);
+          continue;
+        }
 
-      // 插入新记录
-      await database.runAsync(
-        'INSERT INTO inventory_bindings (id, scan_model, inventory_code, supplier, description, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        [
-          generateId(),
+        // 插入新记录
+        await transactionDatabase.runAsync(
+          'INSERT INTO inventory_bindings (id, scan_model, inventory_code, supplier, description, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          [
+            generateId(),
+            binding.scan_model,
+            binding.inventory_code,
+            binding.supplier || null,
+            binding.description || null,
+            getISODateTime(),
+          ]
+        );
+
+        await syncInventoryCodeToHistoricalRecordsWithDatabase(
+          transactionDatabase,
           binding.scan_model,
-          binding.inventory_code,
-          binding.supplier || null,
-          binding.description || null,
-          getISODateTime(),
-        ]
-      );
+          binding.inventory_code
+        );
 
-      await syncInventoryCodeToHistoricalRecords(binding.scan_model, binding.inventory_code);
-
-      importedCount++;
-    }
+        importedCount++;
+      }
+    });
 
     return importedCount;
   } catch (error) {
@@ -5817,7 +6067,11 @@ export const addInboundRecord = async (record: InboundRecordInsert): Promise<str
     }
 
     const database = getDb();
-    return await insertInboundRecord(database, record);
+    let id = '';
+    await runExclusiveWriteTransaction(database, 'addInboundRecord', async (transactionDatabase) => {
+      id = await insertInboundRecord(transactionDatabase, record);
+    });
+    return id;
   } catch (error) {
     logger.error('添加入库记录失败:', error);
     throw error;
@@ -5837,21 +6091,16 @@ export const addInboundRecordsBatch = async (records: InboundRecordInsert[]): Pr
 
     const database = getDb();
     const ids: string[] = [];
-    await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
 
-    try {
+    await runExclusiveWriteTransaction(database, 'addInboundRecordsBatch', async (transactionDatabase) => {
       assertUniqueTraceNosInBatch(records, '入库记录');
-      await assertInboundTraceNosNotAlreadySaved(database, records);
+      await assertInboundTraceNosNotAlreadySaved(transactionDatabase, records);
 
       for (const record of records) {
-        ids.push(await insertInboundRecord(database, record));
+        ids.push(await insertInboundRecord(transactionDatabase, record));
       }
-      await database.execAsync('COMMIT');
-      return ids;
-    } catch (error) {
-      await rollbackTransaction(database, 'addInboundRecordsBatch');
-      throw error;
-    }
+    });
+    return ids;
   } catch (error) {
     logger.error('批量添加入库记录失败:', error);
     throw error;
@@ -5873,22 +6122,24 @@ export const updateInboundDocumentSyncStatus = async (
 
   try {
     const database = getDb();
-    await database.runAsync(
-      `UPDATE inbound_records
-       SET sync_status = ?,
-           sync_file_name = ?,
-           synced_at = ?,
-           sync_message = ?
-       WHERE inbound_no = ? AND warehouse_id = ?`,
-      [
-        status,
-        status === 'success' ? fileName || null : null,
-        status === 'success' ? getISODateTime() : null,
-        status === 'failed' ? message || null : null,
-        trimmedInboundNo,
-        trimmedWarehouseId,
-      ]
-    );
+    await runExclusiveWriteTransaction(database, 'updateInboundDocumentSyncStatus', async (transactionDatabase) => {
+      await transactionDatabase.runAsync(
+        `UPDATE inbound_records
+         SET sync_status = ?,
+             sync_file_name = ?,
+             synced_at = ?,
+             sync_message = ?
+         WHERE inbound_no = ? AND warehouse_id = ?`,
+        [
+          status,
+          status === 'success' ? fileName || null : null,
+          status === 'success' ? getISODateTime() : null,
+          status === 'failed' ? message || null : null,
+          trimmedInboundNo,
+          trimmedWarehouseId,
+        ]
+      );
+    });
   } catch (error) {
     logger.error('[updateInboundDocumentSyncStatus] 更新入库单同步状态失败:', error);
     throw error;
@@ -5961,7 +6212,9 @@ const rebuildInboundSummary = async (
 export const updateInboundSummary = async (warehouseId: string): Promise<void> => {
   try {
     const database = getDb();
-    await rebuildInboundSummary(database, warehouseId);
+    await runExclusiveWriteTransaction(database, 'updateInboundSummary', async (transactionDatabase) => {
+      await rebuildInboundSummary(transactionDatabase, warehouseId);
+    });
   } catch (error) {
     logger.error('[updateInboundSummary] 更新入库汇总表失败:', error);
     throw error;
@@ -6025,15 +6278,10 @@ export const deleteInboundRecord = async (id: string): Promise<void> => {
       return;
     }
 
-    await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
-    try {
-      await database.runAsync('DELETE FROM inbound_records WHERE id = ?', [trimmedId]);
-      await rebuildInboundSummary(database, record.warehouse_id);
-      await database.execAsync('COMMIT');
-    } catch (error) {
-      await rollbackTransaction(database, 'deleteInboundRecord');
-      throw error;
-    }
+    await runExclusiveWriteTransaction(database, 'deleteInboundRecord', async (transactionDatabase) => {
+      await transactionDatabase.runAsync('DELETE FROM inbound_records WHERE id = ?', [trimmedId]);
+      await rebuildInboundSummary(transactionDatabase, record.warehouse_id);
+    });
   } catch (error) {
     logger.error('[deleteInboundRecord] 删除入库记录失败:', error);
     throw error;
@@ -6054,19 +6302,14 @@ export const deleteInboundDocument = async (
     }
 
     const database = getDb();
-    await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
 
-    try {
-      await database.runAsync(
+    await runExclusiveWriteTransaction(database, 'deleteInboundDocument', async (transactionDatabase) => {
+      await transactionDatabase.runAsync(
         'DELETE FROM inbound_records WHERE inbound_no = ? AND warehouse_id = ?',
         [trimmedInboundNo, trimmedWarehouseId]
       );
-      await rebuildInboundSummary(database, trimmedWarehouseId);
-      await database.execAsync('COMMIT');
-    } catch (error) {
-      await rollbackTransaction(database, 'deleteInboundDocument');
-      throw error;
-    }
+      await rebuildInboundSummary(transactionDatabase, trimmedWarehouseId);
+    });
   } catch (error) {
     logger.error('[deleteInboundDocument] 删除入库单失败:', error);
     throw error;
@@ -6402,7 +6645,11 @@ export const addInventoryCheckRecord = async (
     }
 
     const database = getDb();
-    return await insertInventoryCheckRecord(database, record);
+    let id = '';
+    await runExclusiveWriteTransaction(database, 'addInventoryCheckRecord', async (transactionDatabase) => {
+      id = await insertInventoryCheckRecord(transactionDatabase, record);
+    });
+    return id;
   } catch (error) {
     logger.error('添加盘点记录失败:', error);
     throw error;
@@ -6424,21 +6671,16 @@ export const addInventoryCheckRecordsBatch = async (
 
     const database = getDb();
     const ids: string[] = [];
-    await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
 
-    try {
+    await runExclusiveWriteTransaction(database, 'addInventoryCheckRecordsBatch', async (transactionDatabase) => {
       assertUniqueTraceNosInBatch(records, '盘点记录');
-      await assertInventoryTraceNosNotAlreadySaved(database, records);
+      await assertInventoryTraceNosNotAlreadySaved(transactionDatabase, records);
 
       for (const record of records) {
-        ids.push(await insertInventoryCheckRecord(database, record));
+        ids.push(await insertInventoryCheckRecord(transactionDatabase, record));
       }
-      await database.execAsync('COMMIT');
-      return ids;
-    } catch (error) {
-      await rollbackTransaction(database, 'addInventoryCheckRecordsBatch');
-      throw error;
-    }
+    });
+    return ids;
   } catch (error) {
     logger.error('批量添加盘点记录失败:', error);
     throw error;
@@ -6460,22 +6702,24 @@ export const updateInventoryCheckDocumentSyncStatus = async (
 
   try {
     const database = getDb();
-    await database.runAsync(
-      `UPDATE inventory_check_records
-       SET sync_status = ?,
-           sync_file_name = ?,
-           synced_at = ?,
-           sync_message = ?
-       WHERE check_no = ? AND warehouse_id = ?`,
-      [
-        status,
-        status === 'success' ? fileName || null : null,
-        status === 'success' ? getISODateTime() : null,
-        status === 'failed' ? message || null : null,
-        trimmedCheckNo,
-        trimmedWarehouseId,
-      ]
-    );
+    await runExclusiveWriteTransaction(database, 'updateInventoryCheckDocumentSyncStatus', async (transactionDatabase) => {
+      await transactionDatabase.runAsync(
+        `UPDATE inventory_check_records
+         SET sync_status = ?,
+             sync_file_name = ?,
+             synced_at = ?,
+             sync_message = ?
+         WHERE check_no = ? AND warehouse_id = ?`,
+        [
+          status,
+          status === 'success' ? fileName || null : null,
+          status === 'success' ? getISODateTime() : null,
+          status === 'failed' ? message || null : null,
+          trimmedCheckNo,
+          trimmedWarehouseId,
+        ]
+      );
+    });
   } catch (error) {
     logger.error('[updateInventoryCheckDocumentSyncStatus] 更新盘点单同步状态失败:', error);
     throw error;
@@ -6492,7 +6736,9 @@ export const deleteInventoryCheckRecord = async (id: string): Promise<void> => {
     }
 
     const database = getDb();
-    await database.runAsync('DELETE FROM inventory_check_records WHERE id = ?', [id.trim()]);
+    await runExclusiveWriteTransaction(database, 'deleteInventoryCheckRecord', async (transactionDatabase) => {
+      await transactionDatabase.runAsync('DELETE FROM inventory_check_records WHERE id = ?', [id.trim()]);
+    });
   } catch (error) {
     logger.error('[deleteInventoryCheckRecord] 删除盘点记录失败:', error);
     throw error;
@@ -6513,10 +6759,12 @@ export const deleteInventoryCheckDocument = async (
     }
 
     const database = getDb();
-    await database.runAsync(
-      'DELETE FROM inventory_check_records WHERE check_no = ? AND warehouse_id = ?',
-      [trimmedCheckNo, trimmedWarehouseId]
-    );
+    await runExclusiveWriteTransaction(database, 'deleteInventoryCheckDocument', async (transactionDatabase) => {
+      await transactionDatabase.runAsync(
+        'DELETE FROM inventory_check_records WHERE check_no = ? AND warehouse_id = ?',
+        [trimmedCheckNo, trimmedWarehouseId]
+      );
+    });
   } catch (error) {
     logger.error('[deleteInventoryCheckDocument] 删除盘点单失败:', error);
     throw error;
@@ -6558,26 +6806,28 @@ export const addRule = async (
     const id = generateId();
     const isoDateTime = getISODateTime();
 
-    await database.runAsync(
-      `INSERT INTO qr_code_rules (
-        id, name, description, separator, field_order, custom_field_ids, is_active,
-        supplier_name, match_conditions, field_prefixes, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        rule.name,
-        rule.description || null,
-        rule.separator,
-        jsonToString(rule.fieldOrder),
-        rule.customFieldIds ? jsonToString(rule.customFieldIds) : null,
-        rule.isActive ? 1 : 0,
-        rule.supplierName || null,
-        rule.matchConditions ? jsonToString(rule.matchConditions) : null,
-        rule.fieldPrefixes ? jsonToString(rule.fieldPrefixes) : null,
-        isoDateTime,
-        isoDateTime,
-      ]
-    );
+    await runExclusiveWriteTransaction(database, 'addRule', async (transactionDatabase) => {
+      await transactionDatabase.runAsync(
+        `INSERT INTO qr_code_rules (
+          id, name, description, separator, field_order, custom_field_ids, is_active,
+          supplier_name, match_conditions, field_prefixes, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          rule.name,
+          rule.description || null,
+          rule.separator,
+          jsonToString(rule.fieldOrder),
+          rule.customFieldIds ? jsonToString(rule.customFieldIds) : null,
+          rule.isActive ? 1 : 0,
+          rule.supplierName || null,
+          rule.matchConditions ? jsonToString(rule.matchConditions) : null,
+          rule.fieldPrefixes ? jsonToString(rule.fieldPrefixes) : null,
+          isoDateTime,
+          isoDateTime,
+        ]
+      );
+    });
 
     return id;
   } catch (error) {
@@ -6639,10 +6889,12 @@ export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Prom
       updateFields.push('updated_at = ?');
       values.push(getISODateTime());
       values.push(id);
-      await database.runAsync(
-        `UPDATE qr_code_rules SET ${updateFields.join(', ')} WHERE id = ?`,
-        values
-      );
+      await runExclusiveWriteTransaction(database, 'updateRule', async (transactionDatabase) => {
+        await transactionDatabase.runAsync(
+          `UPDATE qr_code_rules SET ${updateFields.join(', ')} WHERE id = ?`,
+          values
+        );
+      });
     }
   } catch (error) {
     logger.error('更新规则失败:', error);
@@ -6660,7 +6912,9 @@ export const deleteRule = async (id: string): Promise<void> => {
     }
 
     const database = getDb();
-    await database.runAsync('DELETE FROM qr_code_rules WHERE id = ?', [id.trim()]);
+    await runExclusiveWriteTransaction(database, 'deleteRule', async (transactionDatabase) => {
+      await transactionDatabase.runAsync('DELETE FROM qr_code_rules WHERE id = ?', [id.trim()]);
+    });
   } catch (error) {
     logger.error('[deleteRule] 删除规则失败:', error);
     throw error;
@@ -6701,7 +6955,6 @@ export const initDefaultCustomFields = async (): Promise<void> => {
 export const getAllCustomFields = async (): Promise<CustomField[]> => {
   try {
     const database = getDb();
-    await database.runAsync("UPDATE custom_fields SET type = 'text' WHERE type NOT IN ('text', 'select')");
     const results = await database.getAllAsync<CustomFieldRow>(
       'SELECT * FROM custom_fields ORDER BY sort_order ASC'
     );
@@ -6727,25 +6980,27 @@ export const addCustomField = async (
     const isoDateTime = getISODateTime();
     const normalizedOptions = field.type === 'select' ? field.options : undefined;
 
-    // 获取当前最大排序值
-    const maxResult = await database.getFirstAsync<{ max: number }>(
-      'SELECT MAX(sort_order) as max FROM custom_fields'
-    );
-    const maxSort = Number(maxResult?.max ?? 0) || 0;
+    await runExclusiveWriteTransaction(database, 'addCustomField', async (transactionDatabase) => {
+      // 获取当前最大排序值
+      const maxResult = await transactionDatabase.getFirstAsync<{ max: number }>(
+        'SELECT MAX(sort_order) as max FROM custom_fields'
+      );
+      const maxSort = Number(maxResult?.max ?? 0) || 0;
 
-    await database.runAsync(
-      'INSERT INTO custom_fields (id, name, type, required, options, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [
-        id,
-        field.name,
-        field.type,
-        field.required ? 1 : 0,
-        normalizedOptions ? jsonToString(normalizedOptions) : null,
-        maxSort + 1,
-        isoDateTime,
-        isoDateTime,
-      ]
-    );
+      await transactionDatabase.runAsync(
+        'INSERT INTO custom_fields (id, name, type, required, options, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [
+          id,
+          field.name,
+          field.type,
+          field.required ? 1 : 0,
+          normalizedOptions ? jsonToString(normalizedOptions) : null,
+          maxSort + 1,
+          isoDateTime,
+          isoDateTime,
+        ]
+      );
+    });
 
     return id;
   } catch (error) {
@@ -6805,10 +7060,12 @@ export const updateCustomField = async (
       updateFields.push('updated_at = ?');
       values.push(getISODateTime());
       values.push(id);
-      await database.runAsync(
-        `UPDATE custom_fields SET ${updateFields.join(', ')} WHERE id = ?`,
-        values
-      );
+      await runExclusiveWriteTransaction(database, 'updateCustomField', async (transactionDatabase) => {
+        await transactionDatabase.runAsync(
+          `UPDATE custom_fields SET ${updateFields.join(', ')} WHERE id = ?`,
+          values
+        );
+      });
     }
   } catch (error) {
     logger.error('更新自定义字段失败:', error);
@@ -6828,11 +7085,9 @@ export const deleteCustomField = async (id: string): Promise<void> => {
     const database = getDb();
     const trimmedId = id.trim();
     const customFieldKey = createCustomFieldKey(trimmedId);
-    const rules = await database.getAllAsync<any>('SELECT * FROM qr_code_rules');
 
-    await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
-
-    try {
+    await runExclusiveWriteTransaction(database, 'deleteCustomField', async (transactionDatabase) => {
+      const rules = await transactionDatabase.getAllAsync<any>('SELECT * FROM qr_code_rules');
       for (const rawRule of rules) {
         const rule = normalizeRuleRecord(rawRule);
         const removedFieldIndex = rule.fieldOrder.findIndex((field) => field === customFieldKey);
@@ -6866,7 +7121,7 @@ export const deleteCustomField = async (id: string): Promise<void> => {
           return [condition];
         });
 
-        await database.runAsync(
+        await transactionDatabase.runAsync(
           `UPDATE qr_code_rules
            SET field_order = ?, custom_field_ids = ?, field_prefixes = ?, match_conditions = ?, updated_at = ?
            WHERE id = ?`,
@@ -6881,12 +7136,8 @@ export const deleteCustomField = async (id: string): Promise<void> => {
         );
       }
 
-      await database.runAsync('DELETE FROM custom_fields WHERE id = ?', [trimmedId]);
-      await database.execAsync('COMMIT');
-    } catch (ruleCleanupError) {
-      await database.execAsync('ROLLBACK');
-      throw ruleCleanupError;
-    }
+      await transactionDatabase.runAsync('DELETE FROM custom_fields WHERE id = ?', [trimmedId]);
+    });
   } catch (error) {
     logger.error('[deleteCustomField] 删除自定义字段失败:', error);
     throw error;
@@ -6897,18 +7148,15 @@ export const deleteCustomField = async (id: string): Promise<void> => {
 export const reorderCustomFields = async (fieldIds: string[]): Promise<void> => {
   const database = getDb();
   try {
-    await database.execAsync('BEGIN TRANSACTION');
-
-    for (let i = 0; i < fieldIds.length; i++) {
-      await database.runAsync('UPDATE custom_fields SET sort_order = ? WHERE id = ?', [
-        i,
-        fieldIds[i],
-      ]);
-    }
-
-    await database.execAsync('COMMIT');
+    await runExclusiveWriteTransaction(database, 'reorderCustomFields', async (transactionDatabase) => {
+      for (let i = 0; i < fieldIds.length; i++) {
+        await transactionDatabase.runAsync('UPDATE custom_fields SET sort_order = ? WHERE id = ?', [
+          i,
+          fieldIds[i],
+        ]);
+      }
+    });
   } catch (error) {
-    await rollbackTransaction(database, 'reorderCustomFields');
     logger.error('重新排序自定义字段失败:', error);
     throw error;
   }
@@ -7345,24 +7593,22 @@ export const importBackupData = async (
       .filter((id): id is string => typeof id === 'string' && id.trim().length > 0);
     const preservedLocalWarehouseIds = referencedWarehouseIds.filter((id) => !backupWarehouseIds.has(id));
 
-    await database.execAsync('BEGIN IMMEDIATE TRANSACTION');
-
-    try {
-      await database.runAsync('DELETE FROM inventory_bindings');
-      await database.runAsync('DELETE FROM qr_code_rules');
-      await database.runAsync('DELETE FROM custom_fields');
+    await runExclusiveWriteTransaction(database, 'importBackupData', async (transactionDatabase) => {
+      await transactionDatabase.runAsync('DELETE FROM inventory_bindings');
+      await transactionDatabase.runAsync('DELETE FROM qr_code_rules');
+      await transactionDatabase.runAsync('DELETE FROM custom_fields');
 
       if (referencedWarehouseIds.length > 0) {
-        await database.runAsync(
+        await transactionDatabase.runAsync(
           `DELETE FROM warehouses WHERE id NOT IN (${referencedWarehouseIds.map(() => '?').join(',')})`,
           referencedWarehouseIds
         );
       } else {
-        await database.runAsync('DELETE FROM warehouses');
+        await transactionDatabase.runAsync('DELETE FROM warehouses');
       }
 
       if (backupHasDefaultWarehouse) {
-        await database.runAsync('UPDATE warehouses SET is_default = 0');
+        await transactionDatabase.runAsync('UPDATE warehouses SET is_default = 0');
       }
 
       // 3. 导入仓库（因为物料绑定依赖仓库）
@@ -7371,7 +7617,7 @@ export const importBackupData = async (
           try {
             const sortOrder =
               getBackupSortOrder(warehouse as unknown as Record<string, unknown>) ?? index;
-            await database.runAsync(
+            await transactionDatabase.runAsync(
               'INSERT OR REPLACE INTO warehouses (id, name, description, is_default, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?)',
               [
                 warehouse.id,
@@ -7393,7 +7639,7 @@ export const importBackupData = async (
       if (backup.rules && backup.rules.length > 0) {
         for (const rule of backup.rules) {
           try {
-            await database.runAsync(
+            await transactionDatabase.runAsync(
               `INSERT INTO qr_code_rules (
                 id, name, description, separator, field_order, custom_field_ids,
                 is_active, supplier_name, match_conditions, field_prefixes, created_at, updated_at
@@ -7425,7 +7671,7 @@ export const importBackupData = async (
         for (const field of backup.customFields) {
           try {
             const sortOrder = getBackupSortOrder(field as unknown as Record<string, unknown>) ?? 0;
-            await database.runAsync(
+            await transactionDatabase.runAsync(
               `INSERT INTO custom_fields (
                 id, name, type, required, options, sort_order, created_at, updated_at
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -7451,7 +7697,7 @@ export const importBackupData = async (
       if (backup.inventoryBindings && backup.inventoryBindings.length > 0) {
         for (const binding of backup.inventoryBindings) {
           try {
-            await database.runAsync(
+            await transactionDatabase.runAsync(
               'INSERT INTO inventory_bindings (id, scan_model, inventory_code, supplier, description, created_at) VALUES (?, ?, ?, ?, ?, ?)',
               [
                 binding.id,
@@ -7468,12 +7714,7 @@ export const importBackupData = async (
           }
         }
       }
-
-      await database.execAsync('COMMIT');
-    } catch (error) {
-      await database.execAsync('ROLLBACK');
-      throw error;
-    }
+    });
 
     if (preservedLocalWarehouseIds.length > 0) {
       warnings.push(`已保留 ${preservedLocalWarehouseIds.length} 个仍被业务数据引用的本地仓库，避免历史记录失去仓库归属。`);
@@ -7605,14 +7846,20 @@ export const incrementExportCount = async (type: ExportType): Promise<number> =>
     const database = getDb();
     const today = getLocalDateString();
     const key = `export_count_${type}_${today}`;
+    let nextCount = 0;
 
-    const current = await getTodayExportCount(type);
-    const nextCount = current + 1;
-
-    await database.runAsync('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)', [
-      key,
-      nextCount.toString(),
-    ]);
+    await runExclusiveWriteTransaction(database, 'incrementExportCount', async (transactionDatabase) => {
+      const result = await transactionDatabase.getFirstAsync<{ value: string }>(
+        'SELECT value FROM system_config WHERE key = ?',
+        [key]
+      );
+      const current = result ? parseInt(result.value, 10) : 0;
+      nextCount = (Number.isFinite(current) ? current : 0) + 1;
+      await transactionDatabase.runAsync('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)', [
+        key,
+        nextCount.toString(),
+      ]);
+    });
 
     return nextCount;
   } catch (error) {
@@ -7627,8 +7874,8 @@ const SQLITE_FILE_HEADER = 'SQLite format 3\u0000';
 const RESTORE_SCHEMA_REQUIREMENTS: Record<string, string[]> = {
   system_config: ['key', 'value'],
   orders: ['id', 'order_no', 'created_at'],
-  materials: ['id', 'order_no', 'quantity', 'scanned_at', 'warehouse_id'],
-  qr_code_rules: ['id', 'name', 'separator', 'field_order', 'is_active', 'field_prefixes'],
+  materials: ['id', 'order_no', 'quantity', 'scanned_at'],
+  qr_code_rules: ['id', 'name', 'separator', 'field_order', 'is_active'],
   custom_fields: ['id', 'name', 'type', 'required', 'sort_order'],
   warehouses: ['id', 'name', 'is_default', 'created_at'],
   inventory_bindings: ['id', 'scan_model', 'inventory_code', 'created_at'],
@@ -7645,6 +7892,7 @@ const RESTORE_SCHEMA_REQUIREMENTS: Record<string, string[]> = {
     'created_at',
   ],
 };
+const RESTORE_REQUIRED_TABLES = new Set(['orders', 'materials']);
 
 const getSelectedDatabaseFileName = (asset: { name?: string; uri: string }): string => {
   if (asset.name?.trim()) {
@@ -7688,7 +7936,10 @@ const validateRestoredDatabaseSchema = async (
     );
 
     if (!tableExists) {
-      throw new Error(`数据库缺少必要数据表: ${tableName}`);
+      if (RESTORE_REQUIRED_TABLES.has(tableName)) {
+        throw new Error(`数据库缺少必要数据表: ${tableName}`);
+      }
+      continue;
     }
 
     const columns = await database.getAllAsync<{ name: string }>(`PRAGMA table_info(${tableName})`);
@@ -7745,11 +7996,13 @@ export const checkpointDatabaseToDisk = async (): Promise<void> => {
     return;
   }
 
-  if (!db) {
-    await initDatabase();
-  }
+  await runSerializedDatabaseOperation('checkpointDatabaseToDisk', async () => {
+    if (!db) {
+      return;
+    }
 
-  await checkpointDatabaseForFileBackup(getDb());
+    await checkpointDatabaseForFileBackup(db);
+  });
 };
 
 export const getSystemConfigValue = async (key: string): Promise<string | null> => {
@@ -7779,10 +8032,13 @@ export const setSystemConfigValue = async (key: string, value: string): Promise<
     await initDatabase();
   }
 
-  await getDb().runAsync('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)', [
-    trimmedKey,
-    value,
-  ]);
+  const database = getDb();
+  await runExclusiveWriteTransaction(database, 'setSystemConfigValue', async (transactionDatabase) => {
+    await transactionDatabase.runAsync('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)', [
+      trimmedKey,
+      value,
+    ]);
+  });
 };
 
 export const removeSystemConfigValue = async (key: string): Promise<void> => {
@@ -7795,7 +8051,10 @@ export const removeSystemConfigValue = async (key: string): Promise<void> => {
     await initDatabase();
   }
 
-  await getDb().runAsync('DELETE FROM system_config WHERE key = ?', [trimmedKey]);
+  const database = getDb();
+  await runExclusiveWriteTransaction(database, 'removeSystemConfigValue', async (transactionDatabase) => {
+    await transactionDatabase.runAsync('DELETE FROM system_config WHERE key = ?', [trimmedKey]);
+  });
 };
 
 const deleteDatabaseSidecarFiles = async (dbFilePath: string): Promise<void> => {
@@ -7838,6 +8097,8 @@ export const exportDatabaseFile = async (): Promise<{
   message: string;
   filePath?: string;
 }> => {
+  let shouldReinitialize = false;
+
   try {
     if (isWebPlatform) {
       return {
@@ -7846,70 +8107,68 @@ export const exportDatabaseFile = async (): Promise<{
       };
     }
 
-    // 确保所有数据已写入磁盘
-    const database = getDb();
-    if (!database) {
+    const result = await runSerializedDatabaseOperation('exportDatabaseFile', async () => {
+      // 确保所有数据已写入磁盘
+      const database = getDb();
+
+      await checkpointDatabaseForFileBackup(database);
+
+      // 关闭数据库连接，确保数据持久化
+      await database.closeAsync();
+      db = null;
+      shouldReinitialize = true;
+
+      // 等待一下，确保文件写入完成
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      const dbFilePath = getDatabaseFilePath();
+
+      // 检查数据库文件是否存在
+      const fileInfo = await FS.getInfoAsync(dbFilePath);
+      if (!fileInfo.exists) {
+        logger.error('数据库文件不存在:', dbFilePath);
+        return {
+          success: false,
+          message: '数据库文件不存在',
+        };
+      }
+
+      // 生成按天归档并自动递增序号的备份文件名
+      const timestamp = getDatabaseBackupDateString();
+      const backupDir = `${FS.documentDirectory}backups`;
+
+      // 确保备份目录存在
+      const dirInfo = await FS.getInfoAsync(backupDir);
+      if (!dirInfo.exists) {
+        await FS.makeDirectoryAsync(backupDir, { intermediates: true });
+      }
+
+      const backupFileName = await getNextDatedBackupFileName(
+        backupDir,
+        sanitizeBackupFileName(APP_NAME),
+        timestamp,
+        'db'
+      );
+      const backupFilePath = `${backupDir}/${backupFileName}`;
+
+      // 复制数据库文件到备份目录
+      await FS.copyAsync({
+        from: dbFilePath,
+        to: backupFilePath,
+      });
+
       return {
-        success: false,
-        message: '数据库未初始化',
+        success: true,
+        message: '数据库文件导出成功',
+        filePath: backupFilePath,
       };
-    }
-
-    await checkpointDatabaseForFileBackup(database);
-
-    // 关闭数据库连接，确保数据持久化
-    await database.closeAsync();
-    db = null;
-
-    // 等待一下，确保文件写入完成
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    const dbFilePath = getDatabaseFilePath();
-
-    // 检查数据库文件是否存在
-    const fileInfo = await FS.getInfoAsync(dbFilePath);
-    if (!fileInfo.exists) {
-      logger.error('数据库文件不存在:', dbFilePath);
-      // 重新初始化数据库连接
-      await initDatabase();
-      return {
-        success: false,
-        message: '数据库文件不存在',
-      };
-    }
-
-    // 生成按天归档并自动递增序号的备份文件名
-    const timestamp = getDatabaseBackupDateString();
-    const backupDir = `${FS.documentDirectory}backups`;
-
-    // 确保备份目录存在
-    const dirInfo = await FS.getInfoAsync(backupDir);
-    if (!dirInfo.exists) {
-      await FS.makeDirectoryAsync(backupDir, { intermediates: true });
-    }
-
-    const backupFileName = await getNextDatedBackupFileName(
-      backupDir,
-      sanitizeBackupFileName(APP_NAME),
-      timestamp,
-      'db'
-    );
-    const backupFilePath = `${backupDir}/${backupFileName}`;
-
-    // 复制数据库文件到备份目录
-    await FS.copyAsync({
-      from: dbFilePath,
-      to: backupFilePath,
     });
 
-    // 重新初始化数据库连接，确保 PRAGMA、索引与保护触发器都处于当前版本。
-    await initDatabase();
+    if (shouldReinitialize) {
+      await initDatabase();
+    }
 
-    return {
-      success: true,
-      message: '数据库文件导出成功',
-      filePath: backupFilePath,
-    };
+    return result;
   } catch (error) {
     logger.error('导出数据库文件失败:', error);
 
@@ -8000,100 +8259,115 @@ export const importDatabaseFile = async (): Promise<{
       };
     }
 
-    // 关闭当前数据库连接
-    const database = getDb();
-    if (database) {
-      await checkpointDatabaseForFileBackup(database);
-      await database.closeAsync();
-    }
-    db = null;
-
-    // 等待一下，确保数据库完全关闭
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    const dbFilePath = getDatabaseFilePath();
-    const dbBackupPath = `${dbFilePath}.backup`;
-
-    try {
-      // 1. 备份当前数据库文件（如果存在）
-      const currentDbInfo = await FS.getInfoAsync(dbFilePath);
-      if (currentDbInfo.exists) {
-        await FS.copyAsync({
-          from: dbFilePath,
-          to: dbBackupPath,
-        });
+    let shouldReinitialize = false;
+    const importResult = await runSerializedDatabaseOperation('importDatabaseFile', async () => {
+      // 关闭当前数据库连接
+      const database = db;
+      if (database) {
+        await checkpointDatabaseForFileBackup(database);
+        await database.closeAsync();
       }
-
-      // 2. 删除当前数据库文件及 WAL/SHM 辅助文件
-      await FS.deleteAsync(dbFilePath, { idempotent: true });
-      await deleteDatabaseSidecarFiles(dbFilePath);
-
-      // 3. 复制新数据库文件
-      await FS.copyAsync({
-        from: sourceFileUri,
-        to: dbFilePath,
-      });
-
-      // 4. 重新打开数据库
-      db = await SQLite.openDatabaseAsync('warehouse.db');
-
-      // 5. 验证数据库结构是否兼容，再获取统计数据
-      await validateRestoredDatabaseSchema(db);
-
-      const orders = await db.getFirstAsync<{ count: number }>(
-        'SELECT COUNT(*) as count FROM orders'
-      );
-      const materials = await db.getFirstAsync<{ count: number }>(
-        'SELECT COUNT(*) as count FROM materials'
-      );
-      const rules = await db.getFirstAsync<{ count: number }>(
-        'SELECT COUNT(*) as count FROM qr_code_rules'
-      );
-      const warehouses = await db.getFirstAsync<{ count: number }>(
-        'SELECT COUNT(*) as count FROM warehouses'
-      );
-
-      // 删除备份文件
-      await FS.deleteAsync(dbBackupPath, { idempotent: true });
-
-      await db.closeAsync();
       db = null;
-      await initDatabase();
+      shouldReinitialize = true;
 
-      return {
-        success: true,
-        message: '数据库文件恢复成功',
-        needRestart: true, // 标记需要重启应用
-        stats: {
-          orders: orders?.count || 0,
-          materials: materials?.count || 0,
-          rules: rules?.count || 0,
-          warehouses: warehouses?.count || 0,
-        },
-      };
-    } catch (restoreError) {
-      logger.error('恢复数据库失败，尝试回滚:', restoreError);
+      // 等待一下，确保数据库完全关闭
+      await new Promise((resolve) => setTimeout(resolve, 500));
 
-      // 恢复失败，尝试回滚到备份
-      const backupInfo = await FS.getInfoAsync(dbBackupPath);
-      if (backupInfo.exists) {
+      const dbFilePath = getDatabaseFilePath();
+      const dbBackupPath = `${dbFilePath}.backup`;
+
+      try {
+        // 1. 备份当前数据库文件（如果存在）
+        const currentDbInfo = await FS.getInfoAsync(dbFilePath);
+        if (currentDbInfo.exists) {
+          await FS.copyAsync({
+            from: dbFilePath,
+            to: dbBackupPath,
+          });
+        }
+
+        // 2. 删除当前数据库文件及 WAL/SHM 辅助文件
         await FS.deleteAsync(dbFilePath, { idempotent: true });
         await deleteDatabaseSidecarFiles(dbFilePath);
+
+        // 3. 复制新数据库文件
         await FS.copyAsync({
-          from: dbBackupPath,
+          from: sourceFileUri,
           to: dbFilePath,
         });
+
+        // 4. 重新打开数据库
+        db = await SQLite.openDatabaseAsync('warehouse.db');
+
+        // 5. 验证数据库结构是否兼容，再获取统计数据
+        await validateRestoredDatabaseSchema(db);
+
+        const orders = await db.getFirstAsync<{ count: number }>(
+          'SELECT COUNT(*) as count FROM orders'
+        );
+        const materials = await db.getFirstAsync<{ count: number }>(
+          'SELECT COUNT(*) as count FROM materials'
+        );
+        const rules = await db.getFirstAsync<{ count: number }>(
+          'SELECT COUNT(*) as count FROM qr_code_rules'
+        );
+        const warehouses = await db.getFirstAsync<{ count: number }>(
+          'SELECT COUNT(*) as count FROM warehouses'
+        );
+
+        // 删除备份文件
         await FS.deleteAsync(dbBackupPath, { idempotent: true });
+
+        await db.closeAsync();
+        db = null;
+
+        return {
+          success: true,
+          message: '数据库文件恢复成功',
+          needRestart: true, // 标记需要重启应用
+          stats: {
+            orders: orders?.count || 0,
+            materials: materials?.count || 0,
+            rules: rules?.count || 0,
+            warehouses: warehouses?.count || 0,
+          },
+        };
+      } catch (restoreError) {
+        logger.error('恢复数据库失败，尝试回滚:', restoreError);
+
+        if (db) {
+          try {
+            await db.closeAsync();
+          } catch (closeError) {
+            logger.warn('恢复失败后关闭数据库连接失败:', closeError);
+          }
+          db = null;
+        }
+
+        // 恢复失败，尝试回滚到备份
+        const backupInfo = await FS.getInfoAsync(dbBackupPath);
+        if (backupInfo.exists) {
+          await FS.deleteAsync(dbFilePath, { idempotent: true });
+          await deleteDatabaseSidecarFiles(dbFilePath);
+          await FS.copyAsync({
+            from: dbBackupPath,
+            to: dbFilePath,
+          });
+          await FS.deleteAsync(dbBackupPath, { idempotent: true });
+        }
+
+        return {
+          success: false,
+          message: `恢复失败，已回滚到原数据库: ${restoreError instanceof Error ? restoreError.message : '未知错误'}`,
+        };
       }
+    });
 
-      // 重新初始化数据库连接
+    if (shouldReinitialize) {
       await initDatabase();
-
-      return {
-        success: false,
-        message: `恢复失败，已回滚到原数据库: ${restoreError instanceof Error ? restoreError.message : '未知错误'}`,
-      };
     }
+
+    return importResult;
   } catch (error) {
     logger.error('导入数据库文件失败:', error);
 

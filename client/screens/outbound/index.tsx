@@ -29,9 +29,6 @@ import {
   Warehouse,
   getAllWarehouses,
   getDefaultWarehouse,
-  getSystemConfigValue,
-  setSystemConfigValue,
-  removeSystemConfigValue,
 } from '@/utils/database';
 import {
   scanQueue,
@@ -72,7 +69,6 @@ import {
 
 const CUSTOMER_NAME_HAS_CHINESE_REGEX = /[\u3400-\u9fff\uf900-\ufaff]/;
 const CUSTOMER_NAME_ALLOWED_REGEX = /^[\u3400-\u9fff\uf900-\ufaffA-Za-z0-9（）()【】\[\]·•&\-—_.、，,．。\s]+$/;
-const OUTBOUND_WORK_DRAFT_DB_KEY = 'outbound_work_draft_v1';
 const LEGACY_OUTBOUND_SCAN_RECORDS_KEY = 'outbound_scan_records';
 
 const normalizeOrderNoCandidate = (value: string) => value.trim().replace(/\s+/g, '').toUpperCase();
@@ -303,6 +299,7 @@ export default function PDAScanScreen() {
   const orderNoRef = useRef(''); // 🔥 添加 orderNoRef，用于批量写入时判断是否需要刷新
   const customerNameRef = useRef('');
   const currentWarehouseRef = useRef<Warehouse | null>(null);
+  const savedOutboundDraftRef = useRef<string | null>(null);
 
   // 仓库
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
@@ -424,48 +421,41 @@ export default function PDAScanScreen() {
     async (nextOrderNo: string, nextCustomerName: string, warehouse: Warehouse) => {
       const draft = createOutboundWorkDraft(nextOrderNo, nextCustomerName, warehouse);
       const serializedDraft = JSON.stringify(draft);
-      await Promise.all([
-        AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT, serializedDraft),
-        AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_ORDER_NO, draft.orderNo),
-        setSystemConfigValue(OUTBOUND_WORK_DRAFT_DB_KEY, serializedDraft),
-      ]);
+      if (savedOutboundDraftRef.current === serializedDraft) {
+        return;
+      }
+
+      try {
+        await Promise.all([
+          AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT, serializedDraft),
+          AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_ORDER_NO, draft.orderNo),
+        ]);
+        savedOutboundDraftRef.current = serializedDraft;
+      } catch (error) {
+        logger.warn('[扫码出库] 保存出库草稿到 AsyncStorage 失败，继续当前扫码流程:', error);
+      }
     },
     []
   );
 
   const clearOutboundWorkDraft = useCallback(async () => {
-    await Promise.all([
+    savedOutboundDraftRef.current = null;
+    await Promise.allSettled([
       AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT),
       AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_ORDER_NO),
-      removeSystemConfigValue(OUTBOUND_WORK_DRAFT_DB_KEY),
     ]);
   }, []);
 
   const loadSavedOutboundWorkDraft = useCallback(async (): Promise<OutboundWorkDraft | null> => {
-    const [asyncDraftText, databaseDraftText] = await Promise.all([
-      AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT),
-      getSystemConfigValue(OUTBOUND_WORK_DRAFT_DB_KEY).catch((error) => {
-        logger.warn('[loadOutboundState] 读取数据库出库草稿失败:', error);
-        return null;
-      }),
-    ]);
+    const asyncDraftText = await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT);
 
-    const asyncDraft = asyncDraftText
+    return asyncDraftText
       ? safeJsonParseNullable<OutboundWorkDraft>(
           asyncDraftText,
           'outbound.workDraft.asyncStorage',
           isOutboundWorkDraft
         )
       : null;
-    const databaseDraft = databaseDraftText
-      ? safeJsonParseNullable<OutboundWorkDraft>(
-          databaseDraftText,
-          'outbound.workDraft.database',
-          isOutboundWorkDraft
-        )
-      : null;
-
-    return asyncDraft || databaseDraft;
   }, []);
 
   // 自动清理震动和提示音
@@ -1061,16 +1051,27 @@ export default function PDAScanScreen() {
           }
 
           const normalizedCustomerName = normalizeCustomerNameScan(code);
-          const existingOrder = await getOrder(activeOrderNo, workWarehouse.id);
-          if (existingOrder) {
+          let orderSaved = true;
+          try {
             await upsertOrder(activeOrderNo, normalizedCustomerName, {
               id: workWarehouse.id,
               name: workWarehouse.name,
             });
+          } catch (error) {
+            orderSaved = false;
+            logger.warn(
+              '[扫码出库] 客户名称已识别，但订单写入暂时失败，将在首条物料扫码时补写:',
+              error
+            );
           }
           setActiveCustomerName(normalizedCustomerName);
           await saveOutboundWorkDraft(activeOrderNo, normalizedCustomerName, workWarehouse);
-          showToast(`客户已识别：${normalizedCustomerName}`, 'success');
+          showToast(
+            orderSaved
+              ? `客户已识别：${normalizedCustomerName}`
+              : `客户已识别：${normalizedCustomerName}，订单将在扫物料时补写`,
+            orderSaved ? 'success' : 'warning'
+          );
           feedbackCustomerSuccess();
           return;
         }
@@ -1219,7 +1220,6 @@ export default function PDAScanScreen() {
         }
 
         // 扫码出库必须在数据库提交成功后再提示成功，避免“已扫码”但实际未落库。
-        await saveOutboundWorkDraft(activeOrderNo, activeCustomerName.trim(), workWarehouse);
         const savedPayload: QueueItemParsedPayload = {
           orderNo: activeOrderNo,
           customerName: activeCustomerName.trim(),
@@ -1262,6 +1262,8 @@ export default function PDAScanScreen() {
           id: savedPayload.warehouseId,
           name: savedPayload.warehouseName,
         });
+
+        await saveOutboundWorkDraft(activeOrderNo, activeCustomerName.trim(), workWarehouse);
 
         if (activeOrderNo === orderNoRef.current) {
           const savedItem = mapQueueItemToMaterialItem(materialId, savedPayload);

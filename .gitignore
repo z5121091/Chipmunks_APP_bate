@@ -1,4 +1,6 @@
 node_modules/
+.pnpm/
+.pnpm-old-autolink-ignore/
 dist/
 build/
 .expo/
