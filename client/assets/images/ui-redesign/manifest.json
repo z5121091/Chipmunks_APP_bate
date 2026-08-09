@@ -1,0 +1,227 @@
+{
+  "assetSet": "ui-redesign",
+  "generatedBy": "scripts/generate_ui_assets.py",
+  "designLanguage": "reliable, clear, fast warehouse operations UI",
+  "icons": [
+    {
+      "name": "icon_inbound_scan",
+      "file": "client/assets/images/ui-redesign/icons/icon_inbound_scan.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#168A67",
+      "description": "入库扫码"
+    },
+    {
+      "name": "icon_outbound_scan",
+      "file": "client/assets/images/ui-redesign/icons/icon_outbound_scan.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#2F6FDD",
+      "description": "出库扫码"
+    },
+    {
+      "name": "icon_document_management",
+      "file": "client/assets/images/ui-redesign/icons/icon_document_management.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#C7862E",
+      "description": "单据管理"
+    },
+    {
+      "name": "icon_inventory_count",
+      "file": "client/assets/images/ui-redesign/icons/icon_inventory_count.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#C55B52",
+      "description": "盘点作业"
+    },
+    {
+      "name": "icon_material_binding",
+      "file": "client/assets/images/ui-redesign/icons/icon_material_binding.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#198CA8",
+      "description": "物料绑定"
+    },
+    {
+      "name": "icon_settings",
+      "file": "client/assets/images/ui-redesign/icons/icon_settings.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#5F7187",
+      "description": "设置"
+    },
+    {
+      "name": "icon_warehouse",
+      "file": "client/assets/images/ui-redesign/icons/icon_warehouse.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#173A5E",
+      "description": "仓库档案"
+    },
+    {
+      "name": "icon_scan_frame",
+      "file": "client/assets/images/ui-redesign/icons/icon_scan_frame.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#2F6FDD",
+      "description": "扫码输入"
+    },
+    {
+      "name": "icon_order",
+      "file": "client/assets/images/ui-redesign/icons/icon_order.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#C7862E",
+      "description": "订单"
+    },
+    {
+      "name": "icon_backup_cloud",
+      "file": "client/assets/images/ui-redesign/icons/icon_backup_cloud.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#2F6FDD",
+      "description": "云端备份"
+    },
+    {
+      "name": "icon_sync_computer",
+      "file": "client/assets/images/ui-redesign/icons/icon_sync_computer.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#198CA8",
+      "description": "同步电脑"
+    },
+    {
+      "name": "icon_database_safe",
+      "file": "client/assets/images/ui-redesign/icons/icon_database_safe.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#168A67",
+      "description": "数据库安全"
+    },
+    {
+      "name": "icon_success_state",
+      "file": "client/assets/images/ui-redesign/icons/icon_success_state.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#168A67",
+      "description": "成功状态"
+    },
+    {
+      "name": "icon_warning_state",
+      "file": "client/assets/images/ui-redesign/icons/icon_warning_state.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#C7862E",
+      "description": "警告状态"
+    },
+    {
+      "name": "icon_error_state",
+      "file": "client/assets/images/ui-redesign/icons/icon_error_state.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#D34B4B",
+      "description": "错误状态"
+    },
+    {
+      "name": "icon_search",
+      "file": "client/assets/images/ui-redesign/icons/icon_search.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#173A5E",
+      "description": "搜索"
+    },
+    {
+      "name": "icon_template_export",
+      "file": "client/assets/images/ui-redesign/icons/icon_template_export.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#5F7187",
+      "description": "模板导出"
+    },
+    {
+      "name": "icon_import",
+      "file": "client/assets/images/ui-redesign/icons/icon_import.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#2F6FDD",
+      "description": "导入"
+    },
+    {
+      "name": "icon_export",
+      "file": "client/assets/images/ui-redesign/icons/icon_export.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#5F7187",
+      "description": "导出"
+    },
+    {
+      "name": "icon_package_split",
+      "file": "client/assets/images/ui-redesign/icons/icon_package_split.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#C7862E",
+      "description": "拆包"
+    },
+    {
+      "name": "icon_edit_quantity",
+      "file": "client/assets/images/ui-redesign/icons/icon_edit_quantity.png",
+      "size": 512,
+      "background": "transparent",
+      "color": "#173A5E",
+      "description": "编辑数量"
+    }
+  ],
+  "backgrounds": [
+    {
+      "name": "bg_workbench_light",
+      "file": "client/assets/images/ui-redesign/backgrounds/bg_workbench_light.png",
+      "size": [
+        1440,
+        2560
+      ],
+      "background": "opaque",
+      "mode": "light"
+    },
+    {
+      "name": "bg_workbench_dark",
+      "file": "client/assets/images/ui-redesign/backgrounds/bg_workbench_dark.png",
+      "size": [
+        1440,
+        2560
+      ],
+      "background": "opaque",
+      "mode": "dark"
+    },
+    {
+      "name": "bg_scan_panel_light",
+      "file": "client/assets/images/ui-redesign/backgrounds/bg_scan_panel_light.png",
+      "size": [
+        1080,
+        720
+      ],
+      "background": "opaque",
+      "mode": "light"
+    },
+    {
+      "name": "bg_scan_panel_dark",
+      "file": "client/assets/images/ui-redesign/backgrounds/bg_scan_panel_dark.png",
+      "size": [
+        1080,
+        720
+      ],
+      "background": "opaque",
+      "mode": "dark"
+    }
+  ],
+  "tokens": {
+    "primary": "#173A5E",
+    "accent": "#2F6FDD",
+    "success": "#168A67",
+    "warning": "#C7862E",
+    "error": "#D34B4B",
+    "cyan": "#198CA8",
+    "backgroundRoot": "#EEF3F8",
+    "backgroundCard": "#FBFCFE"
+  }
+}

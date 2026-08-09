@@ -1,105 +1,156 @@
 import React, { useCallback, useMemo, useState } from 'react';
-import { Text, View, useWindowDimensions } from 'react-native';
+import {
+  ScrollView,
+  Text,
+  TouchableOpacity,
+  View,
+  useWindowDimensions,
+} from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
-import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
-import { AnimatedButton } from '@/components/AnimatedButton';
-import { createStyles } from './styles';
-import { useSafeRouter } from '@/hooks/useSafeRouter';
-import { addWarehouse, getAllWarehouses, hasAnyMaterials, initDatabase } from '@/utils/database';
-import { ModuleColors } from '@/constants/theme';
-import { Str } from '@/resources/strings';
+import { UiAssetIcon, type UiAssetIconName } from '@/components/UiAssetIcon';
 import { WarehouseGuide, shouldShowWarehouseGuide } from '@/components/WarehouseGuide';
-import { logger } from '@/utils/logger';
 import { useCustomAlert } from '@/components/CustomAlert';
+import { ModuleColors } from '@/constants/theme';
+import { useSafeRouter } from '@/hooks/useSafeRouter';
+import { useTheme } from '@/hooks/useTheme';
+import {
+  addWarehouse,
+  getAllWarehouses,
+  getRecentDocumentSummaries,
+  hasAnyMaterials,
+  initDatabase,
+  type RecentDocumentSummary,
+} from '@/utils/database';
+import {
+  loadHomeWorkspaceSnapshot,
+  type HomeActiveWork,
+  type HomeWorkspaceSnapshot,
+} from '@/utils/homeWorkspace';
+import { logger } from '@/utils/logger';
+import { formatDateTime } from '@/utils/time';
+import { withAlpha } from '@/utils/colors';
+import { createStyles } from './styles';
 
-interface Module {
-  id: string;
-  name: string;
-  icon: keyof typeof Feather.glyphMap;
+type FeatherIconName = React.ComponentProps<typeof Feather>['name'];
+
+interface OperationItem {
+  badge?: string;
   color: string;
+  featherIcon?: FeatherIconName;
+  icon?: UiAssetIconName;
+  id: 'outbound' | 'inbound' | 'inventory' | 'stock';
   route: string;
-  priority: 'primary' | 'secondary';
-  action: string;
+  status: string;
+  title: string;
 }
 
-interface HomeModuleCardProps {
-  module: Module;
-  variant: 'primary' | 'secondary';
+interface BottomNavItem {
+  active?: boolean;
+  icon: FeatherIconName;
+  id: string;
+  label: string;
+  route?: string;
+}
+
+const EMPTY_WORKSPACE: HomeWorkspaceSnapshot = {
+  activeWork: [],
+  pendingReceipts: [],
+  pendingReceiptUpdatedAt: '',
+};
+
+const getTodayLabel = () =>
+  new Intl.DateTimeFormat('zh-CN', {
+    day: 'numeric',
+    month: 'long',
+    weekday: 'short',
+  }).format(new Date());
+
+const getWorkByKind = (
+  activeWork: readonly HomeActiveWork[],
+  kind: HomeActiveWork['kind']
+) => activeWork.find((work) => work.kind === kind);
+
+interface BottomNavigationProps {
+  activeColor: string;
+  items: BottomNavItem[];
+  mutedColor: string;
+  onNavigate: (route?: string) => void;
   styles: ReturnType<typeof createStyles>;
-  screenWidth: number;
-  onPress: () => void;
 }
 
-function HomeModuleCardComponent({
-  module,
-  variant,
+function BottomNavigation({
+  activeColor,
+  items,
+  mutedColor,
+  onNavigate,
   styles,
-  screenWidth,
-  onPress,
-}: HomeModuleCardProps) {
-  const isPrimary = variant === 'primary';
-  const iconSize = isPrimary ? (screenWidth <= 410 ? 38 : 42) : screenWidth <= 410 ? 25 : 28;
-
+}: BottomNavigationProps) {
   return (
-    <AnimatedButton
-      containerStyle={isPrimary ? styles.primaryCardWrapper : styles.secondaryCardWrapper}
-      style={isPrimary ? [styles.primaryCard, { borderColor: module.color }] : styles.secondaryCard}
-      activeScale={0.975}
-      activeOpacity={0.92}
-      onPress={onPress}
-    >
-      <View style={isPrimary ? styles.primaryCardInner : styles.secondaryCardInner}>
-        <View
-          style={[
-            isPrimary ? styles.primaryIconContainer : styles.secondaryIconContainer,
-            { backgroundColor: `${module.color}18` },
-          ]}
+    <View style={styles.bottomNav}>
+      {items.map((item) => (
+        <TouchableOpacity
+          key={item.id}
+          style={styles.bottomNavItem}
+          activeOpacity={0.78}
+          disabled={item.active}
+          onPress={() => onNavigate(item.route)}
+          accessibilityRole="button"
+          accessibilityLabel={item.label}
         >
-          <Feather name={module.icon} size={iconSize} color={module.color} />
-        </View>
-
-        <Text style={isPrimary ? styles.primaryTitle : styles.secondaryTitle} numberOfLines={1}>
-          {module.name}
-        </Text>
-
-        <View style={isPrimary ? styles.primaryFooter : styles.secondaryFooter}>
-          <Text style={isPrimary ? styles.primaryAction : styles.secondaryAction}>
-            {module.action}
+          <View style={[styles.bottomNavIndicator, item.active && styles.bottomNavIndicatorActive]} />
+          <Feather
+            name={item.icon}
+            size={19}
+            color={item.active ? activeColor : mutedColor}
+          />
+          <Text style={[styles.bottomNavLabel, item.active && styles.bottomNavLabelActive]}>
+            {item.label}
           </Text>
-          <Feather name="arrow-up-right" size={isPrimary ? 16 : 14} color={module.color} />
-        </View>
-
-        {isPrimary && <View style={[styles.primaryAccent, { backgroundColor: module.color }]} />}
-      </View>
-    </AnimatedButton>
+        </TouchableOpacity>
+      ))}
+    </View>
   );
 }
-
-const HomeModuleCard = React.memo(HomeModuleCardComponent);
 
 export default function HomeScreen() {
   const { theme, isDark } = useTheme();
   const router = useSafeRouter();
   const alert = useCustomAlert();
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
-  const [showWarehouseGuide, setShowWarehouseGuide] = useState(false);
-
   const styles = useMemo(
     () => createStyles(theme, screenWidth, screenHeight),
-    [theme, screenWidth, screenHeight]
+    [screenHeight, screenWidth, theme]
   );
 
-  const checkWarehouseGuide = useCallback(async () => {
+  const [showWarehouseGuide, setShowWarehouseGuide] = useState(false);
+  const [workspace, setWorkspace] = useState<HomeWorkspaceSnapshot>(EMPTY_WORKSPACE);
+  const [recentDocuments, setRecentDocuments] = useState<RecentDocumentSummary[]>([]);
+
+  const moduleColors = theme.isDark ? ModuleColors.dark : ModuleColors.light;
+  const visibleRecentDocuments =
+    screenWidth <= 360 || screenHeight <= 680
+      ? recentDocuments.slice(0, 2)
+      : recentDocuments.slice(0, 3);
+
+  const navigateToRoute = useCallback(
+    (route?: string, params?: Record<string, unknown>) => {
+      if (route) {
+        router.push(route, params || {});
+      }
+    },
+    [router]
+  );
+
+  const loadHomeData = useCallback(async () => {
     await initDatabase();
-
-    const [warehouses, hasBusinessData] = await Promise.all([getAllWarehouses(), hasAnyMaterials()]);
-
-    return shouldShowWarehouseGuide({
-      hasBusinessData,
-      hasWarehouseConfig: warehouses.length > 0,
-    });
+    const [nextWorkspace, latestDocuments] = await Promise.all([
+      loadHomeWorkspaceSnapshot(),
+      getRecentDocumentSummaries(3),
+    ]);
+    setWorkspace(nextWorkspace);
+    setRecentDocuments(latestDocuments);
   }, []);
 
   useFocusEffect(
@@ -108,184 +159,290 @@ export default function HomeScreen() {
 
       const run = async () => {
         try {
-          const needsGuide = await checkWarehouseGuide();
+          await initDatabase();
+          const [warehouses, hasBusinessData] = await Promise.all([
+            getAllWarehouses(),
+            hasAnyMaterials(),
+          ]);
           if (!cancelled) {
-            setShowWarehouseGuide(needsGuide);
+            setShowWarehouseGuide(
+              shouldShowWarehouseGuide({
+                hasBusinessData,
+                hasWarehouseConfig: warehouses.length > 0,
+              })
+            );
           }
+          await loadHomeData();
         } catch (error) {
-      logger.error('[首页] 检查仓库引导失败:', error);
+          logger.error('[首页] 加载工作台失败:', error);
         }
       };
 
       void run();
-
       return () => {
         cancelled = true;
       };
-    }, [checkWarehouseGuide])
+    }, [loadHomeData])
   );
+
+  const outboundWork = getWorkByKind(workspace.activeWork, 'outbound');
+  const inboundWork = getWorkByKind(workspace.activeWork, 'inbound');
+  const inventoryWork = getWorkByKind(workspace.activeWork, 'inventory');
+  const pendingReceiptCount = workspace.pendingReceipts.length;
+
+  const operations: OperationItem[] = [
+    {
+      color: moduleColors.outbound,
+      icon: 'outboundScan',
+      id: 'outbound',
+      route: '/outbound',
+      status: outboundWork ? `继续 ${outboundWork.title}` : '扫描销售出库单',
+      title: '扫码出库',
+    },
+    {
+      badge: pendingReceiptCount > 0 ? String(pendingReceiptCount) : undefined,
+      color: moduleColors.inbound,
+      icon: 'inboundScan',
+      id: 'inbound',
+      route: '/purchase-receive',
+      status: inboundWork
+        ? `继续 ${inboundWork.title}`
+        : pendingReceiptCount > 0
+          ? `${pendingReceiptCount} 张未审单据`
+          : '查看未审采购单',
+      title: '采购入库',
+    },
+    {
+      color: moduleColors.inventory,
+      icon: 'inventoryCount',
+      id: 'inventory',
+      route: '/inventory',
+      status: inventoryWork ? `继续 ${inventoryWork.detail}` : '新建或继续盘点',
+      title: '库存盘点',
+    },
+    {
+      color: moduleColors.materials,
+      featherIcon: 'search',
+      id: 'stock',
+      route: '/stock-query',
+      status: '按型号或存货编码查询',
+      title: '库存查询',
+    },
+  ];
 
   const handleSkipWarehouseGuide = useCallback(async () => {
     try {
       await initDatabase();
       const warehouses = await getAllWarehouses();
-
       if (warehouses.length === 0) {
         await addWarehouse({
-          name: '默认仓库',
           description: '系统自动创建，可在仓库档案中修改',
           is_default: true,
+          name: '默认仓库',
         });
       }
-
       setShowWarehouseGuide(false);
+      await loadHomeData();
     } catch (error) {
-      logger.error('[首页] 跳过引导并创建默认仓库失败:', error);
+      logger.error('[首页] 创建默认仓库失败:', error);
       alert.showError('创建默认仓库失败，请重试或手动创建仓库');
     }
-  }, [alert]);
+  }, [alert, loadHomeData]);
 
-  const handleGoToWarehouseSettings = useCallback(() => {
-    setShowWarehouseGuide(false);
-    router.push('/warehouse-management');
-  }, [router]);
-
-  const moduleColors = theme.isDark
-    ? [
-        ModuleColors.dark.inbound,
-        ModuleColors.dark.outbound,
-        ModuleColors.dark.orders,
-        ModuleColors.dark.inventory,
-        ModuleColors.dark.materials,
-        ModuleColors.dark.settings,
-      ]
-    : [
-        ModuleColors.light.inbound,
-        ModuleColors.light.outbound,
-        ModuleColors.light.orders,
-        ModuleColors.light.inventory,
-        ModuleColors.light.materials,
-        ModuleColors.light.settings,
-      ];
-
-  const modules: Module[] = [
-    {
-      id: 'inbound',
-      name: Str.moduleInbound,
-      icon: 'log-in',
-      color: moduleColors[0],
-      route: '/inbound',
-      priority: 'primary',
-      action: '收货扫码',
+  const handleRecentDocumentPress = useCallback(
+    (document: RecentDocumentSummary) => {
+      if (document.type === 'outbound') {
+        navigateToRoute('/orders', { orderNo: document.document_no });
+        return;
+      }
+      navigateToRoute(
+        document.type === 'inbound' ? '/inbound-records' : '/inventory-records'
+      );
     },
+    [navigateToRoute]
+  );
+
+  const bottomNavItems: BottomNavItem[] = [
+    { active: true, icon: 'home', id: 'workbench', label: '工作台' },
     {
-      id: 'outbound',
-      name: Str.moduleOutbound,
-      icon: 'truck',
-      color: moduleColors[1],
-      route: '/outbound',
-      priority: 'primary',
-      action: '发货扫码',
-    },
-    {
+      icon: 'file-text',
       id: 'documents',
-      name: Str.moduleDocuments,
-      icon: 'folder',
-      color: moduleColors[2],
+      label: '单据',
       route: '/document-management',
-      priority: 'secondary',
-      action: '查单改错',
     },
-    {
-      id: 'inventory',
-      name: Str.moduleInventory,
-      icon: 'check-square',
-      color: moduleColors[3],
-      route: '/inventory',
-      priority: 'secondary',
-      action: '扫码盘点',
-    },
-    {
-      id: 'material',
-      name: Str.moduleMaterials,
-      icon: 'git-merge',
-      color: moduleColors[4],
-      route: '/inventory-binding',
-      priority: 'secondary',
-      action: '型号编码',
-    },
-    {
-      id: 'settings',
-      name: Str.moduleSettings,
-      icon: 'tool',
-      color: moduleColors[5],
-      route: '/settings',
-      priority: 'secondary',
-      action: '参数维护',
-    },
+    { icon: 'settings', id: 'settings', label: '设置', route: '/settings' },
   ];
-
-  const primaryModules = modules.filter((module) => module.priority === 'primary');
-  const secondaryModules = modules.filter((module) => module.priority === 'secondary');
-  const secondaryRows = [
-    secondaryModules.slice(0, 2),
-    secondaryModules.slice(2, 4),
-  ];
-
-  const renderPrimaryCard = useCallback(
-    (module: Module) => (
-      <HomeModuleCard
-        key={module.id}
-        module={module}
-        variant="primary"
-        styles={styles}
-        screenWidth={screenWidth}
-        onPress={() => router.push(module.route as any)}
-      />
-    ),
-    [router, screenWidth, styles]
-  );
-
-  const renderSecondaryCard = useCallback(
-    (module: Module) => (
-      <HomeModuleCard
-        key={module.id}
-        module={module}
-        variant="secondary"
-        styles={styles}
-        screenWidth={screenWidth}
-        onPress={() => router.push(module.route as any)}
-      />
-    ),
-    [router, screenWidth, styles]
-  );
 
   return (
     <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
       <View style={styles.container}>
-        <View style={styles.content}>
-          <View style={styles.workbench}>
-            <View style={[styles.sectionSurface, styles.primarySurface]}>
-              <View style={styles.primarySection}>
-                <Text style={styles.sectionLabel}>扫码作业</Text>
-                <View style={styles.primaryGrid}>{primaryModules.map(renderPrimaryCard)}</View>
-              </View>
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={styles.content}
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.header}>
+            <View>
+              <Text style={styles.appName}>掌上仓库</Text>
+              <Text style={styles.todayText}>{getTodayLabel()}</Text>
             </View>
-
-            <View style={[styles.sectionSurface, styles.secondarySurface]}>
-              <View style={styles.secondarySection}>
-                <Text style={styles.sectionLabel}>单据与配置</Text>
-                <View style={styles.secondaryGrid}>
-                  {secondaryRows.map((row, rowIndex) => (
-                    <View key={`row-${rowIndex}`} style={styles.secondaryRow}>
-                      {row.map(renderSecondaryCard)}
-                    </View>
-                  ))}
-                </View>
-              </View>
+            <View style={styles.headerStatus}>
+              <View style={styles.headerStatusDot} />
+              <Text style={styles.headerStatusText}>
+                {pendingReceiptCount > 0 ? `待办 ${pendingReceiptCount}` : '工作台'}
+              </Text>
             </View>
           </View>
-        </View>
+
+          <View style={styles.section}>
+            <View style={styles.sectionHeading}>
+              <Text style={styles.sectionTitle}>仓库作业</Text>
+              <Text style={styles.sectionHint}>选择作业开始</Text>
+            </View>
+            <View style={styles.operationGrid}>
+              {operations.map((operation) => (
+                <TouchableOpacity
+                  key={operation.id}
+                  style={styles.operationCard}
+                  activeOpacity={0.76}
+                  onPress={() => navigateToRoute(operation.route)}
+                  accessibilityRole="button"
+                  accessibilityLabel={operation.title}
+                >
+                  <View style={styles.operationTopRow}>
+                    <View
+                      style={[
+                        styles.operationIcon,
+                        {
+                          backgroundColor: withAlpha(
+                            operation.color,
+                            isDark ? 0.18 : 0.1
+                          ),
+                        },
+                      ]}
+                    >
+                      {operation.featherIcon ? (
+                        <Feather
+                          name={operation.featherIcon}
+                          size={screenWidth <= 360 || screenHeight <= 680 ? 23 : 26}
+                          color={operation.color}
+                        />
+                      ) : operation.icon ? (
+                        <UiAssetIcon
+                          name={operation.icon}
+                          size={screenWidth <= 360 || screenHeight <= 680 ? 33 : 38}
+                        />
+                      ) : null}
+                    </View>
+                    {operation.badge ? (
+                      <View
+                        style={[
+                          styles.operationBadge,
+                          {
+                            backgroundColor: withAlpha(
+                              operation.color,
+                              isDark ? 0.22 : 0.12
+                            ),
+                          },
+                        ]}
+                      >
+                        <Text style={[styles.operationBadgeText, { color: operation.color }]}>
+                          {operation.badge}
+                        </Text>
+                      </View>
+                    ) : (
+                      <Feather name="arrow-up-right" size={16} color={operation.color} />
+                    )}
+                  </View>
+                  <Text style={styles.operationTitle}>{operation.title}</Text>
+                  <Text style={styles.operationStatus} numberOfLines={1}>
+                    {operation.status}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+
+          <View style={styles.section}>
+            <View style={styles.sectionHeading}>
+              <Text style={styles.sectionTitle}>最近单据</Text>
+              <TouchableOpacity
+                style={styles.sectionAction}
+                activeOpacity={0.72}
+                onPress={() => navigateToRoute('/document-management')}
+                accessibilityRole="button"
+                accessibilityLabel="查看全部单据"
+              >
+                <Text style={styles.sectionActionText}>全部</Text>
+                <Feather name="chevron-right" size={15} color={theme.primary} />
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.recentList}>
+              {visibleRecentDocuments.length > 0 ? (
+                visibleRecentDocuments.map((document, index) => {
+                  const color =
+                    document.type === 'outbound'
+                      ? moduleColors.outbound
+                      : document.type === 'inbound'
+                        ? moduleColors.inbound
+                        : moduleColors.inventory;
+                  const label =
+                    document.type === 'outbound'
+                      ? '出库'
+                      : document.type === 'inbound'
+                        ? '入库'
+                        : '盘点';
+                  return (
+                    <TouchableOpacity
+                      key={`${document.type}:${document.warehouse_id || 'none'}:${document.document_no}`}
+                      style={[styles.recentRow, index > 0 && styles.rowDivider]}
+                      activeOpacity={0.74}
+                      onPress={() => handleRecentDocumentPress(document)}
+                      accessibilityRole="button"
+                      accessibilityLabel={`${label}单据 ${document.document_no}`}
+                    >
+                      <View style={[styles.recentMarker, { backgroundColor: color }]} />
+                      <View style={styles.recentBody}>
+                        <View style={styles.recentTitleRow}>
+                          <Text style={styles.recentNo} numberOfLines={1}>
+                            {document.document_no}
+                          </Text>
+                          <Text style={[styles.recentType, { color }]}>{label}</Text>
+                        </View>
+                        <Text style={styles.recentMeta} numberOfLines={1}>
+                          {document.subject || document.warehouse_name || '仓库单据'} ·{' '}
+                          {formatDateTime(document.created_at)}
+                        </Text>
+                      </View>
+                      <Feather name="chevron-right" size={17} color={theme.textMuted} />
+                    </TouchableOpacity>
+                  );
+                })
+              ) : (
+                <TouchableOpacity
+                  style={styles.recentEmpty}
+                  activeOpacity={0.74}
+                  onPress={() => navigateToRoute('/document-management')}
+                >
+                  <View style={styles.recentEmptyText}>
+                    <Text style={styles.recentEmptyTitle}>暂无最近单据</Text>
+                    <Text style={styles.recentEmptySubtitle}>完成作业后会显示在这里</Text>
+                  </View>
+                  <Feather name="chevron-right" size={17} color={theme.textMuted} />
+                </TouchableOpacity>
+              )}
+            </View>
+          </View>
+        </ScrollView>
+
+        <BottomNavigation
+          activeColor={theme.primary}
+          items={bottomNavItems}
+          mutedColor={theme.textMuted}
+          styles={styles}
+          onNavigate={(route) => navigateToRoute(route)}
+        />
       </View>
 
       <WarehouseGuide
@@ -293,7 +450,10 @@ export default function HomeScreen() {
         onSkip={() => {
           void handleSkipWarehouseGuide();
         }}
-        onGoToSettings={handleGoToWarehouseSettings}
+        onGoToSettings={() => {
+          setShowWarehouseGuide(false);
+          navigateToRoute('/warehouse-management');
+        }}
       />
       {alert.AlertComponent}
     </Screen>

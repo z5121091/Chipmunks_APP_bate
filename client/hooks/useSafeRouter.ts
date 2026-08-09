@@ -76,7 +76,7 @@ const serializeParams = (params: Record<string, unknown>): string => {
 
     return encodedPayload;
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
+    const message = error instanceof Error ? error.message : '未知错误';
     logger.error(LOG_PREFIX, 'serialize failed:', message);
     throw new Error(`${LOG_PREFIX} 参数序列化失败: ${message}`);
   }
@@ -100,7 +100,7 @@ const deserializeParams = <T = Record<string, unknown>>(
     logger.error(
       LOG_PREFIX,
       'deserialize failed:',
-      error instanceof Error ? error.message : 'Unknown error'
+      error instanceof Error ? error.message : '未知错误'
     );
     return null;
   }

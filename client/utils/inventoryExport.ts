@@ -1,10 +1,18 @@
 import type { ExcelSheet } from './excel';
+import {
+  buildExcelSheet,
+  buildExportFileNameWithSequence,
+  buildMaterialDetailColumns,
+  EXCEL_HEADERS,
+  getExportInfoFromDocumentNo,
+} from './excelSchema';
 import { formatDateTimeExport } from './time';
 
 export type InventoryExportMode = 'whole' | 'partial' | 'complete';
 
 export interface InventoryExportRecord {
   check_no?: string;
+  account_name?: string;
   warehouse_name?: string;
   inventory_code?: string;
   scan_model?: string;
@@ -12,15 +20,21 @@ export interface InventoryExportRecord {
   quantity?: number;
   check_type: 'whole' | 'partial';
   actual_quantity?: number;
-  check_date?: string;
   created_at?: string;
   package?: string;
   version?: string;
   productionDate?: string;
   traceNo?: string;
   sourceNo?: string;
-  notes?: string;
+  erp_quantity?: number;
 }
+
+type InventorySummaryItem = {
+  inventoryCode: string;
+  model: string;
+  physicalQuantity: number;
+  erpQuantity: number | null;
+};
 
 export const getInventoryExportModeLabel = (mode: InventoryExportMode): string => {
   if (mode === 'whole') return '整包';
@@ -28,44 +42,48 @@ export const getInventoryExportModeLabel = (mode: InventoryExportMode): string =
   return '完整数据';
 };
 
-const getCompactDate = (date = new Date()): string => {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${year}${month}${day}`;
-};
-
-const sanitizeFileSegment = (value: string): string => {
-  const cleaned = value
-    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
-    .replace(/\s+/g, '')
-    .replace(/_+/g, '_')
-    .replace(/^_+|_+$/g, '');
-  return cleaned || '未命名';
-};
-
-const getExportInfoFromCheckNo = (checkNo: string): { date: Date; sequence: number } => {
-  const match = /^PD-(\d{4})-(\d{2})-(\d{2})-(\d+)$/.exec(checkNo.trim());
-  if (!match) {
-    return { date: new Date(), sequence: 1 };
+const toCellText = (value: string | number | null | undefined): string => {
+  if (value === null || value === undefined) {
+    return '';
   }
 
-  const [, year, month, day, sequence] = match;
-  const parsedDate = new Date(Number(year), Number(month) - 1, Number(day));
-  const parsedSequence = Number.parseInt(sequence, 10);
-
-  if (Number.isNaN(parsedDate.getTime()) || Number.isNaN(parsedSequence) || parsedSequence <= 0) {
-    return { date: new Date(), sequence: 1 };
-  }
-
-  return { date: parsedDate, sequence: parsedSequence };
+  return String(value);
 };
+
+// ERP库存以存货编码为核对单位；同一编码即使历史型号文本有差异，也只生成一条差异记录。
+const getInventorySummaryKey = (record: InventoryExportRecord): string =>
+  toCellText(record.inventory_code).trim().toLocaleLowerCase();
+
+const createInventorySummaryItem = (
+  record: InventoryExportRecord
+): InventorySummaryItem => ({
+  inventoryCode: toCellText(record.inventory_code),
+  model: toCellText(record.scan_model),
+  physicalQuantity: 0,
+  erpQuantity:
+    record.erp_quantity !== undefined && Number.isFinite(Number(record.erp_quantity))
+      ? Number(record.erp_quantity)
+      : null,
+});
+
+const buildInventorySummaryRows = (
+  items: Iterable<InventorySummaryItem>
+) =>
+  Array.from(items)
+    .sort((a, b) => {
+      if (a.inventoryCode !== b.inventoryCode) return a.inventoryCode.localeCompare(b.inventoryCode);
+      return a.model.localeCompare(b.model);
+    })
+    .map((item) => [
+      item.inventoryCode,
+      item.model,
+      item.physicalQuantity,
+      item.erpQuantity ?? '',
+      item.erpQuantity === null ? '' : item.physicalQuantity - item.erpQuantity,
+    ]);
 
 const getEffectiveQuantity = (record: InventoryExportRecord): number => {
-  if (record.check_type === 'partial') {
-    return Number(record.actual_quantity ?? record.quantity ?? 0);
-  }
-  return Number(record.quantity ?? 0);
+  return Number(record.actual_quantity ?? record.quantity ?? 0);
 };
 
 export const buildInventoryExportFileName = (
@@ -74,10 +92,13 @@ export const buildInventoryExportFileName = (
   sequence: number,
   date = new Date()
 ): string => {
-  const warehouse = sanitizeFileSegment(warehouseName || '未命名仓库');
   const modeLabel = getInventoryExportModeLabel(mode);
-  const seqNo = String(Math.max(sequence, 1)).padStart(2, '0');
-  return `盘点单_${warehouse}_${modeLabel}_${getCompactDate(date)}_${seqNo}.xlsx`;
+  return buildExportFileNameWithSequence(
+    '盘点单',
+    [warehouseName || '未命名仓库', modeLabel],
+    sequence,
+    date
+  );
 };
 
 export const buildInventoryExportFileNameFromNo = (
@@ -85,106 +106,60 @@ export const buildInventoryExportFileNameFromNo = (
   mode: InventoryExportMode,
   checkNo: string
 ): string => {
-  const { date, sequence } = getExportInfoFromCheckNo(checkNo);
+  const { date, sequence } = getExportInfoFromDocumentNo(checkNo, 'PD');
   return buildInventoryExportFileName(warehouseName, mode, sequence, date);
 };
 
 export const buildInventorySheets = (records: InventoryExportRecord[]): ExcelSheet[] => {
-  const detailHeaders = [
-    '盘点单号',
-    '仓库名称',
-    '存货编码',
-    '扫描型号',
-    '批次',
-    '数量',
-    '实盘数量',
-    '盘点类型',
-    '版本',
-    '封装',
-    '生产日期',
-    '追溯码',
-    '箱号',
-    '盘点日期',
-    '创建时间',
-  ];
-
-  const detailRows = records.map((record) => [
-    record.check_no || '',
-    record.warehouse_name || '',
-    record.inventory_code || '',
-    record.scan_model || '',
-    record.batch || '',
-    Number(record.quantity || 0),
-    getEffectiveQuantity(record),
-    record.check_type === 'whole' ? '整包' : '拆包',
-    record.version || '',
-    record.package || '',
-    record.productionDate || '',
-    record.traceNo || '',
-    record.sourceNo || '',
-    record.check_date || '',
-    formatDateTimeExport(record.created_at),
-  ]);
-
-  const summaryMap = new Map<
-    string,
-    {
-      warehouse: string;
-      inventoryCode: string;
-      model: string;
-      version: string;
-      package: string;
-      quantity: number;
-      date: string;
-    }
-  >();
+  const summaryMap = new Map<string, InventorySummaryItem>();
 
   records.forEach((record) => {
-    const key = [
-      record.warehouse_name || '',
-      record.inventory_code || '',
-      record.scan_model || '',
-      record.version || '',
-      record.package || '',
-      record.check_date || '',
-    ].join('|');
+    const key = getInventorySummaryKey(record);
 
     if (!summaryMap.has(key)) {
-      summaryMap.set(key, {
-        warehouse: record.warehouse_name || '',
-        inventoryCode: record.inventory_code || '',
-        model: record.scan_model || '',
-        version: record.version || '',
-        package: record.package || '',
-        quantity: 0,
-        date: record.check_date || '',
-      });
+      summaryMap.set(key, createInventorySummaryItem(record));
     }
 
-    summaryMap.get(key)!.quantity += getEffectiveQuantity(record);
+    const summary = summaryMap.get(key)!;
+    summary.physicalQuantity += getEffectiveQuantity(record);
+    if (
+      summary.erpQuantity === null &&
+      record.erp_quantity !== undefined &&
+      Number.isFinite(Number(record.erp_quantity))
+    ) {
+      summary.erpQuantity = Number(record.erp_quantity);
+    }
   });
 
-  const summaryHeaders = ['仓库名称', '存货编码', '扫描型号', '版本', '封装', '盘点数量', '盘点日期'];
-  const summaryRows = Array.from(summaryMap.values())
-    .sort((a, b) => {
-      if (a.warehouse !== b.warehouse) return a.warehouse.localeCompare(b.warehouse);
-      if (a.date !== b.date) return a.date.localeCompare(b.date);
-      if (a.inventoryCode !== b.inventoryCode) return a.inventoryCode.localeCompare(b.inventoryCode);
-      if (a.model !== b.model) return a.model.localeCompare(b.model);
-      return a.version.localeCompare(b.version);
-    })
-    .map((item) => [
-      item.warehouse,
-      item.inventoryCode,
-      item.model,
-      item.version,
-      item.package,
-      item.quantity,
-      item.date,
-    ]);
-
   return [
-    { name: '盘点明细', headers: detailHeaders, rows: detailRows },
-    { name: '型号汇总', headers: summaryHeaders, rows: summaryRows },
+    buildExcelSheet(
+      '盘点明细',
+      [
+        { header: EXCEL_HEADERS.inventoryNo, value: (record) => record.check_no || '' },
+        { header: EXCEL_HEADERS.account, value: (record) => record.account_name || '' },
+        ...buildMaterialDetailColumns<InventoryExportRecord>({
+          quantityColumns: [
+            { header: EXCEL_HEADERS.quantity, value: (record) => Number(record.quantity || 0) },
+            { header: EXCEL_HEADERS.actualQuantity, value: (record) => getEffectiveQuantity(record) },
+          ],
+        }),
+        {
+          header: EXCEL_HEADERS.createdAt,
+          value: (record) => formatDateTimeExport(record.created_at),
+        },
+      ],
+      records
+    ),
+    {
+      name: '盘点差异',
+      headers: [
+        EXCEL_HEADERS.inventoryCode,
+        EXCEL_HEADERS.model,
+        EXCEL_HEADERS.actualQuantity,
+        EXCEL_HEADERS.erpQuantity,
+        EXCEL_HEADERS.differenceQuantity,
+      ],
+      rows: buildInventorySummaryRows(summaryMap.values()),
+    },
   ];
 };

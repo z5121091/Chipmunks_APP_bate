@@ -2,6 +2,7 @@ import { StyleSheet } from 'react-native';
 import { BorderRadius, BorderWidth, Spacing, Theme } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
 import { withAlpha } from '@/utils/colors';
+import { rf } from '@/utils/responsive';
 
 export const createStyles = (theme: Theme) => {
   return StyleSheet.create({
@@ -41,14 +42,14 @@ export const createStyles = (theme: Theme) => {
       flex: 1,
     },
     title: {
-      fontSize: 20,
+      fontSize: rf(20),
       fontWeight: '800',
       color: theme.textPrimary,
       letterSpacing: -0.5,
     },
     subtitle: {
       marginTop: 4,
-      fontSize: 12,
+      fontSize: rf(12),
       lineHeight: 18,
       color: theme.textSecondary,
     },
@@ -63,13 +64,13 @@ export const createStyles = (theme: Theme) => {
       flex: 1,
     },
     toolbarTitle: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '700',
       color: theme.textPrimary,
     },
     toolbarSubtitle: {
       marginTop: 2,
-      fontSize: 12,
+      fontSize: rf(12),
       color: theme.textSecondary,
     },
     addButton: {
@@ -82,7 +83,7 @@ export const createStyles = (theme: Theme) => {
       backgroundColor: theme.primary,
     },
     addButtonText: {
-      fontSize: 13,
+      fontSize: rf(13),
       fontWeight: '700',
       color: theme.buttonPrimaryText,
     },
@@ -124,7 +125,7 @@ export const createStyles = (theme: Theme) => {
       marginTop: 1,
     },
     orderBadgeText: {
-      fontSize: 12,
+      fontSize: rf(12),
       fontWeight: '700',
       color: theme.primary,
     },
@@ -132,7 +133,7 @@ export const createStyles = (theme: Theme) => {
       flex: 1,
     },
     fieldName: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '700',
       color: theme.textPrimary,
     },
@@ -144,7 +145,7 @@ export const createStyles = (theme: Theme) => {
       marginTop: 6,
     },
     typeChip: {
-      fontSize: 11,
+      fontSize: rf(11),
       fontWeight: '700',
       color: theme.textPrimary,
       backgroundColor: theme.backgroundTertiary,
@@ -153,7 +154,7 @@ export const createStyles = (theme: Theme) => {
       borderRadius: BorderRadius.md,
     },
     requiredChip: {
-      fontSize: 11,
+      fontSize: rf(11),
       fontWeight: '700',
       color: theme.error,
       backgroundColor: withAlpha(theme.error, 0.1),
@@ -162,7 +163,7 @@ export const createStyles = (theme: Theme) => {
       borderRadius: BorderRadius.md,
     },
     metaText: {
-      fontSize: 11,
+      fontSize: rf(11),
       color: theme.textSecondary,
     },
     actionRow: {
@@ -187,7 +188,7 @@ export const createStyles = (theme: Theme) => {
       marginLeft: 36,
     },
     optionTag: {
-      fontSize: 11,
+      fontSize: rf(11),
       color: theme.textSecondary,
       backgroundColor: theme.backgroundTertiary,
       paddingHorizontal: Spacing.sm,
@@ -230,7 +231,7 @@ export const createStyles = (theme: Theme) => {
     },
     formLabel: {
       marginBottom: Spacing.xs,
-      fontSize: 13,
+      fontSize: rf(13),
       fontWeight: '600',
       color: theme.textPrimary,
     },
@@ -244,7 +245,7 @@ export const createStyles = (theme: Theme) => {
       backgroundColor: theme.backgroundTertiary,
       borderWidth: BorderWidth.normal,
       borderColor: theme.border,
-      fontSize: 14,
+      fontSize: rf(14),
       color: theme.textPrimary,
       textAlignVertical: 'center',
     },
@@ -281,7 +282,7 @@ export const createStyles = (theme: Theme) => {
       borderColor: withAlpha(theme.primary, 0.26),
     },
     typeButtonText: {
-      fontSize: 13,
+      fontSize: rf(13),
       fontWeight: '600',
       color: theme.textPrimary,
     },
@@ -291,13 +292,13 @@ export const createStyles = (theme: Theme) => {
     },
     typeHint: {
       marginTop: Spacing.xs,
-      fontSize: 11,
+      fontSize: rf(11),
       lineHeight: 16,
       color: theme.textSecondary,
     },
     optionsHint: {
       marginBottom: Spacing.xs,
-      fontSize: 11,
+      fontSize: rf(11),
       lineHeight: 16,
       color: theme.textMuted,
     },
@@ -329,13 +330,13 @@ export const createStyles = (theme: Theme) => {
       paddingTop: 1,
     },
     requiredTitle: {
-      fontSize: 13,
+      fontSize: rf(13),
       fontWeight: '700',
       color: theme.textPrimary,
     },
     requiredSubtitle: {
       marginTop: 2,
-      fontSize: 11,
+      fontSize: rf(11),
       color: theme.textSecondary,
     },
     modalFooter: {

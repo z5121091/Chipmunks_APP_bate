@@ -6,6 +6,7 @@ const {
   withAndroidManifest,
   withAppBuildGradle,
   withDangerousMod,
+  withStringsXml,
 } = require('expo/config-plugins');
 
 const WORK_MANAGER_DEPENDENCY = 'implementation("androidx.work:work-runtime-ktx:2.9.1")';
@@ -112,6 +113,20 @@ function writeBackupWorker(projectRoot, packageName, updateServerUrl) {
 }
 
 module.exports = function withAutoDatabaseBackup(config) {
+  config = withStringsXml(config, (config) => {
+    const appName = String(config.name || '').trim() || 'warehouse';
+    config.modResults = AndroidConfig.Strings.setStringItem(
+      [
+        {
+          $: { name: 'app_name' },
+          _: appName,
+        },
+      ],
+      config.modResults
+    );
+    return config;
+  });
+
   config = withAndroidManifest(config, (config) => {
     ensurePermission(config.modResults, 'android.permission.INTERNET');
     ensurePermission(config.modResults, 'android.permission.ACCESS_NETWORK_STATE');

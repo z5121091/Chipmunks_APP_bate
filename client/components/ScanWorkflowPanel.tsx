@@ -1,5 +1,6 @@
 
-import { Text, View } from 'react-native';
+import { useMemo } from 'react';
+import { StyleSheet, Text, View } from 'react-native';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, BorderWidth, Spacing, Typography } from '@/constants/theme';
 import { withAlpha } from '@/utils/colors';
@@ -24,15 +25,14 @@ export interface WorkflowMetric {
 interface ScanWorkflowPanelProps {
   steps?: WorkflowStep[];
   metrics?: WorkflowMetric[];
-  hint?: string;
 }
 
 export function ScanWorkflowPanel({
   steps,
   metrics = [],
-  hint,
 }: ScanWorkflowPanelProps) {
   const { theme } = useTheme();
+  const styles = useMemo(() => createStyles(), []);
 
   const getStepColors = (status: WorkflowStepStatus) => {
     switch (status) {
@@ -99,40 +99,29 @@ export function ScanWorkflowPanel({
   };
 
   return (
-    <View
-      style={{
-        paddingHorizontal: Spacing.lg,
-        paddingBottom: Spacing.xs,
-        gap: Spacing.xs,
-      }}
-    >
-      <View style={{ flexDirection: 'row', gap: Spacing.xs }}>
-        {(steps ?? []).map((step) => {
+    <View style={styles.container}>
+      <View style={styles.stepRow}>
+        {(steps ?? []).map((step, index) => {
           const colors = getStepColors(step.status);
+          const stepIndex = index + 1;
           return (
             <View
               key={step.key}
-              style={{
-                flex: 1,
-                minHeight: rf(40),
-                borderRadius: BorderRadius.md,
-                borderWidth: BorderWidth.normal,
-                borderColor: colors.cardBorder,
-                backgroundColor: colors.cardBg,
-                paddingVertical: Spacing.xs,
-                paddingHorizontal: Spacing.xs + 2,
-                justifyContent: 'center',
-              }}
+              style={[
+                styles.stepCard,
+                {
+                  borderColor: colors.cardBorder,
+                  backgroundColor: colors.cardBg,
+                },
+              ]}
             >
+              <View style={[styles.stepBadge, { backgroundColor: colors.badgeBg }]}>
+                <Text style={[styles.stepBadgeText, { color: colors.badgeText }]}>
+                  {stepIndex}
+                </Text>
+              </View>
               <Text
-                style={{
-                  ...Typography.captionMedium,
-                  fontSize: rf(11),
-                  lineHeight: rf(16),
-                  color: colors.text,
-                  textAlign: 'center',
-                  flexShrink: 1,
-                }}
+                style={[styles.stepLabel, { color: colors.text }]}
                 numberOfLines={2}
               >
                 {step.label}
@@ -143,46 +132,29 @@ export function ScanWorkflowPanel({
       </View>
 
       {metrics.length > 0 ? (
-        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.xs }}>
+        <View style={styles.metricRow}>
           {metrics.map((metric) => {
             const colors = getMetricColors(metric.tone);
             return (
               <View
                 key={metric.key}
-                style={{
-                  paddingVertical: 5,
-                  paddingHorizontal: Spacing.xs + 2,
-                  borderRadius: BorderRadius.full,
-                  borderWidth: BorderWidth.normal,
-                  borderColor: colors.border,
-                  backgroundColor: colors.bg,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: 6,
-                  maxWidth: '100%',
-                  flexShrink: 1,
-                }}
+                style={[
+                  styles.metricChip,
+                  {
+                    borderColor: colors.border,
+                    backgroundColor: colors.bg,
+                  },
+                ]}
               >
+                <View style={[styles.metricDot, { backgroundColor: colors.text }]} />
                 <Text
-                  style={{
-                    ...Typography.caption,
-                    fontSize: rf(10),
-                    lineHeight: rf(14),
-                    color: colors.label,
-                    flexShrink: 0,
-                  }}
+                  style={[styles.metricLabel, { color: colors.label }]}
                   numberOfLines={2}
                 >
                   {metric.label}
                 </Text>
                 <Text
-                  style={{
-                    ...Typography.captionMedium,
-                    fontSize: rf(10),
-                    lineHeight: rf(14),
-                    color: colors.text,
-                    flexShrink: 1,
-                  }}
+                  style={[styles.metricValue, { color: colors.text }]}
                   numberOfLines={2}
                   ellipsizeMode="middle"
                 >
@@ -196,3 +168,80 @@ export function ScanWorkflowPanel({
     </View>
   );
 }
+
+const createStyles = () => StyleSheet.create({
+  container: {
+    paddingHorizontal: Spacing.md,
+    paddingBottom: Spacing.sm,
+    gap: Spacing.xs,
+  },
+  stepRow: {
+    flexDirection: 'row',
+    gap: Spacing.xs,
+  },
+  stepCard: {
+    flex: 1,
+    minHeight: rf(46),
+    borderRadius: BorderRadius.lg,
+    borderWidth: BorderWidth.normal,
+    paddingVertical: Spacing.xs,
+    paddingHorizontal: Spacing.xs,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 4,
+  },
+  stepBadge: {
+    width: rf(18),
+    height: rf(18),
+    borderRadius: BorderRadius.full,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepBadgeText: {
+    ...Typography.tiny,
+    fontSize: rf(9),
+    lineHeight: rf(12),
+    fontWeight: '900',
+    includeFontPadding: false,
+  },
+  stepLabel: {
+    ...Typography.captionMedium,
+    fontSize: rf(11),
+    lineHeight: rf(15),
+    textAlign: 'center',
+    flexShrink: 1,
+  },
+  metricRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: Spacing.xs,
+  },
+  metricChip: {
+    paddingVertical: 5,
+    paddingHorizontal: Spacing.xs + 2,
+    borderRadius: BorderRadius.full,
+    borderWidth: BorderWidth.normal,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    maxWidth: '100%',
+    flexShrink: 1,
+  },
+  metricDot: {
+    width: 6,
+    height: 6,
+    borderRadius: BorderRadius.full,
+  },
+  metricLabel: {
+    ...Typography.caption,
+    fontSize: rf(10),
+    lineHeight: rf(14),
+    flexShrink: 0,
+  },
+  metricValue: {
+    ...Typography.captionMedium,
+    fontSize: rf(10),
+    lineHeight: rf(14),
+    flexShrink: 1,
+  },
+});

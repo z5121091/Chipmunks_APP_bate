@@ -115,10 +115,21 @@ interface ScreenProps {
 }
 
 type KeyboardAwareProps = {
-  element: React.ReactElement<any, any>;
+  element: ScreenElement;
   extraPadding: number;
   contentInsetBehaviorIOS: 'automatic' | 'never';
 };
+
+type ScreenElementProps = Record<string, unknown> & {
+  children?: React.ReactNode;
+  contentContainerStyle?: unknown;
+  contentInsetAdjustmentBehavior?: 'automatic' | 'never';
+  horizontal?: boolean;
+  keyboardDismissMode?: 'none' | 'interactive' | 'on-drag';
+  keyboardShouldPersistTaps?: boolean | 'always' | 'never' | 'handled';
+};
+
+type ScreenElement = React.ReactElement<ScreenElementProps>;
 
 const KeyboardAwareScrollable = ({
   element,
@@ -126,10 +137,9 @@ const KeyboardAwareScrollable = ({
   contentInsetBehaviorIOS,
 }: KeyboardAwareProps) => {
   // 获取原始组件的 props
-  const childAttrs: any = (element as any).props || {};
-  const originStyle = childAttrs['contentContainerStyle'];
-  const styleArray = Array.isArray(originStyle) ? originStyle : originStyle ? [originStyle] : [];
-  const merged = Object.assign({}, ...styleArray);
+  const childAttrs = element.props || {};
+  const originStyle = childAttrs.contentContainerStyle as ViewStyle | ViewStyle[] | undefined;
+  const merged = StyleSheet.flatten(originStyle) || {};
   const currentPB = typeof merged.paddingBottom === 'number' ? merged.paddingBottom : 0;
 
   // 合并 paddingBottom (安全区 + 额外留白)
@@ -139,8 +149,8 @@ const KeyboardAwareScrollable = ({
   const commonProps = {
     ...childAttrs,
     contentContainerStyle: enhancedContentStyle,
-    keyboardShouldPersistTaps: childAttrs['keyboardShouldPersistTaps'] ?? 'handled',
-    keyboardDismissMode: childAttrs['keyboardDismissMode'] ?? 'on-drag',
+    keyboardShouldPersistTaps: childAttrs.keyboardShouldPersistTaps ?? 'handled',
+    keyboardDismissMode: childAttrs.keyboardDismissMode ?? 'on-drag',
     enableOnAndroid: true,
     // 类似于原代码中的 setTimeout/scrollToEnd 逻辑，这里设置额外的滚动高度确保输入框可见
     extraHeight: SCREEN_KEYBOARD_EXTRA_HEIGHT,
@@ -148,31 +158,31 @@ const KeyboardAwareScrollable = ({
     // 禁用自带的 ScrollView 自动 inset，由外部 padding 控制
     enableAutomaticScroll: true,
     ...(Platform.OS === 'ios'
-      ? { contentInsetAdjustmentBehavior: childAttrs['contentInsetAdjustmentBehavior'] ?? contentInsetBehaviorIOS }
+      ? { contentInsetAdjustmentBehavior: childAttrs.contentInsetAdjustmentBehavior ?? contentInsetBehaviorIOS }
       : {}),
   };
 
-  const t = (element as any).type;
+  const t = element.type;
 
   // 根据组件类型返回对应的 KeyboardAware 版本
   // 注意：不再使用 KeyboardAvoidingView，直接替换为增强版 ScrollView
   if (t === ScrollView) {
-    return <KeyboardAwareScrollView {...commonProps} />;
+    return <KeyboardAwareScrollView {...(commonProps as React.ComponentProps<typeof KeyboardAwareScrollView>)} />;
   }
 
   if (t === FlatList) {
-    return <KeyboardAwareFlatList {...commonProps} />;
+    return <KeyboardAwareFlatList {...(commonProps as React.ComponentProps<typeof KeyboardAwareFlatList>)} />;
   }
 
   if (t === SectionList) {
-    return <KeyboardAwareSectionList {...commonProps} />;
+    return <KeyboardAwareSectionList {...(commonProps as React.ComponentProps<typeof KeyboardAwareSectionList>)} />;
   }
 
   // 理论上不应运行到这里，如果是非标准组件则原样返回，仅修改样式
   return React.cloneElement(element, {
     contentContainerStyle: enhancedContentStyle,
-    keyboardShouldPersistTaps: childAttrs['keyboardShouldPersistTaps'] ?? 'handled',
-    keyboardDismissMode: childAttrs['keyboardDismissMode'] ?? 'on-drag',
+    keyboardShouldPersistTaps: childAttrs.keyboardShouldPersistTaps ?? 'handled',
+    keyboardDismissMode: childAttrs.keyboardDismissMode ?? 'on-drag',
   });
 };
 
@@ -192,14 +202,14 @@ export const Screen = ({
   const isNodeScrollable = (node: React.ReactNode): boolean => {
     const isScrollableElement = (el: unknown): boolean => {
       if (!React.isValidElement(el)) return false;
-      const element = el as React.ReactElement<any, any>;
+      const element = el as ScreenElement;
       const t = element.type;
       // 不递归检查 Modal 内容，避免将弹窗内的 ScrollView 误判为页面已具备垂直滚动
       if (t === Modal) return false;
       const props = element.props as Record<string, unknown> | undefined;
       // 仅识别“垂直”滚动容器；横向滚动不视为页面已处理垂直滚动
       // eslint-disable-next-line react/prop-types
-      const isHorizontal = !!(props && (props as any).horizontal === true);
+      const isHorizontal = props?.horizontal === true;
       if ((t === ScrollView || t === FlatList || t === SectionList) && !isHorizontal) return true;
       const c: React.ReactNode | undefined = props && 'children' in props
         ? (props.children as React.ReactNode)
@@ -265,14 +275,14 @@ export const Screen = ({
 
   // 3. 若子元素自身包含滚动容器，给该滚动容器单独添加键盘避让，不影响其余固定元素（如底部栏）
   const wrapScrollableWithKeyboardAvoid = (nodes: React.ReactNode): React.ReactNode => {
-    const isVerticalScrollable = (el: React.ReactElement<any, any>): boolean => {
+    const isVerticalScrollable = (el: ScreenElement): boolean => {
       const t = el.type;
-      const elementProps = (el as any).props || {};
-      const isHorizontal = !!(elementProps as any).horizontal;
+      const elementProps = el.props || {};
+      const isHorizontal = elementProps.horizontal === true;
       return (t === ScrollView || t === FlatList || t === SectionList) && !isHorizontal;
     };
 
-    const wrapIfNeeded = (el: React.ReactElement<any, any>, idx?: number): React.ReactElement => {
+    const wrapIfNeeded = (el: ScreenElement, idx?: number): React.ReactElement => {
       if (isVerticalScrollable(el)) {
         return (
           <KeyboardAwareScrollable
@@ -289,13 +299,13 @@ export const Screen = ({
     if (Array.isArray(nodes)) {
       return nodes.map((n, idx) => {
         if (React.isValidElement(n)) {
-          return wrapIfNeeded(n as React.ReactElement<any, any>, idx);
+          return wrapIfNeeded(n as ScreenElement, idx);
         }
         return n;
       });
     }
     if (React.isValidElement(nodes)) {
-      return wrapIfNeeded(nodes as React.ReactElement<any, any>, 0);
+      return wrapIfNeeded(nodes as ScreenElement, 0);
     }
     return nodes;
   };

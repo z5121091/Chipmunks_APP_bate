@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Keyboard,
   Modal,
@@ -14,44 +14,24 @@ import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { Screen } from '@/components/Screen';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { AnimatedCard } from '@/components/AnimatedCard';
 import { AppFormField } from '@/components/AppFormField';
-import { AppSegmentedOptions } from '@/components/AppSegmentedOptions';
-import { AppToggleRow } from '@/components/AppToggleRow';
-import { Spacing } from '@/constants/theme';
 import { createStyles } from './styles';
 import { logger } from '@/utils/logger';
 import {
   addCustomField,
+  createCustomFieldKey,
   CustomField,
-  CustomFieldType,
   deleteCustomField,
   getAllCustomFields,
+  getAllRules,
   updateCustomField,
 } from '@/utils/database';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useToast } from '@/utils/toast';
-
-type EditableCustomFieldType = 'text' | 'select';
-
-const FIELD_TYPE_OPTIONS: Array<{
-  type: EditableCustomFieldType;
-  label: string;
-  icon: React.ComponentProps<typeof Feather>['name'];
-  hint: string;
-}> = [
-  { type: 'text', label: '文本', icon: 'type', hint: '适合备注、名称、说明等自由内容' },
-  { type: 'select', label: '选择', icon: 'list', hint: '适合状态、等级、类别等固定选项' },
-];
-
-const FIELD_TYPE_LABELS: Record<CustomFieldType, string> = {
-  text: '文本',
-  select: '选择',
-};
 
 export default function CustomFieldsScreen() {
   const { theme, isDark } = useTheme();
@@ -63,22 +43,22 @@ export default function CustomFieldsScreen() {
 
   const [fields, setFields] = useState<CustomField[]>([]);
   const [modalVisible, setModalVisible] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [editingField, setEditingField] = useState<CustomField | null>(null);
   const [fieldName, setFieldName] = useState('');
-  const [fieldType, setFieldType] = useState<EditableCustomFieldType>('text');
-  const [isRequired, setIsRequired] = useState(false);
-  const [optionsText, setOptionsText] = useState('');
 
   const fieldNameInputRef = useRef<TextInput>(null);
   const fieldNameFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const activeTypeOption =
-    FIELD_TYPE_OPTIONS.find((option) => option.type === fieldType) ?? FIELD_TYPE_OPTIONS[0];
-
   const loadFields = useCallback(async () => {
-    const data = await getAllCustomFields();
-    setFields(data);
-  }, []);
+    try {
+      const data = await getAllCustomFields();
+      setFields(data);
+    } catch (error) {
+      logger.error('加载占位字段失败:', error);
+      alert.showError('占位字段加载失败，请重试');
+    }
+  }, [alert.showError]);
 
   useFocusEffect(
     useCallback(() => {
@@ -112,9 +92,6 @@ export default function CustomFieldsScreen() {
   const resetForm = useCallback(() => {
     setEditingField(null);
     setFieldName('');
-    setFieldType('text');
-    setIsRequired(false);
-    setOptionsText('');
   }, []);
 
   const handleAddField = useCallback(() => {
@@ -125,79 +102,103 @@ export default function CustomFieldsScreen() {
   const handleEditField = useCallback((field: CustomField) => {
     setEditingField(field);
     setFieldName(field.name);
-    setFieldType(field.type === 'select' ? 'select' : 'text');
-    setIsRequired(field.required);
-    setOptionsText(field.options?.join(', ') ?? '');
     setModalVisible(true);
   }, []);
 
   const handleSaveField = useCallback(async () => {
+    if (saving) {
+      return;
+    }
+
     const trimmedName = fieldName.trim();
 
     if (!trimmedName) {
-      alert.showWarning('请输入字段名称');
+      alert.showWarning('请输入占位字段名称');
       return;
     }
 
-    const normalizedOptions =
-      fieldType === 'select'
-        ? optionsText
-            .split(',')
-            .map((option) => option.trim())
-            .filter(Boolean)
-        : undefined;
-
-    if (fieldType === 'select' && (!normalizedOptions || normalizedOptions.length < 2)) {
-      alert.showWarning('选择类型至少需要 2 个选项');
+    if (
+      fields.some(
+        (field) =>
+          field.id !== editingField?.id &&
+          field.name.trim().toLocaleLowerCase() === trimmedName.toLocaleLowerCase()
+      )
+    ) {
+      alert.showWarning('已存在同名占位字段，请使用其他名称');
       return;
     }
 
+    setSaving(true);
     try {
       if (editingField) {
         await updateCustomField(editingField.id, {
           name: trimmedName,
-          type: fieldType,
-          required: isRequired,
-          options: normalizedOptions,
         });
-        alert.showSuccess('字段已更新');
+        alert.showSuccess('占位字段已更新');
       } else {
         await addCustomField({
           name: trimmedName,
-          type: fieldType,
-          required: isRequired,
-          options: normalizedOptions,
+          type: 'text',
+          required: false,
         });
-        alert.showSuccess('字段已添加');
+        alert.showSuccess('占位字段已添加');
       }
 
       closeModal();
       await loadFields();
     } catch (error) {
-      logger.error('保存自定义字段失败:', error);
+      logger.error('保存占位字段失败:', error);
       alert.showError('保存失败');
+    } finally {
+      setSaving(false);
     }
-  }, [alert, closeModal, editingField, fieldName, fieldType, isRequired, loadFields, optionsText]);
+  }, [alert, closeModal, editingField, fieldName, fields, loadFields, saving]);
 
   const handleDeleteField = useCallback(
-    (field: CustomField) => {
+    async (field: CustomField) => {
+      try {
+        const fieldKey = createCustomFieldKey(field.id);
+        const rules = await getAllRules();
+        const affectedRules = rules.filter(
+          (rule) =>
+            rule.fieldOrder.includes(fieldKey) || (rule.customFieldIds || []).includes(field.id)
+        );
+
+        if (affectedRules.length > 0) {
+          const affectedNames = affectedRules
+            .slice(0, 4)
+            .map((rule) => rule.name)
+            .join('、');
+          alert.showWarning(
+            `“${field.name}”仍被解析规则 ${affectedNames}${
+              affectedRules.length > 4 ? ` 等 ${affectedRules.length} 条` : ''
+            } 使用。请先在这些规则中替换或移除该占位字段，再回来删除。`
+          );
+          return;
+        }
+      } catch (error) {
+        logger.error('[占位字段] 读取字段使用情况失败:', error);
+        alert.showError('暂时无法检查字段使用情况，请稍后重试');
+        return;
+      }
+
       alert.showConfirm(
         '确认删除',
-        `确定要删除字段“${field.name}”吗？`,
+        `确定要删除占位字段“${field.name}”吗？\n\n历史记录和原始二维码内容不会被删除。`,
         async () => {
           try {
             await deleteCustomField(field.id);
             await loadFields();
-            showToast('字段已删除', 'success');
+            showToast('占位字段已删除', 'success');
           } catch (error) {
-            logger.error('删除自定义字段失败:', error);
-            alert.showError('删除失败');
+            logger.error('删除占位字段失败:', error);
+            alert.showError(error instanceof Error ? error.message : '删除失败');
           }
         },
         true
       );
     },
-    [alert, loadFields]
+    [alert, loadFields, showToast]
   );
 
   return (
@@ -215,26 +216,26 @@ export default function CustomFieldsScreen() {
             <Feather name="arrow-left" size={20} color={theme.textPrimary} />
           </TouchableOpacity>
           <View style={styles.headerContent}>
-            <Text style={styles.title}>自定义字段</Text>
+            <Text style={styles.title}>占位字段</Text>
           </View>
         </View>
 
         <View style={styles.toolbar}>
           <View style={styles.toolbarTextBlock}>
-            <Text style={styles.toolbarTitle}>字段列表</Text>
-            <Text style={styles.toolbarSubtitle}>当前 {fields.length} 个定义</Text>
+            <Text style={styles.toolbarTitle}>二维码占位</Text>
+            <Text style={styles.toolbarSubtitle}>用于保留不需要导出的二维码段</Text>
           </View>
           <TouchableOpacity style={styles.addButton} activeOpacity={0.8} onPress={handleAddField}>
             <Feather name="plus" size={15} color={theme.buttonPrimaryText} />
-            <Text style={styles.addButtonText}>新增字段</Text>
+            <Text style={styles.addButtonText}>新增占位</Text>
           </TouchableOpacity>
         </View>
 
         {fields.length === 0 ? (
           <AppEmptyState
             icon="plus-square"
-            title="暂无自定义字段"
-            description="添加后可在物料详情中补充记录关键信息。"
+            title="暂无占位字段"
+            description="二维码存在无用段时，可创建占位字段保持后续字段位置正确。"
             style={styles.emptyContainer}
           />
         ) : (
@@ -248,11 +249,8 @@ export default function CustomFieldsScreen() {
                   <View style={styles.fieldTextBlock}>
                     <Text style={styles.fieldName}>{field.name}</Text>
                     <View style={styles.metaRow}>
-                      <Text style={styles.typeChip}>{FIELD_TYPE_LABELS[field.type]}</Text>
-                      {field.required ? <Text style={styles.requiredChip}>必填</Text> : null}
-                      {field.type === 'select' && field.options?.length ? (
-                        <Text style={styles.metaText}>{field.options.length} 项选项</Text>
-                      ) : null}
+                      <Text style={styles.typeChip}>仅占位</Text>
+                      <Text style={styles.metaText}>不显示、不导出</Text>
                     </View>
                   </View>
                 </View>
@@ -275,15 +273,6 @@ export default function CustomFieldsScreen() {
                 </View>
               </View>
 
-              {field.type === 'select' && field.options?.length ? (
-                <View style={styles.optionsRow}>
-                  {field.options.map((option) => (
-                    <Text key={option} style={styles.optionTag}>
-                      {option}
-                    </Text>
-                  ))}
-                </View>
-              ) : null}
             </AnimatedCard>
           ))
         )}
@@ -293,82 +282,45 @@ export default function CustomFieldsScreen() {
         visible={modalVisible}
         transparent
         animationType="fade"
-        onRequestClose={closeModal}
+        onRequestClose={() => {
+          if (!saving) closeModal();
+        }}
       >
         <View style={styles.modalOverlay}>
           <AppModalCard
-            title={editingField ? '编辑字段' : '添加字段'}
-            onClose={closeModal}
+            title={editingField ? '编辑占位字段' : '添加占位字段'}
+            onClose={saving ? undefined : closeModal}
             style={styles.modalContent}
-            bodyStyle={styles.modalBodySection}
             size="form"
-            stretchBody
             footer={
               <AppModalActions
                 containerStyle={styles.modalActions}
                 secondaryLabel="取消"
                 onSecondaryPress={closeModal}
-                primaryLabel="保存"
+                secondaryDisabled={saving}
+                primaryLabel={saving ? '保存中...' : '保存'}
                 onPrimaryPress={handleSaveField}
+                primaryDisabled={saving}
               />
             }
           >
-            <KeyboardAwareFormScrollView
-              style={styles.modalFormScroll}
-              contentContainerStyle={styles.modalFormScrollContent}
-              bottomOffset={Spacing.sm}
-              extraScrollHeight={12}
+            <AppFormField
+              label="占位名称"
+              hint="建议按位置命名，如：忽略段1、供应商保留字段"
+              required
             >
-              <AppFormField label="字段名称" required>
-                <TextInput
-                  ref={fieldNameInputRef}
-                  style={styles.formInput}
-                  value={fieldName}
-                  onChangeText={setFieldName}
-                  placeholder="如：供应商、库位、来料等级"
-                  placeholderTextColor={theme.textMuted}
-                  maxLength={32}
-                  returnKeyType="done"
-                />
-              </AppFormField>
-
-              <AppFormField label="录入方式" hint={activeTypeOption.hint}>
-                <AppSegmentedOptions
-                  options={FIELD_TYPE_OPTIONS.map((option) => ({
-                    value: option.type,
-                    label: option.label,
-                    icon: option.icon,
-                  }))}
-                  value={fieldType}
-                  onChange={setFieldType}
-                />
-              </AppFormField>
-
-              {fieldType === 'select' ? (
-                <AppFormField
-                  label="选项列表"
-                  hint="多个选项用英文逗号分隔，例如：良品, 待检, 退货"
-                >
-                  <TextInput
-                    style={[styles.formInput, styles.optionsInput]}
-                    value={optionsText}
-                    onChangeText={setOptionsText}
-                    placeholder="请输入选项内容"
-                    placeholderTextColor={theme.textMuted}
-                    multiline
-                    scrollEnabled
-                    textAlignVertical="top"
-                  />
-                </AppFormField>
-              ) : null}
-
-              <AppToggleRow
-                title="设为必填字段"
-                description="录入物料时必须填写这个字段"
-                checked={isRequired}
-                onPress={() => setIsRequired((prev) => !prev)}
+              <TextInput
+                ref={fieldNameInputRef}
+                style={styles.formInput}
+                value={fieldName}
+                onChangeText={setFieldName}
+                placeholder="如：忽略段1"
+                placeholderTextColor={theme.textMuted}
+                maxLength={32}
+                returnKeyType="done"
+                onSubmitEditing={() => void handleSaveField()}
               />
-            </KeyboardAwareFormScrollView>
+            </AppFormField>
           </AppModalCard>
         </View>
       </Modal>

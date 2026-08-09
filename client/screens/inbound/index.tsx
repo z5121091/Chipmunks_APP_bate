@@ -1,10 +1,9 @@
-﻿import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+﻿import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import {
   View,
   Text,
   TouchableOpacity,
   TextInput,
-  ActivityIndicator,
   FlatList,
   Platform,
 } from 'react-native';
@@ -12,36 +11,48 @@ import { useFocusEffect } from 'expo-router';
 import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
 import { AppEmptyState } from '@/components/AppEmptyState';
+import { AggregatedRecordItem } from '@/components/AggregatedRecordItem';
 import {
-  ScanWorkflowPanel,
-  type WorkflowMetric,
-} from '@/components/ScanWorkflowPanel';
+  UiPageHeader,
+  UiSafeBottomBar,
+  UiScanBox,
+  UiToolbarButton,
+  UiWorkflowSummary,
+} from '@/components/UiRedesign';
 import { createStyles } from './styles';
 import { useCustomAlert } from '@/components/CustomAlert';
-import { useSafeRouter } from '@/hooks/useSafeRouter';
+import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { safeJsonParseNullable } from '@/utils/json';
 import { logger } from '@/utils/logger';
 import {
   Warehouse,
   getAllWarehouses,
-  getDefaultWarehouse,
   addInboundRecordsBatch,
-  updateInboundSummary,
-  generateInboundNo,
   detectRule,
   parseWithRule,
   getInventoryCodeByModel,
-  getSupplierByModel,
   generateId,
   updateInboundDocumentSyncStatus,
   checkInboundTraceNoExists,
+  getInboundRecordsByNo,
 } from '@/utils/database';
 import { isQRCode } from '@/utils/qrcodeParser';
 import { parseQuantity } from '@/utils/quantity';
 
 import { Feather, FontAwesome6 } from '@expo/vector-icons';
-import { feedbackSuccess, feedbackError, feedbackWarning, feedbackDuplicate, feedbackInboundComplete, feedbackClear, useFeedbackCleanup } from '@/utils/feedback';
+import {
+  feedbackSuccess,
+  feedbackError,
+  feedbackWarning,
+  feedbackDuplicate,
+  feedbackInboundComplete,
+  feedbackClear,
+  feedbackNotBound,
+  feedbackNotInOrder,
+  feedbackOverQuantity,
+  useFeedbackCleanup,
+} from '@/utils/feedback';
 import { useToast } from '@/utils/toast';
 import { Str } from '@/resources/strings';
 import { formatDateTime, formatDate, getISODateTime } from '@/utils/time';
@@ -54,10 +65,28 @@ import {
   type InboundExportRecord,
 } from '@/utils/inboundExport';
 import type { SyncConfig } from '@/constants/config';
+import { sanitizeStructuredScannerInput, shouldIgnoreRecentDuplicateScan } from '@/utils/scannerInput';
 import {
-  sanitizeCompactScannerInput,
-  shouldIgnoreRecentDuplicateScan,
-} from '@/utils/scannerInput';
+  getErpAccountByKey,
+  type ErpAccountConfig,
+  type ErpAccountKey,
+} from '@/utils/erpAccounts';
+import {
+  fetchPurchaseReceiveVoucherStatuses,
+  fetchPurchaseReceiveVoucher,
+  loadCachedPurchaseReceiveVoucher,
+  loadCachedPurchaseReceiveVoucherStatuses,
+  savePurchaseReceiveVoucherCache,
+  savePurchaseReceiveVoucherStatusesCache,
+  type PurchaseReceiveVoucher,
+} from '@/utils/erpPurchaseReceive';
+import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
+import {
+  buildInboundModelKey,
+  buildInboundModelVersionKey,
+  normalizeInboundModel,
+  normalizeInboundVersion,
+} from '@/utils/inboundRecords';
 
 // 扫描记录类型
 interface ScanRecord {
@@ -69,129 +98,96 @@ interface ScanRecord {
   rawContent: string;
   inventoryCode?: string;
   supplier?: string;
+  ruleId?: string;
+  ruleName?: string;
   // 扩展字段
   package?: string;
   version?: string;
   productionDate?: string;
   traceNo?: string;
   sourceNo?: string;
-  // 自定义字段
+  // 占位字段解析值（仅用于兼容和排查，不展示、不导出）
   customFields?: Record<string, string>;
   // 是否已确认
   confirmed?: boolean;
 }
 
-// ========================================
-// React.memo 优化：列表项组件
-// ========================================
-const getRecordRenderSignature = (records: any[] = []) =>
-  records
-    .map((record) =>
-      [
-        record.id || '',
-        record.version || '',
-        record.batch || '',
-        record.productionDate || '',
-        record.quantity ?? '',
-      ].join(':')
-    )
-    .join('|');
+type InboundAggregatedRecord = {
+  model: string;
+  version: string;
+  records: ScanRecord[];
+  totalQuantity: number;
+  count: number;
+};
 
-const RecordItem = React.memo(({ item, isExpanded, isConfirmed, onToggle, onConfirm, onDeleteRecord, theme, styles }: {
-  item: any;
-  isExpanded: boolean;
-  isConfirmed: boolean;
-  onToggle: (key: string) => void;
-  onConfirm: (key: string) => void;
-  onDeleteRecord: (record: any) => void;
-  theme: any;
-  styles: any;
-}) => {
-  const key = `${item.model}|${item.version}`;
+type InboundErpLineProgress = {
+  inventoryCode: string;
+  key: string;
+  remainingQuantity: number;
+  requiredQuantity: number;
+  scannedRecords: ScanRecord[];
+  scannedQuantity: number;
+  specification: string;
+  status: 'complete' | 'partial' | 'pending';
+  unitName: string;
+};
 
-  return (
-    <View key={key} style={styles.itemContainer}>
-      {/* 聚合项 - 两行布局 */}
-      <TouchableOpacity
-        style={[
-          styles.itemRow,
-          isConfirmed && styles.itemConfirmed
-        ]}
-      >
-        {/* 勾选框 */}
-        <TouchableOpacity style={styles.checkbox}
-          activeOpacity={0.7} onPress={() => onConfirm(key)}
-        >
-          <FontAwesome6
-            name={isConfirmed ? "square-check" : "square"}
-            size={18}
-            color={isConfirmed ? theme.success : theme.textMuted}
-          />
-        </TouchableOpacity>
+const normalizeInventoryCode = (value?: string | null) =>
+  (value || '').trim();
+const getInventoryCodeMatchKey = (value?: string | null) =>
+  normalizeInventoryCode(value).toUpperCase();
 
-        {/* 型号内容（包含型号和版本号两行） */}
-        <TouchableOpacity style={styles.modelContent}
-          activeOpacity={0.7} onPress={() => onToggle(key)}
-        >
-          <Text style={[styles.itemModel, isConfirmed && styles.itemModelConfirmed]}>
-            {isExpanded ? '▼' : '▶'} {item.model}
-          </Text>
-          <Text style={[styles.itemBatch, isConfirmed && styles.itemModelConfirmed]}>
-            版本: {item.version || '-'}
-          </Text>
-        </TouchableOpacity>
+const normalizeInboundDraftRecords = async (records: readonly ScanRecord[]) => {
+  const inventoryCodeRequests = new Map<string, Promise<string | null>>();
 
-        {/* 数量 */}
-        <Text style={[styles.itemQty, isConfirmed && styles.itemQtyConfirmed]}>
-          {item.totalQuantity.toLocaleString()}
-        </Text>
-      </TouchableOpacity>
+  return await Promise.all(
+    records.map(async (record) => {
+      const model = normalizeInboundModel(record.model);
+      const version = normalizeInboundVersion(record.version);
+      let inventoryCode = normalizeInventoryCode(record.inventoryCode);
 
-      {/* 展开的明细 */}
-      {isExpanded && (
-        <View style={styles.detailsContainer}>
-          {item.records.map((record: any) => (
-            <TouchableOpacity
-              key={record.id}
-              style={styles.detailItem}
-              onLongPress={() => onDeleteRecord(record)}
-              delayLongPress={500}
-            >
-              <Text style={styles.detailText}>
-                批次: {record.batch || '-'}  |  生产日期: {record.productionDate || '-'}  |  数量: {record.quantity}
-              </Text>
-              <Text style={styles.detailText}>
-                版本号: {record.version || '-'}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-      )}
-    </View>
+      if (!inventoryCode && model) {
+        const key = buildInboundModelVersionKey(model, version);
+        let request = inventoryCodeRequests.get(key);
+        if (!request) {
+          request = getInventoryCodeByModel(model, version);
+          inventoryCodeRequests.set(key, request);
+        }
+        inventoryCode = normalizeInventoryCode(await request);
+      }
+
+      return {
+        ...record,
+        model,
+        version: version || undefined,
+        inventoryCode: inventoryCode || undefined,
+      };
+    })
   );
-}, (prevProps, nextProps) => {
-  // 自定义比较函数：只有关键属性变化时才重新渲染
-  return (
-    prevProps.item.model === nextProps.item.model &&
-    prevProps.item.version === nextProps.item.version &&
-    prevProps.item.totalQuantity === nextProps.item.totalQuantity &&
-    prevProps.item.count === nextProps.item.count &&
-    prevProps.isExpanded === nextProps.isExpanded &&
-    prevProps.isConfirmed === nextProps.isConfirmed &&
-    getRecordRenderSignature(prevProps.item.records) === getRecordRenderSignature(nextProps.item.records)
-  );
-});
+};
+
+const INBOUND_RECORD_SIGNATURE_FIELDS = [
+  'id',
+  'version',
+  'batch',
+  'productionDate',
+  'quantity',
+] as const;
 
 export default function InboundScreen() {
   const { theme, isDark } = useTheme();
   const styles = useMemo(() => createStyles(theme), [theme]);
   const alert = useCustomAlert();
   const router = useSafeRouter();
+  const routeParams = useSafeSearchParams<{ accountKey?: ErpAccountKey; voucherCode?: string }>();
+  const selectedVoucherCode = (routeParams.voucherCode || '').trim().toUpperCase();
+  const selectedAccountKey = routeParams.accountKey;
 
   // 输入
   const inputRef = useRef<TextInput>(null);
   const [inputValue, setInputValue] = useState('');
   const processingRef = useRef(false);
+  const inboundDraftWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const postProcessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -216,39 +212,81 @@ export default function InboundScreen() {
   }, []);
 
   // 仓库
-  const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [currentWarehouse, setCurrentWarehouse] = useState<Warehouse | null>(null);
-  const [showWarehousePicker, setShowWarehousePicker] = useState(false);
 
   // 当前供应商（从物料管理获取）
   const [currentSupplier, setCurrentSupplier] = useState<string | null>(null);
 
   // 入库单号
   const [inboundNo, setInboundNo] = useState('');
+  const erpVoucherRef = useRef<PurchaseReceiveVoucher | null>(null);
+  const [erpVoucher, setErpVoucher] = useState<PurchaseReceiveVoucher | null>(null);
+  const [erpVoucherLoading, setErpVoucherLoading] = useState(Boolean(selectedVoucherCode));
+  const [erpVoucherError, setErpVoucherError] = useState('');
+
+  const setActiveErpVoucher = useCallback((voucher: PurchaseReceiveVoucher | null) => {
+    erpVoucherRef.current = voucher;
+    setErpVoucher(voucher);
+  }, []);
 
   // AsyncStorage Key
   const INBOUND_SCAN_RECORDS_KEY = 'inbound_scan_records';
   const INBOUND_PENDING_DATA_KEY = 'inbound_pending_data';
-  // 全局仓库 Storage Key
-  const GLOBAL_WAREHOUSE_KEY = STORAGE_KEYS.GLOBAL_WAREHOUSE;
-  const getInboundDraftKeys = (warehouseId?: string | null) => {
-    if (!warehouseId) {
-      return {
-        recordsKey: INBOUND_SCAN_RECORDS_KEY,
-        pendingKey: INBOUND_PENDING_DATA_KEY,
-      };
-    }
+  const getLegacyInboundDraftKeys = useCallback(
+    (warehouseId?: string | null) => {
+      if (!warehouseId) {
+        return {
+          recordsKey: INBOUND_SCAN_RECORDS_KEY,
+          pendingKey: INBOUND_PENDING_DATA_KEY,
+        };
+      }
 
-    return {
-      recordsKey: `${INBOUND_SCAN_RECORDS_KEY}:${warehouseId}`,
-      pendingKey: `${INBOUND_PENDING_DATA_KEY}:${warehouseId}`,
-    };
-  };
+      const voucherScope = selectedVoucherCode ? `:${selectedVoucherCode}` : '';
+      return {
+        recordsKey: `${INBOUND_SCAN_RECORDS_KEY}:${warehouseId}${voucherScope}`,
+        pendingKey: `${INBOUND_PENDING_DATA_KEY}:${warehouseId}${voucherScope}`,
+      };
+    },
+    [selectedVoucherCode]
+  );
+  const getInboundDraftKeys = useCallback(
+    (warehouseId?: string | null) => {
+      if (!warehouseId) {
+        return {
+          recordsKey: INBOUND_SCAN_RECORDS_KEY,
+          pendingKey: INBOUND_PENDING_DATA_KEY,
+        };
+      }
+
+      const voucherScope = selectedVoucherCode ? `:${selectedVoucherCode}` : '';
+      const accountScope = selectedAccountKey || 'unscoped';
+      return {
+        recordsKey: `${INBOUND_SCAN_RECORDS_KEY}:${accountScope}:${warehouseId}${voucherScope}`,
+        pendingKey: `${INBOUND_PENDING_DATA_KEY}:${accountScope}:${warehouseId}${voucherScope}`,
+      };
+    },
+    [selectedAccountKey, selectedVoucherCode]
+  );
+
+  const enqueueInboundDraftWrite = useCallback(
+    (operation: () => Promise<void>): Promise<void> => {
+      const nextWrite = inboundDraftWriteQueueRef.current
+        .catch(() => undefined)
+        .then(operation);
+      inboundDraftWriteQueueRef.current = nextWrite.then(
+        () => undefined,
+        () => undefined
+      );
+      return nextWrite;
+    },
+    []
+  );
 
   // 扫描记录
   const [scanRecords, setScanRecords] = useState<ScanRecord[]>([]);
   const scanRecordsRef = useRef<ScanRecord[]>([]);
   const [saving, setSaving] = useState(false);
+  const saveInProgressRef = useRef(false);
 
   // 已保存入库记录
   // Toast
@@ -259,8 +297,8 @@ export default function InboundScreen() {
   }, [scanRecords]);
 
   useEffect(() => {
-    scannerFocusBlockedRef.current = showWarehousePicker || saving;
-  }, [saving, showWarehousePicker]);
+    scannerFocusBlockedRef.current = saving || erpVoucherLoading;
+  }, [erpVoucherLoading, saving]);
 
   const focusScannerInput = useCallback((delay = 80) => {
     if (focusTimerRef.current) {
@@ -275,23 +313,26 @@ export default function InboundScreen() {
     }, delay);
   }, []);
 
-  useEffect(() => () => {
-    if (focusTimerRef.current) {
-      clearTimeout(focusTimerRef.current);
-    }
-    if (autoSubmitTimerRef.current) {
-      clearTimeout(autoSubmitTimerRef.current);
-    }
-    if (postProcessTimerRef.current) {
-      clearTimeout(postProcessTimerRef.current);
-    }
-  }, []);
+  useEffect(
+    () => () => {
+      if (focusTimerRef.current) {
+        clearTimeout(focusTimerRef.current);
+      }
+      if (autoSubmitTimerRef.current) {
+        clearTimeout(autoSubmitTimerRef.current);
+      }
+      if (postProcessTimerRef.current) {
+        clearTimeout(postProcessTimerRef.current);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
-    if (!showWarehousePicker && !saving) {
+    if (!saving && !erpVoucherLoading) {
       focusScannerInput(80);
     }
-  }, [focusScannerInput, saving, showWarehousePicker]);
+  }, [erpVoucherLoading, focusScannerInput, saving]);
 
   // 展开状态管理（用 ref 同步，避免 renderAggregatedRecord 频繁重建）
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
@@ -301,131 +342,345 @@ export default function InboundScreen() {
   const [confirmedGroups, setConfirmedGroups] = useState<Set<string>>(new Set());
   const confirmedGroupsRef = useRef<Set<string>>(new Set());
 
-  // 加载扫描记录
-  const loadScanRecords = async (warehouse?: Warehouse | null): Promise<string | null> => {
-    try {
-      const currentWarehouseId = warehouse?.id;
-      if (!currentWarehouseId) {
-        logger.log('[loadScanRecords] 当前仓库未加载，跳过恢复');
-        return null;
-      }
-
-      const draftKeys = getInboundDraftKeys(currentWarehouseId);
-      let savedRecords = await AsyncStorage.getItem(draftKeys.recordsKey);
-      let pendingData = await AsyncStorage.getItem(draftKeys.pendingKey);
-      let shouldMigrateLegacyDraft = false;
-
-      // 兼容旧版本的单槽草稿，恢复成功后迁移到按仓库隔离的新 key。
-      if (!savedRecords) {
-        savedRecords = await AsyncStorage.getItem(INBOUND_SCAN_RECORDS_KEY);
-        pendingData = await AsyncStorage.getItem(INBOUND_PENDING_DATA_KEY);
-        shouldMigrateLegacyDraft = Boolean(savedRecords);
-      }
-
-      if (savedRecords) {
-        const records = safeJsonParseNullable<ScanRecord[]>(savedRecords, 'inbound.scanRecords');
-        if (!records) {
+  // 加载扫描记录。ERP 上下文显式传入，避免页面状态变化时重建聚焦初始化回调。
+  const loadScanRecords = useCallback(
+    async (
+      warehouse: Warehouse | null,
+      expectedVoucherCode: string,
+      fallbackSupplier?: string | null
+    ): Promise<string | null> => {
+      try {
+        const currentWarehouseId = warehouse?.id;
+        if (!currentWarehouseId) {
+          logger.log('[loadScanRecords] 当前仓库未加载，跳过恢复');
           return null;
         }
-        let restoredInboundNo: string | null = null;
 
-        // 恢复供应商和入库单号，同时检查仓库是否匹配
-        if (pendingData) {
-          const data = safeJsonParseNullable<{
-            supplier?: string | null;
-            inboundNo?: string;
-            warehouseId?: string;
-            warehouseName?: string;
-          }>(pendingData, 'inbound.pendingData');
-          if (!data) {
+        const normalizedExpectedVoucherCode = expectedVoucherCode.trim().toUpperCase();
+        const draftKeys = getInboundDraftKeys(currentWarehouseId);
+        const legacyScopedDraftKeys = getLegacyInboundDraftKeys(currentWarehouseId);
+        let savedRecords = await AsyncStorage.getItem(draftKeys.recordsKey);
+        let pendingData = await AsyncStorage.getItem(draftKeys.pendingKey);
+        let shouldMigrateLegacyDraft = false;
+        let legacyDraftKeysToRemove: string[] = [];
+
+        // 兼容旧版按仓库/单据隔离但未包含账套的草稿。
+        if (!savedRecords) {
+          savedRecords = await AsyncStorage.getItem(legacyScopedDraftKeys.recordsKey);
+          pendingData = await AsyncStorage.getItem(legacyScopedDraftKeys.pendingKey);
+          shouldMigrateLegacyDraft = Boolean(savedRecords);
+          legacyDraftKeysToRemove = [
+            legacyScopedDraftKeys.recordsKey,
+            legacyScopedDraftKeys.pendingKey,
+          ];
+        }
+
+        // 再兼容更早版本的单槽草稿，核对成功后迁移到按账套隔离的新 key。
+        if (!savedRecords) {
+          savedRecords = await AsyncStorage.getItem(INBOUND_SCAN_RECORDS_KEY);
+          pendingData = await AsyncStorage.getItem(INBOUND_PENDING_DATA_KEY);
+          shouldMigrateLegacyDraft = Boolean(savedRecords);
+          legacyDraftKeysToRemove = [INBOUND_SCAN_RECORDS_KEY, INBOUND_PENDING_DATA_KEY];
+        }
+
+        if (savedRecords) {
+          if (shouldMigrateLegacyDraft && normalizedExpectedVoucherCode && !pendingData) {
+            logger.warn('[loadScanRecords] 旧版草稿缺少单号，跳过自动迁移以避免串单');
             return null;
           }
 
-          // 验证保存时的仓库是否与当前仓库匹配（使用传入的 warehouse 参数，避免状态闭包问题）
-          if (data.warehouseId) {
-            if (data.warehouseId !== currentWarehouseId) {
-              // 仓库不匹配，不恢复记录
-              logger.log('[loadScanRecords] 仓库不匹配，跳过恢复:', {
-                savedWarehouseId: data.warehouseId,
-                currentWarehouseId: currentWarehouseId,
+          const parsedRecords = safeJsonParseNullable<ScanRecord[]>(
+            savedRecords,
+            'inbound.scanRecords'
+          );
+          if (!parsedRecords) {
+            return null;
+          }
+          const records = await normalizeInboundDraftRecords(parsedRecords);
+          const normalizedSavedRecords = JSON.stringify(records);
+          let restoredInboundNo: string | null = null;
+
+          // 恢复供应商和入库单号，同时检查仓库是否匹配
+          if (pendingData) {
+            const data = safeJsonParseNullable<{
+              supplier?: string | null;
+               inboundNo?: string;
+               warehouseId?: string;
+               warehouseName?: string;
+               accountKey?: ErpAccountKey;
+             }>(pendingData, 'inbound.pendingData');
+            if (!data) {
+              return null;
+            }
+
+            const savedInboundNo = (data.inboundNo || '').trim().toUpperCase();
+            if (shouldMigrateLegacyDraft && normalizedExpectedVoucherCode && !savedInboundNo) {
+              logger.warn('[loadScanRecords] 旧版草稿没有可核对的单号，跳过自动迁移');
+              return null;
+            }
+            if (
+              normalizedExpectedVoucherCode &&
+              savedInboundNo &&
+              savedInboundNo !== normalizedExpectedVoucherCode
+            ) {
+              logger.warn('[loadScanRecords] 草稿单号与当前ERP单据不一致，跳过恢复:', {
+                currentVoucherCode: normalizedExpectedVoucherCode,
+                savedInboundNo,
               });
               return null;
             }
+            if (
+              data.accountKey &&
+              selectedAccountKey &&
+              data.accountKey !== selectedAccountKey
+            ) {
+              logger.warn('[loadScanRecords] 草稿账套与当前ERP账套不一致，跳过恢复:', {
+                savedAccountKey: data.accountKey,
+                currentAccountKey: selectedAccountKey,
+              });
+              return null;
+            }
+
+            // 验证保存时的仓库是否与当前仓库匹配
+            if (data.warehouseId && data.warehouseId !== currentWarehouseId) {
+              logger.log('[loadScanRecords] 仓库不匹配，跳过恢复:', {
+                savedWarehouseId: data.warehouseId,
+                currentWarehouseId,
+              });
+              return null;
+            }
+
+            setCurrentSupplier(data.supplier || null);
+            setInboundNo(data.inboundNo || '');
+            restoredInboundNo = data.inboundNo || null;
           }
 
-          setCurrentSupplier(data.supplier || null);
-          setInboundNo(data.inboundNo || '');
-          restoredInboundNo = data.inboundNo || null;
+          scanRecordsRef.current = records;
+          setScanRecords(records);
+
+          if (records.length > 0) {
+            showToast(`已恢复 ${records.length} 条入库暂存`, 'success');
+          }
+
+          if (shouldMigrateLegacyDraft) {
+            await AsyncStorage.multiSet([
+              [draftKeys.recordsKey, normalizedSavedRecords],
+              [
+                draftKeys.pendingKey,
+                pendingData ||
+                  JSON.stringify({
+                    supplier: fallbackSupplier || null,
+                     inboundNo: restoredInboundNo || normalizedExpectedVoucherCode,
+                     warehouseId: currentWarehouseId,
+                     warehouseName: warehouse?.name,
+                     accountKey: selectedAccountKey,
+                   }),
+               ],
+             ]);
+            await AsyncStorage.multiRemove(legacyDraftKeysToRemove);
+          } else if (normalizedSavedRecords !== savedRecords) {
+            await AsyncStorage.setItem(draftKeys.recordsKey, normalizedSavedRecords);
+          }
+
+          return restoredInboundNo;
         }
-
-        scanRecordsRef.current = records;
-        setScanRecords(records);
-
-        if (records.length > 0) {
-          showToast(`已恢复 ${records.length} 条入库暂存`, 'success');
-        }
-
-        if (shouldMigrateLegacyDraft) {
-          await AsyncStorage.multiSet([
-            [draftKeys.recordsKey, savedRecords],
-            [
-              draftKeys.pendingKey,
-              pendingData || JSON.stringify({
-                supplier: currentSupplier,
-                inboundNo: restoredInboundNo || inboundNo,
-                warehouseId: currentWarehouseId,
-                warehouseName: warehouse?.name,
-              }),
-            ],
-          ]);
-          await AsyncStorage.multiRemove([INBOUND_SCAN_RECORDS_KEY, INBOUND_PENDING_DATA_KEY]);
-        }
-
-        return restoredInboundNo;
+      } catch (error) {
+        logger.error('加载扫描记录失败:', error);
       }
-    } catch (error) {
-      logger.error('加载扫描记录失败:', error);
-    }
 
-    return null;
-  };
+      return null;
+    },
+    [getInboundDraftKeys, getLegacyInboundDraftKeys, selectedAccountKey, showToast]
+  );
 
   // 保存扫描记录
-  const saveScanRecords = async (records: ScanRecord[], supplier?: string | null) => {
-    try {
-      const draftKeys = getInboundDraftKeys(currentWarehouse?.id);
-      await AsyncStorage.setItem(draftKeys.recordsKey, JSON.stringify(records));
-      
-      const pendingData = {
-        supplier: supplier || currentSupplier,
-        inboundNo: inboundNo,
-        warehouseId: currentWarehouse?.id,
-        warehouseName: currentWarehouse?.name,
-      };
-      await AsyncStorage.setItem(draftKeys.pendingKey, JSON.stringify(pendingData));
-    } catch (error) {
-      logger.error('保存扫描记录失败:', error);
-    }
-  };
+  const saveScanRecords = useCallback(
+    async (records: ScanRecord[], supplier?: string | null): Promise<boolean> => {
+      try {
+        const draftKeys = getInboundDraftKeys(currentWarehouse?.id);
+        const pendingData = {
+          supplier: supplier || currentSupplier,
+          inboundNo,
+          warehouseId: currentWarehouse?.id,
+          warehouseName: currentWarehouse?.name,
+          accountKey: selectedAccountKey,
+        };
+        await enqueueInboundDraftWrite(() =>
+          AsyncStorage.multiSet([
+            [draftKeys.recordsKey, JSON.stringify(records)],
+            [draftKeys.pendingKey, JSON.stringify(pendingData)],
+          ])
+        );
+        return true;
+      } catch (error) {
+        logger.error('保存扫描记录失败:', error);
+        return false;
+      }
+    },
+    [
+      currentSupplier,
+      currentWarehouse,
+      enqueueInboundDraftWrite,
+      getInboundDraftKeys,
+      inboundNo,
+      selectedAccountKey,
+    ]
+  );
 
   // 清空扫描记录
   const clearScanRecords = async () => {
-    try {
-      const draftKeys = getInboundDraftKeys(currentWarehouse?.id);
-      await AsyncStorage.multiRemove([
+    const draftKeys = getInboundDraftKeys(currentWarehouse?.id);
+    const legacyScopedDraftKeys = getLegacyInboundDraftKeys(currentWarehouse?.id);
+    await enqueueInboundDraftWrite(() =>
+      AsyncStorage.multiRemove([
         draftKeys.recordsKey,
         draftKeys.pendingKey,
+        legacyScopedDraftKeys.recordsKey,
+        legacyScopedDraftKeys.pendingKey,
         INBOUND_SCAN_RECORDS_KEY,
         INBOUND_PENDING_DATA_KEY,
-      ]);
-    } catch (error) {
-      logger.error('清空扫描记录失败:', error);
-    }
+      ])
+    );
   };
 
   // 初始化
   // 自动清理震动和提示音
   useFeedbackCleanup();
+
+  const assertPurchaseReceiveUnaudited = useCallback(
+    async (account: ErpAccountConfig, voucherCode: string, forceRefresh = false) => {
+      const cachedStatuses = await loadCachedPurchaseReceiveVoucherStatuses(account.key);
+      let purchaseReceiveStatuses = cachedStatuses?.data || [];
+      const cachedStatusTime = cachedStatuses ? Date.parse(cachedStatuses.cachedAt) : NaN;
+      const statusCacheFresh =
+        Number.isFinite(cachedStatusTime) && Date.now() - cachedStatusTime < 30_000;
+
+      if (forceRefresh || !statusCacheFresh) {
+        purchaseReceiveStatuses = await fetchPurchaseReceiveVoucherStatuses(account);
+        await savePurchaseReceiveVoucherStatusesCache(account.key, purchaseReceiveStatuses);
+      }
+
+      const normalizedVoucherCode = voucherCode.trim().toUpperCase();
+      const audited = purchaseReceiveStatuses.some(
+        (status) =>
+          status.status === 'audited' &&
+          status.voucherCode.trim().toUpperCase() === normalizedVoucherCode
+      );
+      if (audited) {
+        throw new Error(`${voucherCode} 已在ERP审核，不再允许扫码入库`);
+      }
+    },
+    []
+  );
+
+  const loadSelectedErpVoucher = useCallback(async (
+    options: { forceRefresh?: boolean } = {}
+  ): Promise<PurchaseReceiveVoucher> => {
+    if (!selectedVoucherCode || !selectedAccountKey) {
+      setActiveErpVoucher(null);
+      setErpVoucherLoading(false);
+      const message = '请先从采购入库列表选择ERP单据';
+      setErpVoucherError(message);
+      throw new Error(message);
+    }
+
+    const account = getErpAccountByKey(selectedAccountKey);
+    if (!account) {
+      throw new Error('未找到采购入库单所属账套');
+    }
+
+    setErpVoucherLoading(true);
+    setErpVoucherError('');
+    try {
+      try {
+        await assertPurchaseReceiveUnaudited(
+          account,
+          selectedVoucherCode,
+          options.forceRefresh
+        );
+      } catch (statusError) {
+        if (statusError instanceof Error && statusError.message.includes('已在ERP审核')) {
+          throw statusError;
+        }
+        logger.warn('[扫码入库] 审核消息状态读取失败:', statusError);
+        throw new Error('无法确认ERP审核状态，请检查网络后重试');
+      }
+
+      const existingRecords = await getInboundRecordsByNo(selectedVoucherCode);
+      const alreadyCompleted = existingRecords.some(
+        (record) => (record.warehouse_name || '').trim() === account.expectedWarehouseName
+      );
+      if (alreadyCompleted) {
+        throw new Error(
+          `${selectedVoucherCode} 已在本机完成入库，请到单据管理查看，不能重复扫码`
+        );
+      }
+
+      const cached = options.forceRefresh
+        ? null
+        : await loadCachedPurchaseReceiveVoucher(account.key, selectedVoucherCode);
+      const voucher =
+        cached?.data ||
+        (await fetchPurchaseReceiveVoucher(account, selectedVoucherCode, {
+          bypassCache: options.forceRefresh,
+        }));
+      if (!cached) {
+        await savePurchaseReceiveVoucherCache(voucher);
+      }
+      setActiveErpVoucher(voucher);
+      return voucher;
+    } catch (error) {
+      setActiveErpVoucher(null);
+      setErpVoucherError(
+        formatUserFacingErrorMessage(error, '采购入库单加载失败，请稍后重试')
+      );
+      throw error;
+    } finally {
+      setErpVoucherLoading(false);
+    }
+  }, [
+    assertPurchaseReceiveUnaudited,
+    selectedAccountKey,
+    selectedVoucherCode,
+    setActiveErpVoucher,
+  ]);
+
+  const handleRefreshErpVoucher = useCallback(async () => {
+    if (!selectedVoucherCode || !selectedAccountKey || erpVoucherLoading || saving) {
+      focusScannerInput(0);
+      return;
+    }
+
+    try {
+      const voucher = await loadSelectedErpVoucher({ forceRefresh: true });
+      if (
+        currentWarehouse &&
+        voucher.warehouseName.trim() !== currentWarehouse.name.trim()
+      ) {
+        const message = `ERP仓库已变更为 ${voucher.warehouseName || '-'}，请返回列表后重新进入单据`;
+        setActiveErpVoucher(null);
+        setErpVoucherError(message);
+        throw new Error(message);
+      }
+      setCurrentSupplier(voucher.partnerName || null);
+      setInboundNo(voucher.code);
+      showToast('ERP采购入库单已刷新', 'success');
+    } catch (error) {
+      showToast(formatUserFacingErrorMessage(error, 'ERP刷新失败，请稍后重试'), 'warning');
+    } finally {
+      focusScannerInput(100);
+    }
+  }, [
+    currentWarehouse,
+    erpVoucherLoading,
+    focusScannerInput,
+    loadSelectedErpVoucher,
+    saving,
+    selectedAccountKey,
+    selectedVoucherCode,
+    setActiveErpVoucher,
+    showToast,
+  ]);
 
   // 页面聚焦时初始化和恢复数据
   useFocusEffect(
@@ -433,46 +688,51 @@ export default function InboundScreen() {
       screenActiveRef.current = true;
       let isActive = true;
       const init = async () => {
-        // 1. 加载仓库列表（数据库已在 APP 启动时初始化）
-        const list = await getAllWarehouses();
-        setWarehouses(list);
+        try {
+          // 1. 加载仓库列表（数据库已在 APP 启动时初始化）
+          const list = await getAllWarehouses();
 
-        // 2. 恢复之前选择的仓库，并等待状态更新
-        let warehouse: Warehouse | null = null;
-        const savedWarehouse = await AsyncStorage.getItem(GLOBAL_WAREHOUSE_KEY);
-        if (savedWarehouse) {
-          const saved = safeJsonParseNullable<Warehouse>(savedWarehouse, 'inbound.globalWarehouse');
-          // 确保仓库仍然存在
-          const latestWarehouse = saved ? list.find(w => w.id === saved.id) : null;
-          if (latestWarehouse) {
-            warehouse = latestWarehouse;
-            await AsyncStorage.setItem(GLOBAL_WAREHOUSE_KEY, JSON.stringify(latestWarehouse));
+          const selectedVoucher = await loadSelectedErpVoucher();
+
+          // 2. 恢复之前选择的仓库，并等待状态更新
+          const warehouse =
+            list.find((item) => item.name === selectedVoucher.warehouseName) || null;
+          if (!warehouse) {
+            throw new Error(`本地仓库中未找到ERP仓库：${selectedVoucher.warehouseName || '-'}`);
+          }
+          setInboundNo(selectedVoucher.code);
+          setCurrentSupplier(selectedVoucher.partnerName || null);
+
+          // 3. 设置当前仓库并等待状态更新
+          setCurrentWarehouse(warehouse);
+
+          // 4. 加载扫描记录（直接传入 warehouse 参数，避免状态闭包问题）
+          const restoredInboundNo = await loadScanRecords(
+            warehouse,
+            selectedVoucher.code,
+            selectedVoucher.partnerName
+          );
+
+          // 5. 如果没有入库单号，生成新单号
+          setInboundNo(restoredInboundNo || selectedVoucher.code);
+          setCurrentSupplier(selectedVoucher.partnerName || null);
+
+          // 7. 聚焦输入框
+          if (isActive) {
+            focusScannerInput(100);
+          }
+        } catch (error) {
+          logger.error('[扫码入库] 初始化失败:', error);
+          if (isActive) {
+            showToast(
+              formatUserFacingErrorMessage(error, '入库页面初始化失败，请稍后重试'),
+              'error'
+            );
+            focusScannerInput(300);
           }
         }
-
-        // 没有保存的选择，使用默认仓库
-        if (!warehouse) {
-          const def = await getDefaultWarehouse();
-          warehouse = def || list[0] || null;
-        }
-
-        // 3. 设置当前仓库并等待状态更新
-        setCurrentWarehouse(warehouse);
-
-        // 4. 加载扫描记录（直接传入 warehouse 参数，避免状态闭包问题）
-        const restoredInboundNo = await loadScanRecords(warehouse);
-
-        // 5. 如果没有入库单号，生成新单号
-        if (!restoredInboundNo) {
-          await generateNo();
-        }
-
-        // 7. 聚焦输入框
-        if (isActive) {
-          focusScannerInput(100);
-        }
       };
-      init();
+      void init();
 
       return () => {
         isActive = false;
@@ -490,41 +750,8 @@ export default function InboundScreen() {
           postProcessTimerRef.current = null;
         }
       };
-    }, [focusScannerInput])
+    }, [focusScannerInput, loadScanRecords, loadSelectedErpVoucher, showToast])
   );
-
-  // 加载仓库
-  // 切换仓库
-  const handleWarehouseChange = async (warehouse: Warehouse) => {
-    // 先 flush 缓冲中的记录，再保存当前仓库的扫码记录
-    flushPendingRecords();
-    if (scanRecordsRef.current.length > 0) {
-      await saveScanRecords(scanRecordsRef.current);
-    }
-
-    // 切换仓库
-    setCurrentWarehouse(warehouse);
-    await AsyncStorage.setItem(GLOBAL_WAREHOUSE_KEY, JSON.stringify(warehouse));
-
-    // 先重置界面状态，再恢复新仓库自己的暂存
-    pendingRecordsRef.current = [];
-    scanRecordsRef.current = [];
-    setScanRecords([]);
-    setCurrentSupplier(null);
-    setInboundNo('');
-
-    // 清空展开和确认状态（同步 ref）
-    expandedGroupsRef.current = new Set();
-    confirmedGroupsRef.current = new Set();
-    setExpandedGroups(new Set());
-    setConfirmedGroups(new Set());
-
-    const restoredInboundNo = await loadScanRecords(warehouse);
-
-    if (!restoredInboundNo) {
-      await generateNo();
-    }
-  };
 
   // 批量 flush 缓冲的扫码记录到 state
   const flushPendingRecords = useCallback((): ScanRecord[] => {
@@ -542,240 +769,325 @@ export default function InboundScreen() {
     setScanRecords(merged);
     void saveScanRecords(merged, currentSupplier);
     return merged;
-  }, [currentSupplier]);
-
-  // 生成入库单号
-  const generateNo = async () => {
-    const no = await generateInboundNo();
-    setInboundNo(no);
-  };
+  }, [currentSupplier, saveScanRecords]);
 
   // 处理扫描（带参数版本，供自动触发调用）
-  const processScan = useCallback(async (code: string) => {
-    if (!code || processingRef.current) return;
+  const processScan = useCallback(
+    async (code: string) => {
+      if (!code || processingRef.current) return;
 
-    if (!currentWarehouse) {
-      showToast('请先选择仓库', 'error');
-      feedbackError();
-      return;
-    }
+      const activeErpVoucher = erpVoucherRef.current;
 
-    processingRef.current = true;
-    let parsed: {
-      model: string;
-      batch: string;
-      quantity: string;
-      package?: string;
-      version?: string;
-      productionDate?: string;
-      traceNo?: string;
-      sourceNo?: string;
-      customFields?: Record<string, string>;
-    } | null = null;
-
-    try {
-      // 解析二维码
-      try {
-        const rule = await detectRule(code);
-        logger.log('[扫码入库] 检测到规则:', { ruleName: rule?.name, ruleSeparator: rule?.separator, codeLength: code.length });
-        if (rule) {
-          const { standardFields, customFields } = parseWithRule(code, rule);
-          logger.log('[扫码入库] 解析结果:', { standardFields, customFieldsCount: Object.keys(customFields || {}).length });
-          parsed = {
-            model: standardFields.model || '',
-            batch: standardFields.batch || '',
-            quantity: standardFields.quantity || '1',
-            package: standardFields.package || '',
-            version: standardFields.version || '',
-            productionDate: standardFields.productionDate || '',
-            traceNo: standardFields.traceNo || '',
-            sourceNo: standardFields.sourceNo || '',
-            customFields: customFields || {},
-          };
-        } else {
-          logger.warn('[扫码入库] 未检测到匹配的解析规则');
-        }
-      } catch (e) {
-        logger.error('[扫码入库] 规则解析失败:', e);
-        showToast(`解析规则异常：${e instanceof Error ? e.message : String(e)}`, 'error');
+      if (!activeErpVoucher) {
+        showToast('请先从采购入库列表选择ERP单据', 'warning');
+        feedbackWarning();
+        return;
       }
 
-      if (!parsed || !parsed.model) {
-        showToast(`未识别到物料信息\n内容: ${code.substring(0, 20)}${code.length > 20 ? '...' : ''}`, 'error');
+      if (!currentWarehouse) {
+        showToast('请先选择仓库', 'error');
         feedbackError();
-        logger.error('[扫码入库] 无法识别物料信息:', { code, parsed, parsedModel: parsed?.model });
         return;
       }
 
-      const parsedRecord = parsed;
-      const quantity = parseQuantity(parsedRecord.quantity, { min: 1 });
+      processingRef.current = true;
+      let parsed: {
+        model: string;
+        batch: string;
+        quantity: string;
+        package?: string;
+        version?: string;
+        productionDate?: string;
+        traceNo?: string;
+        sourceNo?: string;
+        customFields?: Record<string, string>;
+        ruleId?: string;
+        ruleName?: string;
+      } | null = null;
 
-      if (quantity === null) {
-        logger.warn('[扫码入库] 忽略数量字段无效的扫码内容:', {
-          code,
-          quantity: parsedRecord.quantity,
-          model: parsedRecord.model,
-        });
-        return;
-      }
-
-      // 查找存货编码和供应商
-      const inventoryCode = await getInventoryCodeByModel(parsedRecord.model);
-      const supplier = await getSupplierByModel(parsedRecord.model);
-
-      logger.log('[扫码入库] 查询结果:', {
-        model: parsedRecord.model,
-        inventoryCode,
-        supplier,
-        currentSupplier,
-      });
-
-      // 检查供应商一致性（仅警告，不阻止入库）
-      if (supplier && currentSupplier && supplier !== currentSupplier) {
-        logger.warn('[扫码入库] 供应商不一致:', {
-          currentSupplier,
-          newSupplier: supplier,
-          model: parsedRecord.model,
-        });
-        // 改为警告提示，不阻止入库
-        showToast(`供应商不一致\n当前: ${currentSupplier}\n本次: ${supplier}`, 'warning');
-        // 继续处理，不 return
-      }
-
-      // 首次扫描时设置供应商
-      if (!currentSupplier && supplier) {
-        setCurrentSupplier(supplier);
-      }
-
-      // 检查是否重复扫描（只检测追溯码，因为箱号可能重复）
-      let isDuplicate = false;
-
-      // 根据追溯码判断（已保存的记录 + 缓冲中未 flush 的记录）
-      if (parsedRecord.traceNo) {
-        const allCurrentRecords = [...pendingRecordsRef.current, ...scanRecordsRef.current];
-        const existing = allCurrentRecords.find(r => r.traceNo === parsedRecord.traceNo);
-        if (existing) {
-          isDuplicate = true;
+      try {
+        // 解析二维码
+        try {
+          const rule = await detectRule(code);
+          logger.log('[扫码入库] 检测到规则:', {
+            ruleName: rule?.name,
+            ruleSeparator: rule?.separator,
+            codeLength: code.length,
+          });
+          if (rule) {
+            const { standardFields, customFields } = parseWithRule(code, rule);
+            logger.log('[扫码入库] 解析结果:', {
+              standardFields,
+              customFieldsCount: Object.keys(customFields || {}).length,
+            });
+            parsed = {
+              model: standardFields.model || '',
+              batch: standardFields.batch || '',
+              quantity: standardFields.quantity || '',
+              package: standardFields.package || '',
+              version: standardFields.version || '',
+              productionDate: standardFields.productionDate || '',
+              traceNo: standardFields.traceNo || '',
+              sourceNo: standardFields.sourceNo || '',
+              customFields: customFields || {},
+              ruleId: rule.id,
+              ruleName: rule.name,
+            };
+          } else {
+            logger.warn('[扫码入库] 未检测到匹配的解析规则');
+            if (!isQRCode(code)) {
+              return;
+            }
+            showToast('没有匹配的二维码解析规则，请先在设置中配置', 'error');
+            feedbackError();
+            return;
+          }
+        } catch (e) {
+          logger.error('[扫码入库] 规则解析失败:', e);
+          throw e;
         }
-      }
 
-      if (isDuplicate) {
-        showToast('已扫过此追溯码', 'warning');
-        feedbackDuplicate();
-        return;
-      }
-
-      // 新增记录（保存原始记录，不合并数量）——先放入缓冲队列，批量 flush 到 UI
-      const newRecord: ScanRecord = {
-        id: generateId(),
-        model: parsedRecord.model,
-        batch: parsedRecord.batch,
-        quantity,
-        scanTime: formatDateTime(new Date().toISOString()),
-        rawContent: code,
-        inventoryCode: inventoryCode || undefined,
-        supplier: supplier || undefined,
-        // 扩展字段
-        package: parsedRecord.package || undefined,
-        version: parsedRecord.version || undefined,
-        productionDate: parsedRecord.productionDate || undefined,
-        traceNo: parsedRecord.traceNo || undefined,
-        sourceNo: parsedRecord.sourceNo || undefined,
-        // 自定义字段
-        customFields: parsedRecord.customFields,
-      };
-      pendingRecordsRef.current.push(newRecord);
-      void saveScanRecords(
-        [...pendingRecordsRef.current, ...scanRecordsRef.current],
-        supplier || currentSupplier
-      );
-      showToast(`已扫码：${parsedRecord.model}`, 'success');
-      feedbackSuccess();
-    } catch (e) {
-      logger.error('[扫码入库] 处理失败:', e);
-      const errorMessage = e instanceof Error ? e.message : String(e);
-      logger.error('[扫码入库] 错误详情:', {
-        code,
-        codeLength: code.length,
-        parsed,
-        processingRef: processingRef.current,
-        scanQueueLength: scanQueueRef.current.length,
-      });
-      showToast(`解析失败：${errorMessage}\n长度: ${code.length}`, 'error');
-      feedbackError();
-    } finally {
-      processingRef.current = false;
-      // 处理完成后，检查队列是否有待处理的扫码
-      // 注意：使用 setTimeout 让 React 有机会更新状态，避免重复检测失败
-      if (postProcessTimerRef.current) {
-        clearTimeout(postProcessTimerRef.current);
-      }
-      postProcessTimerRef.current = setTimeout(() => {
-        postProcessTimerRef.current = null;
-        if (!screenActiveRef.current) {
+        if (!parsed || !parsed.model) {
+          showToast(
+            `未识别到物料信息\n内容: ${code.substring(0, 20)}${code.length > 20 ? '...' : ''}`,
+            'error'
+          );
+          feedbackError();
+          logger.error('[扫码入库] 无法识别物料信息:', {
+            code,
+            parsed,
+            parsedModel: parsed?.model,
+          });
           return;
         }
-        if (scanQueueRef.current.length > 0) {
-          logger.log('[扫码入库] 队列中有待处理扫码:', scanQueueRef.current.length);
-          const nextCode = scanQueueRef.current.shift();
-          if (nextCode) {
-            processScan(nextCode);
-          }
-        } else {
-          // 队列空了，启动 flush timer 批量刷新 UI
-          if (!flushTimerRef.current) {
-            flushTimerRef.current = setTimeout(() => {
-              flushTimerRef.current = null;
-              flushPendingRecords();
-            }, 200);
-          }
-          // 短暂延迟后聚焦，等待 flush 完成
-          focusScannerInput(50);
+
+        const parsedRecord = parsed;
+        const normalizedModel = normalizeInboundModel(parsedRecord.model);
+        const normalizedVersion = normalizeInboundVersion(parsedRecord.version);
+        if (!normalizedModel) {
+          showToast('未识别到型号信息', 'error');
+          feedbackError();
+          return;
         }
-      }, 0);
-    }
-  }, [currentWarehouse, currentSupplier, focusScannerInput]);
+        const quantity = parseQuantity(parsedRecord.quantity, { min: 1 });
+
+        if (quantity === null) {
+          logger.warn('[扫码入库] 忽略数量字段无效的扫码内容:', {
+            code,
+            quantity: parsedRecord.quantity,
+            model: parsedRecord.model,
+          });
+          showToast('二维码数量无效，请重新扫描', 'error');
+          feedbackError();
+          return;
+        }
+
+        // ERP 单据是入库供应商的唯一来源；物料绑定只负责型号到存货编码的映射。
+        const inventoryCode = await getInventoryCodeByModel(
+          normalizedModel,
+          normalizedVersion
+        );
+        const normalizedInventoryCode = normalizeInventoryCode(inventoryCode);
+        const inventoryCodeMatchKey = getInventoryCodeMatchKey(inventoryCode);
+
+        logger.log('[扫码入库] 查询结果:', {
+          model: normalizedModel,
+          inventoryCode,
+          currentSupplier,
+        });
+
+        if (activeErpVoucher) {
+          if (!inventoryCodeMatchKey) {
+            showToast(
+              `未绑定存货编码：${normalizedModel}${normalizedVersion ? ` / ${normalizedVersion}` : ''}`,
+              'error'
+            );
+            feedbackNotBound();
+            return;
+          }
+
+          const matchedLine = activeErpVoucher.lines.find(
+            (line) => getInventoryCodeMatchKey(line.inventoryCode) === inventoryCodeMatchKey
+          );
+          const requiredQuantity = activeErpVoucher.lines.reduce(
+            (sum, line) =>
+              getInventoryCodeMatchKey(line.inventoryCode) === inventoryCodeMatchKey
+                ? sum + line.quantity
+                : sum,
+            0
+          );
+
+          if (!matchedLine || requiredQuantity <= 0) {
+            showToast(
+              `不在ERP采购入库单：${normalizedModel}${normalizedVersion ? ` / ${normalizedVersion}` : ''}`,
+              'error'
+            );
+            feedbackNotInOrder();
+            return;
+          }
+
+          const scannedQuantity = [...pendingRecordsRef.current, ...scanRecordsRef.current].reduce(
+            (sum, record) =>
+              getInventoryCodeMatchKey(record.inventoryCode) === inventoryCodeMatchKey
+                ? sum + record.quantity
+                : sum,
+            0
+          );
+          if (scannedQuantity + quantity > requiredQuantity) {
+            const remainingQuantity = Math.max(0, requiredQuantity - scannedQuantity);
+            showToast(
+              remainingQuantity > 0
+                ? `超出本单数量：最多还可入 ${remainingQuantity.toLocaleString()}`
+                : `本物料已扫够：${matchedLine.specification || normalizedModel}`,
+              'warning'
+            );
+            feedbackOverQuantity();
+            return;
+          }
+        }
+
+        // 检查是否重复扫描（只检测追溯码，因为箱号可能重复）
+        let isDuplicate = false;
+
+        // 根据追溯码判断（已保存的记录 + 缓冲中未 flush 的记录）
+        if (parsedRecord.traceNo) {
+          const allCurrentRecords = [...pendingRecordsRef.current, ...scanRecordsRef.current];
+          const existing = allCurrentRecords.find((r) => r.traceNo === parsedRecord.traceNo);
+          if (existing) {
+            isDuplicate = true;
+          }
+        }
+
+        if (isDuplicate) {
+          showToast('已扫过此追溯码', 'warning');
+          feedbackDuplicate();
+          return;
+        }
+
+        // 新增记录（保存原始记录，不合并数量）——先放入缓冲队列，批量 flush 到 UI
+        const newRecord: ScanRecord = {
+          id: generateId(),
+          model: normalizedModel,
+          batch: parsedRecord.batch,
+          quantity,
+          scanTime: formatDateTime(new Date().toISOString()),
+          rawContent: code,
+          inventoryCode: normalizedInventoryCode || undefined,
+          supplier: activeErpVoucher.partnerName || undefined,
+          ruleId: parsedRecord.ruleId,
+          ruleName: parsedRecord.ruleName,
+          // 扩展字段
+          package: parsedRecord.package || undefined,
+          version: normalizedVersion || undefined,
+          productionDate: parsedRecord.productionDate || undefined,
+          traceNo: parsedRecord.traceNo || undefined,
+          sourceNo: parsedRecord.sourceNo || undefined,
+          // 占位字段解析值
+          customFields: parsedRecord.customFields,
+        };
+        pendingRecordsRef.current.push(newRecord);
+        void saveScanRecords(
+          [...pendingRecordsRef.current, ...scanRecordsRef.current],
+          activeErpVoucher.partnerName || currentSupplier
+        );
+        showToast(`已扫码：${normalizedModel}`, 'success');
+        feedbackSuccess();
+      } catch (e) {
+        logger.error('[扫码入库] 处理失败:', e);
+        const errorMessage = formatUserFacingErrorMessage(e, '二维码解析失败，请检查标签内容');
+        logger.error('[扫码入库] 错误详情:', {
+          code,
+          codeLength: code.length,
+          parsed,
+          processingRef: processingRef.current,
+          scanQueueLength: scanQueueRef.current.length,
+        });
+        showToast(`解析失败：${errorMessage}\n长度: ${code.length}`, 'error');
+        feedbackError();
+      } finally {
+        processingRef.current = false;
+        // 处理完成后，检查队列是否有待处理的扫码
+        // 注意：使用 setTimeout 让 React 有机会更新状态，避免重复检测失败
+        if (postProcessTimerRef.current) {
+          clearTimeout(postProcessTimerRef.current);
+        }
+        postProcessTimerRef.current = setTimeout(() => {
+          postProcessTimerRef.current = null;
+          if (!screenActiveRef.current) {
+            return;
+          }
+          if (scanQueueRef.current.length > 0) {
+            logger.log('[扫码入库] 队列中有待处理扫码:', scanQueueRef.current.length);
+            const nextCode = scanQueueRef.current.shift();
+            if (nextCode) {
+              processScanRef.current(nextCode);
+            }
+          } else {
+            // 队列空了，启动 flush timer 批量刷新 UI
+            if (!flushTimerRef.current) {
+              flushTimerRef.current = setTimeout(() => {
+                flushTimerRef.current = null;
+                flushPendingRecords();
+              }, 200);
+            }
+            // 短暂延迟后聚焦，等待 flush 完成
+            focusScannerInput(50);
+          }
+        }, 0);
+      }
+    },
+    [
+      currentSupplier,
+      currentWarehouse,
+      flushPendingRecords,
+      focusScannerInput,
+      saveScanRecords,
+      showToast,
+    ]
+  );
+
+  const processScanRef = useRef(processScan);
+  useEffect(() => {
+    processScanRef.current = processScan;
+  }, [processScan]);
 
   // 输入变化时自动检测并触发（扫码器逐字符输入，需要防抖检测完成）
-  const handleInputChange = useCallback((text: string) => {
-    // 清除之前的定时器（每次输入都重置）
-    if (autoSubmitTimerRef.current) {
-      clearTimeout(autoSubmitTimerRef.current);
-      autoSubmitTimerRef.current = null;
-    }
-
-    // 如果当前有输入内容，启动定时器检测扫码完成
-    if (text.length > 0) {
-      autoSubmitTimerRef.current = setTimeout(() => {
+  const handleInputChange = useCallback(
+    (text: string) => {
+      // 清除之前的定时器（每次输入都重置）
+      if (autoSubmitTimerRef.current) {
+        clearTimeout(autoSubmitTimerRef.current);
         autoSubmitTimerRef.current = null;
-        const code = sanitizeCompactScannerInput(text);
-        // 检测到输入完成（输入停止超过阈值，认为扫码完成）
-        if (code.length >= 1) {
-          // 一维码过滤：不含分隔符的扫码静默忽略
-          if (!isQRCode(code)) {
-            setInputValue(''); // 清空输入框
-            focusScannerInput(0);
-            return;
-          }
-          if (!shouldAcceptScanCode(code)) {
-            setInputValue('');
-            focusScannerInput(0);
-            return;
-          }
-          setInputValue(''); // 清空输入框
-          if (processingRef.current) {
-            scanQueueRef.current.push(code);
-            return;
-          }
-          processScan(code);
-        }
-      }, 150); // 150ms 防抖，等待扫码器输入完成
-      return;
-    }
+      }
 
-    // 输入框被清空时，更新状态
-    setInputValue(text);
-  }, [focusScannerInput, processScan, shouldAcceptScanCode]);
+      // TextInput 是受控组件，非空内容也必须立即入状态，避免逐字符扫码被重渲染清空。
+      setInputValue(text);
+
+      // 如果当前有输入内容，启动定时器检测扫码完成
+      if (text.length > 0) {
+        autoSubmitTimerRef.current = setTimeout(() => {
+          autoSubmitTimerRef.current = null;
+          const code = sanitizeStructuredScannerInput(text);
+          // 检测到输入完成（输入停止超过阈值，认为扫码完成）
+          if (code.length >= 1) {
+            if (!shouldAcceptScanCode(code)) {
+              setInputValue('');
+              focusScannerInput(0);
+              return;
+            }
+            setInputValue(''); // 清空输入框
+            if (processingRef.current) {
+              scanQueueRef.current.push(code);
+              return;
+            }
+            processScan(code);
+          }
+        }, 150); // 150ms 防抖，等待扫码器输入完成
+        return;
+      }
+    },
+    [focusScannerInput, processScan, shouldAcceptScanCode]
+  );
 
   // 扫码完成确认（焦点录入模式：用户手动按回车）
   const handleSubmitEditing = useCallback(() => {
@@ -784,16 +1096,9 @@ export default function InboundScreen() {
       autoSubmitTimerRef.current = null;
     }
 
-    const code = sanitizeCompactScannerInput(inputValue);
+    const code = sanitizeStructuredScannerInput(inputValue);
 
     if (!code) return;
-
-    // 一维码过滤：不含分隔符的扫码静默忽略
-    if (!isQRCode(code)) {
-      setInputValue('');
-      focusScannerInput(0);
-      return;
-    }
 
     if (!shouldAcceptScanCode(code)) {
       setInputValue('');
@@ -809,21 +1114,6 @@ export default function InboundScreen() {
 
     processScan(code);
   }, [focusScannerInput, inputValue, processScan, shouldAcceptScanCode]);
-
-  // 选择仓库
-  const selectWarehouse = async (wh: Warehouse) => {
-    // 如果选择的是当前仓库，直接关闭弹窗
-    if (wh.id === currentWarehouse?.id) {
-      setShowWarehousePicker(false);
-      return;
-    }
-
-    // 切换到新仓库
-    await handleWarehouseChange(wh);
-    setShowWarehousePicker(false);
-    showToast(`仓库已切换：${wh.name}`, 'success');
-    focusScannerInput(100);
-  };
 
   const syncInboundSnapshot = async (
     records: InboundExportRecord[],
@@ -860,50 +1150,125 @@ export default function InboundScreen() {
 
   // 确认入库
   const handleSaveInbound = async () => {
+    if (saveInProgressRef.current) {
+      return;
+    }
     if (!currentWarehouse) {
       showToast('请先选择仓库', 'warning');
       feedbackWarning();
       return;
     }
-    const recordsSnapshot = flushPendingRecords();
-    if (recordsSnapshot.length === 0) {
-      showToast('暂无扫描记录', 'warning');
-      feedbackWarning();
-      return;
-    }
 
-    // 数据库级 traceNo 重复检测
-    const traceNoRecords = recordsSnapshot.filter(r => r.traceNo && r.traceNo.trim());
-    if (traceNoRecords.length > 0) {
-      const uniqueTraceNos = [...new Set(traceNoRecords.map(r => r.traceNo!.trim()))];
-      const checkResults = await Promise.all(
-        uniqueTraceNos.map(async (traceNo) => ({
-          traceNo,
-          exists: await checkInboundTraceNoExists(traceNo),
-        }))
-      );
-      const duplicates = checkResults.filter(r => r.exists).map(r => r.traceNo);
-      if (duplicates.length > 0) {
-        alert.showAlert(
-          '重复追踪码',
-          `以下追踪码已存在于数据库中，无法重复入库：\n${duplicates.join('\n')}`,
-          [{ text: '确定' }],
-          'warning',
-        );
+    saveInProgressRef.current = true;
+    setSaving(true);
+    try {
+      const recordsSnapshot = flushPendingRecords();
+      if (recordsSnapshot.length === 0) {
+        showToast('暂无扫描记录', 'warning');
         feedbackWarning();
         return;
       }
-    }
 
-    setSaving(true);
-    try {
+      const activeErpVoucher = erpVoucherRef.current;
+      if (activeErpVoucher) {
+        const account = selectedAccountKey ? getErpAccountByKey(selectedAccountKey) : null;
+        if (!account) {
+          showToast('未找到采购入库单所属账套', 'error');
+          feedbackError();
+          return;
+        }
+
+        let verifiedErpVoucher = activeErpVoucher;
+        try {
+          await assertPurchaseReceiveUnaudited(account, activeErpVoucher.code, true);
+          verifiedErpVoucher = await fetchPurchaseReceiveVoucher(account, activeErpVoucher.code, {
+            bypassCache: true,
+          });
+          if (verifiedErpVoucher.warehouseName.trim() !== currentWarehouse.name.trim()) {
+            const message = `ERP仓库已变更为 ${verifiedErpVoucher.warehouseName || '-'}，请返回列表后重新进入单据`;
+            setActiveErpVoucher(null);
+            setErpVoucherError(message);
+            throw new Error(message);
+          }
+          await savePurchaseReceiveVoucherCache(verifiedErpVoucher);
+          setActiveErpVoucher(verifiedErpVoucher);
+        } catch (error) {
+          showToast(
+            formatUserFacingErrorMessage(
+              error,
+              '无法确认ERP单据最新状态，请稍后重试'
+            ),
+            'warning'
+          );
+          feedbackWarning();
+          return;
+        }
+
+        const requiredByInventoryCode = new Map<string, number>();
+        verifiedErpVoucher.lines.forEach((line) => {
+          const inventoryCode = getInventoryCodeMatchKey(line.inventoryCode);
+          requiredByInventoryCode.set(
+            inventoryCode,
+            (requiredByInventoryCode.get(inventoryCode) || 0) + line.quantity
+          );
+        });
+        const scannedByInventoryCode = new Map<string, number>();
+        recordsSnapshot.forEach((record) => {
+          const inventoryCode = getInventoryCodeMatchKey(record.inventoryCode);
+          scannedByInventoryCode.set(
+            inventoryCode,
+            (scannedByInventoryCode.get(inventoryCode) || 0) + record.quantity
+          );
+        });
+        const comparedInventoryCodes = new Set([
+          ...requiredByInventoryCode.keys(),
+          ...scannedByInventoryCode.keys(),
+        ]);
+        const incompleteCount = Array.from(comparedInventoryCodes).filter(
+          (inventoryCode) =>
+            (scannedByInventoryCode.get(inventoryCode) || 0) !==
+            (requiredByInventoryCode.get(inventoryCode) || 0)
+        ).length;
+
+        if (incompleteCount > 0) {
+          showToast(`有 ${incompleteCount} 项数量与ERP最新明细不一致`, 'warning');
+          feedbackWarning();
+          return;
+        }
+      }
+
+      // 数据库级 traceNo 重复检测
+      const traceNoRecords = recordsSnapshot.filter((r) => r.traceNo && r.traceNo.trim());
+      if (traceNoRecords.length > 0) {
+        const uniqueTraceNos = [...new Set(traceNoRecords.map((r) => r.traceNo!.trim()))];
+        const currentDraftRecordIds = recordsSnapshot.map((record) => record.id).filter(Boolean);
+        const checkResults = await Promise.all(
+          uniqueTraceNos.map(async (traceNo) => ({
+            traceNo,
+            exists: await checkInboundTraceNoExists(traceNo, undefined, currentDraftRecordIds),
+          }))
+        );
+        const duplicates = checkResults.filter((r) => r.exists).map((r) => r.traceNo);
+        if (duplicates.length > 0) {
+          alert.showAlert(
+            '重复追踪码',
+            `以下追踪码已存在于数据库中，无法重复入库：\n${duplicates.join('\n')}`,
+            [{ text: '确定' }],
+            'warning'
+          );
+          feedbackWarning();
+          return;
+        }
+      }
+
       const today = formatDate(new Date().toISOString());
       const createdAt = getISODateTime();
 
-      const recordsToSave: any[] = [];
+      const recordsToSave: Parameters<typeof addInboundRecordsBatch>[0] = [];
       const exportRecords: InboundExportRecord[] = [];
       for (const record of recordsSnapshot) {
         const base = {
+          id: record.id,
           inbound_no: inboundNo,
           warehouse_id: currentWarehouse.id,
           warehouse_name: currentWarehouse.name,
@@ -920,6 +1285,8 @@ export default function InboundScreen() {
           traceNo: record.traceNo || '',
           sourceNo: record.sourceNo || '',
           customFields: record.customFields,
+          rule_id: record.ruleId,
+          rule_name: record.ruleName,
         };
         recordsToSave.push(base);
         exportRecords.push({ ...base, created_at: createdAt });
@@ -933,6 +1300,14 @@ export default function InboundScreen() {
       });
 
       await addInboundRecordsBatch(recordsToSave);
+      let draftCleared = true;
+      try {
+        await clearScanRecords();
+      } catch (draftError) {
+        draftCleared = false;
+        logger.warn('[handleSaveInbound] 入库已保存，但草稿清理失败:', draftError);
+      }
+
       let syncResult: Awaited<ReturnType<typeof syncInboundSnapshot>> = {
         success: false,
         skipped: false,
@@ -985,43 +1360,69 @@ export default function InboundScreen() {
       } else {
         showToast(`入库已保存，共 ${savedCount} 条`, 'success');
       }
+      if (!draftCleared) {
+        showToast('入库已保存，但本机草稿未能清理；请勿重复提交本单', 'warning');
+      }
       feedbackInboundComplete();
 
       try {
-        await clearScanRecords();
-
-        // 更新入库汇总表（按型号+版本号+入库日期每日统计）
-        await updateInboundSummary(currentWarehouse.id);
-
-        await generateNo();
+        router.back();
       } catch (refreshError) {
         logger.error('[handleSaveInbound] 入库已保存，但刷新失败:', refreshError);
         showToast('入库已保存，但界面刷新失败，请重新进入页面确认', 'warning');
       }
     } catch (error) {
       logger.error('[handleSaveInbound] 保存失败:', error);
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorMessage = formatUserFacingErrorMessage(error, '入库保存失败，请稍后重试');
       showToast(`保存失败: ${errorMessage}`, 'error');
       feedbackError();
     } finally {
+      scannerFocusBlockedRef.current = false;
+      saveInProgressRef.current = false;
       setSaving(false);
+      focusScannerInput(120);
     }
   };
 
   // 清空记录
-  const handleClearRecords = () => {
-    if (scanRecords.length === 0 && pendingRecordsRef.current.length === 0) return;
+  const clearCurrentScanRecords = async () => {
+    if (saving || (scanRecords.length === 0 && pendingRecordsRef.current.length === 0)) return;
     if (flushTimerRef.current) {
       clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
     }
-    pendingRecordsRef.current = [];
-    scanRecordsRef.current = [];
-    setScanRecords([]);
-    setCurrentSupplier(null);
-    clearScanRecords();
-    showToast('记录已清空', 'warning');
-    feedbackClear();
+    try {
+      await clearScanRecords();
+      pendingRecordsRef.current = [];
+      scanRecordsRef.current = [];
+      setScanRecords([]);
+      confirmedGroupsRef.current = new Set();
+      expandedGroupsRef.current = new Set();
+      setConfirmedGroups(new Set());
+      setExpandedGroups(new Set());
+      setCurrentSupplier(erpVoucherRef.current?.partnerName || null);
+      showToast('本单扫码记录已清空', 'warning');
+      feedbackClear();
+    } catch (error) {
+      logger.error('清空扫描记录失败:', error);
+      showToast('清空失败，请重试', 'error');
+      feedbackError();
+    } finally {
+      focusScannerInput(100);
+    }
+  };
+
+  const handleClearRecords = () => {
+    if (saving || (scanRecords.length === 0 && pendingRecordsRef.current.length === 0)) return;
+
+    alert.showConfirm(
+      '清空本单扫码记录',
+      '只会清空本机尚未保存的扫码记录，不会修改 ERP 采购入库单。确定继续吗？',
+      () => {
+        void clearCurrentScanRecords();
+      },
+      true
+    );
   };
 
   // 切换展开/折叠
@@ -1049,21 +1450,30 @@ export default function InboundScreen() {
   }, []);
 
   // 删除单条记录
-  const handleDeleteRecord = useCallback((record: ScanRecord) => {
-    alert.showConfirm(
-      '确认删除',
-      '确定要删除这条记录吗？',
-      () => {
-        flushPendingRecords();
-        const updated = scanRecordsRef.current.filter(r => r.id !== record.id);
-        scanRecordsRef.current = updated;
-        setScanRecords(updated);
-        saveScanRecords(updated);
-        showToast('记录已删除', 'success');
-      },
-      true
-    );
-  }, [alert, flushPendingRecords, showToast]);
+  const handleDeleteRecord = useCallback(
+    (record: ScanRecord) => {
+      alert.showConfirm(
+        '确认删除',
+        '确定要删除这条记录吗？',
+        () => {
+          void (async () => {
+            const recordsSnapshot = flushPendingRecords();
+            const updated = recordsSnapshot.filter((r) => r.id !== record.id);
+            if (!(await saveScanRecords(updated))) {
+              showToast('删除失败，草稿未能保存，请重试', 'error');
+              feedbackError();
+              return;
+            }
+            scanRecordsRef.current = updated;
+            setScanRecords(updated);
+            showToast('记录已删除', 'success');
+          })();
+        },
+        true
+      );
+    },
+    [alert, flushPendingRecords, saveScanRecords, showToast]
+  );
 
   // 计算总数量
   const totalQuantity = scanRecords.reduce((sum, r) => sum + r.quantity, 0);
@@ -1071,227 +1481,495 @@ export default function InboundScreen() {
   // 计算已确认数量
   const confirmedCount = confirmedGroups.size;
   const currentInboundStep = scanRecords.length === 0 ? 'scan' : 'review';
-  const currentInboundPlaceholder =
-    currentInboundStep === 'scan' ? '持续扫描物料二维码' : '继续扫描或确认保存';
+  const currentInboundPlaceholder = erpVoucherLoading
+    ? '正在读取ERP采购入库单...'
+    : erpVoucherError
+      ? 'ERP采购入库单加载失败'
+      : currentInboundStep === 'scan'
+        ? '持续扫描物料二维码'
+        : '继续扫描或确认保存';
 
-  // 聚合扫描记录（按型号+版本号聚合，用于显示）
+  // 入库作业按型号聚合；不同版本保留在展开明细中，不重复计算型号数。
   const aggregatedRecords = useMemo(() => {
-    const map = new Map<string, { records: ScanRecord[], totalQuantity: number }>();
-    
-    scanRecords.forEach(record => {
-      const key = `${record.model}|${record.version || ''}`;
+    const map = new Map<
+      string,
+      { model: string; records: ScanRecord[]; totalQuantity: number }
+    >();
+
+    scanRecords.forEach((record) => {
+      const model = normalizeInboundModel(record.model);
+      const key = buildInboundModelKey(model);
       if (!map.has(key)) {
-        map.set(key, { records: [], totalQuantity: 0 });
+        map.set(key, { model, records: [], totalQuantity: 0 });
       }
       const group = map.get(key)!;
       group.records.push(record);
       group.totalQuantity += record.quantity;
     });
-    
-    return Array.from(map.entries())
-      .map(([key, group]) => {
-        const [model, version] = key.split('|');
+
+    return Array.from(map.values())
+      .map((group) => {
         const records = group.records.slice().sort((a, b) => b.id.localeCompare(a.id));
         return {
-          model,
-          version: version || '',
+          model: group.model,
+          version: '',
           records,
           totalQuantity: group.totalQuantity,
           count: group.records.length,
         };
       })
       .sort((a, b) => (b.records[0]?.id || '').localeCompare(a.records[0]?.id || ''));
-  }, [scanRecords]);
+  }, [scanRecords]) as InboundAggregatedRecord[];
+
+  const erpLineProgressItems = useMemo<InboundErpLineProgress[]>(() => {
+    if (!erpVoucher) {
+      return [];
+    }
+
+    const progressMap = new Map<string, InboundErpLineProgress>();
+    erpVoucher.lines.forEach((line) => {
+      const inventoryCode = getInventoryCodeMatchKey(line.inventoryCode);
+      const key = `erp-inbound:${inventoryCode || line.id}`;
+      const existing = progressMap.get(key);
+      if (existing) {
+        existing.requiredQuantity += line.quantity;
+        existing.remainingQuantity += line.quantity;
+        return;
+      }
+
+      progressMap.set(key, {
+        inventoryCode,
+        key,
+        remainingQuantity: line.quantity,
+        requiredQuantity: line.quantity,
+        scannedRecords: [],
+        scannedQuantity: 0,
+        specification: line.specification || line.inventoryName,
+        status: 'pending',
+        unitName: line.unitName || 'PCS',
+      });
+    });
+
+    progressMap.forEach((progress) => {
+      const scannedRecords = scanRecords.filter(
+        (record) => getInventoryCodeMatchKey(record.inventoryCode) === progress.inventoryCode
+      );
+      const scannedQuantity = scannedRecords.reduce((sum, record) => sum + record.quantity, 0);
+      progress.scannedRecords = scannedRecords;
+      progress.scannedQuantity = scannedQuantity;
+      progress.remainingQuantity = progress.requiredQuantity - scannedQuantity;
+      progress.status =
+        scannedQuantity === progress.requiredQuantity
+          ? 'complete'
+          : scannedQuantity > 0
+            ? 'partial'
+            : 'pending';
+    });
+
+    return Array.from(progressMap.values());
+  }, [erpVoucher, scanRecords]);
+
+  const erpCompletedLineCount = useMemo(
+    () => erpLineProgressItems.filter((line) => line.status === 'complete').length,
+    [erpLineProgressItems]
+  );
+  const incompleteErpLineCount = erpVoucher
+    ? Math.max(0, erpLineProgressItems.length - erpCompletedLineCount)
+    : 0;
+  const inboundReadyToSave = erpVoucher
+    ? erpLineProgressItems.length > 0 && incompleteErpLineCount === 0
+    : scanRecords.length > 0;
+  const inboundSaveLabel = inboundReadyToSave
+    ? '完成入库'
+    : `还差 ${incompleteErpLineCount} 项`;
 
   // 数据变化时自动保存到 AsyncStorage（实现持久化）
   useEffect(() => {
     // 当有扫描记录时自动保存
     if (scanRecords.length > 0) {
-      saveScanRecords(scanRecords, currentSupplier);
+      void saveScanRecords(scanRecords, currentSupplier);
       logger.log('[入库] 数据变化，自动保存记录:', scanRecords.length);
     }
-  }, [scanRecords, currentSupplier, currentWarehouse]);
+  }, [currentSupplier, saveScanRecords, scanRecords]);
 
   const inboundListState = useMemo(
     () => `${[...expandedGroups].join('|')}::${[...confirmedGroups].join('|')}`,
     [expandedGroups, confirmedGroups]
   );
 
-  const workflowMetrics = useMemo<WorkflowMetric[]>(() => {
-    const metrics: WorkflowMetric[] = [
-      {
-        key: 'supplier',
-        label: '供应商',
-        value: currentSupplier || '未设置',
-        tone: currentSupplier ? 'default' : 'warning',
-      },
-    ];
+  const workflowSummaryItems = useMemo(
+    () =>
+      erpVoucher
+        ? [
+            {
+              key: 'account',
+              label: '账套',
+              value: erpVoucher.accountName,
+              icon: 'layers' as const,
+              color: theme.success,
+            },
+            {
+              key: 'inboundNo',
+              label: '入库单号',
+              value: inboundNo || erpVoucher.code,
+              icon: 'file-text' as const,
+              color: theme.success,
+            },
+            {
+              key: 'supplier',
+              label: '供应商',
+              value: currentSupplier || erpVoucher.partnerName || 'ERP未返回',
+              icon: 'truck' as const,
+              color: currentSupplier || erpVoucher.partnerName ? theme.success : theme.warning,
+            },
+          ]
+        : [
+            {
+              key: 'warehouse',
+              label: '仓库',
+              value: currentWarehouse?.name || Str.labelSelectWarehouse,
+              icon: 'archive' as const,
+              color: theme.primary,
+            },
+            {
+              key: 'inboundNo',
+              label: '入库单号',
+              value: inboundNo || '首扫后生成',
+              icon: 'file-text' as const,
+              color: inboundNo ? theme.success : theme.textMuted,
+            },
+            {
+              key: 'supplier',
+              label: '供应商',
+              value: currentSupplier || '待识别',
+              icon: 'truck' as const,
+              color: currentSupplier ? theme.success : theme.warning,
+            },
+          ],
+    [
+      currentSupplier,
+      currentWarehouse?.name,
+      erpVoucher,
+      inboundNo,
+      theme.primary,
+      theme.success,
+      theme.textMuted,
+      theme.warning,
+    ]
+  );
 
-    return metrics;
-  }, [currentSupplier]);
+  const renderInboundLeading = useCallback(
+    (key: string) => {
+      const isConfirmed = confirmedGroupsRef.current.has(key);
 
-  const renderAggregatedRecord = useCallback(({ item }: { item: any }) => {
-    const key = `${item.model}|${item.version}`;
-    const isExpanded = expandedGroupsRef.current.has(key);
-    const isConfirmed = confirmedGroupsRef.current.has(key);
+      return (
+        <TouchableOpacity
+          style={styles.checkbox}
+          activeOpacity={0.7}
+          onPress={() => toggleConfirm(key)}
+        >
+          <FontAwesome6
+            name={isConfirmed ? 'square-check' : 'square'}
+            size={18}
+            color={isConfirmed ? theme.success : theme.textMuted}
+          />
+        </TouchableOpacity>
+      );
+    },
+    [styles.checkbox, theme.success, theme.textMuted, toggleConfirm]
+  );
 
-    return (
-      <RecordItem
-        item={item}
-        isExpanded={isExpanded}
-        isConfirmed={isConfirmed}
-        onToggle={toggleExpand}
-        onConfirm={toggleConfirm}
-        onDeleteRecord={handleDeleteRecord}
-        theme={theme}
-        styles={styles}
-      />
-    );
-  }, [handleDeleteRecord, styles, theme, toggleConfirm, toggleExpand]);
+  const renderInboundDetail = useCallback(
+    (record: ScanRecord) => (
+      <TouchableOpacity
+        key={record.id}
+        style={styles.detailItem}
+        onLongPress={() => handleDeleteRecord(record)}
+        delayLongPress={500}
+      >
+        <Text style={styles.detailText}>
+          版本: {record.version || '-'} | 批次: {record.batch || '-'} | 生产日期:{' '}
+          {record.productionDate || '-'} | 数量: {record.quantity}
+        </Text>
+      </TouchableOpacity>
+    ),
+    [handleDeleteRecord, styles.detailItem, styles.detailText]
+  );
+
+  const renderAggregatedRecord = useCallback(
+    ({ item }: { item: InboundAggregatedRecord }) => {
+      const key = `${item.model}|${item.version}`;
+      const isExpanded = expandedGroupsRef.current.has(key);
+      const isConfirmed = confirmedGroupsRef.current.has(key);
+
+      return (
+        <AggregatedRecordItem
+          groupKey={key}
+          model={item.model}
+          version={item.version}
+          totalQuantity={item.totalQuantity}
+          records={item.records}
+          isExpanded={isExpanded}
+          onToggle={toggleExpand}
+          recordSignatureFields={INBOUND_RECORD_SIGNATURE_FIELDS}
+          compareValues={[item.count, isConfirmed]}
+          containerStyle={styles.itemContainer}
+          rowStyle={[styles.itemRow, isConfirmed && styles.itemConfirmed]}
+          contentStyle={styles.modelContent}
+          titleStyle={[styles.itemModel, isConfirmed && styles.itemModelConfirmed]}
+          subtitleStyle={[styles.itemBatch, isConfirmed && styles.itemModelConfirmed]}
+          quantityStyle={[styles.itemQty, isConfirmed && styles.itemQtyConfirmed]}
+          detailsContainerStyle={styles.detailsContainer}
+          chevronColor={isConfirmed ? theme.success : theme.textPrimary}
+          toggleOnRowPress={false}
+          renderLeading={renderInboundLeading}
+          renderDetail={renderInboundDetail}
+        />
+      );
+    },
+    [
+      renderInboundDetail,
+      renderInboundLeading,
+      styles,
+      theme.success,
+      theme.textPrimary,
+      toggleExpand,
+    ]
+  );
+
+  const renderErpLineProgress = useCallback(
+    ({ item }: { item: InboundErpLineProgress }) => {
+      const isExpanded = expandedGroupsRef.current.has(item.key);
+      const progressRatio =
+        item.requiredQuantity > 0
+          ? Math.min(1, Math.max(0, item.scannedQuantity / item.requiredQuantity))
+          : 0;
+      const statusMeta =
+        item.status === 'complete'
+          ? { label: '完成', color: theme.success }
+          : item.status === 'partial'
+            ? { label: '进行中', color: theme.primary }
+            : { label: '待扫', color: theme.textMuted };
+
+      return (
+        <View style={styles.erpLineCard}>
+          <TouchableOpacity
+            style={styles.erpLineMain}
+            activeOpacity={0.76}
+            onPress={() => toggleExpand(item.key)}
+          >
+            <View style={styles.erpLineContent}>
+              <Text style={styles.erpLineCode} numberOfLines={2} ellipsizeMode="tail">
+                {item.specification || '物料明细'}
+              </Text>
+              <View style={styles.erpLineProgressTrack}>
+                <View
+                  style={[
+                    styles.erpLineProgressFill,
+                    { backgroundColor: statusMeta.color, flex: progressRatio },
+                  ]}
+                />
+                <View style={{ flex: 1 - progressRatio }} />
+              </View>
+              <View style={styles.erpLineMetaRow}>
+                <Text style={styles.erpLineMetaText}>
+                  应入 {item.requiredQuantity.toLocaleString()} / 已扫{' '}
+                  {item.scannedQuantity.toLocaleString()}
+                </Text>
+                <Text style={[styles.erpLineMetaText, { color: statusMeta.color }]}>
+                  剩余 {Math.max(0, item.remainingQuantity).toLocaleString()} · {statusMeta.label}
+                </Text>
+              </View>
+            </View>
+            <Feather
+              name={isExpanded ? 'chevron-up' : 'chevron-down'}
+              size={17}
+              color={theme.textMuted}
+            />
+          </TouchableOpacity>
+          {isExpanded ? (
+            <View style={styles.erpLineDetails}>
+              {item.scannedRecords.length > 0 ? (
+                item.scannedRecords.map((record) => (
+                  <TouchableOpacity
+                    key={record.id}
+                    style={styles.erpLineDetailItem}
+                    activeOpacity={0.76}
+                    onLongPress={() => handleDeleteRecord(record)}
+                    delayLongPress={500}
+                  >
+                    <Text style={styles.detailText}>
+                      {record.model}{record.version ? ` / ${record.version}` : ''} · 数量{' '}
+                      {record.quantity.toLocaleString()}
+                    </Text>
+                    <Text style={styles.detailText}>
+                      批次: {record.batch || '-'} | 追溯码: {record.traceNo || '-'}
+                    </Text>
+                  </TouchableOpacity>
+                ))
+              ) : (
+                <Text style={styles.erpLineEmptyText}>尚未扫描本物料</Text>
+              )}
+            </View>
+          ) : null}
+        </View>
+      );
+    },
+    [handleDeleteRecord, styles, theme.primary, theme.success, theme.textMuted, toggleExpand]
+  );
 
   const aggregatedRecordKeyExtractor = useCallback(
-    (item: any) => `${item.model}|${item.version}`,
+    (item: InboundAggregatedRecord) => `${item.model}|${item.version}`,
     []
   );
 
+  const erpLineKeyExtractor = useCallback((item: InboundErpLineProgress) => item.key, []);
+
   return (
-    <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
+    <Screen
+      backgroundColor={theme.backgroundRoot}
+      statusBarStyle={isDark ? 'light' : 'dark'}
+      safeAreaEdges={['top', 'left', 'right']}
+    >
       <View style={styles.container}>
         <View style={styles.topPanel}>
-          {/* 顶部：仓库选择 + 供应商 */}
-          <View style={styles.topBar}>
-            <TouchableOpacity style={styles.backButton} activeOpacity={0.7} onPress={() => router.back()}>
-              <Feather name="arrow-left" size={24} color={theme.textPrimary} />
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.warehouseBtn} activeOpacity={0.7} onPress={() => setShowWarehousePicker(true)}>
-              <FontAwesome6 name="warehouse" size={14} color={theme.textPrimary} />
-              <Text style={styles.warehouseText} numberOfLines={1} ellipsizeMode="tail">
-                {currentWarehouse?.name || Str.labelSelectWarehouse}
-              </Text>
-              <FontAwesome6 name="chevron-down" size={10} color={theme.textMuted} />
-            </TouchableOpacity>
-            <View style={[styles.supplierTag, currentInboundStep === 'scan' && styles.supplierTagActive]}>
-              <FontAwesome6
-                name={currentInboundStep === 'scan' ? 'magnifying-glass' : 'floppy-disk'}
-                size={12}
-                color={theme.textPrimary}
-              />
-              <Text
-                style={[styles.supplierText, currentInboundStep === 'scan' && styles.supplierTextActive]}
-                numberOfLines={1}
-                ellipsizeMode="tail"
-              >
-                {currentInboundStep === 'scan' ? '等待扫码' : '待保存'}
-              </Text>
-            </View>
-          </View>
+          <UiPageHeader
+            title="入库扫描"
+            onBack={() => router.back()}
+            backLabel="返回采购入库单列表"
+            rightIcon={erpVoucher ? 'refresh-cw' : 'crosshair'}
+            rightLabel={erpVoucher ? '刷新ERP采购入库单' : '聚焦扫码输入框'}
+            rightDisabled={erpVoucherLoading || saving}
+            onRightPress={() => {
+              if (erpVoucher) {
+                void handleRefreshErpVoucher();
+                return;
+              }
+              focusScannerInput(0);
+            }}
+          />
 
-          <ScanWorkflowPanel metrics={workflowMetrics} />
+          <UiWorkflowSummary items={workflowSummaryItems} />
         </View>
 
         {/* 扫码输入 */}
-        <View style={[styles.scanBox, inputValue.length > 0 && styles.scanBoxActive]}>
-          <TextInput
-            ref={inputRef}
-            style={styles.scanInput}
-            value={inputValue}
-            onChangeText={handleInputChange}
-            onSubmitEditing={handleSubmitEditing}
-            onBlur={() => focusScannerInput(120)}
-            placeholder={currentInboundPlaceholder}
-            placeholderTextColor={theme.textMuted}
-            autoCapitalize="characters"
-            autoCorrect={false}
-            autoFocus={false}
-            showSoftInputOnFocus={false}
-          />
-        </View>
+        <UiScanBox
+          inputRef={inputRef}
+          active={inputValue.length > 0}
+          processing={erpVoucherLoading}
+          statusLabel={
+            erpVoucherLoading
+              ? '正在读取ERP采购入库单'
+              : erpVoucher
+                ? '采购入库扫码核对'
+                : currentInboundStep === 'scan'
+                  ? '入库扫码录入'
+                  : '继续扫码或确认保存'
+          }
+          value={inputValue}
+          onChangeText={handleInputChange}
+          onSubmitEditing={handleSubmitEditing}
+          onBlur={() => focusScannerInput(120)}
+          placeholder={currentInboundPlaceholder}
+          placeholderTextColor={theme.textMuted}
+          autoCapitalize="none"
+          autoFocus={false}
+          editable={!erpVoucherLoading && Boolean(erpVoucher)}
+          showSoftInputOnFocus={false}
+        />
 
         {/* 物料列表 */}
         <View style={styles.listSection}>
           <View style={styles.listHeader}>
-            <Text style={styles.listTitle}>待入库记录</Text>
+            <Text style={styles.listTitle}>{erpVoucher ? '本单物料' : '待入库记录'}</Text>
             <Text style={styles.listCount}>
-              {aggregatedRecords.length} 型号 / {totalQuantity} PCS
-              {confirmedCount > 0 && ` / 已确认 ${confirmedCount}`}
+              {erpVoucher
+                ? `${erpCompletedLineCount}/${erpLineProgressItems.length} 完成`
+                : `${aggregatedRecords.length} 型号 / ${totalQuantity} PCS${
+                    confirmedCount > 0 ? ` / 已确认 ${confirmedCount}` : ''
+                  }`}
             </Text>
           </View>
-          <FlatList
-            style={styles.list}
-            contentContainerStyle={aggregatedRecords.length === 0 ? styles.listEmptyContent : styles.listContent}
-            data={aggregatedRecords}
-            renderItem={renderAggregatedRecord}
-            keyExtractor={aggregatedRecordKeyExtractor}
-            extraData={inboundListState}
-            keyboardShouldPersistTaps="handled"
-            initialNumToRender={12}
-            maxToRenderPerBatch={16}
-            windowSize={7}
-            removeClippedSubviews={Platform.OS === 'android'}
-            ListEmptyComponent={
-              <AppEmptyState
-                icon="package"
-                title="暂无扫描记录"
-                description="扫码后的待入库记录会显示在这里"
-                compact
-                style={styles.empty}
-              />
-            }
-          />
+          {erpVoucher ? (
+            <FlatList
+              style={styles.list}
+              contentContainerStyle={
+                erpLineProgressItems.length === 0 ? styles.listEmptyContent : styles.listContent
+              }
+              data={erpLineProgressItems}
+              renderItem={renderErpLineProgress}
+              keyExtractor={erpLineKeyExtractor}
+              extraData={inboundListState}
+              keyboardShouldPersistTaps="handled"
+              removeClippedSubviews={Platform.OS === 'android'}
+              ListEmptyComponent={
+                <AppEmptyState
+                  icon="package"
+                  title="ERP单据无明细"
+                  description="请返回待入库单刷新后重试"
+                  compact
+                  style={styles.empty}
+                />
+              }
+            />
+          ) : (
+            <FlatList
+              style={styles.list}
+              contentContainerStyle={
+                aggregatedRecords.length === 0 ? styles.listEmptyContent : styles.listContent
+              }
+              data={aggregatedRecords}
+              renderItem={renderAggregatedRecord}
+              keyExtractor={aggregatedRecordKeyExtractor}
+              extraData={inboundListState}
+              keyboardShouldPersistTaps="handled"
+              initialNumToRender={12}
+              maxToRenderPerBatch={16}
+              windowSize={7}
+              removeClippedSubviews={Platform.OS === 'android'}
+              ListEmptyComponent={
+                <AppEmptyState
+                  icon="package"
+                  title={erpVoucherError ? 'ERP单据加载失败' : '暂无扫描记录'}
+                  description={erpVoucherError || '扫码后的待入库记录会显示在这里'}
+                  compact
+                  style={styles.empty}
+                />
+              }
+            />
+          )}
 
           {/* 操作按钮 */}
           {scanRecords.length > 0 && (
-            <View style={styles.actionBar}>
-              <TouchableOpacity style={styles.clearBtn} activeOpacity={0.7} onPress={handleClearRecords}>
-                <Feather name="trash-2" size={17} color={theme.textSecondary} />
-                <Text style={styles.clearBtnText}>{Str.btnClear}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.submitBtn}
-                activeOpacity={0.7}
-                onPress={handleSaveInbound}
-                disabled={saving}
-              >
-                {saving ? (
-                  <ActivityIndicator color={theme.buttonPrimaryText} />
-                ) : (
-                  <>
-                    <Feather name="check-circle" size={18} color={theme.buttonPrimaryText} />
-                    <Text style={styles.submitBtnText}>保存入库</Text>
-                  </>
-                )}
-              </TouchableOpacity>
-            </View>
+            <UiSafeBottomBar style={styles.actionBar}>
+              <View style={styles.clearBtn}>
+                <UiToolbarButton
+                  label={Str.btnClear}
+                  icon="trash-2"
+                  variant="secondary"
+                  disabled={saving}
+                  onPress={handleClearRecords}
+                  style={styles.actionButton}
+                />
+              </View>
+              <View style={styles.submitBtn}>
+                <UiToolbarButton
+                  label={inboundSaveLabel}
+                  icon="check-circle"
+                  variant="success"
+                  color={theme.success}
+                  onPress={handleSaveInbound}
+                  disabled={saving || !inboundReadyToSave}
+                  loading={saving}
+                  style={styles.actionButton}
+                />
+              </View>
+            </UiSafeBottomBar>
           )}
         </View>
 
-        {/* 仓库选择器 */}
-        {showWarehousePicker && (
-          <View style={styles.pickerOverlay}>
-            <View style={styles.pickerBox}>
-              <Text style={styles.pickerTitle}>选择仓库</Text>
-              {warehouses.map(wh => (
-                <TouchableOpacity key={wh.id}
-                  style={[styles.pickerItem, currentWarehouse?.id === wh.id && styles.pickerItemActive]}
-                  activeOpacity={0.7} onPress={() => selectWarehouse(wh)}
-                >
-                  <Text style={styles.pickerItemText}>{wh.name}</Text>
-                  {currentWarehouse?.id === wh.id && (
-                    <FontAwesome6 name="check" size={16} color={theme.primary} />
-                  )}
-                </TouchableOpacity>
-              ))}
-              <TouchableOpacity style={styles.pickerClose} activeOpacity={0.7} onPress={() => setShowWarehousePicker(false)}>
-                <Text style={styles.pickerCloseText}>关闭</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        )}
-
         {alert.AlertComponent}
         <ToastContainer />
-
-
       </View>
     </Screen>
   );

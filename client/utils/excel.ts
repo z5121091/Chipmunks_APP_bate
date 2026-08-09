@@ -10,7 +10,14 @@ import { InteractionManager } from 'react-native';
 import { EXPORT_CONFIG, STORAGE_KEYS, SyncConfig } from '@/constants/config';
 import type { JsonValidator } from '@/utils/json';
 import { logger } from '@/utils/logger';
-import { testConnection } from '@/utils/heartbeat';
+import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
+import {
+  getSyncConfigError,
+  getSyncServiceBaseUrl,
+  testConnection,
+} from '@/utils/heartbeat';
+
+const BACKEND_ACCESS_KEY = process.env.EXPO_PUBLIC_BACKEND_ACCESS_KEY?.trim() || '';
 
 /** Excel Sheet 配置 */
 export type ExcelCellValue = string | number | boolean | null | undefined | Date;
@@ -22,6 +29,37 @@ export interface ExcelSheet {
 }
 
 const MAX_AUTO_WIDTH_SAMPLE_ROWS = 100;
+const EXCEL_HEADER_ROW_HEIGHT = 24;
+const EXCEL_DATA_ROW_HEIGHT = 22;
+const EXCEL_DEFAULT_COLUMN_WIDTH = 14;
+
+const EXCEL_COLUMN_WIDTHS: Record<string, number> = {
+  入库单号: 18,
+  订单号: 20,
+  盘点单号: 18,
+  仓库名称: 14,
+  客户名称: 30,
+  供应商: 28,
+  标签类型: 12,
+  存货编码: 18,
+  型号: 24,
+  版本号: 17,
+  封装: 14,
+  批次: 16,
+  数量: 10,
+  实盘数量: 12,
+  合计数量: 12,
+  盘点数量: 12,
+  原数量: 12,
+  标签数量: 12,
+  盘点类型: 12,
+  生产日期: 14,
+  追溯码: 20,
+  箱号: 25,
+  扫描时间: 17,
+  拆包时间: 16,
+  创建时间: 18,
+};
 
 const waitForExportIdle = () =>
   new Promise<void>((resolve) => {
@@ -39,11 +77,33 @@ const getDisplayWidth = (value: ExcelCellValue): number => {
   return width;
 };
 
+const getColumnWidth = (header: string, autoWidth: number): number => {
+  return EXCEL_COLUMN_WIDTHS[header] ?? Math.min(Math.max(autoWidth + 2, EXCEL_DEFAULT_COLUMN_WIDTH), 30);
+};
+
+const buildRowHeights = (rowCount: number) => {
+  return Array.from({ length: rowCount }, (_, index) => ({
+    hpt: index === 0 ? EXCEL_HEADER_ROW_HEIGHT : EXCEL_DATA_ROW_HEIGHT,
+  }));
+};
+
 /** 导出结果 */
 export interface ExportResult {
   success: boolean;
   message?: string;
   fileName?: string;
+  nativePrint?: boolean;
+  nativePrintSkipped?: boolean;
+  nativePrintSkipReason?: string;
+  nativePrintDuplicate?: boolean;
+  nativePrintJobId?: string;
+  nativePrintTemplateNames?: string[];
+}
+
+export interface SyncExcelOptions {
+  queryParams?: Record<string, string | undefined>;
+  requireNativePrint?: boolean;
+  acceptNativePrintPolicySkip?: boolean;
 }
 
 export const formatSyncErrorMessage = (
@@ -51,11 +111,11 @@ export const formatSyncErrorMessage = (
   fallback = '请检查电脑端同步服务'
 ) => {
   const normalized = message
-    ?.replace(/^同步失败[:：]\s*/i, '')
-    .replace(/^错误[:：]\s*/i, '')
+    ?.replace(/^同步失败[:：]\s*/, '')
+    .replace(/^错误[:：]\s*/, '')
     .trim();
 
-  return normalized || fallback;
+  return normalized ? formatUserFacingErrorMessage(normalized, fallback) : fallback;
 };
 
 const setStoredConnectionStatus = async (status: 'success' | 'disconnected') => {
@@ -85,9 +145,10 @@ export const generateExcelBase64 = (sheets: ExcelSheet[]): string => {
         const width = getDisplayWidth(row[colIdx]);
         if (width > maxWidth) maxWidth = width;
       });
-      return { wch: Math.min(maxWidth + 2, 50) };
+      return { wch: getColumnWidth(header, maxWidth) };
     });
     ws['!cols'] = colWidths;
+    ws['!rows'] = buildRowHeights(sheet.rows.length + 1);
 
     XLSX.utils.book_append_sheet(wb, ws, sheet.name);
   }
@@ -176,7 +237,8 @@ export const syncExcelToComputer = async (
   nameSuffix?: string,
   onSuccess?: (fileName: string) => void,
   onError?: (error: string) => void,
-  exactFileName?: string
+  exactFileName?: string,
+  options?: SyncExcelOptions
 ): Promise<ExportResult> => {
   if (!syncConfig.ip) {
     return { success: false, message: '请先配置电脑同步地址' };
@@ -203,7 +265,7 @@ export const syncExcelToComputer = async (
     const bytes = decodeBase64ToBytes(base64String);
     const body = toBinaryBody(bytes);
 
-    const baseUrl = `http://${syncConfig.ip}:${syncConfig.port || '8080'}${endpoint}`;
+    const baseUrl = `${getSyncServiceBaseUrl(syncConfig)}${endpoint}`;
     const queryParams = new URLSearchParams();
     if (nameSuffix) {
       queryParams.set('name_suffix', nameSuffix);
@@ -211,6 +273,12 @@ export const syncExcelToComputer = async (
     if (exactFileName) {
       queryParams.set('file_name', exactFileName);
     }
+    Object.entries(options?.queryParams || {}).forEach(([key, value]) => {
+      const normalizedValue = value?.trim();
+      if (normalizedValue) {
+        queryParams.set(key, normalizedValue);
+      }
+    });
     const queryString = queryParams.toString();
     const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
 
@@ -222,15 +290,38 @@ export const syncExcelToComputer = async (
         method: 'POST',
         headers: {
           'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          ...(BACKEND_ACCESS_KEY ? { 'X-Backend-Access-Key': BACKEND_ACCESS_KEY } : {}),
         },
         body,
         signal: controller.signal,
       });
 
       if (!response.ok) {
+        const responseText = await response.text().catch(() => '');
+        let serverMessage = '';
+        if (responseText.trim()) {
+          try {
+            const parsed = JSON.parse(responseText) as unknown;
+            if (parsed && typeof parsed === 'object') {
+              const body = parsed as Record<string, unknown>;
+              const candidate = body.message || body.error || body.detail;
+              if (typeof candidate === 'string') {
+                serverMessage = candidate;
+              }
+            }
+          } catch {
+            serverMessage = responseText.trim().slice(0, 180);
+          }
+        }
+        const message = formatSyncErrorMessage(
+          serverMessage,
+          `电脑端同步服务异常（${response.status}）`
+        );
+        await setStoredConnectionStatus('disconnected');
+        onError?.(message);
         return {
           success: false,
-          message: `电脑端同步服务异常（${response.status}）`,
+          message,
         };
       }
 
@@ -239,6 +330,12 @@ export const syncExcelToComputer = async (
         message?: string;
         fileName?: string;
         path?: string;
+        nativePrint?: boolean;
+        nativePrintSkipped?: boolean;
+        nativePrintSkipReason?: string;
+        nativePrintDuplicate?: boolean;
+        nativePrintJobId?: string;
+        nativePrintTemplateNames?: string[];
       }>(
         response,
         '服务器返回格式错误，请检查同步服务是否正常运行'
@@ -246,8 +343,30 @@ export const syncExcelToComputer = async (
 
       if (result.success) {
         const returnedFileName = getReturnedFileName(result);
+        const policySkipAccepted =
+          options?.acceptNativePrintPolicySkip === true &&
+          result.nativePrintSkipped === true;
+        if (
+          options?.requireNativePrint &&
+          result.nativePrint !== true &&
+          !policySkipAccepted
+        ) {
+          const message = '同步助手未确认原生打印，请更新电脑端同步助手后重试';
+          onError?.(message);
+          return { success: false, message };
+        }
         onSuccess?.(returnedFileName);
-        return { success: true, fileName: returnedFileName };
+        return {
+          success: true,
+          message: result.message,
+          fileName: returnedFileName,
+          nativePrint: result.nativePrint,
+          nativePrintSkipped: result.nativePrintSkipped,
+          nativePrintSkipReason: result.nativePrintSkipReason,
+          nativePrintDuplicate: result.nativePrintDuplicate,
+          nativePrintJobId: result.nativePrintJobId,
+          nativePrintTemplateNames: result.nativePrintTemplateNames,
+        };
       } else {
         const msg = result.message || '未知错误';
         onError?.(msg);
@@ -258,7 +377,7 @@ export const syncExcelToComputer = async (
     }
   } catch (error: unknown) {
     const errorName = error instanceof Error ? error.name : '';
-    const errorMessage = error instanceof Error ? error.message : '请检查同步助手是否运行';
+    const errorMessage = formatUserFacingErrorMessage(error, '请检查同步助手是否运行');
     const errorMsg =
       errorName === 'AbortError'
         ? '同步超时，请确认电脑端同步助手仍在运行'
@@ -273,5 +392,5 @@ export const syncExcelToComputer = async (
  * 验证同步配置
  */
 export const validateSyncConfig = (config: SyncConfig): boolean => {
-  return Boolean(config.ip);
+  return !getSyncConfigError(config);
 };

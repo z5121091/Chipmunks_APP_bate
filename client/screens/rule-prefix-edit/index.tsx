@@ -45,8 +45,8 @@ const getFieldMeta = (fieldKey: string, index: number, customFields: CustomField
     return {
       key: fieldKey,
       index,
-      label: customField?.name || '未知自定义字段',
-      subtitle: fieldKey,
+      label: `占位：${customField?.name || '未知字段'}`,
+      subtitle: '保持字段位置；前缀可辅助区分相似规则',
     };
   }
 
@@ -102,7 +102,7 @@ export default function RulePrefixEditScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      loadData();
+      void loadData();
     }, [loadData])
   );
 
@@ -132,48 +132,21 @@ export default function RulePrefixEditScreen() {
     setDraftPrefix('');
   }, [saving]);
 
-  const handleApplyField = useCallback(() => {
-    if (!activeField) {
+  const handleApplyField = useCallback(async () => {
+    if (!activeField || !rule || saving) {
       return;
     }
 
     const trimmedValue = draftPrefix.trim();
-    setPrefixes((prev) => {
-      const next = { ...prev };
-      if (trimmedValue) {
-        next[activeField.key] = trimmedValue;
-      } else {
-        delete next[activeField.key];
-      }
-      return next;
-    });
-    setActiveField(null);
-    setDraftPrefix('');
-  }, [activeField, draftPrefix]);
-
-  const handleClearAll = useCallback(() => {
-    showAlert(
-      '清空全部',
-      '确定清空该规则所有字段的前缀配置吗？',
-      [
-        { text: '取消', style: 'cancel' },
-        {
-          text: '清空',
-          style: 'destructive',
-          onPress: () => setPrefixes({}),
-        },
-      ],
-      'warning'
-    );
-  }, [showAlert]);
-
-  const handleSave = useCallback(async () => {
-    if (!rule || saving) {
-      return;
+    const nextPrefixes = { ...prefixes };
+    if (trimmedValue) {
+      nextPrefixes[activeField.key] = trimmedValue;
+    } else {
+      delete nextPrefixes[activeField.key];
     }
 
     const fieldKeys = new Set(fields.map((field) => field.key));
-    const cleanedPrefixes = Object.entries(prefixes).reduce<FieldPrefixes>((acc, [fieldKey, value]) => {
+    const cleanedPrefixes = Object.entries(nextPrefixes).reduce<FieldPrefixes>((acc, [fieldKey, value]) => {
       const trimmedValue = value.trim();
       if (fieldKeys.has(fieldKey) && trimmedValue) {
         acc[fieldKey] = trimmedValue;
@@ -186,19 +159,47 @@ export default function RulePrefixEditScreen() {
       await updateRule(rule.id, { fieldPrefixes: cleanedPrefixes });
       setRule((prev) => (prev ? { ...prev, fieldPrefixes: cleanedPrefixes } : prev));
       setPrefixes(cleanedPrefixes);
-      showAlert(
-        '成功',
-        '字段前缀配置已保存',
-        [{ text: '确定', onPress: () => router.back() }],
-        'success'
-      );
+      setActiveField(null);
+      setDraftPrefix('');
     } catch (error) {
       logger.error('保存字段前缀配置失败:', error);
       showError('保存失败');
     } finally {
       setSaving(false);
     }
-  }, [fields, prefixes, router, rule, saving, showAlert, showError]);
+  }, [activeField, draftPrefix, fields, prefixes, rule, saving, showError]);
+
+  const handleClearAll = useCallback(() => {
+    if (!rule || saving) {
+      return;
+    }
+
+    showAlert(
+      '清空全部',
+      '确定清空该规则所有字段的前缀配置吗？清空后立即保存。',
+      [
+        { text: '取消', style: 'cancel' },
+        {
+          text: '清空',
+          style: 'destructive',
+          onPress: async () => {
+            setSaving(true);
+            try {
+              await updateRule(rule.id, { fieldPrefixes: {} });
+              setRule((prev) => (prev ? { ...prev, fieldPrefixes: {} } : prev));
+              setPrefixes({});
+            } catch (error) {
+              logger.error('清空字段前缀配置失败:', error);
+              showError('清空失败');
+            } finally {
+              setSaving(false);
+            }
+          },
+        },
+      ],
+      'warning'
+    );
+  }, [rule, saving, showAlert, showError]);
 
   const renderField = useCallback(
     ({ item }: { item: FieldRow }) => {
@@ -377,15 +378,9 @@ export default function RulePrefixEditScreen() {
               onPress={handleClearAll}
               disabled={saving}
             >
-              <Text style={styles.clearAllButtonText}>清空全部</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.saveButton}
-              activeOpacity={0.72}
-              onPress={handleSave}
-              disabled={saving}
-            >
-              <Text style={styles.saveButtonText}>{saving ? '保存中...' : '保存'}</Text>
+              <Text style={styles.clearAllButtonText}>
+                {saving ? '保存中...' : '清空全部前缀'}
+              </Text>
             </TouchableOpacity>
           </View>
         )}
@@ -458,11 +453,11 @@ export default function RulePrefixEditScreen() {
                         autoCapitalize="none"
                         autoCorrect={false}
                         returnKeyType="done"
-                        onSubmitEditing={handleApplyField}
+                        onSubmitEditing={() => void handleApplyField()}
                       />
                     </View>
                     <Text style={styles.editorHint}>
-                      留空则不处理，匹配时不区分大小写。
+                      留空则不处理，匹配时不区分大小写；点击保存后立即生效。
                     </Text>
                   </View>
                 </>
@@ -474,8 +469,10 @@ export default function RulePrefixEditScreen() {
                 containerStyle={styles.editorActions}
                 secondaryLabel="清空当前"
                 onSecondaryPress={() => setDraftPrefix('')}
-                primaryLabel="保存"
-                onPrimaryPress={handleApplyField}
+                secondaryDisabled={saving}
+                primaryLabel={saving ? '保存中...' : '保存'}
+                onPrimaryPress={() => void handleApplyField()}
+                primaryDisabled={saving}
               />
             </View>
           </View>

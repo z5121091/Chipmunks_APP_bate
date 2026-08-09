@@ -22,6 +22,7 @@ import { createStyles } from './styles';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { logger } from '@/utils/logger';
 import { useCustomAlert } from '@/components/CustomAlert';
+import { ERP_ACCOUNTS } from '@/utils/erpAccounts';
 import {
   Warehouse,
   getAllWarehouses,
@@ -31,6 +32,10 @@ import {
   reorderWarehouses,
 } from '@/utils/database';
 
+const ERP_MANAGED_WAREHOUSE_NAMES = new Set(
+  ERP_ACCOUNTS.map((account) => account.expectedWarehouseName)
+);
+
 export default function WarehouseManagementScreen() {
   const { theme, isDark } = useTheme();
   const styles = createStyles(theme);
@@ -39,6 +44,7 @@ export default function WarehouseManagementScreen() {
 
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [modalVisible, setModalVisible] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [editingWarehouse, setEditingWarehouse] = useState<Warehouse | null>(null);
   const [formData, setFormData] = useState({
     name: '',
@@ -48,15 +54,20 @@ export default function WarehouseManagementScreen() {
 
   // 加载仓库列表
   const loadWarehouses = useCallback(async () => {
-      logger.log('[WarehouseManagement] 开始加载仓库列表');
-    const data = await getAllWarehouses();
+    logger.log('[WarehouseManagement] 开始加载仓库列表');
+    try {
+      const data = await getAllWarehouses();
       logger.log(`[WarehouseManagement] 加载完成，设置 ${data.length} 条仓库数据`);
-    setWarehouses(data);
-  }, []);
+      setWarehouses(data);
+    } catch (error) {
+      logger.error('加载仓库失败:', error);
+      alert.showError('仓库加载失败，请重试');
+    }
+  }, [alert.showError]);
 
   useFocusEffect(
     useCallback(() => {
-      loadWarehouses();
+      void loadWarehouses();
     }, [loadWarehouses])
   );
 
@@ -82,14 +93,26 @@ export default function WarehouseManagementScreen() {
 
   // 保存仓库
   const handleSave = async () => {
-    // 强制截断名称到4个字符
-    const trimmedName = formData.name.trim().slice(0, 4);
+    if (saving) {
+      return;
+    }
+
+    const trimmedName = formData.name.trim().slice(0, 40);
     if (!trimmedName) {
       alert.showWarning('请输入仓库名称');
       return;
     }
     
     const finalFormData = { ...formData, name: trimmedName };
+
+    if (
+      editingWarehouse &&
+      ERP_MANAGED_WAREHOUSE_NAMES.has(editingWarehouse.name.trim()) &&
+      editingWarehouse.name.trim() !== trimmedName
+    ) {
+      alert.showWarning('ERP对接仓库名称不能修改，请在账套配置中统一调整');
+      return;
+    }
 
     // 检查名称唯一性（排除当前编辑的仓库）
     const existingWarehouse = warehouses.find(
@@ -101,6 +124,7 @@ export default function WarehouseManagementScreen() {
       return;
     }
 
+    setSaving(true);
     try {
       if (editingWarehouse) {
         await updateWarehouse(editingWarehouse.id, finalFormData);
@@ -110,10 +134,12 @@ export default function WarehouseManagementScreen() {
         alert.showSuccess('仓库已添加');
       }
       setModalVisible(false);
-      loadWarehouses();
+      await loadWarehouses();
     } catch (error) {
       logger.error('保存仓库失败:', error);
-      alert.showError('保存失败，请重试');
+      alert.showError(error instanceof Error ? error.message : '保存失败，请重试');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -131,7 +157,7 @@ export default function WarehouseManagementScreen() {
         try {
           await deleteWarehouse(warehouse.id);
           alert.showSuccess('仓库已删除');
-          loadWarehouses();
+          await loadWarehouses();
         } catch (error) {
       logger.error('删除仓库失败:', error);
           alert.showError(error instanceof Error ? error.message : '删除失败，请重试');
@@ -146,7 +172,7 @@ export default function WarehouseManagementScreen() {
     try {
       await updateWarehouse(warehouse.id, { is_default: true });
       alert.showSuccess(`已将「${warehouse.name}」设为默认仓库`);
-      loadWarehouses();
+      await loadWarehouses();
     } catch (error) {
       logger.error('设置默认仓库失败:', error);
       alert.showError('操作失败，请重试');
@@ -171,7 +197,7 @@ export default function WarehouseManagementScreen() {
     } catch (error) {
       logger.error('调整仓库排序失败:', error);
       alert.showError('排序失败，请重试');
-      loadWarehouses();
+      await loadWarehouses();
     }
   };
 
@@ -295,13 +321,15 @@ export default function WarehouseManagementScreen() {
         visible={modalVisible}
         transparent
         animationType="fade"
-        onRequestClose={() => setModalVisible(false)}
+        onRequestClose={() => {
+          if (!saving) setModalVisible(false);
+        }}
       >
         <View style={styles.modalOverlay}>
           <KeyboardAwareModalContainer cardStyle={styles.modalCardFrame}>
             <AppModalCard
               title={editingWarehouse ? '编辑仓库' : '添加仓库'}
-              onClose={() => setModalVisible(false)}
+              onClose={saving ? undefined : () => setModalVisible(false)}
               style={styles.modalContent}
               bodyStyle={styles.modalBody}
               footer={
@@ -309,8 +337,10 @@ export default function WarehouseManagementScreen() {
                   containerStyle={styles.modalActions}
                   secondaryLabel="取消"
                   onSecondaryPress={() => setModalVisible(false)}
-                  primaryLabel="保存"
+                  secondaryDisabled={saving}
+                  primaryLabel={saving ? '保存中...' : '保存'}
                   onPrimaryPress={handleSave}
+                  primaryDisabled={saving}
                 />
               }
             >
@@ -323,6 +353,7 @@ export default function WarehouseManagementScreen() {
                   }}
                   placeholder="请输入仓库名称"
                   placeholderTextColor={theme.textMuted}
+                  maxLength={40}
                 />
               </AppFormField>
 
@@ -340,7 +371,13 @@ export default function WarehouseManagementScreen() {
                 title="设为默认仓库"
                 description="进入业务页面时优先带出这个仓库"
                 checked={formData.is_default}
-                onPress={() => setFormData({ ...formData, is_default: !formData.is_default })}
+                onPress={() => {
+                  if (editingWarehouse?.is_default && formData.is_default) {
+                    alert.showWarning('请先把其他仓库设为默认，再取消当前默认仓库');
+                    return;
+                  }
+                  setFormData({ ...formData, is_default: !formData.is_default });
+                }}
               />
             </AppModalCard>
           </KeyboardAwareModalContainer>

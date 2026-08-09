@@ -18,7 +18,23 @@ import {
 
 
 /** 通用分隔符列表（用于 isQRCode 判断） */
-const COMMON_SEPARATORS = ['||', '//', '/', '|', ',', '*', '#', ';', '\t'];
+const COMMON_SEPARATORS = [
+  '\r\n',
+  '||',
+  '//',
+  '/',
+  '|',
+  ',',
+  '*',
+  '#',
+  ';',
+  ':',
+  '\t',
+  '\n',
+  '\r',
+  '\x1D',
+  '\x1E',
+];
 
 /** 预设括号对（用于检测括号格式） */
 const BRACKET_PAIRS: Record<string, string> = {
@@ -165,26 +181,11 @@ export const parseQRCode = async (
   const trimmedContent = content.trim();
 
   // 调用 database.ts 的 detectRule 自动检测规则
-  // 该方法会：
-  // 1. 尝试匹配用户配置的规则
-  // 2. 若无匹配，自动识别分隔符并创建"自动识别"规则
+  // 只匹配用户已经启用的规则，未知结构不做猜测。
   const rule = await detectRule(trimmedContent);
 
   if (!rule) {
-    // 无法检测规则，整体作为一个字段
-    return {
-      model: trimmedContent,
-      batch: '',
-      package: '',
-      version: '',
-      quantity: '',
-      productionDate: '',
-      traceNo: '',
-      sourceNo: '',
-      rawContent: trimmedContent,
-      fields: [trimmedContent],
-      separator: '',
-    };
+    return null;
   }
 
   // 使用规则解析字段

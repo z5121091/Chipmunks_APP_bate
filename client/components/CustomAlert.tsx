@@ -100,7 +100,7 @@ export function CustomAlert({
         <View style={{
           width: modalWidth,
           maxWidth: APP_MODAL_MAX_WIDTH,
-          borderRadius: BorderRadius['3xl'],
+          borderRadius: BorderRadius.md,
           padding: Spacing['2xl'],
           backgroundColor: theme.backgroundElevated,
           borderWidth: BorderWidth.normal,
@@ -178,7 +178,7 @@ export function CustomAlert({
                     flex: buttons.length <= 2 ? 1 : undefined,
                     width: buttons.length > 2 ? '100%' : undefined,
                     paddingVertical: Spacing.md,
-                    borderRadius: BorderRadius.lg,
+                    borderRadius: BorderRadius.sm,
                     alignItems: 'center',
                     justifyContent: 'center',
                     minHeight: 50,

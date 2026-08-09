@@ -57,6 +57,27 @@ export const parseAuthFromUrl = (
   }
 };
 
+const normalizeUpdateServerIdentity = (url: string): string | null => {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace(/\/+$/, '');
+    return `${parsed.protocol}//${parsed.host.toLowerCase()}${path}${parsed.search}`;
+  } catch {
+    return null;
+  }
+};
+
+const shouldRestoreDefaultServerCredentials = (savedServer: string): boolean => {
+  const defaultAuth = parseAuthFromUrl(UPDATE_CONFIG.DEFAULT_SERVER);
+  if (!defaultAuth || savedServer === UPDATE_CONFIG.DEFAULT_SERVER) {
+    return false;
+  }
+
+  const savedIdentity = normalizeUpdateServerIdentity(savedServer);
+  const defaultIdentity = normalizeUpdateServerIdentity(UPDATE_CONFIG.DEFAULT_SERVER);
+  return Boolean(savedIdentity && defaultIdentity && savedIdentity === defaultIdentity);
+};
+
 /**
  * Base64 编码
  */
@@ -98,7 +119,16 @@ export const getUpdateServer = async (): Promise<string> => {
   }
 
   if (isLegacyUpdateServerUrl(savedServer)) {
-    logger.warn('[update] 检测到旧更新服务器地址，已迁移到默认 NAS 地址:', savedServer);
+    logger.warn(
+      '[update] 检测到旧更新服务器地址，已迁移到默认 NAS 地址:',
+      extractDisplayUrl(savedServer)
+    );
+    await AsyncStorage.setItem(STORAGE_KEYS.UPDATE_SERVER_URL, UPDATE_CONFIG.DEFAULT_SERVER);
+    return UPDATE_CONFIG.DEFAULT_SERVER;
+  }
+
+  if (shouldRestoreDefaultServerCredentials(savedServer)) {
+    logger.warn('[update] 更新服务器凭据已同步为当前应用配置');
     await AsyncStorage.setItem(STORAGE_KEYS.UPDATE_SERVER_URL, UPDATE_CONFIG.DEFAULT_SERVER);
     return UPDATE_CONFIG.DEFAULT_SERVER;
   }

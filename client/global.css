@@ -2,6 +2,10 @@
 @import 'uniwind';
 @import './heroui/styles';
 
+/*
+ * Web color values mirror client/resources/colors.ts, the native source of truth.
+ * client/utils/__tests__/designTokens.test.ts guards the shared values against drift.
+ */
 @theme {
   /* Primitive Colors (Do not change between light and dark) */
   --white: oklch(100% 0 0);
@@ -14,8 +18,8 @@
   --field-border-width: 0px;
 
   /* Base radius */
-  --radius: 0.75rem;
-  --field-radius: calc(var(--radius) * 1.5);
+  --radius: 0.5rem;
+  --field-radius: var(--radius);
 
   /* Opacity */
   --opacity-disabled: 0.5;

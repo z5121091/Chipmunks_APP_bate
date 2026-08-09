@@ -1,7 +1,8 @@
 import { Dimensions, StyleSheet } from 'react-native';
 import { withAlpha } from '@/utils/colors';
-import { Spacing, BorderRadius, Theme, Typography } from '@/constants/theme';
+import { Spacing, BorderRadius, BorderWidth, Theme, Typography } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
+import { getUiRedesignShadow, UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 import { rf } from '@/utils/responsive';
 
 export const createStyles = (theme: Theme) => {
@@ -17,39 +18,48 @@ export const createStyles = (theme: Theme) => {
   topPanel: {
     marginHorizontal: isCompactScreen ? 10 : Spacing.sm,
     marginTop: isCompactScreen ? 10 : Spacing.sm,
-    marginBottom: Spacing.xs,
-    borderRadius: BorderRadius['2xl'],
+    marginBottom: 0,
+    borderRadius: UI_REDESIGN_TOKENS.radius.card,
     backgroundColor: theme.backgroundElevated,
-    borderWidth: 1,
+    borderWidth: BorderWidth.normal,
     borderColor: theme.border,
-    shadowColor: theme.shadowColor,
-    shadowOffset: { width: 0, height: 12 },
-    shadowOpacity: theme.isDark ? 0.2 : 0.08,
-    shadowRadius: 18,
-    elevation: 4,
+    ...getUiRedesignShadow(theme),
   },
 
   // Header
   header: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
     paddingHorizontal: isCompactScreen ? 10 : Spacing.md,
-    paddingTop: isCompactScreen ? 6 : Spacing.xs + 2,
-    paddingBottom: 2,
+    paddingTop: isCompactScreen ? 8 : Spacing.sm,
+    paddingBottom: Spacing.xs,
     backgroundColor: 'transparent',
   },
 
   backButton: {
-    padding: Spacing.xs + 2,
-    minWidth: 38,
-    minHeight: 38,
+    width: 38,
+    height: 38,
+    borderRadius: BorderRadius.full,
     justifyContent: 'center',
     alignItems: 'center',
+    backgroundColor: theme.backgroundTertiary,
   },
 
   headerTitle: {
-    ...Typography.h4,
+    ...Typography.title,
     color: theme.textPrimary,
+    textAlign: 'center',
+    flex: 1,
+  },
+
+  headerMenuButton: {
+    width: 38,
+    height: 38,
+    borderRadius: BorderRadius.full,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: theme.backgroundTertiary,
   },
 
   // 顶栏
@@ -57,8 +67,8 @@ export const createStyles = (theme: Theme) => {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: isCompactScreen ? 10 : Spacing.md,
-    paddingTop: Spacing.xs,
-    paddingBottom: Spacing.xs,
+    paddingTop: 0,
+    paddingBottom: Spacing.sm,
     backgroundColor: 'transparent',
     gap: Spacing.xs,
   },
@@ -70,10 +80,12 @@ export const createStyles = (theme: Theme) => {
     gap: Spacing.xs,
     paddingVertical: Spacing.xs + 2,
     paddingHorizontal: Spacing.sm,
-    backgroundColor: theme.backgroundTertiary,
-    borderRadius: BorderRadius.md,
+    backgroundColor: theme.backgroundDefault,
+    borderRadius: BorderRadius.lg,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
     minWidth: 80,
-    minHeight: isCompactScreen ? 40 : 42,
+    minHeight: isCompactScreen ? 42 : 46,
   },
 
   warehouseText: {
@@ -136,9 +148,11 @@ export const createStyles = (theme: Theme) => {
     gap: Spacing.xs,
     paddingVertical: Spacing.xs + 2,
     paddingHorizontal: Spacing.sm,
-    backgroundColor: theme.backgroundTertiary,
-    borderRadius: BorderRadius.md,
-    minHeight: isCompactScreen ? 40 : 42,
+    backgroundColor: theme.backgroundDefault,
+    borderRadius: BorderRadius.lg,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
+    minHeight: isCompactScreen ? 42 : 46,
   },
 
   stepTagActive: {
@@ -162,9 +176,9 @@ export const createStyles = (theme: Theme) => {
     marginHorizontal: isCompactScreen ? 10 : Spacing.sm,
     height: isCompactScreen ? rf(56) : rf(60),
     backgroundColor: theme.backgroundDefault,
-    borderWidth: 2,
+    borderWidth: BorderWidth.normal,
     borderColor: theme.primary,
-    borderRadius: BorderRadius.xl,
+    borderRadius: BorderRadius.lg,
     overflow: 'hidden', // 隐藏超出的内容
   },
 
@@ -183,11 +197,40 @@ export const createStyles = (theme: Theme) => {
     textAlign: 'center',
   },
 
+  completionBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: Spacing.xs,
+    marginHorizontal: isCompactScreen ? 10 : Spacing.sm,
+    marginBottom: isCompactScreen ? 6 : Spacing.xs,
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: Spacing.xs + 2,
+    borderWidth: BorderWidth.normal,
+    borderColor: withAlpha(theme.success, 0.36),
+    borderRadius: BorderRadius.md,
+    backgroundColor: withAlpha(theme.success, theme.isDark ? 0.18 : 0.1),
+  },
+
+  completionBannerText: {
+    ...Typography.captionMedium,
+    flexShrink: 1,
+    color: theme.success,
+    textAlign: 'center',
+  },
+
   // 列表
   listSection: {
     flex: 1,
-    marginTop: isCompactScreen ? Spacing.sm : Spacing.md,
+    marginHorizontal: isCompactScreen ? 10 : Spacing.sm,
+    marginTop: 0,
+    marginBottom: isCompactScreen ? 10 : Spacing.sm,
+    borderRadius: UI_REDESIGN_TOKENS.radius.card,
+    borderWidth: BorderWidth.normal,
+    borderColor: theme.border,
     backgroundColor: theme.backgroundDefault,
+    overflow: 'hidden',
+    ...getUiRedesignShadow(theme),
   },
 
   listHeader: {
@@ -228,8 +271,13 @@ export const createStyles = (theme: Theme) => {
 
   // 聚合项容器
   itemContainer: {
-    marginBottom: Spacing.xs,
+    marginHorizontal: isCompactScreen ? Spacing.xs : Spacing.sm,
+    marginTop: Spacing.xs,
+    borderRadius: BorderRadius.lg,
     backgroundColor: theme.backgroundDefault,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
+    overflow: 'hidden',
   },
 
   // 聚合项主行（两行布局：型号 + 版本/数量）
@@ -296,6 +344,180 @@ export const createStyles = (theme: Theme) => {
     ...Typography.small,
     color: theme.textSecondary,
     lineHeight: Typography.small.lineHeight,
+  },
+
+  erpLineCard: {
+    marginHorizontal: isCompactScreen ? Spacing.xs : Spacing.sm,
+    marginTop: Spacing.xs,
+    borderRadius: BorderRadius.lg,
+    backgroundColor: theme.backgroundDefault,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
+    overflow: 'hidden',
+  },
+
+  erpLineMain: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: isCompactScreen ? Spacing.sm : Spacing.md,
+    paddingHorizontal: isCompactScreen ? Spacing.xs + 2 : Spacing.sm,
+    gap: Spacing.xs,
+  },
+
+  erpLineContent: {
+    flex: 1,
+    minWidth: 0,
+  },
+
+  erpLineCode: {
+    ...Typography.smallMedium,
+    color: theme.textPrimary,
+    flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
+  },
+
+  erpLineProgressTrack: {
+    height: 5,
+    flexDirection: 'row',
+    backgroundColor: theme.backgroundTertiary,
+    borderRadius: BorderRadius.full,
+    overflow: 'hidden',
+    marginTop: Spacing.xs,
+  },
+
+  erpLineProgressFill: {
+    minWidth: 0,
+  },
+
+  erpLineMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    gap: Spacing.sm,
+    marginTop: Spacing.xs,
+  },
+
+  erpLineMetaText: {
+    ...Typography.caption,
+    color: theme.textMuted,
+    minWidth: 0,
+    flexShrink: 1,
+  },
+
+  erpLineDetails: {
+    backgroundColor: theme.backgroundTertiary,
+    paddingHorizontal: isCompactScreen ? Spacing.xs : Spacing.sm,
+    paddingVertical: isCompactScreen ? 6 : Spacing.xs,
+  },
+
+  erpLineDetailItem: {
+    paddingVertical: isCompactScreen ? Spacing.xs + 2 : Spacing.sm,
+    paddingHorizontal: isCompactScreen ? Spacing.xs : Spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.borderLight,
+  },
+
+  erpLineEmptyText: {
+    ...Typography.caption,
+    color: theme.textMuted,
+    paddingVertical: Spacing.xs,
+    textAlign: 'center',
+  },
+
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: theme.overlay,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: isCompactScreen ? Spacing.md : Spacing.lg,
+  },
+
+  outboundUnpackModalContent: {
+    width: '100%',
+    maxWidth: APP_MODAL_MAX_WIDTH,
+    maxHeight: '84%',
+  },
+
+  modalBody: {
+    paddingBottom: 0,
+  },
+
+  modalActions: {
+    marginTop: 0,
+  },
+
+  outboundUnpackBodyContent: {
+    paddingBottom: Spacing['2xl'],
+  },
+
+  unpackTextInput: {
+    ...Typography.body,
+    color: theme.textPrimary,
+    paddingVertical: Spacing.sm,
+    paddingHorizontal: Spacing.md,
+    minHeight: 48,
+    backgroundColor: theme.backgroundTertiary,
+    borderRadius: BorderRadius.md,
+    borderWidth: BorderWidth.normal,
+    borderColor: theme.border,
+  },
+
+  readOnlyInputContent: {
+    justifyContent: 'center',
+  },
+
+  unpackReadOnlyText: {
+    ...Typography.small,
+    color: theme.textSecondary,
+    lineHeight: Typography.small.lineHeight,
+  },
+
+  unpackTraceText: {
+    ...Typography.smallMedium,
+    color: theme.primary,
+    lineHeight: Typography.smallMedium.lineHeight,
+  },
+
+  unpackQuantityGrid: {
+    flexDirection: 'row',
+    gap: Spacing.xs,
+  },
+
+  unpackQuantityCell: {
+    flex: 1,
+    minWidth: 0,
+    paddingVertical: Spacing.sm,
+    paddingHorizontal: Spacing.xs,
+    borderRadius: BorderRadius.md,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
+    backgroundColor: theme.backgroundTertiary,
+    alignItems: 'center',
+    gap: 2,
+  },
+
+  unpackQuantityLabel: {
+    ...Typography.caption,
+    color: theme.textMuted,
+  },
+
+  unpackQuantityValue: {
+    ...Typography.bodyMedium,
+    color: theme.textPrimary,
+    fontWeight: '700',
+  },
+
+  unpackQuantityValuePrimary: {
+    ...Typography.bodyMedium,
+    color: theme.primary,
+    fontWeight: '800',
+  },
+
+  unpackNotesInput: {
+    minHeight: 76,
+    textAlignVertical: 'top',
   },
 
   empty: {

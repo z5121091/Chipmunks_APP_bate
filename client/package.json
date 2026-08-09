@@ -10,8 +10,9 @@
     "install-missing": "node ./scripts/install-missing-deps.js",
     "lint": "expo lint",
     "typecheck": "tsc --noEmit",
-    "start": "expo start --web --clear",
+    "start": "expo start --web --offline --clear",
     "test": "jest --watchAll",
+    "test:ci": "jest --runInBand",
     "android": "expo run:android",
     "ios": "expo run:ios"
   },

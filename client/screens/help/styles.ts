@@ -1,6 +1,7 @@
 import { StyleSheet } from 'react-native';
 import { withAlpha } from '@/utils/colors';
 import { Spacing, BorderRadius, Theme, BorderWidth } from '@/constants/theme';
+import { rf } from '@/utils/responsive';
 
 export const createStyles = (theme: Theme) => {
   return StyleSheet.create({
@@ -26,7 +27,7 @@ export const createStyles = (theme: Theme) => {
       alignItems: 'center',
     },
     title: {
-      fontSize: 20,
+      fontSize: rf(20),
       fontWeight: '700',
       color: theme.textPrimary,
     },
@@ -53,7 +54,7 @@ export const createStyles = (theme: Theme) => {
       marginRight: Spacing.sm,
     },
     moduleTitle: {
-      fontSize: 15,
+      fontSize: rf(15),
       fontWeight: '700',
       color: theme.primary,
     },
@@ -67,7 +68,7 @@ export const createStyles = (theme: Theme) => {
       alignItems: 'flex-start',
     },
     itemNumber: {
-      fontSize: 11,
+      fontSize: rf(11),
       fontWeight: '600',
       color: theme.primary,
       marginRight: Spacing.xs,
@@ -78,13 +79,13 @@ export const createStyles = (theme: Theme) => {
       flex: 1,
     },
     itemTitle: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '600',
       color: theme.textPrimary,
       marginBottom: Spacing.xs,
     },
     itemDescription: {
-      fontSize: 13,
+      fontSize: rf(13),
       color: theme.textSecondary,
       lineHeight: 20,
     },
@@ -97,7 +98,7 @@ export const createStyles = (theme: Theme) => {
       borderRadius: BorderRadius.sm,
     },
     tipText: {
-      fontSize: 12,
+      fontSize: rf(12),
       color: theme.textMuted,
       lineHeight: 18,
     },

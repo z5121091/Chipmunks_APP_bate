@@ -1,16 +1,7 @@
 ﻿import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import {
-  View,
-  Text,
-  TouchableOpacity,
-  TextInput,
-  Modal,
-  Platform,
-  ActivityIndicator,
-  FlatList,
-} from 'react-native';
+import { View, Text, TouchableOpacity, TextInput, Modal, Platform, FlatList } from 'react-native';
 import { useFocusEffect } from 'expo-router';
-import { Feather, FontAwesome6 } from '@expo/vector-icons';
+import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, Typography } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
@@ -19,19 +10,20 @@ import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
 import { AppFormField } from '@/components/AppFormField';
 import { AppEmptyState } from '@/components/AppEmptyState';
-import { useCustomAlert } from '@/components/CustomAlert';
+import { AggregatedRecordItem } from '@/components/AggregatedRecordItem';
 import {
-  ScanWorkflowPanel,
-  type WorkflowMetric,
-  type WorkflowStep,
-} from '@/components/ScanWorkflowPanel';
+  UiPageHeader,
+  UiSafeBottomBar,
+  UiScanBox,
+  UiToolbarButton,
+  UiWorkflowSummary,
+} from '@/components/UiRedesign';
+import { useCustomAlert } from '@/components/CustomAlert';
 import { createStyles } from './styles';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { logger } from '@/utils/logger';
 import {
   Warehouse,
-  getAllWarehouses,
-  getDefaultWarehouse,
   detectRule,
   parseWithRule,
   getInventoryCodeByModel,
@@ -50,6 +42,7 @@ import {
   feedbackDuplicate,
   feedbackConfirm,
   feedbackInventoryComplete,
+  feedbackNotBound,
   useFeedbackCleanup,
 } from '@/utils/feedback';
 import { useToast } from '@/utils/toast';
@@ -66,12 +59,20 @@ import {
   InventoryExportRecord,
 } from '@/utils/inventoryExport';
 import {
-  sanitizeCompactScannerInput,
+  hasMatchingTraceNo,
+  sanitizeStructuredScannerInput,
   shouldIgnoreRecentDuplicateScan,
 } from '@/utils/scannerInput';
-
-// 盘点类型
-type CheckType = 'whole' | 'partial';
+import {
+  ERP_ACCOUNTS,
+  isErpAccountAvailable,
+  type ErpAccountConfig,
+  type ErpAccountKey,
+} from '@/utils/erpAccounts';
+import {
+  getInventoryCodeLookupKey,
+  reconcileInventoryRecords,
+} from '@/utils/inventoryReconciliation';
 
 // 扫描记录（每条独立）
 interface ScanRecord {
@@ -83,160 +84,53 @@ interface ScanRecord {
   actualQuantity?: number;
   inventoryCode?: string;
   scanTime: string;
+  ruleId?: string;
+  ruleName?: string;
   // 扩展字段
   package?: string;
   version?: string;
   productionDate?: string;
   traceNo?: string;
   sourceNo?: string;
-  // 自定义字段
+  // 占位字段解析值（仅用于兼容和排查，不展示、不导出）
   customFields?: Record<string, string>;
 }
 
+type InventoryAggregatedRecord = {
+  key: string;
+  model: string;
+  version: string;
+  records: ScanRecord[];
+  totalQuantity: number;
+  actualTotalQuantity: number;
+  count: number;
+};
 
-// ========================================
-// React.memo 优化：列表项组件
-// ========================================
-const getRecordRenderSignature = (records: any[] = []) =>
-  records
-    .map((record) =>
-      [
-        record.id || '',
-        record.version || '',
-        record.batch || '',
-        record.sourceNo || '',
-        record.package || '',
-        record.productionDate || '',
-        record.quantity ?? '',
-        record.actualQuantity ?? '',
-      ].join(':')
-    )
-    .join('|');
+const INVENTORY_RECORD_SIGNATURE_FIELDS = [
+  'id',
+  'version',
+  'batch',
+  'sourceNo',
+  'package',
+  'productionDate',
+  'quantity',
+  'actualQuantity',
+] as const;
 
 const buildInventoryGroupKey = (record: ScanRecord) =>
-  JSON.stringify([
-    record.model || '',
-    record.version || '',
-  ]);
+  JSON.stringify([record.model || '', record.version || '']);
 
-const RecordItem = React.memo(
-  ({
-    item,
-    isExpanded,
-    onToggle,
-    onDeleteRecord,
-    onEditQuantity,
-    checkType,
-    theme,
-    styles,
-  }: {
-    item: any;
-    isExpanded: boolean;
-    onToggle: (key: string) => void;
-    onDeleteRecord: (record: any) => void;
-    onEditQuantity?: (record: any) => void;
-    checkType: CheckType;
-    theme: any;
-    styles: any;
-  }) => {
-    const key = item.key;
+const INVENTORY_CHECK_RECORDS_KEY = 'inventory_check_records_by_erp_account_v1';
+type InventoryDraftStore = Record<string, ScanRecord[]>;
 
-    return (
-      <View key={key} style={styles.itemContainer}>
-        {/* 聚合项（两行布局） */}
-        <TouchableOpacity
-          style={styles.itemRow}
-          activeOpacity={0.7}
-          onPress={() => onToggle(key)}
-        >
-          <View style={styles.itemLeft}>
-            <TouchableOpacity
-              style={styles.itemModelRow}
-              activeOpacity={0.7}
-              onPress={() => onToggle(key)}
-            >
-              <Text style={styles.itemModel}>
-                {isExpanded ? '▼' : '▶'} {item.model}
-              </Text>
-            </TouchableOpacity>
-            <Text style={styles.itemBatch}>版本: {item.version || '-'}</Text>
-          </View>
-          <View style={styles.itemRight}>
-            {checkType === 'partial' ? (
-              <>
-                <View style={styles.quantityRow}>
-                  <Text style={styles.itemQtyLabel}>标签:</Text>
-                  <Text style={styles.itemQty}>{item.totalQuantity.toLocaleString()}</Text>
-                </View>
-                <View style={styles.actualRow}>
-                  <Text style={styles.actualLabel}>实际:</Text>
-                  <Text style={styles.actualQty}>{item.actualTotalQuantity.toLocaleString()}</Text>
-                </View>
-              </>
-            ) : (
-              <Text style={styles.itemQty}>{item.totalQuantity.toLocaleString()}</Text>
-            )}
-          </View>
-        </TouchableOpacity>
+const getInventoryWarehouseForAccount = (account: ErpAccountConfig): Warehouse => ({
+  id: `erp-account:${account.key}`,
+  name: account.expectedWarehouseName.trim() || account.name,
+  description: `${account.name} ERP盘点仓库`,
+});
 
-        {/* 展开的明细 */}
-        {isExpanded && (
-          <View style={styles.detailsContainer}>
-            {item.records.map((record: any) => {
-              const actualQuantity =
-                record.actualQuantity !== undefined && record.actualQuantity !== null
-                  ? record.actualQuantity
-                  : record.quantity;
-              const isAdjusted =
-                record.actualQuantity !== undefined &&
-                record.actualQuantity !== null &&
-                record.actualQuantity !== record.quantity;
-
-              return (
-                <TouchableOpacity
-                  key={record.id}
-                  style={styles.detailItem}
-                  activeOpacity={checkType === 'partial' ? 0.7 : 1}
-                  onPress={checkType === 'partial' ? () => onEditQuantity?.(record) : undefined}
-                  onLongPress={() => onDeleteRecord(record)}
-                  delayLongPress={500}
-                >
-                  <Text style={styles.detailText}>
-                    批次: {record.batch || '-'}  |  生产日期: {record.productionDate || '-'}  |  标签:{' '}
-                    {record.quantity}
-                  </Text>
-                  {checkType === 'partial' && (
-                    <View style={styles.detailActualRow}>
-                      <Text style={styles.detailText}>
-                        实际: {actualQuantity}
-                        {isAdjusted ? ' (已调整)' : ''}
-                      </Text>
-                      <Feather name="edit-3" size={12} color={theme.accent} />
-                    </View>
-                  )}
-                  <Text style={styles.detailText}>版本号: {record.version || '-'}</Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
-        )}
-      </View>
-    );
-  },
-  (prevProps, nextProps) => {
-    // 自定义比较函数：只有关键属性变化时才重新渲染
-    return (
-      prevProps.item.model === nextProps.item.model &&
-      prevProps.item.version === nextProps.item.version &&
-      prevProps.item.totalQuantity === nextProps.item.totalQuantity &&
-      prevProps.item.actualTotalQuantity === nextProps.item.actualTotalQuantity &&
-      prevProps.item.count === nextProps.item.count &&
-      prevProps.isExpanded === nextProps.isExpanded &&
-      prevProps.checkType === nextProps.checkType &&
-      getRecordRenderSignature(prevProps.item.records) === getRecordRenderSignature(nextProps.item.records)
-    );
-  }
-);
+const getDraftScopeKey = (accountKey: ErpAccountKey, warehouseId: string): string =>
+  `${accountKey}::${warehouseId}`;
 
 export default function InventoryScreen() {
   const { theme, isDark } = useTheme();
@@ -273,9 +167,12 @@ export default function InventoryScreen() {
     [theme]
   );
   const router = useSafeRouter();
+  const { showToast, ToastContainer } = useToast();
+  const alert = useCustomAlert();
 
-  // 盘点类型
-  const [checkType, setCheckType] = useState<CheckType>('whole');
+  const [selectedAccount, setSelectedAccount] = useState<ErpAccountConfig>(ERP_ACCOUNTS[0]);
+  const selectedAccountRef = useRef<ErpAccountConfig>(ERP_ACCOUNTS[0]);
+  const selectedAccountAvailable = isErpAccountAvailable(selectedAccount);
 
   // 输入
   const inputRef = useRef<TextInput>(null);
@@ -289,6 +186,7 @@ export default function InventoryScreen() {
   const scannerFocusBlockedRef = useRef(false);
   // 扫码队列 - 暂存处理中的新扫码
   const scanQueueRef = useRef<string[]>([]);
+  const processScanRef = useRef<(code: string) => void>(() => undefined);
   const lastScanRef = useRef('');
   const lastScanTimeRef = useRef(0);
 
@@ -301,10 +199,12 @@ export default function InventoryScreen() {
     return true;
   }, []);
 
-  // 仓库
-  const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
-  const [currentWarehouse, setCurrentWarehouse] = useState<Warehouse | null>(null);
-  const [showWarehousePicker, setShowWarehousePicker] = useState(false);
+  // 盘点仓库由账套固定映射，不允许再手动组合账套与仓库。
+  const [currentWarehouse, setCurrentWarehouse] = useState<Warehouse>(() =>
+    getInventoryWarehouseForAccount(ERP_ACCOUNTS[0])
+  );
+  const [switchingAccount, setSwitchingAccount] = useState(false);
+  const accountSwitchInProgressRef = useRef(false);
 
   // 扫描记录
   const [scanRecords, setScanRecords] = useState<ScanRecord[]>([]);
@@ -321,18 +221,18 @@ export default function InventoryScreen() {
     });
   }, []);
 
-  // AsyncStorage Key
-  const INVENTORY_CHECK_RECORDS_KEY = 'inventory_check_records';
-  const INVENTORY_CHECK_TYPE_KEY = 'inventory_check_type';
-  const INVENTORY_PENDING_WAREHOUSE_KEY = 'inventory_pending_warehouse';
-  // 全局仓库 Storage Key
-  const GLOBAL_WAREHOUSE_KEY = STORAGE_KEYS.GLOBAL_WAREHOUSE;
+  const draftMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
 
-  type InventoryDraftStore = Record<string, Partial<Record<CheckType, ScanRecord[]>>>;
+  const enqueueDraftMutation = useCallback(<T,>(task: () => Promise<T>): Promise<T> => {
+    const queuedTask = draftMutationQueueRef.current.then(task, task);
+    draftMutationQueueRef.current = queuedTask.then(
+      () => undefined,
+      () => undefined
+    );
+    return queuedTask;
+  }, []);
 
-  const isScanRecordArray = (value: unknown): value is ScanRecord[] => Array.isArray(value);
-
-  const readCheckDraftStore = async (): Promise<InventoryDraftStore> => {
+  const readCheckDraftStore = useCallback(async (): Promise<InventoryDraftStore> => {
     const savedRecords = await AsyncStorage.getItem(INVENTORY_CHECK_RECORDS_KEY);
     if (!savedRecords) {
       return {};
@@ -344,140 +244,116 @@ export default function InventoryScreen() {
     }
 
     return parsed as InventoryDraftStore;
-  };
+  }, []);
 
-  const getDraftRecords = async (
-    warehouse: Warehouse | null | undefined,
-    type: CheckType
-  ): Promise<ScanRecord[]> => {
-    if (!warehouse) {
-      return [];
-    }
-
-    const savedRecords = await AsyncStorage.getItem(INVENTORY_CHECK_RECORDS_KEY);
-    if (!savedRecords) {
-      return [];
-    }
-
-    const parsed = safeJsonParseNullable<unknown>(savedRecords, 'inventory.scanRecords');
-    if (!parsed) {
-      return [];
-    }
-
-    // 兼容旧版本单草稿结构，首次读取后会被新的分类型结构覆盖。
-    if (isScanRecordArray(parsed)) {
-      const [savedType, savedWarehouse] = await Promise.all([
-        AsyncStorage.getItem(INVENTORY_CHECK_TYPE_KEY),
-        AsyncStorage.getItem(INVENTORY_PENDING_WAREHOUSE_KEY),
-      ]);
-      const savedWarehouseInfo = savedWarehouse
-        ? safeJsonParseNullable<{ id?: string }>(savedWarehouse, 'inventory.pendingWarehouse')
-        : null;
-      if ((savedType || 'whole') === type && savedWarehouseInfo?.id === warehouse.id) {
-        return parsed;
-      }
-      return [];
-    }
-
-    if (typeof parsed !== 'object') {
-      return [];
-    }
-
-    const store = parsed as InventoryDraftStore;
-    const records = store[warehouse.id]?.[type];
-    return Array.isArray(records) ? records : [];
-  };
-
-  // 加载指定盘点类型的扫描记录
-  const loadCheckRecords = async (warehouse?: Warehouse | null, type: CheckType = checkType) => {
-    try {
+  const getDraftRecords = useCallback(
+    async (
+      warehouse: Warehouse | null | undefined,
+      accountKey: ErpAccountKey
+    ): Promise<ScanRecord[]> => {
       if (!warehouse) {
-        logger.log('[盘点] 当前仓库未加载，跳过恢复');
-        return;
+        return [];
       }
 
-      const records = await getDraftRecords(warehouse, type);
-      replaceScanRecords(records);
-
-      if (records.length > 0) {
-        showToast(`已恢复 ${records.length} 条${type === 'whole' ? '整包' : '拆包'}暂存`, 'success');
-      }
-    } catch (error) {
-      logger.error('[盘点] 加载记录失败:', error);
-    }
-  };
-
-  // 保存指定盘点类型的扫描记录
-  const saveCheckRecords = async (
-    records: ScanRecord[],
-    type: CheckType,
-    warehouse?: Warehouse | null
-  ) => {
-    try {
-      if (!warehouse) {
-        return;
+      await draftMutationQueueRef.current;
+      const savedRecords = await AsyncStorage.getItem(INVENTORY_CHECK_RECORDS_KEY);
+      if (!savedRecords) {
+        return [];
       }
 
-      const store = await readCheckDraftStore();
-      const warehouseDraft = { ...(store[warehouse.id] || {}) };
-
-      if (records.length > 0) {
-        warehouseDraft[type] = records;
-      } else {
-        delete warehouseDraft[type];
+      const parsed = safeJsonParseNullable<unknown>(savedRecords, 'inventory.scanRecords');
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+        return [];
       }
 
-      if (warehouseDraft.whole?.length || warehouseDraft.partial?.length) {
-        store[warehouse.id] = warehouseDraft;
-      } else {
-        delete store[warehouse.id];
-      }
+      const store = parsed as InventoryDraftStore;
+      const records = store[getDraftScopeKey(accountKey, warehouse.id)];
+      return Array.isArray(records) ? records : [];
+    },
+    []
+  );
 
-      await AsyncStorage.setItem(INVENTORY_CHECK_RECORDS_KEY, JSON.stringify(store));
-      await AsyncStorage.setItem(INVENTORY_CHECK_TYPE_KEY, type);
-      if (warehouse) {
-        await AsyncStorage.setItem(INVENTORY_PENDING_WAREHOUSE_KEY, JSON.stringify(warehouse));
-      }
-    } catch (error) {
-      logger.error('[盘点] 保存记录失败:', error);
-    }
-  };
-
-  // 清空扫描记录，可只清当前类型，也可清当前仓库全部盘点草稿
-  const clearCheckRecords = async (type?: CheckType, warehouse?: Warehouse | null) => {
-    try {
-      if (!warehouse) {
-        await AsyncStorage.removeItem(INVENTORY_CHECK_RECORDS_KEY);
-        await AsyncStorage.removeItem(INVENTORY_CHECK_TYPE_KEY);
-        await AsyncStorage.removeItem(INVENTORY_PENDING_WAREHOUSE_KEY);
-        return true;
-      }
-
-      const store = await readCheckDraftStore();
-      if (type) {
-        const warehouseDraft = { ...(store[warehouse.id] || {}) };
-        delete warehouseDraft[type];
-
-        if (warehouseDraft.whole?.length || warehouseDraft.partial?.length) {
-          store[warehouse.id] = warehouseDraft;
-        } else {
-          delete store[warehouse.id];
+  // 每个账套、每个本地仓库拥有独立盘点草稿。
+  const loadCheckRecords = useCallback(
+    async (warehouse: Warehouse | null | undefined, account: ErpAccountConfig) => {
+      try {
+        if (!warehouse) {
+          logger.log('[盘点] 当前仓库未加载，跳过恢复');
+          return;
         }
-      } else {
-        delete store[warehouse.id];
+
+        const records = await getDraftRecords(warehouse, account.key);
+        replaceScanRecords(records);
+
+        if (records.length > 0) {
+          showToast(`已恢复 ${account.name} 的 ${records.length} 条盘点暂存`, 'success');
+        }
+      } catch (error) {
+        logger.error('[盘点] 加载记录失败:', error);
       }
+    },
+    [getDraftRecords, replaceScanRecords, showToast]
+  );
 
-      await AsyncStorage.setItem(INVENTORY_CHECK_RECORDS_KEY, JSON.stringify(store));
-      await AsyncStorage.setItem(INVENTORY_CHECK_TYPE_KEY, checkType);
-      return true;
-    } catch (error) {
-      logger.error('[盘点] 清空记录失败:', error);
-      return false;
-    }
-  };
+  // 保存当前账套的盘点草稿。
+  const saveCheckRecords = useCallback(
+    async (
+      records: ScanRecord[],
+      warehouse: Warehouse | null | undefined,
+      accountKey: ErpAccountKey
+    ): Promise<boolean> => {
+      return enqueueDraftMutation(async () => {
+        try {
+          if (!warehouse) {
+            return false;
+          }
 
-  // 拆包数量修改
+          const store = await readCheckDraftStore();
+          const scopeKey = getDraftScopeKey(accountKey, warehouse.id);
+
+          if (records.length > 0) {
+            store[scopeKey] = records;
+          } else {
+            delete store[scopeKey];
+          }
+
+          await AsyncStorage.setItem(INVENTORY_CHECK_RECORDS_KEY, JSON.stringify(store));
+          return true;
+        } catch (error) {
+          logger.error('[盘点] 保存记录失败:', error);
+          return false;
+        }
+      });
+    },
+    [enqueueDraftMutation, readCheckDraftStore]
+  );
+
+  // 清空指定账套和仓库的盘点草稿。
+  const clearCheckRecords = useCallback(
+    async (warehouse: Warehouse | null | undefined, accountKey: ErpAccountKey) => {
+      return enqueueDraftMutation(async () => {
+        try {
+          if (!warehouse) {
+            return false;
+          }
+
+          const store = await readCheckDraftStore();
+          delete store[getDraftScopeKey(accountKey, warehouse.id)];
+
+          await AsyncStorage.setItem(INVENTORY_CHECK_RECORDS_KEY, JSON.stringify(store));
+          return true;
+        } catch (error) {
+          logger.error('[盘点] 清空记录失败:', error);
+          return false;
+        }
+      });
+    },
+    [enqueueDraftMutation, readCheckDraftStore]
+  );
+
+  // 任意盘点明细都可修正实盘数量，扫描时默认使用标签数量。
   const [quantityModalVisible, setQuantityModalVisible] = useState(false);
+  const quantityModalVisibleRef = useRef(false);
   const [editingRecord, setEditingRecord] = useState<ScanRecord | null>(null);
   const [quantityInput, setQuantityInput] = useState('');
   const quantityInputRef = useRef<TextInput>(null);
@@ -502,15 +378,11 @@ export default function InventoryScreen() {
 
   // 保存状态
   const [saving, setSaving] = useState(false);
-
-  // Toast
-  const { showToast, ToastContainer } = useToast();
-  const alert = useCustomAlert();
+  const saveInProgressRef = useRef(false);
 
   useEffect(() => {
-    scannerFocusBlockedRef.current =
-      showWarehousePicker || quantityModalVisible || saving;
-  }, [quantityModalVisible, saving, showWarehousePicker]);
+    scannerFocusBlockedRef.current = quantityModalVisible || saving || switchingAccount;
+  }, [quantityModalVisible, saving, switchingAccount]);
 
   const focusScannerInput = useCallback((delay = 80) => {
     if (focusTimerRef.current) {
@@ -524,6 +396,20 @@ export default function InventoryScreen() {
       }
     }, delay);
   }, []);
+
+  const resumeQueuedScans = useCallback(() => {
+    if (!screenActiveRef.current || processingRef.current || quantityModalVisibleRef.current) {
+      return;
+    }
+
+    const nextCode = scanQueueRef.current.shift();
+    if (nextCode) {
+      processScanRef.current(nextCode);
+      return;
+    }
+
+    focusScannerInput(0);
+  }, [focusScannerInput]);
 
   useEffect(
     () => () => {
@@ -544,10 +430,10 @@ export default function InventoryScreen() {
   );
 
   useEffect(() => {
-    if (!showWarehousePicker && !quantityModalVisible && !saving) {
+    if (!quantityModalVisible && !saving && !switchingAccount) {
       focusScannerInput(80);
     }
-  }, [focusScannerInput, quantityModalVisible, saving, showWarehousePicker]);
+  }, [focusScannerInput, quantityModalVisible, saving, switchingAccount]);
 
   // 展开状态管理（用 ref 同步，避免 renderAggregatedRecord 频繁重建）
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
@@ -568,9 +454,9 @@ export default function InventoryScreen() {
   // 数据变化时自动保存
   useEffect(() => {
     if (scanRecords.length > 0) {
-      saveCheckRecords(scanRecords, checkType, currentWarehouse);
+      void saveCheckRecords(scanRecords, currentWarehouse, selectedAccount.key);
     }
-  }, [scanRecords, checkType, currentWarehouse]);
+  }, [currentWarehouse, saveCheckRecords, scanRecords, selectedAccount.key]);
 
   // 删除单条记录
   const handleDeleteRecord = useCallback(
@@ -579,15 +465,26 @@ export default function InventoryScreen() {
         '确认删除',
         '确定要删除这条记录吗？',
         () => {
-          const updated = scanRecordsRef.current.filter((r) => r.id !== record.id);
-          replaceScanRecords(updated);
-          void saveCheckRecords(updated, checkType, currentWarehouse);
-          showToast('记录已删除', 'success');
+          void (async () => {
+            const updated = scanRecordsRef.current.filter((r) => r.id !== record.id);
+            const saved = await saveCheckRecords(
+              updated,
+              currentWarehouse,
+              selectedAccount.key
+            );
+            if (!saved) {
+              showToast('删除暂存失败，请重试', 'error');
+              feedbackError();
+              return;
+            }
+            replaceScanRecords(updated);
+            showToast('记录已删除', 'success');
+          })();
         },
         true
       );
     },
-    [alert, checkType, currentWarehouse, replaceScanRecords, showToast]
+    [alert, currentWarehouse, replaceScanRecords, saveCheckRecords, selectedAccount.key, showToast]
   );
 
   // 自动清理震动和提示音
@@ -599,45 +496,25 @@ export default function InventoryScreen() {
       screenActiveRef.current = true;
       let isActive = true;
       const init = async () => {
-        // 1. 加载仓库列表（数据库已在 APP 启动时初始化）
-        const list = await getAllWarehouses();
-        setWarehouses(list);
+        try {
+          const account = selectedAccountRef.current;
+          const warehouse = getInventoryWarehouseForAccount(account);
+          setCurrentWarehouse(warehouse);
+          await loadCheckRecords(warehouse, account);
 
-        // 2. 恢复之前选择的仓库，并等待状态更新
-        let warehouse: Warehouse | null = null;
-        const savedWarehouse = await AsyncStorage.getItem(GLOBAL_WAREHOUSE_KEY);
-        if (savedWarehouse) {
-          const saved = safeJsonParseNullable<Warehouse>(
-            savedWarehouse,
-            'inventory.globalWarehouse'
-          );
-          // 确保仓库仍然存在
-          const latestWarehouse = saved ? list.find((w) => w.id === saved.id) : null;
-          if (latestWarehouse) {
-            warehouse = latestWarehouse;
-            await AsyncStorage.setItem(GLOBAL_WAREHOUSE_KEY, JSON.stringify(latestWarehouse));
+          if (isActive) {
+            focusScannerInput(100);
           }
-        }
-
-        // 没有保存的选择，使用默认仓库
-        if (!warehouse) {
-          const def = await getDefaultWarehouse();
-          warehouse = def || list[0] || null;
-        }
-
-        // 3. 设置当前仓库并等待状态更新
-        setCurrentWarehouse(warehouse);
-
-        // 4. 加载检查记录（直接使用显式仓库，避免闭包拿到旧状态）
-        await loadCheckRecords(warehouse);
-
-        // 5. 聚焦输入框
-        if (isActive) {
-          focusScannerInput(100);
+        } catch (error) {
+          logger.error('[扫码盘点] 初始化失败:', error);
+          if (isActive) {
+            showToast('数据库读取失败，请关闭应用后重试', 'error');
+            focusScannerInput(300);
+          }
         }
       };
 
-      init();
+      void init();
 
       return () => {
         isActive = false;
@@ -659,65 +536,68 @@ export default function InventoryScreen() {
           errorActionTimerRef.current = null;
         }
       };
-    }, [focusScannerInput])
+    }, [focusScannerInput, loadCheckRecords, showToast])
   );
 
-  // 加载仓库
-  // 切换仓库
-  const handleWarehouseChange = async (warehouse: Warehouse) => {
-    // 先保存当前仓库的扫码记录
-    if (scanRecords.length > 0) {
-      await saveCheckRecords(scanRecords, checkType, currentWarehouse);
-    }
-
-    // 切换仓库
-    setCurrentWarehouse(warehouse);
-    await AsyncStorage.setItem(GLOBAL_WAREHOUSE_KEY, JSON.stringify(warehouse));
-
-    // 先重置界面状态，再恢复新仓库自己的暂存
-    replaceScanRecords([]);
-    expandedGroupsRef.current = new Set();
-    setExpandedGroups(new Set());
-    setEditingRecord(null);
-    setQuantityModalVisible(false);
-
-    await loadCheckRecords(warehouse);
-  };
-
-  const handleCheckTypeChange = useCallback(
-    async (nextType: CheckType) => {
-      if (nextType === checkType) {
+  const handleAccountChange = useCallback(
+    async (nextAccount: ErpAccountConfig) => {
+      if (
+        nextAccount.key === selectedAccount.key ||
+        accountSwitchInProgressRef.current
+      ) {
         return;
       }
 
-      if (currentWarehouse && scanRecords.length > 0) {
-        await saveCheckRecords(scanRecords, checkType, currentWarehouse);
-      }
-
-      const savedCount = scanRecords.length;
-      const fromLabel = checkType === 'whole' ? '整包' : '拆包';
-      const toLabel = nextType === 'whole' ? '整包' : '拆包';
-
-      setCheckType(nextType);
-      replaceScanRecords([]);
-      expandedGroupsRef.current = new Set();
-      setExpandedGroups(new Set());
-      setEditingRecord(null);
-      setQuantityModalVisible(false);
-
-      if (currentWarehouse) {
-        const nextRecords = await getDraftRecords(currentWarehouse, nextType);
-        await loadCheckRecords(currentWarehouse, nextType);
-
-        if (savedCount > 0) {
-          const restoreText = nextRecords.length > 0 ? `，已恢复${toLabel}${nextRecords.length}条` : '';
-          showToast(`${fromLabel}已暂存 ${savedCount} 条${restoreText}，确认盘点会合并保存`, 'success');
-        } else if (nextRecords.length > 0) {
-          showToast(`已恢复${toLabel}暂存 ${nextRecords.length} 条`, 'success');
+      accountSwitchInProgressRef.current = true;
+      setSwitchingAccount(true);
+      try {
+        const currentRecords = [...scanRecordsRef.current];
+        if (currentRecords.length > 0) {
+          const saved = await saveCheckRecords(
+            currentRecords,
+            currentWarehouse,
+            selectedAccount.key
+          );
+          if (!saved) {
+            showToast('当前盘点暂存失败，已取消切换账套', 'error');
+            feedbackError();
+            return;
+          }
         }
+
+        const nextWarehouse = getInventoryWarehouseForAccount(nextAccount);
+        selectedAccountRef.current = nextAccount;
+        setSelectedAccount(nextAccount);
+        setCurrentWarehouse(nextWarehouse);
+        replaceScanRecords([]);
+        expandedGroupsRef.current = new Set();
+        setExpandedGroups(new Set());
+        setEditingRecord(null);
+        quantityModalVisibleRef.current = false;
+        setQuantityModalVisible(false);
+        scanQueueRef.current = [];
+
+        const nextRecords = await getDraftRecords(nextWarehouse, nextAccount.key);
+        replaceScanRecords(nextRecords);
+
+        if (!isErpAccountAvailable(nextAccount)) {
+          showToast(`${nextAccount.name}账套暂未开放`, 'warning');
+        } else {
+          showToast(`已切换到 ${nextAccount.name}`, 'success');
+        }
+      } finally {
+        accountSwitchInProgressRef.current = false;
+        setSwitchingAccount(false);
       }
     },
-    [checkType, currentWarehouse, replaceScanRecords, scanRecords]
+    [
+      currentWarehouse,
+      replaceScanRecords,
+      getDraftRecords,
+      saveCheckRecords,
+      selectedAccount.key,
+      showToast,
+    ]
   );
 
   // 处理扫描（带参数版本）
@@ -743,14 +623,23 @@ export default function InventoryScreen() {
         return;
       }
 
+      if (!selectedAccountAvailable) {
+        showToast(`${selectedAccount.name}账套暂未开放，不能开始盘点`, 'warning');
+        feedbackWarning();
+        return;
+      }
+
       processingRef.current = true;
 
       try {
         // 解析二维码
         const rule = await detectRule(code);
         if (!rule) {
-          const errorDetail = getErrorDetail('ERR_QR_FORMAT', { code }, router);
-          showToast(errorDetail.title, 'error');
+          if (!isQRCode(code)) {
+            logger.log('[盘点] 静默忽略未匹配规则的一维码');
+            return;
+          }
+          showToast('没有匹配的二维码解析规则，请先在设置中配置', 'error');
           logger.error('[盘点] 无法识别二维码格式:', code);
           feedbackError();
           return;
@@ -775,25 +664,20 @@ export default function InventoryScreen() {
             quantity: standardFields.quantity,
             model,
           });
+          showToast('二维码数量无效，请重新扫描', 'error');
+          feedbackError();
           return;
         }
 
-        // 查找存货编码
-        const inventoryCode = await getInventoryCodeByModel(model);
-
-        // 检查重复（只检测追溯码，因为箱号可能重复）
-        let isDuplicate = false;
-
-        // 根据追溯码字段判断（已保存的记录）
-        if (standardFields.traceNo) {
-          const currentRecords = scanRecordsRef.current;
-          const existingByTraceNo = currentRecords.find((r) => r.traceNo === standardFields.traceNo);
-          if (existingByTraceNo) {
-            isDuplicate = true;
-          }
+        // 盘点必须按“型号 + 可选版本号”匹配，保持与出入库一致。
+        const inventoryCode = await getInventoryCodeByModel(model, version);
+        if (!inventoryCode) {
+          showToast(`未绑定存货编码：${model}${version ? ` / ${version}` : ''}`, 'error');
+          feedbackNotBound();
+          return;
         }
 
-        if (isDuplicate) {
+        if (hasMatchingTraceNo(scanRecordsRef.current, standardFields.traceNo)) {
           showToast('已扫过此追溯码', 'warning');
           feedbackDuplicate();
           return;
@@ -806,35 +690,27 @@ export default function InventoryScreen() {
           model,
           batch,
           quantity,
-          actualQuantity: checkType === 'partial' ? quantity : undefined,
+          actualQuantity: quantity,
           inventoryCode: inventoryCode || undefined,
           scanTime: formatDateTime(new Date().toISOString()),
+          ruleId: rule.id,
+          ruleName: rule.name,
           // 扩展字段
           package: standardFields.package || undefined,
           version: version || undefined,
           productionDate: standardFields.productionDate || undefined,
           traceNo: standardFields.traceNo || undefined,
           sourceNo: standardFields.sourceNo || undefined,
-          // 自定义字段
+          // 占位字段解析值
           customFields: customFields || {},
         };
 
-        if (checkType === 'partial') {
-          const groupKey = buildInventoryGroupKey(newRecord);
-          const nextExpandedGroups = new Set(expandedGroupsRef.current);
-          nextExpandedGroups.add(groupKey);
-          expandedGroupsRef.current = nextExpandedGroups;
-          setExpandedGroups(nextExpandedGroups);
-        }
-
         updateScanRecords((prev) => [newRecord, ...prev]);
-
         showToast(`已扫码：${model}`, 'success');
         feedbackSuccess();
       } catch (e) {
         logger.error('[盘点] 处理失败:', e);
-        logger.error(e);
-        showToast('处理失败', 'error');
+        showToast(e instanceof Error && e.message ? e.message : '处理失败，请重新扫描', 'error');
         feedbackError();
       } finally {
         processingRef.current = false;
@@ -845,23 +721,23 @@ export default function InventoryScreen() {
         }
         postProcessTimerRef.current = setTimeout(() => {
           postProcessTimerRef.current = null;
-          if (!screenActiveRef.current) {
-            return;
-          }
-          if (scanQueueRef.current.length > 0) {
-            const nextCode = scanQueueRef.current.shift();
-            if (nextCode) {
-              processScan(nextCode);
-            }
-          } else {
-            // 队列空了，重新聚焦输入框
-            focusScannerInput(0);
-          }
+          resumeQueuedScans();
         }, 0);
       }
     },
-    [checkType, currentWarehouse, focusScannerInput, updateScanRecords]
+    [
+      currentWarehouse,
+      resumeQueuedScans,
+      router,
+      selectedAccount.name,
+      selectedAccountAvailable,
+      showToast,
+      updateScanRecords,
+    ]
   );
+  useEffect(() => {
+    processScanRef.current = processScan;
+  }, [processScan]);
 
   // 输入变化时自动检测并触发（扫码器逐字符输入，需要防抖检测完成）
   const handleInputChange = useCallback(
@@ -872,19 +748,16 @@ export default function InventoryScreen() {
         autoSubmitTimerRef.current = null;
       }
 
+      // TextInput 是受控组件，逐字符扫码时也必须保留当前输入。
+      setInputValue(text);
+
       // 如果当前有输入内容，启动定时器检测扫码完成
       if (text.length > 0) {
         autoSubmitTimerRef.current = setTimeout(() => {
           autoSubmitTimerRef.current = null;
-          const code = sanitizeCompactScannerInput(text);
+          const code = sanitizeStructuredScannerInput(text);
           // 检测到输入完成（输入停止超过阈值，认为扫码完成）
           if (code.length >= 1) {
-            // 一维码过滤：不含分隔符的扫码静默忽略
-            if (!isQRCode(code)) {
-              setInputValue(''); // 清空输入框
-              focusScannerInput(0);
-              return;
-            }
             if (!shouldAcceptScanCode(code)) {
               setInputValue('');
               focusScannerInput(0);
@@ -900,9 +773,6 @@ export default function InventoryScreen() {
         }, 150); // 150ms 防抖，等待扫码器输入完成
         return;
       }
-
-      // 输入框被清空时，更新状态
-      setInputValue(text);
     },
     [focusScannerInput, processScan, shouldAcceptScanCode]
   );
@@ -914,16 +784,9 @@ export default function InventoryScreen() {
       autoSubmitTimerRef.current = null;
     }
 
-    const code = sanitizeCompactScannerInput(inputValue);
+    const code = sanitizeStructuredScannerInput(inputValue);
 
     if (!code) return;
-
-    // 一维码过滤：不含分隔符的扫码静默忽略
-    if (!isQRCode(code)) {
-      setInputValue('');
-      focusScannerInput(0);
-      return;
-    }
 
     if (!shouldAcceptScanCode(code)) {
       setInputValue('');
@@ -940,27 +803,14 @@ export default function InventoryScreen() {
     processScan(code);
   }, [focusScannerInput, inputValue, processScan, shouldAcceptScanCode]);
 
-  // 选择仓库
-  const selectWarehouse = async (wh: Warehouse) => {
-    // 如果选择的是当前仓库，直接关闭弹窗
-    if (wh.id === currentWarehouse?.id) {
-      setShowWarehousePicker(false);
-      return;
-    }
-
-    // 切换到新仓库
-    await handleWarehouseChange(wh);
-    setShowWarehousePicker(false);
-    showToast(`仓库已切换：${wh.name}`, 'success');
-    focusScannerInput(100);
-  };
-
   // 打开数量修改弹窗
-  const openQuantityModal = (record: ScanRecord) => {
+  const openQuantityModal = useCallback((record: ScanRecord) => {
+    scannerFocusBlockedRef.current = true;
+    quantityModalVisibleRef.current = true;
     setEditingRecord(record);
     setQuantityInput(record.actualQuantity?.toString() || record.quantity.toString());
     setQuantityModalVisible(true);
-  };
+  }, []);
 
   // 确认修改数量（支持回车和按钮）
   const handleConfirmQuantity = () => {
@@ -975,10 +825,21 @@ export default function InventoryScreen() {
     updateScanRecords((prev) =>
       prev.map((r) => (r.id === editingRecord.id ? { ...r, actualQuantity: qty } : r))
     );
+    scannerFocusBlockedRef.current = false;
+    quantityModalVisibleRef.current = false;
     setQuantityModalVisible(false);
     setEditingRecord(null);
     showToast(`实盘数量已改为 ${qty}`, 'success');
     feedbackConfirm();
+    setTimeout(resumeQueuedScans, 0);
+  };
+
+  const handleCancelQuantity = () => {
+    scannerFocusBlockedRef.current = false;
+    quantityModalVisibleRef.current = false;
+    setQuantityModalVisible(false);
+    setEditingRecord(null);
+    setTimeout(resumeQueuedScans, 0);
   };
 
   const syncInventorySnapshot = async (
@@ -1015,53 +876,65 @@ export default function InventoryScreen() {
     };
   };
 
-  // 确认盘点
-  const handleSaveInventory = async () => {
+  const performSaveInventory = async () => {
+    if (saveInProgressRef.current) {
+      return;
+    }
     if (!currentWarehouse) {
       showToast('请先选择仓库', 'warning');
       feedbackWarning();
       return;
     }
-    const wholeDraft = checkType === 'whole'
-      ? scanRecords
-      : await getDraftRecords(currentWarehouse, 'whole');
-    const partialDraft = checkType === 'partial'
-      ? scanRecords
-      : await getDraftRecords(currentWarehouse, 'partial');
-    const allDraftRecords = [
-      ...wholeDraft.map((record) => ({ record, type: 'whole' as const })),
-      ...partialDraft.map((record) => ({ record, type: 'partial' as const })),
-    ];
-
-    if (allDraftRecords.length === 0) {
-      showToast('暂无扫描记录', 'warning');
+    if (!selectedAccountAvailable) {
+      showToast(`${selectedAccount.name}账套暂未开放，无法核对ERP库存`, 'warning');
       feedbackWarning();
       return;
     }
-
-    // 数据库已在 APP 启动时初始化，直接处理保存
-
+    saveInProgressRef.current = true;
     setSaving(true);
     try {
-      logger.log('[库存盘点] 开始保存盘点记录，共', scanRecords.length, '条');
-      const checkNo = await generateCheckNo();
+      const allDraftRecords = [...scanRecordsRef.current];
+      if (allDraftRecords.length === 0) {
+        showToast('暂无扫描记录', 'warning');
+        feedbackWarning();
+        return;
+      }
+
+      showToast(`正在核对 ${selectedAccount.name} ERP库存…`, 'success');
+      const reconciliation = await reconcileInventoryRecords(selectedAccount, allDraftRecords);
+      logger.log('[库存盘点] ERP库存核对完成', {
+        account: selectedAccount.key,
+        queryCount: reconciliation.queryCount,
+      });
+
+      logger.log('[库存盘点] 开始保存盘点记录，共', allDraftRecords.length, '条');
+      let checkNo = await generateCheckNo();
       const today = formatDate(new Date().toISOString());
       const createdAt = getISODateTime();
       logger.log('[库存盘点] 盘点单号:', checkNo);
 
-      const recordsToSave: any[] = [];
+      const recordsToSave: Parameters<typeof addInventoryCheckRecordsBatch>[0] = [];
       const exportRecords: InventoryExportRecord[] = [];
-      for (const { record, type } of allDraftRecords) {
+      for (const record of allDraftRecords) {
+        const inventoryCode = record.inventoryCode || '';
+        const erpQuantity = reconciliation.erpQuantityByInventoryCode.get(
+          getInventoryCodeLookupKey(inventoryCode)
+        );
+        if (erpQuantity === undefined) {
+          throw new Error(`${inventoryCode || record.model} 缺少ERP库存核对结果`);
+        }
+
         const base = {
+          id: record.id,
           check_no: checkNo,
           warehouse_id: currentWarehouse.id,
           warehouse_name: currentWarehouse.name,
-          inventory_code: record.inventoryCode || '',
+          inventory_code: inventoryCode,
           scan_model: record.model,
           batch: record.batch,
           quantity: record.quantity,
-          check_type: type,
-          actual_quantity: type === 'partial' ? record.actualQuantity : undefined,
+          check_type: 'whole' as const,
+          actual_quantity: record.actualQuantity ?? record.quantity,
           check_date: today,
           notes: '',
           package: record.package,
@@ -1070,26 +943,46 @@ export default function InventoryScreen() {
           traceNo: record.traceNo,
           sourceNo: record.sourceNo,
           customFields: record.customFields,
+          rule_id: record.ruleId,
+          rule_name: record.ruleName,
+          erp_account_key: selectedAccount.key,
+          erp_account_name: selectedAccount.name,
+          erp_quantity: erpQuantity,
         };
         recordsToSave.push(base);
-        exportRecords.push({ ...base, created_at: createdAt });
+        exportRecords.push({
+          ...base,
+          account_name: selectedAccount.name,
+          created_at: createdAt,
+        });
       }
-      const exportMode: InventoryExportMode =
-        wholeDraft.length > 0 && partialDraft.length > 0
-          ? 'complete'
-          : wholeDraft.length > 0
-            ? 'whole'
-            : 'partial';
+      const exportMode: InventoryExportMode = 'complete';
       const savedCount = recordsToSave.length;
 
-      await addInventoryCheckRecordsBatch(recordsToSave);
+      const batchSaveResult = await addInventoryCheckRecordsBatch(recordsToSave);
+      checkNo = batchSaveResult.checkNo || checkNo;
+      if (batchSaveResult.reusedExisting) {
+        exportRecords.forEach((record) => {
+          record.check_no = checkNo;
+        });
+        logger.warn('[库存盘点] 检测到已保存草稿，沿用原盘点单继续清理和同步:', checkNo);
+      }
+      const draftsCleared = await clearCheckRecords(currentWarehouse, selectedAccount.key);
+      if (!draftsCleared) {
+        logger.error('[库存盘点] 盘点已保存，但本地草稿清理失败');
+      }
       let syncResult: Awaited<ReturnType<typeof syncInventorySnapshot>> = {
         success: false,
         skipped: false,
         message: '电脑同步失败，请稍后重试',
       };
       try {
-        syncResult = await syncInventorySnapshot(exportRecords, exportMode, currentWarehouse.name, checkNo);
+        syncResult = await syncInventorySnapshot(
+          exportRecords,
+          exportMode,
+          currentWarehouse.name,
+          checkNo
+        );
       } catch (syncError) {
         logger.warn('[库存盘点] 盘点已保存，但同步流程异常:', syncError);
         syncResult = {
@@ -1131,32 +1024,76 @@ export default function InventoryScreen() {
       }
       feedbackInventoryComplete();
 
-      try {
-        const cleared = await clearCheckRecords(checkType, currentWarehouse);
-        if (!cleared) {
-          throw new Error('本地盘点草稿清理失败');
-        }
-      } catch (refreshError) {
-        logger.error('[库存盘点] 盘点已保存，但界面刷新失败:', refreshError);
-        showToast('盘点已保存，但界面刷新失败，请重新进入页面确认', 'warning');
+      if (!draftsCleared) {
+        showToast('盘点已保存，但本地草稿未清理，请重新进入页面确认', 'warning');
       }
     } catch (error) {
       logger.error('[库存盘点] 保存失败:', error);
       const errorMessage = error instanceof Error ? error.message : String(error);
-      showToast(`保存失败: ${errorMessage}`, 'error');
+      showToast(`盘点未完成：${errorMessage}\n扫描暂存已保留`, 'error');
       feedbackError();
     } finally {
+      saveInProgressRef.current = false;
       setSaving(false);
     }
+  };
+
+  // 完成盘点前明确告知本次将消耗多少次ERP查询，避免误触。
+  const handleSaveInventory = () => {
+    if (saveInProgressRef.current || saving) {
+      return;
+    }
+    if (!currentWarehouse) {
+      showToast('请先选择仓库', 'warning');
+      feedbackWarning();
+      return;
+    }
+    if (scanRecords.length === 0) {
+      showToast('暂无扫描记录', 'warning');
+      feedbackWarning();
+      return;
+    }
+    if (!selectedAccountAvailable) {
+      showToast(`${selectedAccount.name}账套暂未开放，无法完成盘点`, 'warning');
+      feedbackWarning();
+      return;
+    }
+
+    const queryCount = new Set(
+      scanRecords
+        .map((record) => getInventoryCodeLookupKey(record.inventoryCode || ''))
+        .filter(Boolean)
+    ).size;
+    alert.showConfirm(
+      '完成盘点',
+      `将查询 ${selectedAccount.name} ERP 的 ${queryCount} 个存货编码，并生成盘点差异。完成后本次暂存会清空，确定继续吗？`,
+      () => {
+        void performSaveInventory();
+      }
+    );
   };
 
   // 清空记录
   const handleClearRecords = () => {
     if (scanRecords.length === 0) return;
-    replaceScanRecords([]);
-    clearCheckRecords(checkType, currentWarehouse);
-    showToast('记录已清空', 'warning');
-    feedbackWarning();
+    alert.showConfirm(
+      '清空盘点记录',
+      `将清空 ${selectedAccount.name} 当前仓库的 ${scanRecords.length} 条盘点暂存，确定继续吗？`,
+      () => {
+        void (async () => {
+          const cleared = await clearCheckRecords(currentWarehouse, selectedAccount.key);
+          if (!cleared) {
+            showToast('清空失败，请重试', 'error');
+            feedbackError();
+            return;
+          }
+          replaceScanRecords([]);
+          showToast('盘点记录已清空', 'warning');
+          feedbackWarning();
+        })();
+      },
+      true
+    );
   };
 
   // 计算每个型号+版本的累计数量
@@ -1177,24 +1114,27 @@ export default function InventoryScreen() {
   // 计算总数量
   const totalQuantity = useMemo(() => {
     return Object.values(modelVersionTotals).reduce((sum, t) => {
-      return sum + (checkType === 'partial' ? t.actualQty : t.qty);
+      return sum + t.actualQty;
     }, 0);
-  }, [modelVersionTotals, checkType]);
+  }, [modelVersionTotals]);
+  const totalDraftCount = scanRecords.length;
   const currentInventoryStep =
     scanRecords.length === 0
       ? 'scan'
-      : checkType === 'partial' && quantityModalVisible
+      : quantityModalVisible
         ? 'adjust'
         : 'review';
   const currentInventoryPlaceholder =
-    currentInventoryStep === 'scan'
+    !selectedAccountAvailable
+      ? `${selectedAccount.name}账套暂未开放`
+      : currentInventoryStep === 'scan'
       ? '持续扫描盘点二维码'
-      : checkType === 'partial'
-        ? '继续扫码或调整实际数量'
-        : '继续扫码或确认盘点';
+      : currentInventoryStep === 'adjust'
+        ? '调整实际数量'
+        : '继续扫码或完成盘点';
 
   // 聚合显示数据（按型号+版本号聚合，显示规则与扫码入库保持一致）
-  const aggregatedRecords = useMemo(() => {
+  const aggregatedRecords = useMemo<InventoryAggregatedRecord[]>(() => {
     const map = new Map<
       string,
       { records: ScanRecord[]; totalQuantity: number; actualTotalQuantity: number }
@@ -1233,203 +1173,231 @@ export default function InventoryScreen() {
   }, [scanRecords]);
 
   const inventoryListState = useMemo(
-    () => `${[...expandedGroups].join('|')}::${checkType}`,
-    [checkType, expandedGroups]
+    () => `${[...expandedGroups].join('|')}::${selectedAccount.key}`,
+    [expandedGroups, selectedAccount.key]
   );
-  const workflowSteps = useMemo<WorkflowStep[]>(
-    () =>
-      checkType === 'partial'
-        ? [
-            {
-              key: 'scan',
-              label: '物料',
-              status: scanRecords.length === 0 ? 'active' : 'complete',
-            },
-            {
-              key: 'adjust',
-              label: '数量',
-              status:
-                scanRecords.length === 0
-                  ? 'pending'
-                  : quantityModalVisible
-                    ? 'active'
-                    : 'complete',
-            },
-            {
-              key: 'review',
-              label: '确认',
-              status:
-                scanRecords.length === 0
-                  ? 'pending'
-                  : quantityModalVisible
-                    ? 'pending'
-                    : 'active',
-            },
-          ]
-        : [
-            {
-              key: 'scan',
-              label: '物料',
-              status: scanRecords.length === 0 ? 'active' : 'complete',
-            },
-            {
-              key: 'review',
-              label: '确认',
-              status: scanRecords.length === 0 ? 'pending' : 'active',
-            },
-          ],
-    [checkType, quantityModalVisible, scanRecords.length]
-  );
-  const workflowMetrics = useMemo<WorkflowMetric[]>(
+  const workflowSummaryItems = useMemo(
     () => [
       {
-        key: 'step',
-        label: '当前步骤',
-        value:
-          currentInventoryStep === 'scan'
-            ? '等待扫码'
-            : currentInventoryStep === 'adjust'
-              ? '调整数量'
-              : '待确认',
-        tone: (
-          currentInventoryStep === 'scan'
-            ? 'default'
-            : currentInventoryStep === 'adjust'
-              ? 'warning'
-              : 'success'
-        ) as WorkflowMetric['tone'],
+        key: 'drafts',
+        label: '本次盘点',
+        value: `${scanRecords.length} 条 / ${totalQuantity.toLocaleString()} PCS`,
+        icon: 'layers' as const,
+        color: totalDraftCount > 0 ? theme.success : theme.textMuted,
       },
       {
-        key: 'mode',
-        label: '盘点方式',
-        value: checkType === 'partial' ? '拆包盘点' : '整包盘点',
-        tone: 'accent',
+        key: 'warehouse',
+        label: '仓库',
+        value: currentWarehouse?.name || '请选择仓库',
+        icon: 'archive' as const,
+        color: theme.primary,
+        onPress: () => setShowWarehousePicker(true),
       },
     ],
-    [checkType, currentInventoryStep]
+    [
+      currentWarehouse?.name,
+      scanRecords.length,
+      theme.primary,
+      theme.success,
+      theme.textMuted,
+      totalQuantity,
+      totalDraftCount,
+    ]
+  );
+
+  const renderInventoryRight = useCallback(
+    (item: InventoryAggregatedRecord) => (
+      <View style={styles.itemRight}>
+        {item.actualTotalQuantity !== item.totalQuantity ? (
+          <React.Fragment>
+            <View style={styles.quantityRow}>
+              <Text style={styles.itemQtyLabel}>标签:</Text>
+              <Text style={styles.itemQty}>{item.totalQuantity.toLocaleString()}</Text>
+            </View>
+            <View style={styles.actualRow}>
+              <Text style={styles.actualLabel}>实际:</Text>
+              <Text style={styles.actualQty}>{item.actualTotalQuantity.toLocaleString()}</Text>
+            </View>
+          </React.Fragment>
+        ) : (
+          <Text style={styles.itemQty}>{item.actualTotalQuantity.toLocaleString()}</Text>
+        )}
+      </View>
+    ),
+    [
+      styles.actualLabel,
+      styles.actualQty,
+      styles.actualRow,
+      styles.itemQty,
+      styles.itemQtyLabel,
+      styles.itemRight,
+      styles.quantityRow,
+    ]
+  );
+
+  const renderInventoryDetail = useCallback(
+    (record: ScanRecord) => {
+      const actualQuantity =
+        record.actualQuantity !== undefined && record.actualQuantity !== null
+          ? record.actualQuantity
+          : record.quantity;
+      const isAdjusted =
+        record.actualQuantity !== undefined &&
+        record.actualQuantity !== null &&
+        record.actualQuantity !== record.quantity;
+
+      return (
+        <TouchableOpacity
+          key={record.id}
+          style={styles.detailItem}
+          activeOpacity={0.7}
+          onPress={() => openQuantityModal(record)}
+          onLongPress={() => handleDeleteRecord(record)}
+          delayLongPress={500}
+        >
+          <Text style={styles.detailText}>
+            批次: {record.batch || '-'} | 生产日期: {record.productionDate || '-'} | 标签:{' '}
+            {record.quantity}
+          </Text>
+          <View style={styles.detailActualRow}>
+            <Text style={styles.detailText}>
+              实际: {actualQuantity}
+              {isAdjusted ? ' (已调整)' : ''}
+            </Text>
+            <Feather name="edit-3" size={12} color={theme.accent} />
+          </View>
+        </TouchableOpacity>
+      );
+    },
+    [
+      handleDeleteRecord,
+      openQuantityModal,
+      styles.detailActualRow,
+      styles.detailItem,
+      styles.detailText,
+      theme.accent,
+    ]
   );
 
   const renderAggregatedRecord = useCallback(
-    ({ item }: { item: any }) => {
+    ({ item }: { item: InventoryAggregatedRecord }) => {
       const key = item.key;
       const isExpanded = expandedGroupsRef.current.has(key);
 
       return (
-        <RecordItem
-          item={item}
+        <AggregatedRecordItem
+          groupKey={key}
+          model={item.model}
+          version={item.version}
+          totalQuantity={item.totalQuantity}
+          records={item.records}
           isExpanded={isExpanded}
           onToggle={toggleExpand}
-          onDeleteRecord={handleDeleteRecord}
-          onEditQuantity={openQuantityModal}
-          checkType={checkType}
-          theme={theme}
-          styles={styles}
+          recordSignatureFields={INVENTORY_RECORD_SIGNATURE_FIELDS}
+          compareValues={[item.actualTotalQuantity, item.count, selectedAccount.key]}
+          containerStyle={styles.itemContainer}
+          rowStyle={styles.itemRow}
+          contentStyle={styles.itemLeft}
+          titleStyle={styles.itemModel}
+          subtitleStyle={styles.itemBatch}
+          detailsContainerStyle={styles.detailsContainer}
+          chevronColor={theme.textPrimary}
+          renderRight={() => renderInventoryRight(item)}
+          renderDetail={renderInventoryDetail}
         />
       );
     },
     [
-      checkType,
-      handleDeleteRecord,
-      openQuantityModal,
+      renderInventoryDetail,
+      renderInventoryRight,
+      selectedAccount.key,
       styles,
-      theme,
+      theme.textPrimary,
       toggleExpand,
     ]
   );
 
   const aggregatedRecordKeyExtractor = useCallback(
-    (item: any) => item.key,
+    (item: InventoryAggregatedRecord) => item.key,
     []
   );
 
   return (
-    <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
+    <Screen
+      backgroundColor={theme.backgroundRoot}
+      statusBarStyle={isDark ? 'light' : 'dark'}
+      safeAreaEdges={['top', 'left', 'right']}
+    >
       <View style={styles.container}>
         <View style={styles.topPanel}>
-          {/* 顶栏：盘点类型 + 仓库 */}
-          <View style={styles.topBar}>
-            <TouchableOpacity
-              style={styles.backButton}
-              activeOpacity={0.7}
-              onPress={() => router.back()}
-            >
-              <Feather name="arrow-left" size={24} color={theme.textPrimary} />
-            </TouchableOpacity>
-            {/* 盘点类型选择 */}
-            <View style={styles.typeSelector}>
-              <TouchableOpacity
-                style={[styles.typeBtn, checkType === 'whole' && styles.typeBtnActive]}
-                activeOpacity={0.7}
-                onPress={() => {
-                  void handleCheckTypeChange('whole');
-                }}
-              >
-                <FontAwesome6
-                  name="box"
-                  size={12}
-                  color={checkType === 'whole' ? theme.white : theme.textSecondary}
-                />
-                <Text style={[styles.typeBtnText, checkType === 'whole' && styles.typeBtnTextActive]}>
-                  整包
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.typeBtn, checkType === 'partial' && styles.typeBtnActive]}
-                activeOpacity={0.7}
-                onPress={() => {
-                  void handleCheckTypeChange('partial');
-                }}
-              >
-                <FontAwesome6
-                  name="layer-group"
-                  size={12}
-                  color={checkType === 'partial' ? theme.white : theme.textSecondary}
-                />
-                <Text
-                  style={[styles.typeBtnText, checkType === 'partial' && styles.typeBtnTextActive]}
-                >
-                  拆包
-                </Text>
-              </TouchableOpacity>
-            </View>
+          <UiPageHeader
+            title="库存盘点"
+            onBack={() => router.back()}
+            rightIcon="crosshair"
+            rightLabel="聚焦扫码输入框"
+            onRightPress={() => focusScannerInput(0)}
+          />
 
-            {/* 仓库选择 */}
-            <TouchableOpacity
-              style={styles.warehouseBtn}
-              activeOpacity={0.7}
-              onPress={() => setShowWarehousePicker(true)}
-            >
-              <FontAwesome6 name="warehouse" size={14} color={theme.textPrimary} />
-              <Text style={styles.warehouseText} numberOfLines={1}>
-                {currentWarehouse?.name || '仓库'}
-              </Text>
-              <FontAwesome6 name="chevron-down" size={10} color={theme.textMuted} />
-            </TouchableOpacity>
+          {/* 顶栏：ERP账套 */}
+          <View style={styles.topBar}>
+            <View style={styles.typeSelector}>
+              {ERP_ACCOUNTS.map((account) => {
+                const active = selectedAccount.key === account.key;
+                const available = isErpAccountAvailable(account);
+                const contentColor = active ? theme.buttonPrimaryText : theme.textPrimary;
+
+                return (
+                  <TouchableOpacity
+                    key={account.key}
+                    style={[styles.typeBtn, active && styles.typeBtnActive]}
+                    activeOpacity={0.82}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: active, disabled: saving }}
+                    disabled={saving}
+                    onPress={() => {
+                      void handleAccountChange(account);
+                    }}
+                  >
+                    <Feather name="briefcase" size={15} color={contentColor} />
+                    <Text
+                      style={[styles.typeBtnText, active && styles.typeBtnTextActive]}
+                      numberOfLines={1}
+                    >
+                      {account.name}{available ? '' : '（未开放）'}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
           </View>
 
-          <ScanWorkflowPanel
-            steps={workflowSteps}
-            metrics={workflowMetrics}
-          />
+          <UiWorkflowSummary items={workflowSummaryItems} />
         </View>
 
         {/* 扫码输入 */}
-        <View style={[styles.scanBox, inputValue.length > 0 && styles.scanBoxActive]}>
-          <TextInput
-            ref={inputRef}
-            style={styles.scanInput}
-            value={inputValue}
-            onChangeText={handleInputChange}
-            onSubmitEditing={handleSubmitEditing}
-            onBlur={() => focusScannerInput(120)}
-            placeholder={currentInventoryPlaceholder}
-            placeholderTextColor={theme.textMuted}
-            autoCapitalize="characters"
-            autoCorrect={false}
-            autoFocus={false}
-            showSoftInputOnFocus={false}
-          />
-        </View>
+        <UiScanBox
+          inputRef={inputRef}
+          active={inputValue.length > 0}
+          statusLabel={
+            !selectedAccountAvailable
+              ? '当前账套暂未开放'
+              : currentInventoryStep === 'scan'
+              ? '盘点扫码录入'
+              : currentInventoryStep === 'adjust'
+                ? '调整实际数量'
+                : '继续扫码或确认盘点'
+          }
+          value={inputValue}
+          editable={selectedAccountAvailable && !saving}
+          onChangeText={handleInputChange}
+          onSubmitEditing={handleSubmitEditing}
+          onBlur={() => focusScannerInput(120)}
+          placeholder={currentInventoryPlaceholder}
+          placeholderTextColor={theme.textMuted}
+          autoCapitalize="none"
+          autoFocus={false}
+          showSoftInputOnFocus={false}
+        />
 
         {/* 物料列表 */}
         <View style={styles.listSection}>
@@ -1465,28 +1433,30 @@ export default function InventoryScreen() {
           />
 
           {/* 操作按钮 */}
-          {scanRecords.length > 0 && (
-            <View style={styles.actionBar}>
-              <TouchableOpacity
-                style={styles.clearBtn}
-                activeOpacity={0.7}
-                onPress={handleClearRecords}
-              >
-                <Text style={styles.clearBtnText}>清空</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.submitBtn}
-                activeOpacity={0.7}
-                onPress={handleSaveInventory}
-                disabled={saving}
-              >
-                {saving ? (
-                  <ActivityIndicator color="#FFFFFF" size="small" />
-                ) : (
-                  <Text style={styles.submitBtnText}>确认盘点</Text>
-                )}
-              </TouchableOpacity>
-            </View>
+          {totalDraftCount > 0 && (
+            <UiSafeBottomBar style={styles.actionBar}>
+              <View style={styles.clearBtn}>
+                <UiToolbarButton
+                  label="清空盘点"
+                  icon="trash-2"
+                  variant="secondary"
+                  disabled={saving || scanRecords.length === 0}
+                  onPress={handleClearRecords}
+                  style={styles.actionButton}
+                />
+              </View>
+              <View style={styles.submitBtn}>
+                <UiToolbarButton
+                  label="完成盘点"
+                  icon="check-circle"
+                  variant="primary"
+                  loading={saving}
+                  onPress={handleSaveInventory}
+                  disabled={saving}
+                  style={styles.actionButton}
+                />
+              </View>
+            </UiSafeBottomBar>
           )}
         </View>
 
@@ -1522,18 +1492,18 @@ export default function InventoryScreen() {
           </View>
         )}
 
-        {/* 拆包数量修改弹窗 */}
+        {/* 实盘数量修改弹窗 */}
         <Modal
           visible={quantityModalVisible}
           transparent
           animationType="fade"
-          onRequestClose={() => setQuantityModalVisible(false)}
+          onRequestClose={handleCancelQuantity}
         >
           <View style={quantityModalStyles.modalOverlay}>
             <AppModalCard
               title="修改实际数量"
               subtitle={editingRecord ? `用于修正 ${editingRecord.model} 的实际数量` : undefined}
-              onClose={() => setQuantityModalVisible(false)}
+              onClose={handleCancelQuantity}
               style={quantityModalStyles.modalContent}
               bodyStyle={quantityModalStyles.modalBody}
               size="compact"
@@ -1541,7 +1511,7 @@ export default function InventoryScreen() {
               footer={
                 <AppModalActions
                   secondaryLabel="取消"
-                  onSecondaryPress={() => setQuantityModalVisible(false)}
+                  onSecondaryPress={handleCancelQuantity}
                   primaryLabel="保存"
                   onPrimaryPress={handleConfirmQuantity}
                 />
@@ -1569,7 +1539,6 @@ export default function InventoryScreen() {
 
         {alert.AlertComponent}
         <ToastContainer />
-
       </View>
     </Screen>
   );

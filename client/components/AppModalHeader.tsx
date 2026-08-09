@@ -4,6 +4,7 @@ import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, BorderWidth, Spacing, Typography } from '@/constants/theme';
 import { withAlpha } from '@/utils/colors';
+import { MIN_TOUCH_TARGET } from '@/utils/responsive';
 
 interface AppModalHeaderProps {
   title: string;
@@ -20,12 +21,12 @@ export function AppModalHeader({ title, subtitle, onClose }: AppModalHeaderProps
         flexDirection: 'row',
         alignItems: 'flex-start',
         justifyContent: 'space-between',
-        gap: Spacing.md,
-        marginBottom: Spacing.lg,
+        gap: Spacing.sm,
+        marginBottom: Spacing.md,
       }}
     >
       <View style={{ flex: 1 }}>
-        <Text style={{ ...Typography.h4, color: theme.textPrimary }}>{title}</Text>
+        <Text style={{ ...Typography.title, color: theme.textPrimary }}>{title}</Text>
         {subtitle ? (
           <Text
             style={{
@@ -42,9 +43,9 @@ export function AppModalHeader({ title, subtitle, onClose }: AppModalHeaderProps
       {onClose ? (
         <TouchableOpacity
           style={{
-            width: 36,
-            height: 36,
-            borderRadius: BorderRadius.md,
+            width: MIN_TOUCH_TARGET,
+            height: MIN_TOUCH_TARGET,
+            borderRadius: BorderRadius.full,
             alignItems: 'center',
             justifyContent: 'center',
             backgroundColor: theme.backgroundTertiary,
@@ -52,6 +53,8 @@ export function AppModalHeader({ title, subtitle, onClose }: AppModalHeaderProps
             borderColor: withAlpha(theme.textMuted, 0.12),
           }}
           activeOpacity={0.75}
+          accessibilityLabel="关闭"
+          accessibilityRole="button"
           onPress={onClose}
         >
           <Feather name="x" size={18} color={theme.textMuted} />

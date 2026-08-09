@@ -21,6 +21,7 @@ export interface QueueItemParsedPayload {
   version?: string;
   productionDate?: string;
   separator?: string;
+  ruleId?: string;
   ruleName?: string;
   customFields?: Record<string, string>;
   inventoryCode?: string;
@@ -87,7 +88,7 @@ class ScanQueue {
     materialIds: string[];
     errors: (string | null)[];
   }> = async () => {
-    throw new Error('batchWriteToDatabase not configured');
+    throw new Error('扫码队列未配置数据库批量写入方法');
   };
 
   constructor(config: Partial<BatchConfig> = {}) {

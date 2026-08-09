@@ -1,0 +1,47 @@
+upstream palm_warehouse_erp_wuxi {
+    server 127.0.0.1:18081;
+    keepalive 16;
+}
+
+upstream palm_warehouse_erp_shanghai {
+    server 127.0.0.1:18082;
+    keepalive 16;
+}
+
+# Replace both example hostnames before installing this file. Let Certbot create
+# the TLS server blocks, or add your existing certificate paths here.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name erp-wuxi.example.com;
+
+    client_max_body_size 55m;
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 30s;
+        proxy_pass http://palm_warehouse_erp_wuxi;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name erp-shanghai.example.com;
+
+    client_max_body_size 55m;
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 30s;
+        proxy_pass http://palm_warehouse_erp_shanghai;
+    }
+}

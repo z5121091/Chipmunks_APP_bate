@@ -8,6 +8,7 @@ import {
   ViewStyle,
   TextStyle,
 } from 'react-native';
+import { MIN_TOUCH_TARGET } from '@/utils/responsive';
 
 interface AnimatedButtonProps {
   onPress: () => void;
@@ -59,6 +60,8 @@ export function AnimatedButton({
         onPressIn={handlePressIn}
         onPressOut={handlePressOut}
         activeOpacity={activeOpacity}
+        accessibilityRole="button"
+        accessibilityState={{ disabled }}
         disabled={disabled}
       >
         {typeof children === 'string' ? (
@@ -74,6 +77,7 @@ export function AnimatedButton({
 const styles = StyleSheet.create({
   button: {
     width: '100%',
+    minHeight: MIN_TOUCH_TARGET,
   },
   text: {},
 });

@@ -38,6 +38,12 @@ import {
 } from '@/utils/inboundExport';
 import { STORAGE_KEYS, type SyncConfig } from '@/constants/config';
 import { safeJsonParseNullable } from '@/utils/json';
+import {
+  buildInboundModelKey,
+  deduplicateInboundRowsById,
+  normalizeInboundModel,
+  normalizeInboundVersion,
+} from '@/utils/inboundRecords';
 import { createStyles } from './styles';
 
 type DetailMap = Record<string, InboundRecord[]>;
@@ -45,7 +51,7 @@ type NoticeType = AppPillToastType;
 type InboundDetailGroup = {
   key: string;
   model: string;
-  version: string;
+  versions: string[];
   records: InboundRecord[];
   totalQuantity: number;
 };
@@ -413,21 +419,24 @@ export default function InboundRecordsScreen() {
   const getDetailGroups = useCallback((records: InboundRecord[]): InboundDetailGroup[] => {
     const groupMap = new Map<string, InboundDetailGroup>();
 
-    records.forEach((record) => {
-      const model = record.scan_model || '-';
-      const version = record.version || '';
-      const key = `${model}|${version}`;
+    deduplicateInboundRowsById(records).forEach((record) => {
+      const model = normalizeInboundModel(record.scan_model) || '-';
+      const version = normalizeInboundVersion(record.version);
+      const key = buildInboundModelKey(model);
       if (!groupMap.has(key)) {
         groupMap.set(key, {
           key,
           model,
-          version,
+          versions: [],
           records: [],
           totalQuantity: 0,
         });
       }
 
       const group = groupMap.get(key)!;
+      if (version && !group.versions.some((item) => item.toUpperCase() === version.toUpperCase())) {
+        group.versions.push(version);
+      }
       group.records.push(record);
       group.totalQuantity += Number(record.quantity || 0);
     });
@@ -494,7 +503,7 @@ export default function InboundRecordsScreen() {
       </View>
       <View style={styles.detailContent}>
         <Text style={styles.detailTitle} numberOfLines={1}>
-          批次 {record.batch || '-'}
+          版本 {normalizeInboundVersion(record.version) || '-'} · 批次 {record.batch || '-'}
         </Text>
         <Text style={styles.detailMeta} numberOfLines={1}>
           存货编码 {record.inventory_code || '-'}
@@ -531,8 +540,8 @@ export default function InboundRecordsScreen() {
             <Text style={styles.detailGroupTitle} numberOfLines={1}>
               型号：{group.model}
             </Text>
-            <Text style={styles.detailGroupMeta}>
-              版本号：{group.version || '-'}
+            <Text style={styles.detailGroupMeta} numberOfLines={1}>
+              版本：{group.versions.length > 0 ? group.versions.join('、') : '-'}
             </Text>
             <Text style={styles.detailGroupCount}>{group.records.length} 条明细</Text>
           </View>

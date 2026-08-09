@@ -10,7 +10,6 @@ import {
   Platform,
   Modal,
   Linking,
-  Switch,
   InteractionManager,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -26,54 +25,97 @@ import { logger } from '@/utils/logger';
 import {
   getAllUnpackRecords,
   getAllInboundRecords,
-  getAllInventoryCheckRecords,
-  getInboundExportSummaryRows,
-  getInventoryCheckExportSummaryRows,
+  getInventoryCheckDocumentSummaries,
+  getInventoryCheckRecordsByNo,
   getOutboundExportRows,
   exportBackupData,
   importBackupData,
   getConfigStats,
+  getTodayExportCount,
   incrementExportCount,
   importDatabaseFile,
   BackupData,
   isBackupDataShape,
   STORAGE_KEYS,
+  updateInventoryCheckDocumentSyncStatus,
 } from '@/utils/database';
-import { formatTime, formatDate, formatDateTimeExport } from '@/utils/time';
+import { formatDateTimeExport } from '@/utils/time';
 import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
+import { UiListItem, UiListSection, UiPageHeader } from '@/components/UiRedesign';
 import { createStyles } from './styles';
-import { AnimatedCard } from '@/components/AnimatedCard';
 import { AnimatedButton } from '@/components/AnimatedButton';
-import { getSpacing, Spacing } from '@/constants/theme';
+import { Spacing } from '@/constants/theme';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { Feather } from '@expo/vector-icons';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { rs } from '@/utils/responsive';
 import { APP_VERSION, APP_NAME, COMPANY_NAME, COMPANY_WEBSITE, AUTHOR } from '@/constants/version';
+import { setSoundEnabled as setSoundEnabledFn, initSoundSetting } from '@/utils/feedback';
+import { formatSyncErrorMessage, syncExcelToComputer, type ExcelSheet } from '@/utils/excel';
 import {
-  setSoundEnabled as setSoundEnabledFn,
-  initSoundSetting,
-} from '@/utils/feedback';
-import { formatSyncErrorMessage, syncExcelToComputer } from '@/utils/excel';
-import { buildInventorySheets } from '@/utils/inventoryExport';
+  getWarehouseExportSegment,
+} from '@/utils/excelSchema';
+import {
+  buildInboundExportFileName,
+  buildInboundSheets,
+  type InboundExportRecord,
+} from '@/utils/inboundExport';
+import {
+  buildInventoryExportFileNameFromNo,
+  buildInventorySheets,
+  type InventoryExportRecord,
+} from '@/utils/inventoryExport';
+import { buildUnpackLabelSheet } from '@/utils/labelExport';
+import { buildOutboundExportFileName, buildOutboundSheets } from '@/utils/outboundExport';
+import { selectLatestOrderUnpackRecords } from '@/utils/unpackRecords';
 import { safeJsonParseNullable } from '@/utils/json';
-import { testConnection } from '@/utils/heartbeat';
+import {
+  getSyncConfigError,
+  normalizeSyncConfig,
+  testConnection,
+} from '@/utils/heartbeat';
 import { NETWORK_CONFIG, SyncConfig, ConnectionStatus } from '@/constants/config';
 import { parseAuthFromUrl, base64Encode, compareVersions, getUpdateServer } from '@/utils/update';
-import { parseQuantity } from '@/utils/quantity';
+import { getDatabaseBackupDateString } from '@/utils/backupNaming';
 import { useToast } from '@/utils/toast';
 import { scanQueue } from '@/utils/scanQueue';
 import {
   createRealtimeDatabaseBackupFile,
   createRealtimeDatabaseBackupToNas,
+  getLastNasDatabaseBackupSuccess,
+  getNasDatabaseBackupSourceLabel,
+  type NasDatabaseBackupSuccess,
   uploadDatabaseBackupToNas,
 } from '@/utils/nasBackup';
+import {
+  getAutoNasBackupReasonLabel,
+  getAutoNasBackupStatus,
+  getAutoNasBackupStatusLabel,
+  getAutoNasBackupTriggerLabel,
+  getNativeAutoNasBackupReasonLabel,
+  getNativeAutoNasBackupStatus,
+  getNativeAutoNasBackupStatusLabel,
+  type AutoNasBackupStatus,
+  type NativeAutoNasBackupStatus,
+} from '@/utils/autoNasBackup';
+import { backendJsonRequest, buildErpProxyPath } from '@/utils/backendApi';
+import {
+  ERP_ACCOUNTS,
+  isErpAccountAvailable,
+  type ErpAccountKey,
+} from '@/utils/erpAccounts';
+import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 
-// 使用 any 绕过类型检查
-const FileSystem = FileSystemLegacy as any;
+const FileSystem = FileSystemLegacy;
+
+type SyncTaskKey = 'inbound' | 'outbound' | 'inventory' | 'order-labels';
+const activeSyncTasks = new Set<SyncTaskKey>();
+
+const getErrorMessage = (error: unknown, fallback: string) =>
+  formatUserFacingErrorMessage(error, fallback);
 
 const isSyncConfig = (value: unknown): value is SyncConfig => {
   return (
@@ -86,22 +128,53 @@ const isSyncConfig = (value: unknown): value is SyncConfig => {
 
 const UPDATE_RETRY_DELAYS = [1000, 2000, 4000];
 
+type SettingsGroupId = 'system' | 'erp' | 'sync' | 'rules' | 'backup' | 'about';
+
+type ErpConnectionStatus = 'idle' | 'checking' | 'connected' | 'warning' | 'error' | 'unavailable';
+
+type ErpConnectionState = {
+  message: string;
+  status: ErpConnectionStatus;
+  tokenExpiryText?: string;
+};
+type ErpConnectionStates = Record<ErpAccountKey, ErpConnectionState>;
+
+type ErpHealthResponse = {
+  accountKey?: ErpAccountKey;
+  appKeyConfigured?: boolean;
+  appSecretConfigured?: boolean;
+  appTicketCached?: boolean;
+  businessReady?: boolean;
+  lastTokenRefreshError?: string;
+  lastTokenRefreshErrorAt?: string;
+  lastTokenRefreshSucceededAt?: string;
+  messageReady?: boolean;
+  messageSecretConfigured?: boolean;
+  messageRecentlyReceived?: boolean;
+  lastMessageReceivedAt?: string;
+  openTokenConfigured?: boolean;
+  openTokenExpired?: boolean;
+  openTokenExpiresAt?: string;
+  ready?: boolean;
+  refreshTokenConfigured?: boolean;
+  refreshTokenExpired?: boolean;
+  refreshTokenExpiresAt?: string;
+  success?: boolean;
+  tokenAutoRefreshEnabled?: boolean;
+  tokenOrgMatches?: boolean;
+  tokenRefreshReady?: boolean;
+};
+
+const ERP_HEALTH_PATH = buildErpProxyPath('/api/erp/health');
+const ERP_AUTO_CHECK_TTL_MS = 5 * 60 * 1000;
+let cachedErpConnectionStates: ErpConnectionStates | null = null;
+let lastErpConnectionCheckAt = 0;
+let erpConnectionCheckInFlight: Promise<ErpConnectionStates> | null = null;
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const getUpdateRequestErrorMessage = (error: unknown): string => {
-  if (error instanceof Error) {
-    if (error.name === 'AbortError') {
-      return '请求超时';
-    }
-
-    if (error.message.includes('Network request failed')) {
-      return '网络请求失败';
-    }
-
-    return error.message || '未知错误';
-  }
-
-  return String(error || '未知错误');
+  return formatUserFacingErrorMessage(error, '检查更新失败，请稍后重试');
 };
 
 const withUpdateCacheBuster = (url: string): string => {
@@ -159,6 +232,7 @@ const resolveUpdateDownloadUrls = (
 const backupDatabaseToNasForUpdate = async (stage: string) => {
   const backupResult = await createRealtimeDatabaseBackupToNas({
     timeoutMs: 15000,
+    source: 'online-update',
   });
   logger.log(`[update] ${stage} 数据库已备份到 NAS:`, backupResult.fileName);
   return backupResult;
@@ -202,6 +276,7 @@ export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
   const alert = useCustomAlert();
+  const showSettingsLoadError = alert.showError;
   const { ToastContainer } = useToast();
 
   // 使用 useWindowDimensions 替代 Dimensions.addEventListener，
@@ -230,11 +305,31 @@ export default function SettingsScreen() {
   const [configStats, setConfigStats] = useState({
     rules: 0,
     customFields: 0,
+    inventoryBindings: 0,
+    warehouses: 0,
   });
   const [backupLoading, setBackupLoading] = useState(false);
   const [restoreLoading, setRestoreLoading] = useState(false);
   const [dbBackupLoading, setDbBackupLoading] = useState(false);
   const [dbRestoreLoading, setDbRestoreLoading] = useState(false);
+  const [lastNasBackupSuccess, setLastNasBackupSuccess] =
+    useState<NasDatabaseBackupSuccess | null>(null);
+  const [autoBackupStatus, setAutoBackupStatus] = useState<AutoNasBackupStatus | null>(null);
+  const [nativeAutoBackupStatus, setNativeAutoBackupStatus] =
+    useState<NativeAutoNasBackupStatus | null>(null);
+  const [expandedSettingsGroup, setExpandedSettingsGroup] = useState<SettingsGroupId | null>(null);
+  const [erpConnectionStates, setErpConnectionStates] = useState<
+    Record<ErpAccountKey, ErpConnectionState>
+  >(() =>
+    Object.fromEntries(
+      ERP_ACCOUNTS.map((account) => [
+        account.key,
+        isErpAccountAvailable(account)
+          ? { message: '正在检测后端', status: 'checking' as const }
+          : { message: '账套尚未开放', status: 'unavailable' as const },
+      ])
+    ) as Record<ErpAccountKey, ErpConnectionState>
+  );
 
   // 数据库恢复后的重启提示弹窗
   const [showRestartModal, setShowRestartModal] = useState(false);
@@ -250,10 +345,6 @@ export default function SettingsScreen() {
   const [syncingInbound, setSyncingInbound] = useState(false);
   const [syncingOutbound, setSyncingOutbound] = useState(false);
   const [syncingInventory, setSyncingInventory] = useState(false);
-  const syncingInboundRef = useRef(false);
-  const syncingOutboundRef = useRef(false);
-  const syncingInventoryRef = useRef(false);
-  const syncingInventoryPartialRef = useRef(false);
   const [syncingLabels, setSyncingLabels] = useState(false);
 
   // 在线更新相关状态
@@ -275,12 +366,7 @@ export default function SettingsScreen() {
 
   // 加载数据
   const loadData = useCallback(async () => {
-    const [
-      stats,
-      savedSyncConfig,
-      savedConnectionStatus,
-      savedSoundEnabled,
-    ] = await Promise.all([
+    const [stats, savedSyncConfig, savedConnectionStatus, savedSoundEnabled] = await Promise.all([
       getConfigStats(),
       AsyncStorage.getItem(STORAGE_KEYS.SYNC_CONFIG),
       AsyncStorage.getItem(STORAGE_KEYS.CONNECTION_STATUS),
@@ -288,63 +374,276 @@ export default function SettingsScreen() {
     ]);
     setConfigStats(stats);
 
-    // 加载声音开关状态，默认为 true
-    if (savedSoundEnabled !== null) {
-      setSoundEnabled(savedSoundEnabled === 'true');
+    const nextSoundEnabled = savedSoundEnabled !== 'false';
+    setSoundEnabled(nextSoundEnabled);
+    setSoundEnabledFn(nextSoundEnabled);
+
+    if (!savedSyncConfig) {
+      setSyncConfig({ ip: '', port: NETWORK_CONFIG.DEFAULT_PORT });
+      setConnectionStatus('idle');
+      if (savedConnectionStatus) {
+        await AsyncStorage.removeItem(STORAGE_KEYS.CONNECTION_STATUS).catch((error) => {
+          logger.warn('[设置] 清理过期同步状态失败:', error);
+        });
+      }
+      return;
     }
 
-    if (savedSyncConfig) {
-      const config = safeJsonParseNullable<SyncConfig>(
-        savedSyncConfig,
-        'settings.syncConfig',
-        isSyncConfig
-      );
-      if (!config) {
-        setConnectionStatus('idle');
-        return;
-      }
-      setSyncConfig(config);
+    const config = safeJsonParseNullable<SyncConfig>(
+      savedSyncConfig,
+      'settings.syncConfig',
+      isSyncConfig
+    );
+    if (!config || getSyncConfigError(config)) {
+      setSyncConfig({ ip: '', port: NETWORK_CONFIG.DEFAULT_PORT });
+      setConnectionStatus('idle');
+      await Promise.all([
+        AsyncStorage.removeItem(STORAGE_KEYS.SYNC_CONFIG),
+        AsyncStorage.removeItem(STORAGE_KEYS.CONNECTION_STATUS),
+      ]);
+      return;
+    }
 
-      // 页面恢复时复测一次，避免电脑端同步助手已经退出但手机仍显示“已连接”。
-      if (
-        config.ip &&
-        (savedConnectionStatus === 'success' || savedConnectionStatus === 'testing')
-      ) {
-        setConnectionStatus('testing');
-        void testConnection(config)
-          .then(async (success) => {
-            const status: ConnectionStatus = success ? 'success' : 'disconnected';
-            setConnectionStatus(status);
-            await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, status);
-          })
-          .catch(async () => {
-            setConnectionStatus('disconnected');
-            await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, 'disconnected');
-          });
-      } else if (savedConnectionStatus === 'disconnected') {
-        setConnectionStatus('disconnected');
-      } else if (savedConnectionStatus === 'error') {
-        setConnectionStatus('error');
-      } else {
-        setConnectionStatus('idle');
-      }
+    const normalizedConfig = normalizeSyncConfig(config);
+    setSyncConfig(normalizedConfig);
+
+    // 页面恢复时复测一次，避免电脑端同步助手已经退出但手机仍显示“已连接”。
+    if (savedConnectionStatus === 'success' || savedConnectionStatus === 'testing') {
+      setConnectionStatus('testing');
+      void testConnection(normalizedConfig)
+        .then(async (success) => {
+          const status: ConnectionStatus = success ? 'success' : 'disconnected';
+          setConnectionStatus(status);
+          await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, status);
+        })
+        .catch(async () => {
+          setConnectionStatus('disconnected');
+          await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, 'disconnected');
+        });
+    } else if (savedConnectionStatus === 'disconnected') {
+      setConnectionStatus('disconnected');
+    } else if (savedConnectionStatus === 'error') {
+      setConnectionStatus('error');
+    } else {
+      setConnectionStatus('idle');
     }
   }, []);
 
+  const loadAutoBackupStatus = useCallback(async () => {
+    const [status, nativeStatus, lastNasSuccess] = await Promise.all([
+      getAutoNasBackupStatus(),
+      getNativeAutoNasBackupStatus(),
+      getLastNasDatabaseBackupSuccess(),
+    ]);
+    setAutoBackupStatus(status);
+    setNativeAutoBackupStatus(nativeStatus);
+    setLastNasBackupSuccess(lastNasSuccess);
+  }, []);
+
+  const checkErpConnections = useCallback(
+    async (options: { force?: boolean } = {}): Promise<void> => {
+      if (
+        !options.force &&
+        cachedErpConnectionStates &&
+        Date.now() - lastErpConnectionCheckAt < ERP_AUTO_CHECK_TTL_MS
+      ) {
+        setErpConnectionStates(cachedErpConnectionStates);
+        return;
+      }
+
+      setErpConnectionStates(
+        Object.fromEntries(
+          ERP_ACCOUNTS.map((account) => [
+            account.key,
+            isErpAccountAvailable(account)
+              ? { message: '正在检测后端', status: 'checking' as const }
+              : { message: '账套尚未开放', status: 'unavailable' as const },
+          ])
+        ) as ErpConnectionStates
+      );
+
+      if (!erpConnectionCheckInFlight) {
+        const checkTask = (async (): Promise<ErpConnectionStates> => {
+          const entries = await Promise.all(
+            ERP_ACCOUNTS.map(async (account): Promise<[ErpAccountKey, ErpConnectionState]> => {
+          if (!isErpAccountAvailable(account)) {
+            return [account.key, { message: '账套尚未开放', status: 'unavailable' }];
+          }
+
+          try {
+            const health = await backendJsonRequest<ErpHealthResponse>(ERP_HEALTH_PATH, {
+              baseUrl: account.backendBaseUrl,
+              erpAccountKey: account.key,
+              method: 'GET',
+            });
+            if (health.accountKey && health.accountKey !== account.key) {
+              throw new Error(
+                `后端账套不匹配：请求 ${account.name}，服务器返回 ${health.accountKey}`
+              );
+            }
+            if (!health.success) {
+              throw new Error('后端健康检查未通过');
+            }
+
+            const businessIssues: string[] = [];
+            if (!health.appKeyConfigured || !health.appSecretConfigured) {
+              businessIssues.push('应用凭据');
+            }
+            if (!health.openTokenConfigured) {
+              businessIssues.push('Token');
+            } else if (health.openTokenExpired) {
+              businessIssues.push('Token已过期');
+            }
+            if (health.tokenOrgMatches === false) {
+              businessIssues.push('Token账套不匹配');
+            }
+
+            const maintenanceIssues: string[] = [];
+            if (health.tokenAutoRefreshEnabled === false) {
+              maintenanceIssues.push('自动续期未开启');
+            } else if (health.tokenAutoRefreshEnabled === true) {
+              if (!health.refreshTokenConfigured) {
+                maintenanceIssues.push('缺少刷新Token');
+              } else if (health.refreshTokenExpired) {
+                maintenanceIssues.push('刷新Token已过期');
+              }
+            }
+
+            const refreshErrorAt = health.lastTokenRefreshErrorAt
+              ? Date.parse(health.lastTokenRefreshErrorAt)
+              : Number.NaN;
+            const refreshSucceededAt = health.lastTokenRefreshSucceededAt
+              ? Date.parse(health.lastTokenRefreshSucceededAt)
+              : Number.NaN;
+            if (
+              health.lastTokenRefreshError &&
+              Number.isFinite(refreshErrorAt) &&
+              (!Number.isFinite(refreshSucceededAt) || refreshErrorAt > refreshSucceededAt)
+            ) {
+              maintenanceIssues.push('最近自动续期失败');
+            }
+
+            const messageReady = health.messageReady ?? health.messageSecretConfigured;
+            const messageIssue = messageReady === false ? '消息密钥未配置' : '';
+            const messageWaitingForTicket =
+              messageReady === true && !health.appTicketCached && !health.messageRecentlyReceived;
+
+            const tokenExpiry = health.openTokenExpiresAt
+              ? new Date(health.openTokenExpiresAt).toLocaleString('zh-CN', {
+                  month: 'numeric',
+                  day: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })
+              : '';
+            const tokenExpiryText =
+              health.openTokenConfigured && tokenExpiry
+                ? `Token${health.openTokenExpired ? '已到期' : '到期'}：${tokenExpiry}`
+                : undefined;
+
+            if (businessIssues.length > 0) {
+              return [
+                account.key,
+                {
+                  message: `业务待完善：${businessIssues.join('、')}`,
+                  status: 'warning',
+                  tokenExpiryText,
+                },
+              ];
+            }
+
+            if (maintenanceIssues.length > 0 || messageIssue) {
+              return [
+                account.key,
+                {
+                  message: `业务可用 · ${[...maintenanceIssues, messageIssue]
+                    .filter(Boolean)
+                    .join('、')}`,
+                  status: 'warning',
+                  tokenExpiryText,
+                },
+              ];
+            }
+
+            const readyParts = ['业务正常'];
+            if (
+              health.tokenAutoRefreshEnabled === true &&
+              health.tokenRefreshReady !== false
+            ) {
+              readyParts.push('续期正常');
+            }
+            readyParts.push(
+              messageWaitingForTicket ? '等待AppTicket' : '消息正常'
+            );
+
+            return [
+              account.key,
+              {
+                message: readyParts.join(' · '),
+                status: 'connected',
+                tokenExpiryText,
+              },
+            ];
+          } catch (error) {
+            logger.warn(`[ERP对接] ${account.name} 健康检查失败:`, error);
+            return [
+              account.key,
+              {
+                message: formatUserFacingErrorMessage(error, '无法连接后端'),
+                status: 'error',
+              },
+            ];
+          }
+            })
+          );
+
+          return Object.fromEntries(entries) as ErpConnectionStates;
+        })();
+        erpConnectionCheckInFlight = checkTask;
+        const clearCurrentCheck = () => {
+          if (erpConnectionCheckInFlight === checkTask) {
+            erpConnectionCheckInFlight = null;
+          }
+        };
+        void checkTask.then(clearCurrentCheck, clearCurrentCheck);
+      }
+
+      const activeCheck = erpConnectionCheckInFlight;
+      if (!activeCheck) {
+        return;
+      }
+      const nextStates = await activeCheck;
+      cachedErpConnectionStates = nextStates;
+      lastErpConnectionCheckAt = Date.now();
+      setErpConnectionStates(nextStates);
+    },
+    []
+  );
+
+  const handleManualErpCheck = useCallback(() => {
+    void checkErpConnections({ force: true });
+  }, [checkErpConnections]);
+
   // 切换声音开关
-  const toggleSound = useCallback(async (value: boolean) => {
+  const toggleSound = useCallback((value: boolean) => {
     setSoundEnabled(value);
     setSoundEnabledFn(value);
-    await AsyncStorage.setItem(STORAGE_KEYS.SOUND_ENABLED, String(value));
   }, []);
 
   useFocusEffect(
     useCallback(() => {
       const task = InteractionManager.runAfterInteractions(() => {
-        loadData();
+        void loadData().catch((error) => {
+          logger.error('[设置] 加载设置数据失败:', error);
+          showSettingsLoadError('设置数据加载失败，请重新进入页面');
+        });
+        void loadAutoBackupStatus().catch((error) => {
+          logger.error('[设置] 加载自动备份状态失败:', error);
+        });
+        void checkErpConnections();
       });
       return () => task.cancel();
-    }, [loadData])
+    }, [checkErpConnections, loadAutoBackupStatus, loadData, showSettingsLoadError])
   );
 
   const stopHeartbeat = useCallback(() => {
@@ -357,26 +656,18 @@ export default function SettingsScreen() {
   const startHeartbeat = useCallback(() => {
     stopHeartbeat();
     failureCountRef.current = 0;
-    const targetUrl = `http://${syncConfig.ip}:${syncConfig.port || NETWORK_CONFIG.DEFAULT_PORT}/health`;
-
     const runHeartbeatCheck = async () => {
       // 滚动中标记，避免滚动时心跳触发重渲染 setState ????
       if (scrollingRef.current) return;
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), NETWORK_CONFIG.HEARTBEAT_TIMEOUT);
 
       try {
-        const response = await fetch(targetUrl, { signal: controller.signal });
-
-        if (response.ok) {
+        if (await testConnection(syncConfig)) {
           failureCountRef.current = 0;
         } else {
           failureCountRef.current++;
         }
       } catch {
         failureCountRef.current++;
-      } finally {
-        clearTimeout(timeoutId);
       }
 
       if (failureCountRef.current >= NETWORK_CONFIG.MAX_FAILURE_COUNT) {
@@ -388,7 +679,7 @@ export default function SettingsScreen() {
 
     void runHeartbeatCheck();
     heartbeatTimerRef.current = setInterval(runHeartbeatCheck, NETWORK_CONFIG.HEARTBEAT_INTERVAL);
-  }, [stopHeartbeat, syncConfig.ip, syncConfig.port]);
+  }, [stopHeartbeat, syncConfig]);
 
   // 心跳检测
   useEffect(() => {
@@ -406,42 +697,42 @@ export default function SettingsScreen() {
 
   // 端口变更
   const handlePortChange = (text: string) => {
-    setSyncConfig((prev) => ({ ...prev, port: text }));
+    setSyncConfig((prev) => ({ ...prev, port: text.replace(/\D/g, '').slice(0, 5) }));
     setConnectionStatus('idle');
   };
 
   // 测试连接
   const handleTestConnection = async () => {
-    if (!syncConfig.ip) {
-      alert.showWarning('请输入服务器地址');
+    const normalizedConfig = normalizeSyncConfig(syncConfig);
+    const configError = getSyncConfigError(normalizedConfig);
+    if (configError) {
+      alert.showWarning(configError);
       return;
     }
 
+    setSyncConfig(normalizedConfig);
     setConnectionStatus('testing');
-    const success = await testConnection(syncConfig);
+    const success = await testConnection(normalizedConfig, { force: true });
     const status: ConnectionStatus = success ? 'success' : 'error';
     setConnectionStatus(status);
     await Promise.all([
-      AsyncStorage.setItem(STORAGE_KEYS.SYNC_CONFIG, JSON.stringify(syncConfig)),
+      AsyncStorage.setItem(STORAGE_KEYS.SYNC_CONFIG, JSON.stringify(normalizedConfig)),
       AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, status),
     ]);
   };
 
   // 生成 Excel 并同步到电脑（支持多Sheet）
   const syncToComputerMultiSheet = async (
-    sheets: Array<{
-      name: string;
-      headers: string[];
-      rows: any[][];
-    }>,
+    sheets: ExcelSheet[],
     endpoint: string,
     setLoading: (loading: boolean) => void,
-    nameSuffix?: string
-  ) => {
+    nameSuffix?: string,
+    exactFileName?: string
+  ): Promise<boolean> => {
     const totalRows = sheets.reduce((sum, sheet) => sum + sheet.rows.length, 0);
     if (totalRows === 0) {
       alert.showWarning('暂无数据可同步');
-      return;
+      return false;
     }
 
     setLoading(true);
@@ -453,21 +744,27 @@ export default function SettingsScreen() {
         nameSuffix,
         (fileName) =>
           alert.showSuccess(fileName ? `已同步到电脑\n文件：${fileName}` : '已同步到电脑'),
-        undefined
+        undefined,
+        exactFileName
       );
 
       if (!result.success && result.message) {
         if (result.message.includes('暂无数据可同步')) {
           alert.showWarning(result.message);
-          return;
+          return false;
         }
 
         setConnectionStatus('disconnected');
         await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, 'disconnected');
         alert.showError(formatSyncErrorMessage(result.message));
+        return false;
       }
-    } catch (error: any) {
-      alert.showError(`同步失败：${formatSyncErrorMessage(error.message, '请检查服务是否运行')}`);
+      return result.success;
+    } catch (error: unknown) {
+      alert.showError(
+        `同步失败：${formatSyncErrorMessage(getErrorMessage(error, ''), '请检查服务是否运行')}`
+      );
+      return false;
     } finally {
       setLoading(false);
     }
@@ -475,11 +772,11 @@ export default function SettingsScreen() {
 
   // 同步入库单（包含所有扩展字段）
   const handleSyncInbound = async () => {
-    if (syncingInboundRef.current) {
+    if (activeSyncTasks.has('inbound')) {
       return;
     }
 
-    syncingInboundRef.current = true;
+    activeSyncTasks.add('inbound');
     setSyncingInbound(true);
     try {
       const records = await getAllInboundRecords();
@@ -489,86 +786,42 @@ export default function SettingsScreen() {
         return;
       }
 
-      // 获取当天的导出序号（按天递增）
-      const todayCount = await incrementExportCount('inbound');
-      const seqNo = String(todayCount).padStart(2, '0');
+      const todayCount = (await getTodayExportCount('inbound')) + 1;
 
-      // 入库明细表
-      const detailHeaders = [
-        '入库单号',
-        '仓库名称',
-        '存货编码',
-        '扫描型号',
-        '批次',
-        '数量',
-        '版本号',
-        '封装',
-        '生产日期',
-        '追溯码',
-        '箱号',
-        '入库日期',
-        '备注',
-        '创建时间',
-      ];
+      const sheets = buildInboundSheets(records as InboundExportRecord[]);
 
-      const detailRows = records.map((r) => [
-        r.inbound_no || '',
-        r.warehouse_name || '',
-        r.inventory_code || '',
-        r.scan_model || '',
-        r.batch || '',
-        r.quantity || 0,
-        r.version || '',
-        r.package || '',
-        r.productionDate || '',
-        r.traceNo || '',
-        r.sourceNo || '',
-        r.in_date || '',
-        r.notes || '',
-        formatDateTimeExport(r.created_at),
-      ]);
+      const warehouseName = getWarehouseExportSegment(
+        records.map((record) => record.warehouse_name)
+      );
+      const exactFileName = buildInboundExportFileName(warehouseName, todayCount);
 
-      const summaryHeaders = ['仓库名称', '存货编码', '扫描型号', '版本号', '封装', '合计数量', '入库日期'];
-      const summaryRows = (await getInboundExportSummaryRows()).map((s) => [
-        s.warehouse_name,
-        s.inventory_code,
-        s.scan_model,
-        s.version,
-        s.package,
-        s.total_quantity,
-        s.in_date,
-      ]);
-
-      // 获取唯一仓库名称列表，文件名加入序号
-      const warehouses = [...new Set(records.map((r) => r.warehouse_name).filter(Boolean))];
-      const warehouseSuffix =
-        warehouses.length === 1 ? warehouses[0] : warehouses.length > 1 ? '多仓库' : '';
-      const nameSuffix = warehouseSuffix ? `${warehouseSuffix}_${seqNo}` : seqNo;
-
-      await syncToComputerMultiSheet(
-        [
-          { name: '入库明细', headers: detailHeaders, rows: detailRows },
-          { name: '型号汇总', headers: summaryHeaders, rows: summaryRows },
-        ],
+      const synced = await syncToComputerMultiSheet(
+        sheets,
         '/inbound',
         setSyncingInbound,
-        nameSuffix
+        undefined,
+        exactFileName
       );
-    } catch (error: any) {
-      alert.showError(`同步失败：${formatSyncErrorMessage(error.message, '请检查服务是否运行')}`);
+      if (synced) {
+        await incrementExportCount('inbound');
+      }
+    } catch (error: unknown) {
+      alert.showError(
+        `同步失败：${formatSyncErrorMessage(getErrorMessage(error, ''), '请检查服务是否运行')}`
+      );
     } finally {
-      syncingInboundRef.current = false;
+      activeSyncTasks.delete('inbound');
       setSyncingInbound(false);
     }
   };
 
   // 同步出库单（扫码出库的物料信息）
   const handleSyncOutbound = async () => {
-    if (syncingOutboundRef.current) {
+    if (activeSyncTasks.has('outbound')) {
       return;
     }
 
-    syncingOutboundRef.current = true;
+    activeSyncTasks.add('outbound');
     setSyncingOutbound(true);
     try {
       const outboundQueueStats = await scanQueue.flushPendingWrites({
@@ -576,7 +829,9 @@ export default function SettingsScreen() {
         retryFailed: true,
       });
       if (outboundQueueStats.failed > 0) {
-        alert.showError(`仍有 ${outboundQueueStats.failed} 条出库扫码记录写入失败，请回到扫码出库页确认后再同步`);
+        alert.showError(
+          `仍有 ${outboundQueueStats.failed} 条出库扫码记录写入失败，请回到扫码出库页确认后再同步`
+        );
         return;
       }
 
@@ -587,246 +842,138 @@ export default function SettingsScreen() {
         return;
       }
 
-      // 获取当天的导出序号（按天递增）
-      const todayCount = await incrementExportCount('outbound');
-      const seqNo = String(todayCount).padStart(2, '0');
+      const todayCount = (await getTodayExportCount('outbound')) + 1;
 
-      // 调整列顺序：生产日期放在封装后面（与入库单一致）
-      const headers = [
-        '订单号',
-        '客户',
-        '仓库名称',
-        '存货编码',
-        '型号',
-        '批次',
-        '封装',
-        '生产日期',
-        '版本',
-        '数量',
-        '追踪码',
-        '箱号',
-        '扫描日期',
-        '扫描时间',
-      ];
+      const sheets = buildOutboundSheets(records);
+      const warehouseName = getWarehouseExportSegment(
+        records.map((record) => record.warehouse_name)
+      );
+      const exactFileName = buildOutboundExportFileName(warehouseName, todayCount);
 
-      const rows = records.map((r) => [
-        r.order_no || '',
-        r.customer_name || '',
-        r.warehouse_name || '',
-        r.inventory_code || '',
-        r.model || '',
-        r.batch || '',
-        r.package || '',
-        r.productionDate || '',
-        r.version || '',
-        parseQuantity(r.quantity, { min: 0 }) ?? 0,
-        r.traceNo || '',
-        r.sourceNo || '',
-        formatDate(r.scanned_at),
-        formatTime(r.scanned_at),
-      ]);
-
-      // 获取唯一仓库名称列表，文件名加入序号
-      const warehouses = [...new Set(records.map((r) => r.warehouse_name).filter(Boolean))];
-      const warehouseSuffix =
-        warehouses.length === 1 ? warehouses[0] : warehouses.length > 1 ? '多仓库' : '';
-      const nameSuffix = warehouseSuffix ? `${warehouseSuffix}_${seqNo}` : seqNo;
-
-      await syncToComputerMultiSheet(
-        [{ name: '出库明细', headers, rows }],
+      const synced = await syncToComputerMultiSheet(
+        sheets,
         '/outbound',
         setSyncingOutbound,
-        nameSuffix
+        undefined,
+        exactFileName
       );
-    } catch (error: any) {
-      alert.showError(`同步失败：${formatSyncErrorMessage(error.message, '请检查服务是否运行')}`);
+      if (synced) {
+        await incrementExportCount('outbound');
+      }
+    } catch (error: unknown) {
+      alert.showError(
+        `同步失败：${formatSyncErrorMessage(getErrorMessage(error, ''), '请检查服务是否运行')}`
+      );
     } finally {
-      syncingOutboundRef.current = false;
+      activeSyncTasks.delete('outbound');
       setSyncingOutbound(false);
     }
   };
 
   // 同步盘点单
   const handleSyncInventory = async () => {
-    if (syncingInventoryRef.current) {
+    if (activeSyncTasks.has('inventory')) {
       return;
     }
 
-    syncingInventoryRef.current = true;
+    activeSyncTasks.add('inventory');
     setSyncingInventory(true);
     try {
-      const records = await getAllInventoryCheckRecords();
+      const documents = await getInventoryCheckDocumentSummaries();
+      const latestDocument = documents[0];
 
-      if (records.length === 0) {
+      if (!latestDocument) {
         alert.showWarning('暂无盘点数据可同步');
         return;
       }
 
-      // 获取当天的导出序号（按天递增）
-      const todayCount = await incrementExportCount('inventory');
-      const seqNo = String(todayCount).padStart(2, '0');
-
-      const sheets = buildInventorySheets(records);
-      const inventorySummaryRows = (await getInventoryCheckExportSummaryRows()).map((s) => [
-        s.warehouse_name,
-        s.inventory_code,
-        s.scan_model,
-        s.version,
-        s.package,
-        s.total_quantity,
-        s.check_date,
-      ]);
-
-      if (sheets[1]) {
-        sheets[1] = {
-          ...sheets[1],
-          rows: inventorySummaryRows,
-        };
+      const records = await getInventoryCheckRecordsByNo(
+        latestDocument.check_no,
+        latestDocument.warehouse_id
+      );
+      if (records.length === 0) {
+        alert.showWarning('最近一张盘点单没有可同步明细');
+        return;
       }
 
-      // 获取唯一仓库名称列表，文件名加入序号
-      const warehouses = [...new Set(records.map((r) => r.warehouse_name).filter(Boolean))];
-      const warehouseSuffix =
-        warehouses.length === 1 ? warehouses[0] : warehouses.length > 1 ? '多仓库' : '';
-      const nameSuffix = warehouseSuffix ? `${warehouseSuffix}_${seqNo}` : seqNo;
+      const exportRecords: InventoryExportRecord[] = records.map((record) => ({
+        ...record,
+        account_name:
+          record.erp_account_name || latestDocument.erp_account_name || '',
+      }));
+      const sheets = buildInventorySheets(exportRecords);
+      const exactFileName = buildInventoryExportFileNameFromNo(
+        latestDocument.warehouse_name,
+        'complete',
+        latestDocument.check_no
+      );
 
-      await syncToComputerMultiSheet(
+      const synced = await syncToComputerMultiSheet(
         sheets,
         '/inventory',
         setSyncingInventory,
-        nameSuffix
+        undefined,
+        exactFileName
       );
-      // 型号汇总：整包+拆包整合，按型号+版本+仓库+盘点日期汇总
-      // 整包用原数量，拆包用实际数量，相同型号版本合并
-      logger.log('盘点导出完成', {
+      try {
+        await updateInventoryCheckDocumentSyncStatus(
+          latestDocument.check_no,
+          latestDocument.warehouse_id,
+          synced ? 'success' : 'failed',
+          exactFileName,
+          synced ? undefined : '手动同步失败'
+        );
+      } catch (statusError) {
+        logger.warn('[设置] 最近盘点单同步状态写入失败:', statusError);
+      }
+      if (!synced) return;
+
+      logger.log('最近盘点单同步完成', {
+        checkNo: latestDocument.check_no,
         detailCount: sheets[0]?.rows.length || 0,
-        summaryCount: sheets[1]?.rows.length || 0,
+        differenceCount: sheets[1]?.rows.length || 0,
       });
-    } catch (error: any) {
-      alert.showError(`同步失败：${formatSyncErrorMessage(error.message, '请检查服务是否运行')}`);
+    } catch (error: unknown) {
+      alert.showError(
+        `同步失败：${formatSyncErrorMessage(getErrorMessage(error, ''), '请检查服务是否运行')}`
+      );
     } finally {
-      syncingInventoryRef.current = false;
+      activeSyncTasks.delete('inventory');
       setSyncingInventory(false);
     }
   };
 
-  // 导出盘点拆包标签
-  const [syncingInventoryPartial, setSyncingInventoryPartial] = useState(false);
-  const handleSyncInventoryPartial = async () => {
-    if (syncingInventoryPartialRef.current) {
+  // 同步最近一个订单的全部拆包标签。
+  const handleSyncLabels = async () => {
+    if (activeSyncTasks.has('order-labels')) {
       return;
     }
 
-    syncingInventoryPartialRef.current = true;
-    setSyncingInventoryPartial(true);
-
-    // 只获取拆包类型的盘点记录，避免先全量读取再在 JS 里过滤。
+    activeSyncTasks.add('order-labels');
+    setSyncingLabels(true);
     try {
-      const records = await getAllInventoryCheckRecords(undefined, 'partial');
+      const records = await getAllUnpackRecords();
 
       if (records.length === 0) {
-        alert.showWarning('暂无盘点拆包记录');
+        alert.showWarning('暂无订单标签可同步');
         return;
       }
 
-      const headers = [
-        '盘点单号',
-        '仓库名称',
-        '存货编码',
-        '扫描型号',
-        '批次',
-        '封装',
-        '版本',
-        '实际数量',
-        '生产日期',
-        '追踪码',
-        '箱号',
-        '盘点日期',
-        '创建时间',
-      ];
+      const latestOrderRecords = selectLatestOrderUnpackRecords(records);
+      if (latestOrderRecords.length === 0) {
+        alert.showWarning('最近订单暂无标签可同步');
+        return;
+      }
 
-      const rows = records.map((r) => [
-        r.check_no || '',
-        r.warehouse_name || '',
-        r.inventory_code || '',
-        r.scan_model || '',
-        r.batch || '',
-        r.package || '',
-        r.version || '',
-        r.actual_quantity || '',
-        r.productionDate || '',
-        r.traceNo || '',
-        r.sourceNo || '',
-        r.check_date || '',
-        formatDateTimeExport(r.created_at),
-      ]);
-
-      await syncToComputerMultiSheet(
-        [{ name: '拆包标签', headers, rows }],
-        '/inventory',
-        setSyncingInventoryPartial,
-        '拆包标签'
-      );
-    } catch (error: any) {
-      alert.showError(`导出失败: ${error.message || '请检查服务是否运行'}`);
+      const labelSheet = buildUnpackLabelSheet(latestOrderRecords);
+      await syncToComputerMultiSheet([labelSheet], '/labels', setSyncingLabels);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '请检查服务是否运行';
+      alert.showError(`同步失败：${formatSyncErrorMessage(message)}`);
     } finally {
-      syncingInventoryPartialRef.current = false;
-      setSyncingInventoryPartial(false);
+      activeSyncTasks.delete('order-labels');
+      setSyncingLabels(false);
     }
-  };
-
-  // 同步标签数据（原有拆包记录）
-  const handleSyncLabels = async () => {
-    const records = await getAllUnpackRecords();
-
-    if (records.length === 0) {
-      alert.showWarning('暂无订单标签可同步');
-      return;
-    }
-
-    const headers = [
-      '仓库名称',
-      '标签类型',
-      '订单号',
-      '客户',
-      '型号',
-      '存货编码',
-      '批次',
-      '封装',
-      '版本',
-      '原数量',
-      '标签数量',
-      '生产日期',
-      '追踪码',
-      '箱号',
-      '拆包时间',
-      '备注',
-    ];
-
-    const rows = records.map((r) => [
-      r.warehouse_name || '',
-      r.label_type === 'shipped' ? '发货标签' : '剩余标签',
-      r.order_no || '',
-      r.customer_name || '',
-      r.model || '',
-      r.inventory_code || '',
-      r.batch || '',
-      r.package || '',
-      r.version || '',
-      parseQuantity(r.original_quantity, { min: 0 }) ?? 0,
-      parseQuantity(r.new_quantity, { min: 0 }) ?? 0,
-      r.productionDate || '',
-      r.label_type === 'shipped' ? r.new_traceNo || r.traceNo || '' : r.traceNo || '',
-      r.sourceNo || '',
-      formatTime(r.unpacked_at),
-      r.notes || '',
-    ]);
-
-    await syncToComputerMultiSheet(
-      [{ name: '标签明细', headers, rows }],
-      '/labels',
-      setSyncingLabels
-    );
   };
 
   // ==================== 在线更新功能 ====================
@@ -932,20 +1079,8 @@ export default function SettingsScreen() {
           changelogText = data.changelog;
         }
 
-        try {
-          await backupDatabaseToNasForUpdate('检测到新版本');
-        } catch (backupError) {
-          const backupMessage =
-            backupError instanceof Error ? backupError.message : String(backupError || '未知错误');
-          logger.error('[checkForUpdate] 新版本更新前 NAS 数据库备份失败:', backupError);
-          alert.showError(
-            `检测到新版本，但更新前数据库备份到 NAS 失败：${backupMessage}。请先备份成功后再更新，避免覆盖安装后数据丢失。`
-          );
-          return;
-        }
-
         setUpdateInfo({
-          version: data.version || latestVersion,
+          version: latestVersion,
           downloadUrls: resolveUpdateDownloadUrls(data.downloadUrl, data.downloadUrls, baseUrl),
           changelog: changelogText,
           forceUpdate: data.forceUpdate || false,
@@ -1036,12 +1171,14 @@ export default function SettingsScreen() {
           downloadCallback
         );
 
-        let result: { uri: string; status: number } | null;
+        let result: { uri: string; status: number } | undefined;
         try {
           result = await downloadResumable.downloadAsync();
         } catch (downloadError) {
           const message =
-            downloadError instanceof Error ? downloadError.message : String(downloadError || '未知错误');
+            downloadError instanceof Error
+              ? downloadError.message
+              : String(downloadError || '未知错误');
           lastDownloadErrorMessage = message;
           logger.warn(
             `[update] 安装包下载线路 ${index + 1}/${updateInfo.downloadUrls.length} 失败:`,
@@ -1085,7 +1222,9 @@ export default function SettingsScreen() {
         await backupDatabaseToNasForUpdate('安装前');
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error || '未知错误');
-        alert.showError(`安装前 NAS 数据库备份失败：${message}。请稍后再试，避免覆盖安装时丢失当前出库数据。`);
+        alert.showError(
+          `安装前 NAS 数据库备份失败：${message}。请稍后再试，避免覆盖安装时丢失当前出库数据。`
+        );
         setDownloading(false);
         return;
       }
@@ -1110,12 +1249,8 @@ export default function SettingsScreen() {
     } catch (error) {
       logger.error('安装程序打开失败:', error);
       const message = error instanceof Error ? error.message : String(error || '');
-      const installHint = message
-        ? `\n原因：${message}`
-        : '';
-      alert.showError(
-        `安装程序打开失败，请确认已允许本应用安装未知来源应用${installHint}`
-      );
+      const installHint = message ? `\n原因：${message}` : '';
+      alert.showError(`安装程序打开失败，请确认已允许本应用安装未知来源应用${installHint}`);
       setDownloading(false);
     }
   };
@@ -1156,8 +1291,10 @@ export default function SettingsScreen() {
             UTI: 'public.json',
           });
           alert.showSuccess(
-            `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 自定义字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n请妥善保管备份文件！`
+            `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n请妥善保管备份文件！`
           );
+        } else {
+          alert.showError('当前设备不支持文件分享，未能导出配置备份');
         }
       } else {
         // Android 7.0 及以下：保存到 Downloads 文件夹
@@ -1184,7 +1321,7 @@ export default function SettingsScreen() {
           try {
             const albums = await MediaLibrary.getAlbumsAsync();
             let downloadAlbum = albums.find(
-              (album: any) => album.title === 'Download' || album.title === 'Downloads'
+              (album) => album.title === 'Download' || album.title === 'Downloads'
             );
 
             if (!downloadAlbum) {
@@ -1210,7 +1347,7 @@ export default function SettingsScreen() {
           }
 
           alert.showSuccess(
-            `备份已保存到 Downloads 文件夹:\n${fileName}\n\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 自定义字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}`
+            `备份已保存到 Downloads 文件夹:\n${fileName}\n\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}`
           );
         } catch (mediaError) {
           logger.error('保存到Downloads失败:', mediaError);
@@ -1223,7 +1360,7 @@ export default function SettingsScreen() {
               UTI: 'public.json',
             });
             alert.showSuccess(
-              `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 自定义字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}`
+              `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}`
             );
           } else {
             alert.showError('备份失败，请重试');
@@ -1269,7 +1406,6 @@ export default function SettingsScreen() {
         encoding: FileSystem.EncodingType.UTF8,
       });
 
-      let backupData: BackupData;
       const parsedBackupData = safeJsonParseNullable<BackupData>(
         fileContent,
         'settings.backupFile',
@@ -1280,11 +1416,11 @@ export default function SettingsScreen() {
         alert.showError('无效的备份文件格式');
         return;
       }
-      backupData = parsedBackupData;
+      const backupData = parsedBackupData;
 
       alert.showConfirm(
         '确认恢复配置',
-        `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n即将恢复以下配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 自定义字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n[注意] 恢复前会清空当前所有配置数据（规则、字段、绑定、仓库等），业务数据（订单、物料、拆包记录等）不受影响！此操作不可撤销！`,
+        `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n即将恢复以下配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === undefined ? '沿用当前设置' : backupData.soundEnabled ? '开启' : '关闭'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n[注意] 恢复前会替换当前配置数据，业务数据（订单、物料、拆包记录等）不受影响；被历史业务引用的仓库会保留。此操作不可撤销！`,
         async () => {
           setRestoreLoading(true);
           try {
@@ -1295,15 +1431,14 @@ export default function SettingsScreen() {
                 : result.stats?.syncConfigRestored
                   ? '已恢复'
                   : '恢复失败';
-              const summary =
-                `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n恢复成功:\n• 解析规则: ${result.stats?.rules || 0} 条\n• 自定义字段: ${result.stats?.customFields || 0} 个\n• 物料绑定: ${result.stats?.inventoryBindings || 0} 条\n• 仓库: ${result.stats?.warehouses || 0} 个\n• 同步服务器: ${syncConfigStatus}`;
+              const summary = `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n恢复成功:\n• 解析规则: ${result.stats?.rules || 0} 条\n• 占位字段: ${result.stats?.customFields || 0} 个\n• 物料绑定: ${result.stats?.inventoryBindings || 0} 条\n• 仓库: ${result.stats?.warehouses || 0} 个\n• 出库单号规则: ${result.stats?.outboundWarehouseOrderRules || 0} 条\n• 同步服务器: ${syncConfigStatus}`;
 
               if (result.warnings?.length) {
                 alert.showWarning(`${summary}\n\n注意:\n• ${result.warnings.join('\n• ')}`);
               } else {
                 alert.showSuccess(summary);
               }
-              loadData();
+              await loadData();
             } else {
               alert.showError(result.message);
             }
@@ -1344,29 +1479,36 @@ export default function SettingsScreen() {
           let nasBackupError: string | null = null;
 
           try {
-            const nasBackupResult = await uploadDatabaseBackupToNas(localFilePath);
+            const nasBackupResult = await uploadDatabaseBackupToNas(localFilePath, {
+              source: 'manual-export',
+            });
             nasBackupFileName = nasBackupResult.fileName;
+            void loadAutoBackupStatus();
           } catch (error) {
             nasBackupError = error instanceof Error ? error.message : 'NAS 云端备份失败';
             logger.error('NAS 数据库备份失败:', error);
           }
 
-          // 使用 expo-sharing 分享文件
-          if (await Sharing.isAvailableAsync()) {
+          const sharingAvailable = await Sharing.isAvailableAsync();
+          if (sharingAvailable) {
             await Sharing.shareAsync(localFilePath, {
               mimeType: 'application/x-sqlite3',
               dialogTitle: '保存数据库备份',
             });
-          } else {
-            alert.showError('您的设备不支持文件分享');
           }
           if (nasBackupError) {
-            alert.showWarning(`数据库文件已本地备份，但 NAS 云端备份失败：${nasBackupError}`);
+            if (sharingAvailable) {
+              alert.showWarning(`数据库文件已本地导出，但 NAS 云端备份失败：${nasBackupError}`);
+            } else {
+              alert.showError(`设备不支持文件分享，且 NAS 云端备份失败：${nasBackupError}`);
+            }
           } else {
             alert.showSuccess(
               nasBackupFileName
-                ? `数据库文件备份成功\nNAS 云端备份：${nasBackupFileName}`
-                : '数据库文件备份成功'
+                ? `数据库已备份到 NAS：${nasBackupFileName}${sharingAvailable ? '\n本地分享窗口也已打开' : ''}`
+                : sharingAvailable
+                  ? '数据库文件已打开分享窗口'
+                  : '数据库备份文件已生成，但设备不支持分享'
             );
           }
         } catch (error) {
@@ -1409,7 +1551,7 @@ export default function SettingsScreen() {
                   alert.showSuccess(
                     `数据库文件恢复成功！\n\n恢复后的数据统计：\n• 订单: ${result.stats?.orders || 0} 条\n• 物料: ${result.stats?.materials || 0} 条\n• 规则: ${result.stats?.rules || 0} 条\n• 仓库: ${result.stats?.warehouses || 0} 个`
                   );
-                  loadData();
+                  await loadData();
                 }
               } else {
                 alert.showError(result.message);
@@ -1428,7 +1570,7 @@ export default function SettingsScreen() {
   };
 
   // 是否可以同步
-  const canSync = syncConfig.ip && connectionStatus === 'success';
+  const canSync = Boolean(syncConfig.ip) && connectionStatus === 'success';
   const syncTarget = syncConfig.ip
     ? `${syncConfig.ip}:${syncConfig.port || NETWORK_CONFIG.DEFAULT_PORT}`
     : '未配置';
@@ -1466,14 +1608,74 @@ export default function SettingsScreen() {
       color: theme.textMuted,
       icon: 'monitor' as keyof typeof Feather.glyphMap,
     };
+  }, [connectionStatus, syncTarget, theme.error, theme.primary, theme.success, theme.textMuted]);
+
+  const erpConnectionSummary = useMemo(() => {
+    const availableAccounts = ERP_ACCOUNTS.filter(isErpAccountAvailable);
+    const connectedCount = availableAccounts.filter(
+      (account) => erpConnectionStates[account.key].status === 'connected'
+    ).length;
+    const checking = availableAccounts.some(
+      (account) => erpConnectionStates[account.key].status === 'checking'
+    );
+
+    if (checking) {
+      return '正在检测ERP后端';
+    }
+    if (availableAccounts.length === 0) {
+      return '尚未开放ERP账套';
+    }
+    return `${connectedCount}/${availableAccounts.length} 套已就绪`;
+  }, [erpConnectionStates]);
+
+  const erpConnectionGroupColor = useMemo(() => {
+    const statuses = Object.values(erpConnectionStates).map((item) => item.status);
+
+    if (statuses.includes('error')) {
+      return theme.error;
+    }
+    if (statuses.includes('warning')) {
+      return theme.warning;
+    }
+    if (statuses.includes('checking')) {
+      return theme.primary;
+    }
+    if (statuses.includes('connected')) {
+      return theme.success;
+    }
+    return theme.textMuted;
   }, [
-    connectionStatus,
-    syncTarget,
+    erpConnectionStates,
     theme.error,
     theme.primary,
     theme.success,
     theme.textMuted,
+    theme.warning,
   ]);
+
+  const getErpConnectionVisual = useCallback(
+    (status: ErpConnectionStatus) => {
+      switch (status) {
+        case 'connected':
+          return { color: theme.success, icon: 'check-circle' as const, label: '正常' };
+        case 'checking':
+          return { color: theme.primary, icon: 'loader' as const, label: '检测中' };
+        case 'warning':
+          return { color: theme.warning, icon: 'alert-triangle' as const, label: '待配置' };
+        case 'error':
+          return { color: theme.error, icon: 'x-circle' as const, label: '异常' };
+        case 'unavailable':
+          return { color: theme.textMuted, icon: 'slash' as const, label: '未开放' };
+        default:
+          return { color: theme.textMuted, icon: 'clock' as const, label: '未检测' };
+      }
+    },
+    [theme.error, theme.primary, theme.success, theme.textMuted, theme.warning]
+  );
+
+  const toggleSettingsGroup = useCallback((group: SettingsGroupId) => {
+    setExpandedSettingsGroup((current) => (current === group ? null : group));
+  }, []);
 
   // 渲染菜单卡片
   const renderMenuCard = useCallback(
@@ -1487,33 +1689,19 @@ export default function SettingsScreen() {
       loading?: boolean,
       rightText?: string
     ) => (
-      <AnimatedCard
+      <UiListItem
+        title={title}
+        subtitle={desc}
+        icon={iconName}
+        color={color}
         onPress={onPress}
         disabled={disabled || loading}
-        style={[styles.exportCardContainer, disabled && styles.exportCardDisabled]}
-        disablePressAnimation
-      >
-        <View style={styles.exportCard}>
-          <View style={[styles.exportIcon, { backgroundColor: color + '15' }]}>
-            {loading ? (
-              <ActivityIndicator size="small" color={color} />
-            ) : (
-              <Feather name={iconName} size={20} color={color} />
-            )}
-          </View>
-          <View style={styles.exportInfo}>
-            <Text style={styles.exportTitle}>{loading ? '处理中...' : title}</Text>
-            <Text style={styles.exportDesc}>{desc}</Text>
-          </View>
-          {rightText ? (
-            <Text style={[styles.rightText, { color }]}>{rightText}</Text>
-          ) : (
-            <Feather name="chevron-right" size={16} color={theme.textMuted} />
-          )}
-        </View>
-      </AnimatedCard>
+        loading={loading}
+        rightText={rightText}
+        compact
+      />
     ),
-    [styles, theme.textMuted]
+    []
   );
 
   // 渲染开关设置项
@@ -1526,30 +1714,204 @@ export default function SettingsScreen() {
       value: boolean,
       onValueChange: (value: boolean) => void
     ) => (
-      <AnimatedCard
-        onPress={() => onValueChange(!value)}
-        style={styles.exportCardContainer}
-        disablePressAnimation
-      >
-        <View style={styles.exportCard}>
-          <View style={[styles.exportIcon, { backgroundColor: color + '15' }]}>
-            <Feather name={iconName} size={20} color={color} />
-          </View>
-          <View style={styles.exportInfo}>
-            <Text style={styles.exportTitle}>{title}</Text>
-            <Text style={styles.exportDesc}>{desc}</Text>
-          </View>
-          <Switch
-            value={value}
-            onValueChange={onValueChange}
-            trackColor={{ false: theme.border, true: color + '80' }}
-            thumbColor={value ? color : theme.textMuted}
-          />
-        </View>
-      </AnimatedCard>
+      <UiListItem
+        title={title}
+        subtitle={desc}
+        icon={iconName}
+        color={color}
+        switchValue={value}
+        onSwitchChange={onValueChange}
+        compact
+      />
     ),
-    [styles, theme.border, theme.textMuted]
+    []
   );
+
+  const openBatteryOptimizationSettings = useCallback(async () => {
+    if (Platform.OS !== 'android') {
+      await Linking.openSettings();
+      return;
+    }
+
+    try {
+      await IntentLauncher.startActivityAsync(
+        'android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS'
+      );
+    } catch (error) {
+      logger.warn('[设置] 打开电池优化设置失败，改为打开应用设置:', error);
+      await Linking.openSettings();
+    }
+  }, []);
+
+  const formatAutoBackupTime = useCallback((timeMs?: number) => {
+    if (!timeMs) {
+      return '暂无';
+    }
+    return formatDateTimeExport(new Date(timeMs).toISOString());
+  }, []);
+
+  const renderAutoBackupDiagnosticRow = useCallback(
+    (label: string, value: string, numberOfLines = 1, emphasizeError = false) => (
+      <View style={styles.autoBackupDiagnosticRow}>
+        <Text style={styles.autoBackupDiagnosticLabel}>{label}</Text>
+        <Text
+          style={[
+            styles.autoBackupDiagnosticValue,
+            emphasizeError && styles.autoBackupDiagnosticValueError,
+          ]}
+          numberOfLines={numberOfLines}
+        >
+          {value}
+        </Text>
+      </View>
+    ),
+    [styles]
+  );
+
+  const renderAutoBackupDiagnostic = useCallback(() => {
+    const today = getDatabaseBackupDateString();
+    const nativeSuccessAt =
+      nativeAutoBackupStatus?.status === 'success' ? nativeAutoBackupStatus.checkedAtMs : 0;
+    const latestSuccessAt = Math.max(lastNasBackupSuccess?.successAtMs ?? 0, nativeSuccessAt);
+    const latestSuccessDate = latestSuccessAt
+      ? getDatabaseBackupDateString(new Date(latestSuccessAt))
+      : null;
+    const hasNasSuccessToday = latestSuccessDate === today;
+    const hasFailure =
+      autoBackupStatus?.status === 'failed' || nativeAutoBackupStatus?.status === 'failed';
+    const statusLabel = hasNasSuccessToday
+      ? 'NAS已备份'
+      : hasFailure
+        ? '存在异常'
+        : lastNasBackupSuccess
+          ? '需备份'
+          : nativeAutoBackupStatus
+            ? getNativeAutoNasBackupStatusLabel(nativeAutoBackupStatus)
+            : getAutoNasBackupStatusLabel(autoBackupStatus);
+    const hasSuccess =
+      hasNasSuccessToday ||
+      autoBackupStatus?.status === 'success' ||
+      nativeAutoBackupStatus?.status === 'success';
+    const badgeStyle =
+      hasSuccess
+        ? styles.autoBackupDiagnosticBadgeSuccess
+        : hasFailure
+        ? styles.autoBackupDiagnosticBadgeError
+        : styles.autoBackupDiagnosticBadgeWarning;
+    const badgeTextStyle =
+      hasSuccess
+        ? styles.autoBackupDiagnosticBadgeTextSuccess
+        : hasFailure
+        ? styles.autoBackupDiagnosticBadgeTextError
+        : styles.autoBackupDiagnosticBadgeTextWarning;
+    const resultText =
+      autoBackupStatus?.status === 'failed'
+        ? autoBackupStatus.lastError || '未知错误'
+        : autoBackupStatus?.status === 'skipped'
+          ? getAutoNasBackupReasonLabel(autoBackupStatus.reason)
+          : autoBackupStatus?.status === 'success'
+            ? '最近一次自动备份已上传到 NAS'
+            : '暂无自动备份检查记录';
+    const successText = autoBackupStatus?.lastSuccessAt
+      ? `${formatAutoBackupTime(autoBackupStatus.lastSuccessAt)} · ${
+          autoBackupStatus.lastSuccessFileName || 'NAS 备份'
+        }`
+      : '暂无成功记录';
+    const latestNasSuccessText =
+      nativeSuccessAt > (lastNasBackupSuccess?.successAtMs ?? 0)
+        ? `${formatAutoBackupTime(nativeSuccessAt)} · ${getNasDatabaseBackupSourceLabel(
+            'native-workmanager'
+          )} · ${nativeAutoBackupStatus?.fileName || 'NAS 备份'}`
+        : lastNasBackupSuccess
+          ? `${formatAutoBackupTime(lastNasBackupSuccess.successAtMs)} · ${getNasDatabaseBackupSourceLabel(
+              lastNasBackupSuccess.source
+            )} · ${lastNasBackupSuccess.fileName}`
+          : '暂无 NAS 成功记录';
+    const nativeResultText =
+      nativeAutoBackupStatus?.status === 'failed'
+        ? nativeAutoBackupStatus.errorMessage || '未知错误'
+        : nativeAutoBackupStatus?.status === 'skipped'
+          ? getNativeAutoNasBackupReasonLabel(nativeAutoBackupStatus.reason)
+          : nativeAutoBackupStatus?.status === 'success'
+            ? '后台任务已上传数据库到 NAS'
+            : nativeAutoBackupStatus?.status === 'running'
+              ? '后台任务正在执行'
+              : '暂无后台任务记录';
+    const nativeSuccessText = nativeAutoBackupStatus?.fileName
+      ? `${formatAutoBackupTime(nativeAutoBackupStatus.checkedAtMs)} · ${
+          nativeAutoBackupStatus.fileName
+        }`
+      : nativeAutoBackupStatus?.lastSuccessAtMs
+        ? `${formatAutoBackupTime(nativeAutoBackupStatus.lastSuccessAtMs)} · 后台任务`
+        : '暂无后台成功记录';
+
+    return (
+      <View style={styles.autoBackupDiagnosticCard}>
+        <View style={styles.autoBackupDiagnosticHeader}>
+          <Text style={styles.autoBackupDiagnosticTitle}>NAS备份诊断</Text>
+          <View style={[styles.autoBackupDiagnosticBadge, badgeStyle]}>
+            <Text style={[styles.autoBackupDiagnosticBadgeText, badgeTextStyle]}>
+              {statusLabel}
+            </Text>
+          </View>
+        </View>
+        {renderAutoBackupDiagnosticRow('NAS最新', latestNasSuccessText, 2)}
+        {renderAutoBackupDiagnosticRow(
+          '前台检查',
+          formatAutoBackupTime(autoBackupStatus?.lastCheckedAt)
+        )}
+        {renderAutoBackupDiagnosticRow(
+          '前台来源',
+          getAutoNasBackupTriggerLabel(autoBackupStatus?.trigger)
+        )}
+        {renderAutoBackupDiagnosticRow(
+          '前台说明',
+          resultText,
+          2,
+          autoBackupStatus?.status === 'failed'
+        )}
+        {renderAutoBackupDiagnosticRow('前台成功', successText, 2)}
+        {renderAutoBackupDiagnosticRow('前台策略', '前台每 15 分钟刷新状态，Android 自动上传交给后台任务', 2)}
+        <View style={styles.autoBackupDiagnosticDivider} />
+        {renderAutoBackupDiagnosticRow('后台任务', getNativeAutoNasBackupStatusLabel(nativeAutoBackupStatus))}
+        {renderAutoBackupDiagnosticRow(
+          '后台时间',
+          formatAutoBackupTime(nativeAutoBackupStatus?.checkedAtMs)
+        )}
+        {renderAutoBackupDiagnosticRow(
+          '后台说明',
+          nativeResultText,
+          2,
+          nativeAutoBackupStatus?.status === 'failed'
+        )}
+        {renderAutoBackupDiagnosticRow('后台成功', nativeSuccessText, 2)}
+        {renderAutoBackupDiagnosticRow('后台策略', 'Android WorkManager 每 6 小时调度，锁屏后由系统执行', 2)}
+        <View style={styles.autoBackupProtectionBox}>
+          <Text style={styles.autoBackupProtectionTitle}>企业 PDA 后台保障</Text>
+          <Text style={styles.autoBackupProtectionText}>
+            建议把掌上仓库加入电池优化白名单，并允许后台网络，避免锁屏或省电策略延迟上传。
+          </Text>
+          {Platform.OS === 'android' && (
+            <AnimatedButton
+              style={styles.autoBackupProtectionButton}
+              activeOpacity={0.82}
+              onPress={openBatteryOptimizationSettings}
+            >
+              <Text style={styles.autoBackupProtectionButtonText}>打开电池优化设置</Text>
+            </AnimatedButton>
+          )}
+        </View>
+      </View>
+    );
+  }, [
+    autoBackupStatus,
+    formatAutoBackupTime,
+    lastNasBackupSuccess,
+    nativeAutoBackupStatus,
+    openBatteryOptimizationSettings,
+    renderAutoBackupDiagnosticRow,
+    styles,
+  ]);
 
   return (
     <Screen
@@ -1564,380 +1926,445 @@ export default function SettingsScreen() {
         scrollEventThrottle={16} // 控制滚动事件频率（16ms ≈ 60fps）
         decelerationRate="normal" // 正常减速率，改善滑动手感
         directionalLockEnabled={true} // 锁定滚动方向，提升跟手性
-        onScrollBeginDrag={() => { scrollingRef.current = true; }}
-        onScrollEndDrag={() => { scrollingRef.current = false; }}
-        onMomentumScrollBegin={() => { scrollingRef.current = true; }}
-        onMomentumScrollEnd={() => { scrollingRef.current = false; }}
+        onScrollBeginDrag={() => {
+          scrollingRef.current = true;
+        }}
+        onScrollEndDrag={() => {
+          scrollingRef.current = false;
+        }}
+        onMomentumScrollBegin={() => {
+          scrollingRef.current = true;
+        }}
+        onMomentumScrollEnd={() => {
+          scrollingRef.current = false;
+        }}
       >
-        {/* 头部 */}
-        <View style={styles.header}>
-          <TouchableOpacity
-            style={styles.backButton}
-            activeOpacity={0.7}
-            onPress={() => router.back()}
-          >
-            <Feather name="arrow-left" size={20} color={theme.textPrimary} />
-          </TouchableOpacity>
-          <View style={styles.headerContent}>
-            <Text style={styles.title}>设置</Text>
-          </View>
-        </View>
+        <UiPageHeader title="设置" onBack={() => router.back()} style={styles.settingsPageHeader} />
 
-        {/* ========== 常用设置 ========== */}
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>常用设置</Text>
-        </View>
-
-        <View style={{ gap: getSpacing().md }}>
-          {renderMenuCard('仓库档案', '维护仓库与默认仓库', 'box', theme.primary, () =>
-            router.push('/warehouse-management')
+        <UiListSection style={styles.settingsOverview}>
+          <UiListItem
+            title="作业与物料"
+            subtitle="仓库、物料对应关系与扫码反馈"
+            icon="box"
+            color={theme.primary}
+            onPress={() => toggleSettingsGroup('system')}
+            expanded={expandedSettingsGroup === 'system'}
+          />
+          {expandedSettingsGroup === 'system' && (
+            <View style={styles.settingsGroupPanel}>
+              {renderMenuCard('仓库档案', '维护仓库与默认仓库', 'box', theme.primary, () =>
+                router.push('/warehouse-management')
+              )}
+              {renderMenuCard(
+                '物料绑定',
+                '维护型号、版本与ERP存货编码',
+                'link-2',
+                theme.success,
+                () => router.push('/inventory-binding'),
+                false,
+                false,
+                `${configStats.inventoryBindings} 条`
+              )}
+              {renderSwitchCard(
+                '扫码提示音',
+                '扫码成功、重复、异常反馈',
+                'radio',
+                theme.primary,
+                soundEnabled,
+                toggleSound
+              )}
+            </View>
           )}
 
-          {renderSwitchCard(
-            '扫码提示音',
-            '扫码成功、重复、异常反馈',
-            'radio',
-            theme.primary,
-            soundEnabled,
-            toggleSound
+          <UiListItem
+            title="ERP对接"
+            subtitle={erpConnectionSummary}
+            icon="cloud"
+            color={erpConnectionGroupColor}
+            onPress={() => toggleSettingsGroup('erp')}
+            expanded={expandedSettingsGroup === 'erp'}
+          />
+          {expandedSettingsGroup === 'erp' && (
+            <View style={styles.settingsGroupPanel}>
+              {ERP_ACCOUNTS.map((account) => {
+                const connection = erpConnectionStates[account.key];
+                const visual = getErpConnectionVisual(connection.status);
+                return (
+                  <UiListItem
+                    key={account.key}
+                    title={account.name}
+                    subtitle={connection.message}
+                    metaText={connection.tokenExpiryText}
+                    icon={visual.icon}
+                    color={visual.color}
+                    rightText={visual.label}
+                    compact
+                  />
+                );
+              })}
+              {renderMenuCard(
+                '重新检测ERP',
+                '仅检查后端配置，不消耗ERP业务接口次数',
+                'refresh-cw',
+                theme.primary,
+                handleManualErpCheck,
+                false,
+                Object.values(erpConnectionStates).some((item) => item.status === 'checking')
+              )}
+            </View>
           )}
 
-          {renderMenuCard(
-            '检查更新',
-            `当前版本 ${APP_VERSION}`,
-            'refresh-cw',
-            theme.success,
-            checkForUpdate,
-            checkingUpdate,
-            checkingUpdate
+          <UiListItem
+            title="同步助手"
+            subtitle={syncAssistantStatus.title}
+            icon="refresh-cw"
+            color={syncAssistantStatus.color}
+            onPress={() => toggleSettingsGroup('sync')}
+            expanded={expandedSettingsGroup === 'sync'}
+          />
+          {expandedSettingsGroup === 'sync' && (
+            <View style={styles.settingsGroupPanel}>
+              <View style={styles.syncConfigCard}>
+                <View style={styles.syncAssistantHeader}>
+                  <View
+                    style={[
+                      styles.syncAssistantIcon,
+                      { backgroundColor: `${syncAssistantStatus.color}18` },
+                    ]}
+                  >
+                    {connectionStatus === 'testing' ? (
+                      <ActivityIndicator size="small" color={syncAssistantStatus.color} />
+                    ) : (
+                      <Feather
+                        name={syncAssistantStatus.icon}
+                        size={20}
+                        color={syncAssistantStatus.color}
+                      />
+                    )}
+                  </View>
+                  <View style={styles.syncAssistantInfo}>
+                    <Text style={styles.syncAssistantTitle}>{syncAssistantStatus.title}</Text>
+                    <Text style={styles.syncAssistantDesc}>{syncAssistantStatus.desc}</Text>
+                  </View>
+                </View>
+
+                <View style={styles.syncConfigRow}>
+                  <Text style={styles.syncConfigLabel}>电脑IP</Text>
+                  <TextInput
+                    style={styles.syncConfigInput}
+                    value={syncConfig.ip}
+                    onChangeText={handleIpChange}
+                    placeholder="例如 192.168.1.100"
+                    placeholderTextColor={theme.textMuted}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
+                </View>
+                <View style={styles.syncConfigRow}>
+                  <Text style={styles.syncConfigLabel}>端口</Text>
+                  <TextInput
+                    style={styles.syncConfigInput}
+                    value={syncConfig.port}
+                    onChangeText={handlePortChange}
+                    placeholder="默认: 8080"
+                    placeholderTextColor={theme.textMuted}
+                    keyboardType="numeric"
+                  />
+                </View>
+                <View style={styles.syncConfigButtons}>
+                  <AnimatedButton
+                    containerStyle={styles.syncButtonWrap}
+                    style={[
+                      styles.syncButton,
+                      styles.syncButtonTest,
+                      connectionStatus === 'success' && styles.syncButtonSuccess,
+                      (connectionStatus === 'error' || connectionStatus === 'disconnected') &&
+                        styles.syncButtonError,
+                    ]}
+                    onPress={handleTestConnection}
+                    disabled={connectionStatus === 'testing'}
+                    activeScale={0.96}
+                    activeOpacity={0.9}
+                  >
+                    {connectionStatus === 'testing' ? (
+                      <ActivityIndicator size="small" color={theme.primary} />
+                    ) : (
+                      <Text
+                        style={[
+                          styles.syncButtonTestText,
+                          connectionStatus === 'success' && styles.syncButtonSuccessText,
+                          (connectionStatus === 'error' || connectionStatus === 'disconnected') &&
+                            styles.syncButtonErrorText,
+                        ]}
+                      >
+                        {connectionStatus === 'success'
+                          ? '已连接 ✓'
+                          : connectionStatus === 'disconnected'
+                            ? '重新检测'
+                            : connectionStatus === 'error'
+                              ? '重新检测'
+                              : '测试连接'}
+                      </Text>
+                    )}
+                  </AnimatedButton>
+                </View>
+                {connectionStatus === 'success' && (
+                  <Text style={styles.syncStatusHint}>连接成功，配置已自动保存</Text>
+                )}
+                {connectionStatus === 'disconnected' && (
+                  <Text style={styles.syncStatusHintError}>
+                    网络连接已断开，请检查网络后重新连接
+                  </Text>
+                )}
+                {connectionStatus === 'error' && (
+                  <Text style={styles.syncStatusHintError}>请检查服务器地址和状态后重试</Text>
+                )}
+                {connectionStatus === 'idle' && !syncConfig.ip && (
+                  <Text style={styles.syncStatusHintIdle}>电脑端托盘菜单可查看服务地址</Text>
+                )}
+              </View>
+
+              {renderMenuCard(
+                '同步入库单',
+                '生成入库 Excel 到电脑同步文件夹',
+                'file-plus',
+                theme.success,
+                handleSyncInbound,
+                !canSync,
+                syncingInbound
+              )}
+              {renderMenuCard(
+                '同步出库单',
+                '生成出库 Excel 到电脑同步文件夹',
+                'file-minus',
+                theme.primary,
+                handleSyncOutbound,
+                !canSync,
+                syncingOutbound
+              )}
+              {renderMenuCard(
+                '同步盘点单',
+                '重新生成最近一张盘点 Excel',
+                'bar-chart-2',
+                theme.accent,
+                handleSyncInventory,
+                !canSync,
+                syncingInventory
+              )}
+              {renderMenuCard(
+                '同步订单标签',
+                '生成最近订单拆包标签 Excel',
+                'copy',
+                theme.purple,
+                handleSyncLabels,
+                !canSync,
+                syncingLabels
+              )}
+            </View>
           )}
 
-
-        </View>
-
-        {/* ========== 扫码解析 ========== */}
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>扫码解析</Text>
-        </View>
-
-        <View style={{ gap: getSpacing().md }}>
-          {renderMenuCard(
-            '解析规则',
-            '按分隔符识别二维码字段',
-            'sliders',
-            theme.accent,
-            () => router.push('/rules'),
-            false,
-            false,
-            `${configStats.rules} 条`
+          <UiListItem
+            title="扫码规则"
+            subtitle="条码规则、字段、前缀、出库单号"
+            icon="file-text"
+            color={theme.accent}
+            onPress={() => toggleSettingsGroup('rules')}
+            expanded={expandedSettingsGroup === 'rules'}
+          />
+          {expandedSettingsGroup === 'rules' && (
+            <View style={styles.settingsGroupPanel}>
+              {renderMenuCard(
+                '解析规则',
+                '按分隔符识别二维码字段',
+                'sliders',
+                theme.accent,
+                () => router.push('/rules'),
+                false,
+                false,
+                `${configStats.rules} 条`
+              )}
+              {renderMenuCard(
+                '占位字段',
+                '跳过二维码中不需要使用的数据段',
+                'edit-3',
+                theme.warning,
+                () => router.push('/custom-fields'),
+                false,
+                false,
+                `${configStats.customFields} 个`
+              )}
+              {renderMenuCard(
+                '前缀配置',
+                '自动去除 PART NO.、QTY 等前缀',
+                'type',
+                theme.success,
+                () => router.push('/rule-prefixes')
+              )}
+              {renderMenuCard('出库单号规则', '配置订单格式与仓库绑定', 'hash', theme.primary, () =>
+                router.push('/outbound-order-rules')
+              )}
+            </View>
           )}
 
-          {renderMenuCard(
-            '自定义字段',
-            '扩展二维码里的业务字段',
-            'edit-3',
-            theme.warning,
-            () => router.push('/custom-fields'),
-            false,
-            false,
-            `${configStats.customFields} 个`
+          <UiListItem
+            title="备份与恢复"
+            subtitle="配置备份、数据库备份与恢复"
+            icon="archive"
+            color={theme.cyan}
+            onPress={() => toggleSettingsGroup('backup')}
+            expanded={expandedSettingsGroup === 'backup'}
+          />
+          {expandedSettingsGroup === 'backup' && (
+            <View style={styles.settingsGroupPanel}>
+              {renderMenuCard(
+                '备份配置',
+                '备份规则、字段、绑定、仓库、单号规则、声音与服务器',
+                'save',
+                theme.cyan,
+                handleBackup,
+                false,
+                backupLoading
+              )}
+              {renderMenuCard(
+                '恢复配置',
+                '从配置备份恢复设置',
+                'rotate-ccw',
+                theme.purple,
+                handleRestore,
+                false,
+                restoreLoading
+              )}
+              {renderMenuCard(
+                '备份数据库',
+                '导出完整数据库文件',
+                'database',
+                theme.success,
+                handleDatabaseBackup,
+                false,
+                dbBackupLoading
+              )}
+              {renderMenuCard(
+                '恢复数据库',
+                '用数据库备份替换当前数据',
+                'hard-drive',
+                theme.warning,
+                handleDatabaseRestore,
+                false,
+                dbRestoreLoading
+              )}
+              {renderAutoBackupDiagnostic()}
+            </View>
           )}
 
-          {renderMenuCard('前缀配置', '自动去除 PART NO.、QTY 等前缀', 'type', theme.success, () =>
-            router.push('/rule-prefixes')
-          )}
+          <UiListItem
+            title="关于掌上仓库"
+            subtitle={`当前版本 ${APP_VERSION}`}
+            icon="info"
+            color={theme.textSecondary}
+            onPress={() => toggleSettingsGroup('about')}
+            expanded={expandedSettingsGroup === 'about'}
+          />
+        </UiListSection>
 
-          {renderMenuCard('出库单号规则', '配置订单格式与仓库绑定', 'hash', theme.primary, () =>
-            router.push('/outbound-order-rules')
-          )}
-        </View>
+        {expandedSettingsGroup === 'about' && (
+          <View style={styles.aboutCard}>
+            {/* App图标和名称 */}
+            <View style={styles.aboutAppSection}>
+              <View style={styles.aboutLogo}>
+                <Feather name="package" size={rs(16)} color={theme.primary} />
+              </View>
+              <Text style={styles.aboutAppName}>{APP_NAME}</Text>
+              <View style={styles.aboutVersionBadge}>
+                <Text style={styles.aboutVersionText}>{APP_VERSION}</Text>
+              </View>
+            </View>
 
-        {/* ========== 电脑同步 ========== */}
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>电脑同步</Text>
-        </View>
+            <View style={styles.aboutDivider} />
 
-        {/* 服务器配置 */}
-        <View style={styles.syncConfigCard}>
-          <View style={styles.syncAssistantHeader}>
-            <View
-              style={[
-                styles.syncAssistantIcon,
-                { backgroundColor: `${syncAssistantStatus.color}18` },
-              ]}
-            >
-              {connectionStatus === 'testing' ? (
-                <ActivityIndicator size="small" color={syncAssistantStatus.color} />
-              ) : (
+            {/* 公司信息 */}
+            <View style={styles.aboutDetailsSection}>
+              <AnimatedButton
+                style={styles.aboutDetailRow}
+                activeOpacity={0.7}
+                onPress={() => Linking.openURL(COMPANY_WEBSITE)}
+              >
+                <View style={styles.aboutDetailIconWrapper}>
+                  <Feather name="briefcase" size={rs(14)} color={theme.textSecondary} />
+                </View>
+                <Text style={styles.aboutDetailLabel}>公司</Text>
+                <View style={styles.aboutDetailRight}>
+                  <Text style={styles.aboutDetailValue}>{COMPANY_NAME}</Text>
+                  <Feather name="external-link" size={rs(12)} color={theme.textMuted} />
+                </View>
+              </AnimatedButton>
+
+              <View style={styles.aboutDetailRow}>
+                <View style={styles.aboutDetailIconWrapper}>
+                  <Feather name="user" size={rs(14)} color={theme.textSecondary} />
+                </View>
+                <Text style={styles.aboutDetailLabel}>作者</Text>
+                <Text style={styles.aboutDetailValue}>{AUTHOR}</Text>
+              </View>
+
+              <AnimatedButton
+                style={styles.aboutDetailRow}
+                activeOpacity={0.7}
+                disabled={checkingUpdate}
+                onPress={checkForUpdate}
+              >
+                <View style={styles.aboutDetailIconWrapper}>
+                  {checkingUpdate ? (
+                    <ActivityIndicator size="small" color={theme.success} />
+                  ) : (
+                    <Feather name="refresh-cw" size={rs(14)} color={theme.success} />
+                  )}
+                </View>
+                <Text style={styles.aboutDetailLabel}>检查更新</Text>
+                <View style={styles.aboutDetailRight}>
+                  <Text style={styles.aboutDetailValue}>
+                    {checkingUpdate ? '检查中' : `当前 ${APP_VERSION}`}
+                  </Text>
+                  <Feather name="chevron-right" size={rs(12)} color={theme.textMuted} />
+                </View>
+              </AnimatedButton>
+            </View>
+
+            <View style={styles.aboutDivider} />
+
+            {/* 使用说明和更新日志 */}
+            <View style={styles.helpRow}>
+              <TouchableOpacity
+                style={styles.helpEntry}
+                activeOpacity={0.7}
+                onPress={() => router.push('/help')}
+              >
                 <Feather
-                  name={syncAssistantStatus.icon}
-                  size={20}
-                  color={syncAssistantStatus.color}
+                  name="book-open"
+                  size={rs(14)}
+                  color={theme.textMuted}
+                  style={styles.helpIconWrapper}
                 />
-              )}
-            </View>
-            <View style={styles.syncAssistantInfo}>
-              <Text style={styles.syncAssistantTitle}>{syncAssistantStatus.title}</Text>
-              <Text style={styles.syncAssistantDesc}>{syncAssistantStatus.desc}</Text>
-            </View>
-          </View>
+                <Text style={styles.helpText}>使用说明</Text>
+                <Feather name="chevron-right" size={rs(14)} color={theme.textMuted} />
+              </TouchableOpacity>
 
-          <View style={styles.syncConfigRow}>
-            <Text style={styles.syncConfigLabel}>电脑IP</Text>
-            <TextInput
-              style={styles.syncConfigInput}
-              value={syncConfig.ip}
-              onChangeText={handleIpChange}
-              placeholder="例如 192.168.1.100"
-              placeholderTextColor={theme.textMuted}
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
-          </View>
-          <View style={styles.syncConfigRow}>
-            <Text style={styles.syncConfigLabel}>端口</Text>
-            <TextInput
-              style={styles.syncConfigInput}
-              value={syncConfig.port}
-              onChangeText={handlePortChange}
-              placeholder="默认: 8080"
-              placeholderTextColor={theme.textMuted}
-              keyboardType="numeric"
-            />
-          </View>
-          <View style={styles.syncConfigButtons}>
-            <AnimatedButton
-              containerStyle={styles.syncButtonWrap}
-              style={[
-                styles.syncButton,
-                styles.syncButtonTest,
-                connectionStatus === 'success' && styles.syncButtonSuccess,
-                (connectionStatus === 'error' || connectionStatus === 'disconnected') &&
-                  styles.syncButtonError,
-              ]}
-              onPress={handleTestConnection}
-              disabled={connectionStatus === 'testing'}
-              activeScale={0.96}
-              activeOpacity={0.9}
-            >
-              {connectionStatus === 'testing' ? (
-                <ActivityIndicator size="small" color={theme.primary} />
-              ) : (
-                <Text
-                  style={[
-                    styles.syncButtonTestText,
-                    connectionStatus === 'success' && styles.syncButtonSuccessText,
-                    (connectionStatus === 'error' || connectionStatus === 'disconnected') &&
-                      styles.syncButtonErrorText,
-                  ]}
-                >
-                  {connectionStatus === 'success'
-                    ? '已连接 ✓'
-                    : connectionStatus === 'disconnected'
-                      ? '断开连接 ✗'
-                      : connectionStatus === 'error'
-                        ? '连接失败 ✗'
-                        : '测试连接'}
-                </Text>
-              )}
-            </AnimatedButton>
-          </View>
-          {connectionStatus === 'success' && (
-            <Text style={styles.syncStatusHint}>连接成功，配置已自动保存</Text>
-          )}
-          {connectionStatus === 'disconnected' && (
-            <Text style={styles.syncStatusHintError}>网络连接已断开，请检查网络后重新连接</Text>
-          )}
-          {connectionStatus === 'error' && (
-            <Text style={styles.syncStatusHintError}>请检查服务器地址和状态后重试</Text>
-          )}
-          {connectionStatus === 'idle' && !syncConfig.ip && (
-            <Text style={styles.syncStatusHintIdle}>电脑端托盘菜单可查看服务地址</Text>
-          )}
-        </View>
-
-        {/* 同步按钮 */}
-        <View style={{ gap: getSpacing().sm }}>
-          {renderMenuCard(
-            '同步入库单',
-            '生成入库 Excel 到电脑同步文件夹',
-            'file-plus',
-            theme.success,
-            handleSyncInbound,
-            !canSync,
-            syncingInbound
-          )}
-
-          {renderMenuCard(
-            '同步出库单',
-            '生成出库 Excel 到电脑同步文件夹',
-            'file-minus',
-            theme.primary,
-            handleSyncOutbound,
-            !canSync,
-            syncingOutbound
-          )}
-
-          {renderMenuCard(
-            '同步盘点单',
-            '生成盘点 Excel 到电脑同步文件夹',
-            'bar-chart-2',
-            theme.accent,
-            handleSyncInventory,
-            !canSync,
-            syncingInventory
-          )}
-
-          {renderMenuCard(
-            '同步盘点标签',
-            '生成盘点拆包标签 Excel',
-            'printer',
-            theme.purple,
-            handleSyncInventoryPartial,
-            !canSync,
-            syncingInventoryPartial
-          )}
-
-          {renderMenuCard(
-            '同步订单标签',
-            '生成订单拆包标签 Excel',
-            'copy',
-            theme.purple,
-            handleSyncLabels,
-            !canSync,
-            syncingLabels
-          )}
-        </View>
-
-        {/* ========== 数据维护 ========== */}
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>数据维护</Text>
-        </View>
-
-        <View style={{ gap: getSpacing().md }}>
-          {renderMenuCard(
-            '备份配置',
-            '备份规则、字段、绑定、仓库、服务器',
-            'save',
-            theme.cyan,
-            handleBackup,
-            false,
-            backupLoading
-          )}
-
-          {renderMenuCard(
-            '恢复配置',
-            '从配置备份恢复设置',
-            'rotate-ccw',
-            theme.purple,
-            handleRestore,
-            false,
-            restoreLoading
-          )}
-
-          {/* 数据库文件备份/恢复 */}
-          {renderMenuCard(
-            '备份数据库',
-            '导出完整数据库文件',
-            'database',
-            theme.success,
-            handleDatabaseBackup,
-            false,
-            dbBackupLoading
-          )}
-
-          {renderMenuCard(
-            '恢复数据库',
-            '用数据库备份替换当前数据',
-            'hard-drive',
-            theme.warning,
-            handleDatabaseRestore,
-            false,
-            dbRestoreLoading
-          )}
-
-        </View>
-
-        {/* ========== 关于 ========== */}
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>关于</Text>
-        </View>
-
-        <View style={styles.aboutCard}>
-          {/* App图标和名称 */}
-          <View style={styles.aboutAppSection}>
-            <View style={styles.aboutLogo}>
-              <Feather name="package" size={rs(16)} color={theme.primary} />
-            </View>
-            <Text style={styles.aboutAppName}>{APP_NAME}</Text>
-            <View style={styles.aboutVersionBadge}>
-              <Text style={styles.aboutVersionText}>{APP_VERSION}</Text>
+              <TouchableOpacity
+                style={styles.helpEntry}
+                activeOpacity={0.7}
+                onPress={() => router.push('/changelog')}
+              >
+                <Feather
+                  name="clock"
+                  size={rs(14)}
+                  color={theme.textMuted}
+                  style={styles.changelogIconWrapper}
+                />
+                <Text style={styles.changelogText}>更新日志</Text>
+                <Feather name="chevron-right" size={rs(14)} color={theme.textMuted} />
+              </TouchableOpacity>
             </View>
           </View>
-
-          <View style={styles.aboutDivider} />
-
-          {/* 公司信息 */}
-          <View style={styles.aboutDetailsSection}>
-            <AnimatedButton
-              style={styles.aboutDetailRow}
-              activeOpacity={0.7}
-              onPress={() => Linking.openURL(COMPANY_WEBSITE)}
-            >
-              <View style={styles.aboutDetailIconWrapper}>
-                <Feather name="briefcase" size={rs(14)} color={theme.textSecondary} />
-              </View>
-              <Text style={styles.aboutDetailLabel}>公司</Text>
-              <View style={styles.aboutDetailRight}>
-                <Text style={styles.aboutDetailValue}>{COMPANY_NAME}</Text>
-                <Feather name="external-link" size={rs(12)} color={theme.textMuted} />
-              </View>
-            </AnimatedButton>
-
-            <View style={styles.aboutDetailRow}>
-              <View style={styles.aboutDetailIconWrapper}>
-                <Feather name="user" size={rs(14)} color={theme.textSecondary} />
-              </View>
-              <Text style={styles.aboutDetailLabel}>作者</Text>
-              <Text style={styles.aboutDetailValue}>{AUTHOR}</Text>
-            </View>
-          </View>
-
-          <View style={styles.aboutDivider} />
-
-          {/* 使用说明和更新日志 */}
-          <View style={styles.helpRow}>
-            <TouchableOpacity
-              style={styles.helpEntry}
-              activeOpacity={0.7}
-              onPress={() => router.push('/help')}
-            >
-              <Feather
-                name="book-open"
-                size={rs(14)}
-                color={theme.textMuted}
-                style={styles.helpIconWrapper}
-              />
-              <Text style={styles.helpText}>使用说明</Text>
-              <Feather name="chevron-right" size={rs(14)} color={theme.textMuted} />
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.helpEntry}
-              activeOpacity={0.7}
-              onPress={() => router.push('/changelog')}
-            >
-              <Feather
-                name="clock"
-                size={rs(14)}
-                color={theme.textMuted}
-                style={styles.changelogIconWrapper}
-              />
-              <Text style={styles.changelogText}>更新日志</Text>
-              <Feather name="chevron-right" size={rs(14)} color={theme.textMuted} />
-            </TouchableOpacity>
-          </View>
-        </View>
+        )}
 
         {/* 底部留白 */}
         <View style={{ height: Spacing['4xl'] }} />
@@ -2057,7 +2484,10 @@ export default function SettingsScreen() {
             </View>
 
             <View style={styles.restartModalWarningContainer}>
-              <Text style={styles.restartModalWarning}>⚠️ 必须重启应用才能继续使用</Text>
+              <View style={styles.restartModalWarningTitleRow}>
+                <Feather name="alert-triangle" size={18} color={theme.warning} />
+                <Text style={styles.restartModalWarning}>必须重启应用才能继续使用</Text>
+              </View>
               <Text style={styles.restartModalWarningSub}>未重启可能导致数据错乱</Text>
             </View>
           </AppModalCard>

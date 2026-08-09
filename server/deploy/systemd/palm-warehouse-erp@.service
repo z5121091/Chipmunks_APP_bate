@@ -1,0 +1,32 @@
+[Unit]
+Description=Palm Warehouse ERP backend (%i)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/palm-warehouse/erp/%i.env
+
+[Service]
+Type=simple
+User=palmwarehouse
+Group=palmwarehouse
+WorkingDirectory=/opt/palm-warehouse/multi-account/server
+Environment=DOTENV_CONFIG_PATH=/dev/null
+EnvironmentFile=/etc/palm-warehouse/erp/%i.env
+ExecStart=/usr/bin/node /opt/palm-warehouse/multi-account/server/dist/index.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/palm-warehouse
+
+[Install]
+WantedBy=multi-user.target

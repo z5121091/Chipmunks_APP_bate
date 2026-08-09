@@ -1,6 +1,7 @@
 import { StyleSheet } from 'react-native';
 import { Spacing, BorderRadius, BorderWidth, Theme, Typography } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
+import { getUiRedesignShadow, UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 import { withAlpha } from '@/utils/colors';
 import { rf } from '@/utils/responsive';
 
@@ -13,16 +14,12 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
   topPanel: {
     marginHorizontal: Spacing.sm,
     marginTop: Spacing.sm,
-    marginBottom: Spacing.xs,
-    borderRadius: BorderRadius['2xl'],
+    marginBottom: 0,
+    borderRadius: UI_REDESIGN_TOKENS.radius.card,
     backgroundColor: theme.backgroundElevated,
-    borderWidth: 1,
+    borderWidth: BorderWidth.normal,
     borderColor: theme.border,
-    shadowColor: theme.shadowColor,
-    shadowOffset: { width: 0, height: 12 },
-    shadowOpacity: theme.isDark ? 0.2 : 0.08,
-    shadowRadius: 18,
-    elevation: 4,
+    ...getUiRedesignShadow(theme),
   },
 
   // Header
@@ -31,22 +28,34 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: Spacing.md,
-    paddingTop: Spacing.xs + 2,
-    paddingBottom: 2,
+    paddingTop: Spacing.sm,
+    paddingBottom: Spacing.xs,
     backgroundColor: 'transparent',
   },
 
   backButton: {
-    padding: Spacing.xs + 2,
-    minWidth: 38,
-    minHeight: 38,
+    width: 38,
+    height: 38,
+    borderRadius: BorderRadius.full,
     justifyContent: 'center',
     alignItems: 'center',
+    backgroundColor: theme.backgroundTertiary,
   },
 
   headerTitle: {
-    ...Typography.h4,
+    ...Typography.title,
     color: theme.textPrimary,
+    textAlign: 'center',
+    flex: 1,
+  },
+
+  headerMenuButton: {
+    width: 38,
+    height: 38,
+    borderRadius: BorderRadius.full,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: theme.backgroundTertiary,
   },
 
   // 顶栏
@@ -54,8 +63,8 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: Spacing.md,
-    paddingTop: Spacing.xs,
-    paddingBottom: Spacing.xs,
+    paddingTop: 0,
+    paddingBottom: Spacing.sm,
     backgroundColor: 'transparent',
     gap: Spacing.xs,
   },
@@ -67,10 +76,12 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     gap: Spacing.xs,
     paddingVertical: Spacing.xs + 2,
     paddingHorizontal: Spacing.sm,
-    backgroundColor: theme.backgroundTertiary,
-    borderRadius: BorderRadius.md,
+    backgroundColor: theme.backgroundDefault,
+    borderRadius: BorderRadius.lg,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
     minWidth: 80,
-    minHeight: 42,
+    minHeight: 46,
   },
 
   warehouseText: {
@@ -88,9 +99,11 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     gap: Spacing.xs,
     paddingVertical: Spacing.xs + 2,
     paddingHorizontal: Spacing.sm,
-    backgroundColor: theme.backgroundTertiary,
-    borderRadius: BorderRadius.md,
-    minHeight: 42,
+    backgroundColor: theme.backgroundDefault,
+    borderRadius: BorderRadius.lg,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
+    minHeight: 46,
   },
 
   supplierTagActive: {
@@ -113,9 +126,9 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     marginHorizontal: Spacing.sm,
     height: rf(60),
     backgroundColor: theme.backgroundDefault,
-    borderWidth: 2,
+    borderWidth: BorderWidth.normal,
     borderColor: theme.primary,
-    borderRadius: BorderRadius.xl,
+    borderRadius: BorderRadius.lg,
     overflow: 'hidden',
   },
 
@@ -155,8 +168,15 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
   // 列表
   listSection: {
     flex: 1,
-    marginTop: Spacing.md,
+    marginHorizontal: Spacing.sm,
+    marginTop: 0,
+    marginBottom: Spacing.sm,
+    borderRadius: UI_REDESIGN_TOKENS.radius.card,
+    borderWidth: BorderWidth.normal,
+    borderColor: theme.border,
     backgroundColor: theme.backgroundDefault,
+    overflow: 'hidden',
+    ...getUiRedesignShadow(theme),
   },
 
   listHeader: {
@@ -223,8 +243,13 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
 
   // 聚合项容器
   itemContainer: {
-    marginBottom: Spacing.xs,
+    marginHorizontal: Spacing.sm,
+    marginTop: Spacing.xs,
+    borderRadius: BorderRadius.lg,
     backgroundColor: theme.backgroundDefault,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
+    overflow: 'hidden',
   },
 
   // 聚合项主行（两行布局）
@@ -305,11 +330,92 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     lineHeight: Typography.small.lineHeight,
   },
 
+  erpLineCard: {
+    marginHorizontal: Spacing.sm,
+    marginTop: Spacing.xs,
+    borderRadius: BorderRadius.lg,
+    backgroundColor: theme.backgroundDefault,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
+    overflow: 'hidden',
+  },
+
+  erpLineMain: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: Spacing.md,
+    paddingHorizontal: Spacing.sm,
+    gap: Spacing.xs,
+  },
+
+  erpLineContent: {
+    flex: 1,
+    minWidth: 0,
+  },
+
+  erpLineCode: {
+    ...Typography.smallMedium,
+    color: theme.textPrimary,
+    flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
+  },
+
+  erpLineProgressTrack: {
+    height: 5,
+    flexDirection: 'row',
+    backgroundColor: theme.backgroundTertiary,
+    borderRadius: BorderRadius.full,
+    overflow: 'hidden',
+    marginTop: Spacing.xs,
+  },
+
+  erpLineProgressFill: {
+    minWidth: 0,
+  },
+
+  erpLineMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    gap: Spacing.sm,
+    marginTop: Spacing.xs,
+  },
+
+  erpLineMetaText: {
+    ...Typography.caption,
+    color: theme.textMuted,
+    minWidth: 0,
+    flexShrink: 1,
+  },
+
+  erpLineDetails: {
+    backgroundColor: theme.backgroundTertiary,
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: Spacing.xs,
+  },
+
+  erpLineDetailItem: {
+    paddingVertical: Spacing.sm,
+    paddingHorizontal: Spacing.sm,
+    borderBottomWidth: BorderWidth.thin,
+    borderBottomColor: theme.borderLight,
+  },
+
+  erpLineEmptyText: {
+    ...Typography.caption,
+    color: theme.textMuted,
+    paddingVertical: Spacing.xs,
+    textAlign: 'center',
+  },
+
   // 操作按钮
   actionBar: {
     flexDirection: 'row',
+    alignItems: 'stretch',
     paddingHorizontal: Spacing.sm,
-    paddingVertical: Spacing.md,
+    paddingVertical: Spacing.sm,
     backgroundColor: theme.backgroundDefault,
     borderTopWidth: 1,
     borderTopColor: theme.borderLight,
@@ -318,38 +424,19 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
 
   clearBtn: {
     flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: Spacing.xs,
-    minHeight: rf(60),
-    paddingVertical: Spacing.md,
-    backgroundColor: theme.backgroundTertiary,
-    borderRadius: BorderRadius.lg,
-  },
-
-  clearBtnText: {
-    fontSize: rf(16),
-    fontWeight: '600',
-    color: theme.textSecondary,
+    flexBasis: 0,
+    minWidth: 0,
   },
 
   submitBtn: {
     flex: 2,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: Spacing.xs,
-    minHeight: rf(60),
-    paddingVertical: Spacing.md,
-    backgroundColor: theme.primary,
-    borderRadius: BorderRadius.lg,
+    flexBasis: 0,
+    minWidth: 0,
   },
 
-  submitBtnText: {
-    fontSize: rf(16),
-    fontWeight: '600',
-    color: theme.buttonPrimaryText,
+  actionButton: {
+    width: '100%',
+    minHeight: 56,
   },
 
   // 仓库选择器

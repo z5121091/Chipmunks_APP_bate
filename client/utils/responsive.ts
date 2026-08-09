@@ -47,30 +47,29 @@ export const rs = (size: number): number => {
 };
 
 /**
- * 响应式字体大小
- * - 小屏（≤375px）：缩小至0.9倍，最小不低于0.80倍
- * - 大屏（≥430px）：放大至1.2倍，最大不高于1.30倍
- * - 中等屏幕：按比例缩放
+ * 字体大小
+ * 保留 rf API 兼容旧代码，但只做设备档位级别的温和缩放。
+ * Text/TextInput 默认仍会跟随系统字体缩放设置，避免破坏 Android 可访问性。
  */
 export const rf = (fontSize: number): number => {
-  const { scale, screenWidth } = getScreenDimensions();
-  const scaledSize = fontSize * scale;
-  
-  // 小屏幕（≤375px）：确保最小可读性
-  if (screenWidth <= 375) {
-    const minSize = fontSize * 0.80;  // 最小不低于80%
-    return PixelRatio.roundToNearestPixel(Math.max(scaledSize, minSize));
+  const { screenWidth, screenHeight } = getScreenDimensions();
+  const shortSide = Math.min(screenWidth, screenHeight);
+  const longSide = Math.max(screenWidth, screenHeight);
+
+  let scale = 1;
+
+  if (shortSide < 360) {
+    scale = 0.94;
+  } else if (shortSide < BASE_WIDTH) {
+    scale = 0.97;
+  } else if (shortSide >= 430 && longSide >= 820) {
+    scale = 1.06;
   }
-  
-  // 大屏幕（≥430px）：适度放大
-  if (screenWidth >= 430) {
-    const maxSize = fontSize * 1.30;  // 最大不高于130%
-    return PixelRatio.roundToNearestPixel(Math.min(scaledSize, maxSize));
-  }
-  
-  // 中等屏幕：按正常比例缩放
-  return PixelRatio.roundToNearestPixel(scaledSize);
+
+  return PixelRatio.roundToNearestPixel(fontSize * scale);
 };
+
+export const MIN_TOUCH_TARGET = 48;
 
 /**
  * 获取当前设备信息

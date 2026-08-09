@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useReducer,
   useRef,
@@ -64,7 +65,7 @@ function createStringToastComponent(
   label: string,
   globalConfig: ToastGlobalConfig | undefined
 ): (props: ToastComponentProps) => React.ReactElement {
-  return (props: ToastComponentProps) => {
+  function StringToastComponent(props: ToastComponentProps) {
     const mergedConfig = mergeToastConfig(globalConfig, {
       variant: 'default',
     });
@@ -78,7 +79,9 @@ function createStringToastComponent(
         animation={mergedConfig.animation}
       />
     );
-  };
+  }
+
+  return StringToastComponent;
 }
 
 /**
@@ -88,7 +91,7 @@ function createConfigToastComponent(
   config: ToastShowConfig,
   globalConfig: ToastGlobalConfig | undefined
 ): (props: ToastComponentProps) => React.ReactElement {
-  return (props: ToastComponentProps) => {
+  function ConfigToastComponent(props: ToastComponentProps) {
     const mergedConfig = mergeToastConfig(globalConfig, {
       variant: config.variant,
       placement: config.placement,
@@ -109,7 +112,9 @@ function createConfigToastComponent(
         icon={config.icon}
       />
     );
-  };
+  }
+
+  return ConfigToastComponent;
 }
 
 /**
@@ -248,8 +253,10 @@ export function ToastProvider({
     [total, heights, toasts]
   );
 
-  // Keep hide ref up to date
-  hideRef.current = hide;
+  // Keep timeout callbacks pointed at the latest hide implementation.
+  useEffect(() => {
+    hideRef.current = hide;
+  }, [hide]);
 
   /**
    * Show a toast

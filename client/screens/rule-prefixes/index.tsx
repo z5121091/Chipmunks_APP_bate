@@ -5,9 +5,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
 import { AppEmptyState } from '@/components/AppEmptyState';
+import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
 import { getAllRules, QRCodeRule } from '@/utils/database';
+import { logger } from '@/utils/logger';
 import { createStyles } from './styles';
 
 const getSeparatorLabel = (separator: string): string => {
@@ -17,6 +19,12 @@ const getSeparatorLabel = (separator: string): string => {
     '[]': '[*]',
     '<>': '<*>',
     ' ': '空格',
+    '\r\n': '回车换行',
+    '\n': '换行',
+    '\r': '回车',
+    '\t': '制表符',
+    '\x1D': 'GS',
+    '\x1E': 'RS',
   };
 
   return separatorDisplayMap[separator] || separator || '未配置';
@@ -32,6 +40,7 @@ export default function RulePrefixesScreen() {
   const styles = createStyles(theme);
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
+  const { showError, AlertComponent } = useCustomAlert();
 
   const [rules, setRules] = useState<QRCodeRule[]>([]);
   const [loading, setLoading] = useState(false);
@@ -41,14 +50,17 @@ export default function RulePrefixesScreen() {
     try {
       const data = await getAllRules();
       setRules(data);
+    } catch (error) {
+      logger.error('加载字段前缀规则失败:', error);
+      showError('字段前缀配置加载失败，请重试');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [showError]);
 
   useFocusEffect(
     useCallback(() => {
-      loadRules();
+      void loadRules();
     }, [loadRules])
   );
 
@@ -161,6 +173,7 @@ export default function RulePrefixesScreen() {
           showsVerticalScrollIndicator={false}
         />
       </View>
+      {AlertComponent}
     </Screen>
   );
 }

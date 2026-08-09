@@ -46,11 +46,13 @@ export default function RulesScreen() {
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
   const alert = useCustomAlert();
+  const showRuleLoadError = alert.showError;
   const { showToast, ToastContainer } = useToast();
   
   const [rules, setRules] = useState<QRCodeRule[]>([]);
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
   const [modalVisible, setModalVisible] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [editingRule, setEditingRule] = useState<QRCodeRule | null>(null);
   
   // 规则名称输入框 ref
@@ -70,17 +72,22 @@ export default function RulesScreen() {
   
   // 加载数据
   const loadData = useCallback(async () => {
-    const [rulesData, fieldsData] = await Promise.all([
-      getAllRules(),
-      getAllCustomFields(),
-    ]);
-    setRules(rulesData);
-    setCustomFields(fieldsData);
-  }, []);
+    try {
+      const [rulesData, fieldsData] = await Promise.all([
+        getAllRules(),
+        getAllCustomFields(),
+      ]);
+      setRules(rulesData);
+      setCustomFields(fieldsData);
+    } catch (error) {
+      logger.error('加载解析规则失败:', error);
+      showRuleLoadError('解析规则加载失败，请重试');
+    }
+  }, [showRuleLoadError]);
   
   useFocusEffect(
     useCallback(() => {
-      loadData();
+      void loadData();
     }, [loadData])
   );
   
@@ -113,9 +120,34 @@ export default function RulesScreen() {
       '()': '( * )',
       '[]': '[ * ]',
       '<>': '< * >',
+      '\r\n': '回车换行',
+      '\n': '换行',
+      '\r': '回车',
+      '\t': '制表符',
+      '\x1D': 'GS',
+      '\x1E': 'RS',
     };
     
-    const presetSeparators = ['/', '|', ',', '*', '#', ' ', ';', ':', '{}', '()', '[]', '<>'];
+    const presetSeparators = [
+      '/',
+      '|',
+      ',',
+      '*',
+      '#',
+      ' ',
+      ';',
+      ':',
+      '{}',
+      '()',
+      '[]',
+      '<>',
+      '\r\n',
+      '\n',
+      '\r',
+      '\t',
+      '\x1D',
+      '\x1E',
+    ];
     if (presetSeparators.includes(rule.separator)) {
       setRuleSeparator(separatorToDisplay[rule.separator] || rule.separator);
       setCustomSeparator('');
@@ -173,6 +205,9 @@ export default function RulesScreen() {
   
   // 保存规则
   const handleSaveRule = async () => {
+    if (saving) {
+      return;
+    }
     if (!ruleName.trim()) {
       alert.showWarning('请输入规则名称');
       return;
@@ -187,6 +222,12 @@ export default function RulesScreen() {
       '( * )': '()',
       '[ * ]': '[]',
       '< * >': '<>',
+      '回车换行': '\r\n',
+      '换行': '\n',
+      '回车': '\r',
+      '制表符': '\t',
+      'GS': '\x1D',
+      'RS': '\x1E',
     };
     
     let finalSeparator: string;
@@ -196,6 +237,10 @@ export default function RulesScreen() {
     } else if (ruleSeparator === 'special') {
       if (!customLeftBracket.trim() || !customRightBracket.trim()) {
         alert.showWarning('请输入左右分隔符');
+        return;
+      }
+      if (customLeftBracket.trim() === customRightBracket.trim()) {
+        alert.showWarning('左右分隔符不能相同');
         return;
       }
       finalSeparator = customLeftBracket.trim() + customRightBracket.trim();
@@ -212,7 +257,7 @@ export default function RulesScreen() {
       if (isCustomField(field)) {
         const fieldId = getCustomFieldId(field);
         const customField = customFields.find(f => f.id === fieldId);
-        return customField?.name || '未知字段';
+        return `占位：${customField?.name || '未知字段'}`;
       }
       return FIELD_LABELS[field] || field;
     };
@@ -222,12 +267,23 @@ export default function RulesScreen() {
       '()': '( * )',
       '[]': '[ * ]',
       '<>': '< * >',
+      '\r\n': '回车换行',
+      '\n': '换行',
+      '\r': '回车',
+      '\t': '制表符',
+      '\x1D': 'GS',
+      '\x1E': 'RS',
     };
     
     const separatorForDisplay = separatorToDisplayFormat[finalSeparator] || finalSeparator;
     const separatorDisplay = finalSeparator === ' ' ? '空格' : `"${separatorForDisplay}"`;
     const fieldDisplay = selectedFields.map(f => getFieldDisplayName(f)).join(' → ');
     const autoDescription = `分隔符: ${separatorDisplay} | 字段: ${fieldDisplay}`;
+    const fieldPrefixes = Object.fromEntries(
+      Object.entries(editingRule?.fieldPrefixes || {}).filter(
+        ([fieldName, prefix]) => selectedFields.includes(fieldName) && prefix.trim().length > 0
+      )
+    );
     
     // 保存的规则数据（避免 undefined 被 JSON.stringify 忽略）
     const ruleData: Parameters<typeof addRule>[0] = {
@@ -235,15 +291,17 @@ export default function RulesScreen() {
       description: autoDescription,
       separator: finalSeparator,
       fieldOrder: selectedFields,
-      isActive: true,
+      isActive: editingRule?.isActive ?? true,
       supplierName: supplierName.trim(),
       matchConditions: matchConditions.length > 0 ? matchConditions : [],
-      // 提取自定义字段ID
+      fieldPrefixes,
+      // 提取占位字段 ID（底层键名保留 customFieldIds 以兼容旧备份）
       customFieldIds: selectedFields
         .filter(f => isCustomField(f))
         .map(f => getCustomFieldId(f)),
     };
 
+    setSaving(true);
     try {
       if (editingRule) {
         await updateRule(editingRule.id, ruleData);
@@ -253,10 +311,12 @@ export default function RulesScreen() {
         alert.showSuccess('规则已添加');
       }
       setModalVisible(false);
-      loadData();
+      await loadData();
     } catch (error) {
       logger.error('保存规则失败:', error);
       alert.showError('保存失败');
+    } finally {
+      setSaving(false);
     }
   };
   
@@ -281,7 +341,7 @@ export default function RulesScreen() {
         try {
           await deleteRule(rule.id);
           alert.showSuccess('规则已删除');
-          loadData();
+          await loadData();
         } catch (error) {
       logger.error('删除规则失败:', error);
           alert.showError('删除失败');
@@ -293,8 +353,28 @@ export default function RulesScreen() {
   
   // 切换字段选择
   const toggleField = (fieldKey: string) => {
-    if (selectedFields.includes(fieldKey)) {
+    const removedIndex = selectedFields.indexOf(fieldKey);
+    if (removedIndex >= 0) {
       setSelectedFields(selectedFields.filter(f => f !== fieldKey));
+      setNewConditionIndex((current) => {
+        if (!current) return current;
+        const selectedIndex = Number.parseInt(current, 10) - 1;
+        if (!Number.isInteger(selectedIndex)) return '';
+        if (selectedIndex === removedIndex) return '';
+        return selectedIndex > removedIndex ? String(selectedIndex) : current;
+      });
+      setMatchConditions((current) =>
+        current.flatMap((condition) => {
+          if (condition.fieldIndex === removedIndex) {
+            return [];
+          }
+          return [
+            condition.fieldIndex > removedIndex
+              ? { ...condition, fieldIndex: condition.fieldIndex - 1 }
+              : condition,
+          ];
+        })
+      );
     } else {
       setSelectedFields([...selectedFields, fieldKey]);
     }
@@ -306,6 +386,20 @@ export default function RulesScreen() {
       const newFields = [...selectedFields];
       [newFields[index - 1], newFields[index]] = [newFields[index], newFields[index - 1]];
       setSelectedFields(newFields);
+      setNewConditionIndex((current) => {
+        const selectedIndex = Number.parseInt(current, 10) - 1;
+        if (!Number.isInteger(selectedIndex)) return current;
+        if (selectedIndex === index) return String(index);
+        if (selectedIndex === index - 1) return String(index + 1);
+        return current;
+      });
+      setMatchConditions((current) =>
+        current.map((condition) => {
+          if (condition.fieldIndex === index) return { ...condition, fieldIndex: index - 1 };
+          if (condition.fieldIndex === index - 1) return { ...condition, fieldIndex: index };
+          return condition;
+        })
+      );
     }
   };
   
@@ -314,6 +408,20 @@ export default function RulesScreen() {
       const newFields = [...selectedFields];
       [newFields[index], newFields[index + 1]] = [newFields[index + 1], newFields[index]];
       setSelectedFields(newFields);
+      setNewConditionIndex((current) => {
+        const selectedIndex = Number.parseInt(current, 10) - 1;
+        if (!Number.isInteger(selectedIndex)) return current;
+        if (selectedIndex === index) return String(index + 2);
+        if (selectedIndex === index + 1) return String(index + 1);
+        return current;
+      });
+      setMatchConditions((current) =>
+        current.map((condition) => {
+          if (condition.fieldIndex === index) return { ...condition, fieldIndex: index + 1 };
+          if (condition.fieldIndex === index + 1) return { ...condition, fieldIndex: index };
+          return condition;
+        })
+      );
     }
   };
   
@@ -322,7 +430,7 @@ export default function RulesScreen() {
     if (isCustomField(fieldKey)) {
       const fieldId = getCustomFieldId(fieldKey);
       const customField = customFields.find(f => f.id === fieldId);
-      return customField?.name || '未知字段';
+      return `占位：${customField?.name || '未知字段'}`;
     }
     return FIELD_LABELS[fieldKey] || fieldKey;
   };
@@ -381,10 +489,26 @@ export default function RulesScreen() {
                           '()': '(*)',
                           '[]': '[*]',
                           '<>': '<*>',
+                          '\r\n': '回车换行',
+                          '\n': '换行',
+                          '\r': '回车',
+                          '\t': '制表符',
+                          '\x1D': 'GS',
+                          '\x1E': 'RS',
                         };
                         return rule.separator === ' ' ? '空格' 
                           : (separatorDisplayMap[rule.separator] || rule.separator);
                       })()}
+                      {` · ${rule.fieldOrder?.length || 0} 段`}
+                      {(rule.matchConditions?.length || 0) > 0
+                        ? ` · ${rule.matchConditions?.length} 个条件`
+                        : ''}
+                      {Object.values(rule.fieldPrefixes || {}).some((prefix) => prefix.trim())
+                        ? ` · ${
+                            Object.values(rule.fieldPrefixes || {}).filter((prefix) => prefix.trim())
+                              .length
+                          } 个前缀`
+                        : ''}
                     </Text>
                     {/* 第三行：字段顺序预览 */}
                     <Text style={styles.ruleFields} numberOfLines={1}>
@@ -396,10 +520,9 @@ export default function RulesScreen() {
                         return rule.fieldOrder.map((field, index) => {
                           let label: string;
                           if (isCustomField(field)) {
-                            // 自定义字段
                             const fieldId = getCustomFieldId(field);
                             const customField = customFields.find(f => f.id === fieldId);
-                            label = customField?.name || field;
+                            label = `占位：${customField?.name || '未知字段'}`;
                           } else {
                             // 标准字段
                             label = FIELD_LABELS[field] || field;
@@ -429,14 +552,16 @@ export default function RulesScreen() {
         visible={modalVisible}
         animationType="slide"
         presentationStyle="fullScreen"
-        onRequestClose={() => setModalVisible(false)}
+        onRequestClose={() => {
+          if (!saving) setModalVisible(false);
+        }}
       >
         <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
           <View style={[styles.ruleEditorScreen, { paddingTop: insets.top }]}>
             <View style={styles.ruleEditorHeader}>
               <AppModalHeader
                 title={editingRule ? '编辑规则' : '添加规则'}
-                onClose={() => setModalVisible(false)}
+                onClose={saving ? undefined : () => setModalVisible(false)}
               />
             </View>
 
@@ -461,7 +586,25 @@ export default function RulesScreen() {
               {/* 分隔符 */}
               <Text style={styles.inputLabel}>分隔符 *</Text>
               <View style={styles.separatorOptions}>
-                {['/', '|', ',', '*', '#', ' ', ';', ':', '{ * }', '( * )', '[ * ]', '< * >'].map((sep) => (
+                {[
+                  '/',
+                  '|',
+                  ',',
+                  '*',
+                  '#',
+                  ' ',
+                  ';',
+                  ':',
+                  '换行',
+                  '回车换行',
+                  '制表符',
+                  'GS',
+                  'RS',
+                  '{ * }',
+                  '( * )',
+                  '[ * ]',
+                  '< * >',
+                ].map((sep) => (
                   <TouchableOpacity key={sep}
                     style={[
                       styles.separatorBtn,
@@ -591,10 +734,13 @@ export default function RulesScreen() {
                 ))}
               </View>
               
-              {/* 自定义字段选择 */}
+              {/* 占位字段选择 */}
               {customFields.length > 0 && (
                 <View style={styles.customFieldsSection}>
-                  <Text style={styles.inputLabel}>自定义字段（点击添加/移除）</Text>
+                  <Text style={styles.inputLabel}>占位字段（点击添加/移除）</Text>
+                  <Text style={styles.sectionHint}>
+                    用于接收不需要使用的二维码段，只保持字段位置，不显示也不导出
+                  </Text>
                   <View style={styles.fieldOptions}>
                     {customFields.map((field) => {
                       const fieldKey = createCustomFieldKey(field.id);
@@ -613,7 +759,7 @@ export default function RulesScreen() {
                               isSelected && styles.fieldBtnTextActive,
                             ]}
                           >
-                            {field.name}
+                            占位：{field.name}
                           </Text>
                         </TouchableOpacity>
                       );
@@ -635,7 +781,7 @@ export default function RulesScreen() {
                         <Text style={styles.selectedFieldName}>{displayName}</Text>
                         {isCustom && (
                           <View style={[styles.customTag, { backgroundColor: 'rgba(14, 165, 233, 0.12)' }]}>
-                            <Text style={[styles.customTagText, { color: theme.accent }]}>自定义</Text>
+                            <Text style={[styles.customTagText, { color: theme.accent }]}>占位</Text>
                           </View>
                         )}
                         <View style={styles.selectedFieldActions}>
@@ -659,10 +805,10 @@ export default function RulesScreen() {
                 
                 {/* 供应商名称 */}
                 <View style={styles.conditionInputRow}>
-                  <Text style={styles.inputRowLabel}>供应商</Text>
+                  <Text style={styles.inputRowLabel}>供应商备注</Text>
                   <TextInput
                     style={styles.inputRowField}
-                    placeholder="选填"
+                    placeholder="选填，不参与识别"
                     placeholderTextColor={theme.textMuted}
                     value={supplierName}
                     onChangeText={setSupplierName}
@@ -713,7 +859,12 @@ export default function RulesScreen() {
                           }}
                         >
                           <Text style={styles.fieldSelectText} numberOfLines={1}>
-                            {newConditionIndex ? getFieldDisplayName(selectedFields[parseInt(newConditionIndex, 10) - 1]) : '点击选择'}
+                            {newConditionIndex &&
+                            selectedFields[parseInt(newConditionIndex, 10) - 1]
+                              ? getFieldDisplayName(
+                                  selectedFields[parseInt(newConditionIndex, 10) - 1]
+                                )
+                              : '点击选择'}
                           </Text>
                         </TouchableOpacity>
                         <Text style={styles.conditionLabel}>包含</Text>
@@ -746,8 +897,10 @@ export default function RulesScreen() {
                 containerStyle={styles.ruleEditorActions}
                 secondaryLabel="取消"
                 onSecondaryPress={() => setModalVisible(false)}
-                primaryLabel="保存"
+                secondaryDisabled={saving}
+                primaryLabel={saving ? '保存中...' : '保存'}
                 onPrimaryPress={handleSaveRule}
+                primaryDisabled={saving}
               />
             </View>
           </View>

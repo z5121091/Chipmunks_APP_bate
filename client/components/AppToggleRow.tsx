@@ -2,7 +2,9 @@
 import { Text, TouchableOpacity, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
-import { BorderRadius, BorderWidth, Spacing } from '@/constants/theme';
+import { BorderWidth, Spacing, Typography } from '@/constants/theme';
+import { UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
+import { MIN_TOUCH_TARGET } from '@/utils/responsive';
 
 interface AppToggleRowProps {
   title: string;
@@ -20,13 +22,16 @@ export function AppToggleRow({ title, description, checked, onPress }: AppToggle
         flexDirection: 'row',
         alignItems: 'flex-start',
         gap: Spacing.sm,
+        minHeight: MIN_TOUCH_TARGET,
         padding: Spacing.md,
-        borderRadius: BorderRadius.xl,
+        borderRadius: UI_REDESIGN_TOKENS.radius.card,
         backgroundColor: theme.backgroundTertiary,
         borderWidth: BorderWidth.normal,
         borderColor: theme.border,
       }}
       activeOpacity={0.82}
+      accessibilityRole="checkbox"
+      accessibilityState={{ checked }}
       onPress={onPress}
     >
       <View
@@ -47,7 +52,7 @@ export function AppToggleRow({ title, description, checked, onPress }: AppToggle
       <View style={{ flex: 1, paddingTop: 1 }}>
         <Text
           style={{
-            fontSize: 13,
+            ...Typography.captionMedium,
             fontWeight: '700',
             color: theme.textPrimary,
           }}
@@ -57,8 +62,8 @@ export function AppToggleRow({ title, description, checked, onPress }: AppToggle
         {description ? (
           <Text
             style={{
+              ...Typography.caption,
               marginTop: 2,
-              fontSize: 11,
               lineHeight: 16,
               color: theme.textSecondary,
             }}

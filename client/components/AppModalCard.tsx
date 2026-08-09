@@ -1,5 +1,5 @@
 import React from 'react';
-import { Dimensions, StyleProp, View, ViewStyle, useWindowDimensions } from 'react-native';
+import { StyleProp, View, ViewStyle, useWindowDimensions } from 'react-native';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, BorderWidth, Spacing } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH, getAppModalWidth } from '@/constants/modal';
@@ -33,8 +33,7 @@ export function AppModalCard({
 }: AppModalCardProps) {
   const { theme } = useTheme();
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
-  const screenHeight = Dimensions.get('screen').height;
-  const effectiveHeight = Math.max(windowHeight, screenHeight);
+  const effectiveHeight = windowHeight;
 
   const modalWidth = getAppModalWidth(windowWidth);
 
@@ -77,15 +76,15 @@ export function AppModalCard({
           width: modalWidth,
           maxWidth: APP_MODAL_MAX_WIDTH,
           backgroundColor: theme.backgroundElevated,
-          borderRadius: BorderRadius['3xl'],
+          borderRadius: BorderRadius.md,
           borderWidth: BorderWidth.normal,
           borderColor: theme.border,
           overflow: 'hidden',
           shadowColor: theme.shadowColor,
-          shadowOffset: { width: 0, height: 4 },
-          shadowOpacity: theme.isDark ? 0.24 : 0.14,
-          shadowRadius: 18,
-          elevation: 10,
+          shadowOffset: { width: 0, height: 12 },
+          shadowOpacity: theme.isDark ? 0.28 : 0.12,
+          shadowRadius: 22,
+          elevation: 12,
         },
         style,
         computedSizeStyle,
@@ -94,8 +93,8 @@ export function AppModalCard({
     >
       <View
         style={{
-          paddingHorizontal: Spacing.lg,
-          paddingTop: Spacing.lg,
+          paddingHorizontal: Spacing.md,
+          paddingTop: Spacing.md,
           paddingBottom: Spacing.sm,
         }}
       >
@@ -105,8 +104,8 @@ export function AppModalCard({
       <View
         style={[
           {
-            paddingHorizontal: Spacing.lg,
-            paddingBottom: Spacing.lg,
+            paddingHorizontal: Spacing.md,
+            paddingBottom: Spacing.md,
           },
           shouldStretchBody
             ? {
@@ -124,10 +123,10 @@ export function AppModalCard({
           style={{
             paddingHorizontal: Spacing.md,
             paddingTop: Spacing.sm,
-            paddingBottom: Spacing.lg,
+            paddingBottom: Spacing.md,
             borderTopWidth: BorderWidth.normal,
             borderTopColor: theme.border,
-            backgroundColor: withAlpha(theme.backgroundTertiary, theme.isDark ? 0.26 : 0.42),
+            backgroundColor: withAlpha(theme.backgroundTertiary, theme.isDark ? 0.18 : 0.34),
           }}
         >
           {footer}

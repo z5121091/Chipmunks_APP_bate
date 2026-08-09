@@ -1,16 +1,19 @@
 import { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, Platform, Modal, TextInput } from 'react-native';
+import { View, Text, TouchableOpacity, ScrollView, Platform } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/hooks/useTheme';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { Screen } from '@/components/Screen';
-import { AppModalActions } from '@/components/AppModalActions';
-import { AppModalCard } from '@/components/AppModalCard';
-import { AppFormField } from '@/components/AppFormField';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { createStyles } from './styles';
-import { getMaterial, deleteMaterial, getOrder, MaterialRecord, getAllCustomFields, CustomField, updateMaterialCustomFields, getRuleById, getAllRules } from '@/utils/database';
+import {
+  getMaterial,
+  deleteMaterial,
+  getOrder,
+  MaterialRecord,
+  getRuleById,
+  getAllRules,
+} from '@/utils/database';
 import { formatDateTime } from '@/utils/time';
 import { Feather } from '@expo/vector-icons';
 import { useCustomAlert } from '@/components/CustomAlert';
@@ -30,12 +33,8 @@ export default function DetailScreen() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [customerName, setCustomerName] = useState<string>('');
-  const [customFields, setCustomFields] = useState<CustomField[]>([]);
-  const [ruleCustomFieldIds, setRuleCustomFieldIds] = useState<string[]>([]);
   const [ruleSeparator, setRuleSeparator] = useState<string>('/'); // 规则的分隔符
   const [ruleName, setRuleName] = useState<string>(''); // 规则名称
-  const [editModalVisible, setEditModalVisible] = useState(false);
-  const [editingCustomFields, setEditingCustomFields] = useState<Record<string, string>>({});
   
   // 初始化数据库并加载记录
   useEffect(() => {
@@ -53,8 +52,6 @@ export default function DetailScreen() {
         setError(null);
         setRecord(null);
         setCustomerName('');
-        setCustomFields([]);
-        setRuleCustomFieldIds([]);
 
         setRuleName('');
         setRuleSeparator('/');
@@ -92,32 +89,13 @@ export default function DetailScreen() {
           }
         });
 
-        // 加载所有自定义字段
-        const allFields = await getAllCustomFields();
-        updateIfActive(() => {
-          setCustomFields(allFields);
-        });
-        
-        // 如果有规则ID，加载规则关联的自定义字段
+        // 如果有规则 ID，只加载当时使用的规则信息。
         if (result.rule_id) {
-          // 从规则中获取信息
           const rule = await getRuleById(result.rule_id);
           if (rule) {
             updateIfActive(() => {
               setRuleSeparator(result.separator || rule.separator || '/');
               setRuleName(rule.name || '');
-              // 兼容新旧格式
-              const hasCustomFieldsInOrder = rule.fieldOrder?.some((f: string) => f.startsWith('custom:'));
-              if (hasCustomFieldsInOrder) {
-                // 新格式：从 fieldOrder 提取自定义字段ID
-                const customIds = rule.fieldOrder
-                  .filter((f: string) => f.startsWith('custom:'))
-                  .map((f: string) => f.replace('custom:', ''));
-                setRuleCustomFieldIds(customIds);
-              } else if (rule.customFieldIds) {
-                // 旧格式：使用 customFieldIds
-                setRuleCustomFieldIds(rule.customFieldIds);
-              }
             });
           }
         } else if (result.separator) {
@@ -125,19 +103,14 @@ export default function DetailScreen() {
           updateIfActive(() => {
             setRuleSeparator(result.separator || '/');
           });
-          // 尝试通过分隔符查找匹配的规则
+          // 优先按扫码时保存的规则名称恢复；旧记录再按分隔符兼容查找。
           const rules = await getAllRules();
-          const matchedRule = rules.find(r => r.separator === result.separator);
+          const matchedRule =
+            rules.find((r) => result.rule_name && r.name === result.rule_name) ||
+            rules.find((r) => r.separator === result.separator);
           if (matchedRule) {
             updateIfActive(() => {
               setRuleName(matchedRule.name || '');
-              const hasCustomFieldsInOrder = matchedRule.fieldOrder?.some((f: string) => f.startsWith('custom:'));
-              if (hasCustomFieldsInOrder) {
-                const customIds = matchedRule.fieldOrder
-                  .filter((f: string) => f.startsWith('custom:'))
-                  .map((f: string) => f.replace('custom:', ''));
-                setRuleCustomFieldIds(customIds);
-              }
             });
           }
         }
@@ -213,58 +186,6 @@ export default function DetailScreen() {
   // 返回
   const handleBack = () => {
     router.back();
-  };
-  
-  // 打开编辑自定义字段弹窗
-  const handleEditCustomFields = () => {
-    if (!record) return;
-    setEditingCustomFields(record.customFields || {});
-    setEditModalVisible(true);
-  };
-  
-  // 保存自定义字段
-  const handleSaveCustomFields = async () => {
-    if (!record) return;
-
-    const normalizedCustomFields: Record<string, string> = {};
-    const ruleCustomFields = getRuleCustomFields();
-
-    for (const field of ruleCustomFields) {
-      const rawValue = editingCustomFields[field.id] ?? '';
-      const trimmedValue = rawValue.trim();
-
-      if (field.required && !trimmedValue) {
-        alert.showWarning(`${field.name} 为必填项`);
-        return;
-      }
-
-      if (trimmedValue) {
-        normalizedCustomFields[field.id] = trimmedValue;
-      }
-    }
-
-    try {
-      await updateMaterialCustomFields(record.id!, normalizedCustomFields);
-      setRecord({ ...record, customFields: normalizedCustomFields });
-      setEditModalVisible(false);
-      alert.showSuccess('自定义字段已更新');
-    } catch (error) {
-      logger.error('保存自定义字段失败:', error);
-      alert.showError('保存失败');
-    }
-  };
-  
-  // 获取规则关联的自定义字段
-  const getRuleCustomFields = (): CustomField[] => {
-    if (ruleCustomFieldIds.length === 0) return [];
-    return customFields.filter(f => ruleCustomFieldIds.includes(f.id));
-  };
-
-  const getCustomFieldInputConfig = (field: CustomField) => {
-    return {
-      keyboardType: 'default' as const,
-      placeholder: `请输入${field.name}`,
-    };
   };
   
   // 加载中
@@ -374,26 +295,6 @@ export default function DetailScreen() {
             <Text style={styles.fieldValue}>{record.sourceNo || '-'}</Text>
           </View>
         </View>
-        
-        {/* 自定义字段 - 仅当规则有关联字段时显示 */}
-        {getRuleCustomFields().length > 0 && (
-          <View style={styles.card}>
-            <View style={styles.cardHeader}>
-              <Text style={styles.cardTitle}>自定义字段</Text>
-              <TouchableOpacity onPress={handleEditCustomFields}>
-                <Feather name="edit-2" size={18} color={theme.primary} />
-              </TouchableOpacity>
-            </View>
-            {getRuleCustomFields().map(field => (
-              <View key={field.id} style={styles.fieldRow}>
-                <Text style={styles.fieldLabel}>{field.name}</Text>
-                <Text style={styles.fieldValue}>
-                  {record.customFields?.[field.id] || '-'}
-                </Text>
-              </View>
-            ))}
-          </View>
-        )}
         
         {/* 原始内容 */}
         <View style={[styles.card, styles.rawContentCard]}>
@@ -517,76 +418,6 @@ export default function DetailScreen() {
           </TouchableOpacity>
         </View>
       </ScrollView>
-      
-      {/* 编辑自定义字段弹窗 */}
-      <Modal
-        visible={editModalVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setEditModalVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <AppModalCard
-            title="编辑自定义字段"
-            onClose={() => setEditModalVisible(false)}
-            style={styles.modalContent}
-            bodyStyle={styles.modalBodyContent}
-            size="form"
-            stretchBody
-            footer={
-              <AppModalActions
-                containerStyle={styles.modalActions}
-                secondaryLabel="取消"
-                onSecondaryPress={() => setEditModalVisible(false)}
-                primaryLabel="保存"
-                onPrimaryPress={handleSaveCustomFields}
-              />
-            }
-          >
-            <KeyboardAwareFormScrollView bottomOffset={16} extraScrollHeight={8}>
-              {getRuleCustomFields().map(field => (
-                <AppFormField key={field.id} label={field.name} required={field.required}>
-                  {field.type === 'select' && field.options ? (
-                    <View style={styles.optionsContainer}>
-                      {field.options.map(opt => (
-                        <TouchableOpacity key={opt}
-                          style={[
-                            styles.optionButton,
-                            editingCustomFields[field.id] === opt && styles.optionButtonActive,
-                          ]}
-                          activeOpacity={0.76} onPress={() => setEditingCustomFields({ 
-                            ...editingCustomFields, 
-                            [field.id]: opt 
-                          })}
-                        >
-                          <Text style={[
-                            styles.optionButtonText,
-                            editingCustomFields[field.id] === opt && styles.optionButtonTextActive,
-                          ]}>
-                            {opt}
-                          </Text>
-                        </TouchableOpacity>
-                      ))}
-                    </View>
-                  ) : (
-                    <TextInput
-                      style={styles.formInput}
-                      value={editingCustomFields[field.id] || ''}
-                      onChangeText={(text) => setEditingCustomFields({ 
-                        ...editingCustomFields, 
-                        [field.id]: text 
-                      })}
-                      placeholder={getCustomFieldInputConfig(field).placeholder}
-                      placeholderTextColor={theme.textMuted}
-                      keyboardType={getCustomFieldInputConfig(field).keyboardType}
-                    />
-                  )}
-                </AppFormField>
-              ))}
-            </KeyboardAwareFormScrollView>
-          </AppModalCard>
-        </View>
-      </Modal>
       
       {/* 自定义弹窗 */}
       {alert.AlertComponent}

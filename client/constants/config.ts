@@ -1,4 +1,5 @@
 import updateServerConfig from '../update-server.json';
+import Constants from 'expo-constants';
 
 /**
  * 应用配置常量
@@ -8,46 +9,21 @@ import updateServerConfig from '../update-server.json';
 
 // ============== 存储键配置 ==============
 export const STORAGE_KEYS = {
-  // 业务数据
-  ORDERS: '@warehouse_orders',
-  MATERIALS: '@warehouse_materials',
-  RULES: '@warehouse_qrcode_rules',
-  CUSTOM_FIELDS: '@warehouse_custom_fields',
-  UNPACK_RECORDS: '@warehouse_unpack_records',
-  PRINT_HISTORY: '@warehouse_print_history',
-  WAREHOUSES: '@warehouse_warehouses',
-  INVENTORY_BINDINGS: '@warehouse_inventory_bindings',
-  INBOUND_RECORDS: '@warehouse_inbound_records',
-  INVENTORY_RECORDS: '@warehouse_inventory_records',
-  
-  // 应用配置
-  DATA_VERSION: '@warehouse_data_version',
+  // 应用配置与连接状态
   SYNC_CONFIG: '@sync_config',
   CONNECTION_STATUS: '@sync_connection_status',
   UPDATE_SERVER_URL: '@update_server_url',
   SOUND_ENABLED: '@settings_sound_enabled',
   OUTBOUND_ORDER_RULE: '@settings_outbound_order_rule',
   OUTBOUND_WAREHOUSE_ORDER_RULES: '@settings_outbound_warehouse_order_rules',
-  EXPORT_COUNT: '@warehouse_export_count',
-  WAREHOUSE_GUIDE_SHOWN: '@warehouse_guide_shown',
-  
-  // 临时数据
-  INBOUND_SCAN_RECORDS: '@inbound_scan_records',
-  INBOUND_PENDING_DATA: '@inbound_pending_data',
-  INVENTORY_CHECK_RECORDS: '@inventory_check_records',
-  INVENTORY_CHECK_TYPE: '@inventory_check_type',
 
-  // 全局仓库配置（所有模块共享）
+  // 当前仓库选择（盘点、出库、单据管理共享）
   GLOBAL_WAREHOUSE: '@global_current_warehouse',
 
-  // 扫码出库持久化数据（已废弃，改用 GLOBAL_WAREHOUSE）
+  // 扫码出库作业草稿和兼容旧版草稿的暂存键
   OUTBOUND_WORK_DRAFT: '@outbound_work_draft',
   OUTBOUND_ORDER_NO: '@outbound_order_no',
   OUTBOUND_SCAN_RECORDS: '@outbound_scan_records',
-  OUTBOUND_WAREHOUSE: '@outbound_warehouse',
-
-  // 订单管理页面独立仓库选择（已废弃，改用 GLOBAL_WAREHOUSE）
-  ORDERS_WAREHOUSE: '@orders_warehouse',
 } as const;
 
 // ============== 网络配置 ==============
@@ -60,9 +36,16 @@ export const NETWORK_CONFIG = {
 } as const;
 
 // ============== 更新服务器配置 ==============
+const runtimeUpdateServer =
+  typeof Constants.expoConfig?.extra?.updateServerUrl === 'string'
+    ? Constants.expoConfig.extra.updateServerUrl.trim()
+    : '';
+const configuredUpdateServer =
+  runtimeUpdateServer || updateServerConfig.defaultServer.trim();
+
 export const UPDATE_CONFIG = {
-  DEFAULT_SERVER: updateServerConfig.defaultServer.replace(/\/+$/, ''),
-  DEFAULT_DOWNLOAD_URL: `${updateServerConfig.defaultServer.replace(/\/+$/, '')}/app-release.apk`,
+  DEFAULT_SERVER: configuredUpdateServer.replace(/\/+$/, ''),
+  DEFAULT_DOWNLOAD_URL: `${configuredUpdateServer.replace(/\/+$/, '')}/app-release.apk`,
   APK_FILE_NAME: 'app-release.apk',
 };
 

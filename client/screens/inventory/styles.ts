@@ -13,16 +13,16 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
   topPanel: {
     marginHorizontal: Spacing.sm,
     marginTop: Spacing.sm,
-    marginBottom: Spacing.xs,
-    borderRadius: BorderRadius['2xl'],
+    marginBottom: 0,
+    borderRadius: BorderRadius.xl,
     backgroundColor: theme.backgroundElevated,
-    borderWidth: 1,
+    borderWidth: BorderWidth.normal,
     borderColor: theme.border,
     shadowColor: theme.shadowColor,
-    shadowOffset: { width: 0, height: 12 },
-    shadowOpacity: theme.isDark ? 0.2 : 0.08,
-    shadowRadius: 18,
-    elevation: 4,
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: theme.isDark ? 0.18 : 0.06,
+    shadowRadius: 14,
+    elevation: 3,
   },
 
   // Header
@@ -31,22 +31,34 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: Spacing.md,
-    paddingTop: Spacing.xs + 2,
-    paddingBottom: 2,
+    paddingTop: Spacing.sm,
+    paddingBottom: Spacing.xs,
     backgroundColor: 'transparent',
   },
 
   backButton: {
-    padding: Spacing.xs + 2,
-    minWidth: 38,
-    minHeight: 38,
+    width: 38,
+    height: 38,
+    borderRadius: BorderRadius.full,
     justifyContent: 'center',
     alignItems: 'center',
+    backgroundColor: theme.backgroundTertiary,
   },
 
   headerTitle: {
-    ...Typography.h4,
+    ...Typography.title,
     color: theme.textPrimary,
+    textAlign: 'center',
+    flex: 1,
+  },
+
+  headerMenuButton: {
+    width: 38,
+    height: 38,
+    borderRadius: BorderRadius.full,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: theme.backgroundTertiary,
   },
 
   // 顶栏
@@ -55,8 +67,8 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: Spacing.md,
-    paddingTop: Spacing.xs,
-    paddingBottom: Spacing.xs,
+    paddingTop: 0,
+    paddingBottom: Spacing.sm,
     backgroundColor: 'transparent',
     gap: Spacing.xs,
   },
@@ -64,32 +76,44 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
   // 盘点类型选择器
   typeSelector: {
     flexDirection: 'row',
-    gap: Spacing.xs,
-    flexShrink: 1,
+    flex: 1,
+    gap: 4,
+    padding: 4,
+    borderRadius: BorderRadius.xl,
+    backgroundColor: theme.backgroundTertiary,
+    borderWidth: BorderWidth.normal,
+    borderColor: theme.border,
   },
 
   typeBtn: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 42,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 4,
-    paddingVertical: Spacing.xs + 2,
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: Spacing.xs,
     paddingHorizontal: Spacing.sm,
-    backgroundColor: theme.backgroundTertiary,
-    borderRadius: BorderRadius.md,
-    minHeight: 42,
+    backgroundColor: 'transparent',
+    borderRadius: BorderRadius.lg,
+    borderWidth: BorderWidth.normal,
+    borderColor: 'transparent',
   },
 
   typeBtnActive: {
-    backgroundColor: theme.success,
+    backgroundColor: theme.primary,
+    borderColor: withAlpha(theme.primary, theme.isDark ? 0.48 : 0.3),
   },
 
   typeBtnText: {
-    ...Typography.smallMedium,
+    ...Typography.captionMedium,
+    flexShrink: 1,
     color: theme.textPrimary,
   },
 
   typeBtnTextActive: {
-    color: theme.white,
+    color: theme.buttonPrimaryText,
   },
 
   // 仓库按钮
@@ -100,10 +124,12 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     gap: Spacing.xs,
     paddingVertical: Spacing.xs + 2,
     paddingHorizontal: Spacing.sm,
-    backgroundColor: theme.backgroundTertiary,
-    borderRadius: BorderRadius.md,
+    backgroundColor: theme.backgroundDefault,
+    borderRadius: BorderRadius.lg,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
     minWidth: 80,
-    minHeight: 42,
+    minHeight: 46,
   },
 
   warehouseText: {
@@ -118,9 +144,9 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     marginHorizontal: Spacing.sm,
     height: rf(60),
     backgroundColor: theme.backgroundDefault,
-    borderWidth: 2,
+    borderWidth: BorderWidth.normal,
     borderColor: theme.primary,
-    borderRadius: BorderRadius.xl,
+    borderRadius: BorderRadius.lg,
     overflow: 'hidden', // 隐藏超出的内容
   },
 
@@ -142,8 +168,19 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
   // 列表
   listSection: {
     flex: 1,
-    marginTop: Spacing.md,
+    marginHorizontal: Spacing.sm,
+    marginTop: 0,
+    marginBottom: Spacing.sm,
+    borderRadius: BorderRadius.xl,
+    borderWidth: BorderWidth.normal,
+    borderColor: theme.border,
     backgroundColor: theme.backgroundDefault,
+    overflow: 'hidden',
+    shadowColor: theme.shadowColor,
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: theme.isDark ? 0.16 : 0.05,
+    shadowRadius: 14,
+    elevation: 2,
   },
 
   listHeader: {
@@ -181,8 +218,13 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
 
   // 聚合项容器
   itemContainer: {
-    marginBottom: Spacing.xs,
+    marginHorizontal: Spacing.sm,
+    marginTop: Spacing.xs,
+    borderRadius: BorderRadius.lg,
     backgroundColor: theme.backgroundDefault,
+    borderWidth: BorderWidth.thin,
+    borderColor: theme.borderLight,
+    overflow: 'hidden',
   },
 
   // 聚合项主行（两行布局：型号 + 版本/数量）
@@ -315,6 +357,7 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
   // 操作按钮
   actionBar: {
     flexDirection: 'row',
+    alignItems: 'stretch',
     gap: Spacing.sm,
     padding: Spacing.sm,
     borderTopWidth: 1,
@@ -323,34 +366,20 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
 
   clearBtn: {
     flex: 1,
-    minHeight: rf(60),
-    paddingVertical: Spacing.sm,
-    borderRadius: BorderRadius.lg,
-    backgroundColor: theme.backgroundTertiary,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  clearBtnText: {
-    fontSize: rf(16),
-    fontWeight: '600',
-    color: theme.textSecondary,
+    flexBasis: 0,
+    minWidth: 0,
   },
 
   submitBtn: {
     flex: 1,
-    minHeight: rf(60),
-    paddingVertical: Spacing.sm,
-    borderRadius: BorderRadius.lg,
-    backgroundColor: theme.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
+    flexBasis: 0,
+    minWidth: 0,
   },
 
-  submitBtnText: {
-    fontSize: rf(16),
-    fontWeight: '600',
-    color: theme.buttonPrimaryText,
+  actionButton: {
+    width: '100%',
+    minHeight: 56,
+    borderRadius: BorderRadius.lg,
   },
 
   // 仓库选择器

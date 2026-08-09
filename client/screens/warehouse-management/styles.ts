@@ -2,6 +2,7 @@ import { StyleSheet } from 'react-native';
 import { withAlpha } from '@/utils/colors';
 import { Spacing, BorderRadius, Theme, BorderWidth } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
+import { UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 import { rf } from '@/utils/responsive';
 
 export const createStyles = (theme: Theme) => {
@@ -20,7 +21,7 @@ export const createStyles = (theme: Theme) => {
       alignItems: 'center',
       marginBottom: Spacing.md,
       padding: Spacing.lg,
-      borderRadius: BorderRadius['2xl'],
+      borderRadius: UI_REDESIGN_TOKENS.radius.card,
       backgroundColor: theme.backgroundElevated,
       borderWidth: BorderWidth.normal,
       borderColor: theme.border,
@@ -66,7 +67,7 @@ export const createStyles = (theme: Theme) => {
     // 仓库卡片
     warehouseCard: {
       backgroundColor: theme.backgroundElevated,
-      borderRadius: BorderRadius.xl,
+      borderRadius: UI_REDESIGN_TOKENS.radius.card,
       padding: Spacing.lg,
       marginBottom: Spacing.sm,
       borderWidth: BorderWidth.normal,
@@ -97,6 +98,7 @@ export const createStyles = (theme: Theme) => {
     },
     warehouseActions: {
       flexDirection: 'row',
+      alignItems: 'center',
       gap: Spacing.xs,
     },
     actionButtonWrap: {
@@ -106,6 +108,7 @@ export const createStyles = (theme: Theme) => {
     actionButton: {
       width: 30,
       height: 30,
+      minHeight: 30,
       borderRadius: 15,
       backgroundColor: theme.backgroundTertiary,
       justifyContent: 'center',
@@ -129,7 +132,7 @@ export const createStyles = (theme: Theme) => {
     // 添加按钮
     addButton: {
       backgroundColor: theme.primary,
-      borderRadius: BorderRadius.md,
+      borderRadius: UI_REDESIGN_TOKENS.radius.control,
       paddingHorizontal: Spacing.xl,
       paddingVertical: Spacing.sm + 2,
       alignItems: 'center',
@@ -170,7 +173,7 @@ export const createStyles = (theme: Theme) => {
     },
     input: {
       backgroundColor: theme.backgroundTertiary,
-      borderRadius: BorderRadius.lg,
+      borderRadius: UI_REDESIGN_TOKENS.radius.control,
       paddingHorizontal: Spacing.md,
       paddingVertical: Spacing.sm + 2,
       fontSize: rf(14),

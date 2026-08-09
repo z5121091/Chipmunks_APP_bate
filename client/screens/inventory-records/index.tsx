@@ -34,7 +34,6 @@ import { formatSyncErrorMessage, syncExcelToComputer } from '@/utils/excel';
 import {
   buildInventoryExportFileNameFromNo,
   buildInventorySheets,
-  InventoryExportMode,
   type InventoryExportRecord,
 } from '@/utils/inventoryExport';
 import { STORAGE_KEYS, type SyncConfig } from '@/constants/config';
@@ -49,8 +48,6 @@ type InventoryDetailGroup = {
   version: string;
   records: InventoryCheckRecord[];
   totalQuantity: number;
-  wholeCount: number;
-  partialCount: number;
 };
 
 const getDocumentKey = (
@@ -65,23 +62,11 @@ const formatVersion = (value?: string | null) => {
 };
 
 const getEffectiveQuantity = (record: InventoryCheckRecord) => {
-  if (record.check_type === 'partial') {
-    return Number(record.actual_quantity ?? record.quantity ?? 0);
-  }
-  return Number(record.quantity ?? 0);
+  return Number(record.actual_quantity ?? record.quantity ?? 0);
 };
 
-const getDocumentTypeLabel = (item: InventoryCheckDocumentSummary) => {
-  if (item.whole_count > 0 && item.partial_count > 0) return '混合盘点';
-  if (item.partial_count > 0) return '拆包盘点';
-  return '整包盘点';
-};
-
-const getInventoryExportMode = (item: InventoryCheckDocumentSummary): InventoryExportMode => {
-  if (item.whole_count > 0 && item.partial_count > 0) return 'complete';
-  if (item.partial_count > 0) return 'partial';
-  return 'whole';
-};
+const getDocumentAccountLabel = (item: InventoryCheckDocumentSummary) =>
+  item.erp_account_name?.trim() || '未记录账套';
 
 const isSyncConfig = (value: unknown): value is SyncConfig => {
   return (
@@ -379,9 +364,15 @@ export default function InventoryRecordsScreen() {
           return;
         }
 
-        const mode = getInventoryExportMode(item);
-        const fileName = buildInventoryExportFileNameFromNo(item.warehouse_name, mode, item.check_no);
-        const exportRecords: InventoryExportRecord[] = records.map((record) => ({ ...record }));
+        const fileName = buildInventoryExportFileNameFromNo(
+          item.warehouse_name,
+          'complete',
+          item.check_no
+        );
+        const exportRecords: InventoryExportRecord[] = records.map((record) => ({
+          ...record,
+          account_name: record.erp_account_name || item.erp_account_name || '',
+        }));
         const result = await syncExcelToComputer(
           buildInventorySheets(exportRecords),
           '/inventory',
@@ -448,19 +439,12 @@ export default function InventoryRecordsScreen() {
           version,
           records: [],
           totalQuantity: 0,
-          wholeCount: 0,
-          partialCount: 0,
         });
       }
 
       const group = groupMap.get(key)!;
       group.records.push(record);
       group.totalQuantity += getEffectiveQuantity(record);
-      if (record.check_type === 'partial') {
-        group.partialCount += 1;
-      } else {
-        group.wholeCount += 1;
-      }
     });
 
     return Array.from(groupMap.values()).sort((a, b) => {
@@ -514,7 +498,6 @@ export default function InventoryRecordsScreen() {
     document: InventoryCheckDocumentSummary,
     index: number
   ) => {
-    const typeLabel = record.check_type === 'partial' ? '拆包' : '整包';
     const effectiveQuantity = getEffectiveQuantity(record);
 
     return (
@@ -529,7 +512,7 @@ export default function InventoryRecordsScreen() {
         </View>
         <View style={styles.detailContent}>
           <Text style={styles.detailTitle} numberOfLines={1}>
-            {typeLabel} · 批次 {record.batch || '-'}
+            批次 {record.batch || '-'}
           </Text>
           <Text style={styles.detailMeta} numberOfLines={1}>
             存货编码 {record.inventory_code || '-'}
@@ -555,10 +538,6 @@ export default function InventoryRecordsScreen() {
   ) => {
     const groupKey = `${documentKey}::${group.key}`;
     const isExpanded = expandedDetailGroupKeys.has(groupKey);
-    const countParts = [
-      group.wholeCount > 0 ? `整包 ${group.wholeCount} 条` : '',
-      group.partialCount > 0 ? `拆包 ${group.partialCount} 条` : '',
-    ].filter(Boolean);
 
     return (
       <View key={groupKey} style={styles.detailGroupCard}>
@@ -574,7 +553,7 @@ export default function InventoryRecordsScreen() {
             <Text style={styles.detailGroupMeta}>
               版本号：{group.version || '-'}
             </Text>
-            <Text style={styles.detailGroupCount}>{countParts.join(' / ') || '0 条明细'}</Text>
+            <Text style={styles.detailGroupCount}>{group.records.length} 条明细</Text>
           </View>
           <View style={styles.detailGroupRight}>
             <View style={styles.detailGroupQuantityRow}>
@@ -656,7 +635,7 @@ export default function InventoryRecordsScreen() {
                 </TouchableOpacity>
               </View>
               <Text style={styles.documentMeta} numberOfLines={1}>
-                {item.check_date} · {item.warehouse_name} · {getDocumentTypeLabel(item)}
+                {item.check_date} · {item.warehouse_name} · {getDocumentAccountLabel(item)}
               </Text>
             </View>
             <Feather

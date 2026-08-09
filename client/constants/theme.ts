@@ -339,6 +339,29 @@ export const Typography = new Proxy({} as ReturnType<typeof getTypography>, {
   }
 });
 
+// 公共业务组件的稳定尺寸和排版。页面组件应优先引用这里，避免另起一套字号与高度。
+export const AppComponentTokens = {
+  size: {
+    buttonHeight: 44,
+    buttonHeightCompact: 44,
+    buttonHeightCompactSmall: 44,
+    inputHeight: 52,
+    inputHeightSmall: 48,
+    scanBoxHeight: 52,
+    scanBoxHeightSmall: 50,
+    listItemMinHeight: 58,
+    listIcon: 38,
+    listIconSmall: 34,
+  },
+  typography: {
+    button: Typography.smallMedium,
+    input: Typography.small,
+    tag: Typography.labelSmall,
+    title: Typography.smallMedium,
+    subtitle: Typography.caption,
+  },
+} as const;
+
 // Theme 类型定义 - 使用 string 类型支持浅色/深色主题
 export interface Theme {
   // 基础文字色

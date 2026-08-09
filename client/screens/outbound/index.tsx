@@ -1,5 +1,5 @@
-﻿import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { View, Text, TouchableOpacity, FlatList, TextInput, Platform } from 'react-native';
+﻿import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
+import { View, Text, TouchableOpacity, FlatList, TextInput, Platform, Modal } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { safeJsonParseNullable } from '@/utils/json';
@@ -8,13 +8,14 @@ import { parseQuantity } from '@/utils/quantity';
 import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
 import { AppEmptyState } from '@/components/AppEmptyState';
+import { AggregatedRecordItem } from '@/components/AggregatedRecordItem';
+import { AppFormField } from '@/components/AppFormField';
+import { AppModalActions } from '@/components/AppModalActions';
+import { AppModalCard } from '@/components/AppModalCard';
+import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
+import { UiPageHeader, UiScanBox, UiWorkflowSummary } from '@/components/UiRedesign';
 import { useCustomAlert } from '@/components/CustomAlert';
-import {
-  ScanWorkflowPanel,
-  type WorkflowMetric,
-} from '@/components/ScanWorkflowPanel';
 import { createStyles } from './styles';
-import { parseQRCodeSync, isQRCode } from '@/utils/qrcodeParser';
 import {
   initDatabase,
   upsertOrder,
@@ -23,36 +24,38 @@ import {
   detectRule,
   parseWithRule,
   checkMaterialExists,
-  searchMaterials,
+  getMaterialsByOrder,
   getInventoryCodeByModel,
   deleteMaterial,
+  generateId,
+  saveUnpackOperation,
+  type MaterialRecord,
+  type UnpackRecord,
   Warehouse,
   getAllWarehouses,
   getDefaultWarehouse,
 } from '@/utils/database';
-import {
-  scanQueue,
-  QueueItem,
-  QueueItemParsedPayload,
-} from '@/utils/scanQueue';
+import { scanQueue, QueueItem, QueueItemParsedPayload } from '@/utils/scanQueue';
 import { STORAGE_KEYS } from '@/constants/config';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { Feather, FontAwesome6 } from '@expo/vector-icons';
 import {
   feedbackSuccess,
-  feedbackCustomerSuccess,
   feedbackError,
   feedbackWarning,
   feedbackDuplicate,
-  feedbackNeedCustomerName,
+  feedbackNewOrder,
   feedbackSwitchOrder,
+  feedbackNotBound,
+  feedbackNotInOrder,
+  feedbackOverQuantity,
   initSoundSetting,
   useFeedbackCleanup,
 } from '@/utils/feedback';
 import { useToast } from '@/utils/toast';
 import { getISODateTime } from '@/utils/time';
 import {
-  sanitizeLooseScannerInput,
+  sanitizeStructuredScannerInput,
   shouldIgnoreRecentDuplicateScan,
 } from '@/utils/scannerInput';
 import {
@@ -66,41 +69,26 @@ import {
   type OutboundOrderRuleConfig,
   type OutboundWarehouseSampleRuleMap,
 } from '@/utils/outboundOrderRule';
+import { getErpAccountByOutboundOrderNo, type ErpAccountConfig } from '@/utils/erpAccounts';
+import {
+  fetchSaleDispatchVoucher,
+  type SaleDispatchVoucher,
+} from '@/utils/erpSaleDispatch';
+import {
+  buildNextUnpackTraceNo,
+  getUnpackSyncFailureMessage,
+  syncUnpackRecordsToComputer,
+} from '@/utils/unpackWorkflow';
+import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 
-const CUSTOMER_NAME_HAS_CHINESE_REGEX = /[\u3400-\u9fff\uf900-\ufaff]/;
-const CUSTOMER_NAME_ALLOWED_REGEX = /^[\u3400-\u9fff\uf900-\ufaffA-Za-z0-9（）()【】\[\]·•&\-—_.、，,．。\s]+$/;
 const LEGACY_OUTBOUND_SCAN_RECORDS_KEY = 'outbound_scan_records';
+const OUTBOUND_ERP_VOUCHER_CACHE_KEY = '@outbound_erp_voucher_cache';
+const OUTBOUND_ERP_VOUCHER_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const OUTBOUND_ERP_VOUCHER_CACHE_MAX_ITEMS = 30;
+const SCAN_AUTO_SUBMIT_DEBOUNCE_MS = 150;
+const ORDER_SCAN_FAST_SUBMIT_DEBOUNCE_MS = 80;
 
 const normalizeOrderNoCandidate = (value: string) => value.trim().replace(/\s+/g, '').toUpperCase();
-
-const sanitizeScannerInput = sanitizeLooseScannerInput;
-
-const normalizeCustomerNameScan = (value: string) => sanitizeScannerInput(value);
-
-const isValidCustomerNameScan = (
-  value: string,
-  orderRule: OutboundOrderRuleConfig,
-  warehouseRules: OutboundWarehouseSampleRuleMap
-) => {
-  const normalized = normalizeCustomerNameScan(value);
-  if (!normalized || normalized.length < 2 || normalized.length > 40) {
-    return false;
-  }
-
-  const normalizedOrderCandidate = normalizeOrderNoCandidate(normalized);
-  if (getMatchingOutboundWarehouseOrderRules(normalizedOrderCandidate, warehouseRules).length > 0) {
-    return false;
-  }
-
-  if (Object.keys(warehouseRules).length === 0 && isOutboundOrderNo(normalizedOrderCandidate, orderRule)) {
-    return false;
-  }
-
-  return (
-    CUSTOMER_NAME_HAS_CHINESE_REGEX.test(normalized) &&
-    CUSTOMER_NAME_ALLOWED_REGEX.test(normalized)
-  );
-};
 
 interface MaterialItem {
   id: string;
@@ -113,6 +101,7 @@ interface MaterialItem {
   sourceNo?: string;
   package?: string;
   productionDate?: string;
+  inventoryCode?: string;
   customFields?: Record<string, string>;
 }
 
@@ -128,7 +117,41 @@ interface AggregatedGroup {
   items: MaterialItem[]; // 所有items，用于聚合总数量和显示
 }
 
+interface ErpLineProgress {
+  inventoryCode: string;
+  inventoryName: string;
+  key: string;
+  remainingQuantity: number;
+  requiredQuantity: number;
+  scannedItems: MaterialItem[];
+  scannedQuantity: number;
+  specification: string;
+  status: 'complete' | 'partial' | 'pending' | 'over';
+  unitName: string;
+}
+
+interface PendingOutboundUnpack {
+  lineSpecification: string;
+  newTraceNo: string;
+  originalQuantity: number;
+  rawContent: string;
+  remainingQuantity: number;
+  savedPayload: QueueItemParsedPayload;
+  shippedQuantity: number;
+}
+
+const MATERIAL_ITEM_SIGNATURE_FIELDS = [
+  'id',
+  'version',
+  'batch',
+  'sourceNo',
+  'package',
+  'productionDate',
+  'quantity',
+] as const;
+
 interface OutboundWorkDraft {
+  erpVoucher?: OutboundWorkDraftErpVoucher;
   orderNo: string;
   customerName: string;
   warehouseId: string;
@@ -136,26 +159,242 @@ interface OutboundWorkDraft {
   updatedAt: string;
 }
 
-const isOutboundWorkDraft = (value: unknown): value is OutboundWorkDraft => {
-  if (!value || typeof value !== 'object') {
+interface OutboundWorkDraftErpLine {
+  inventoryCode: string;
+  inventoryName: string;
+  quantity: number;
+  specification: string;
+  unitName: string;
+}
+
+interface OutboundWorkDraftErpVoucher {
+  accountKey: SaleDispatchVoucher['accountKey'];
+  accountName: string;
+  clerkName: string;
+  code: string;
+  customerName: string;
+  expectedWarehouseName: string;
+  id: number | string;
+  lines: OutboundWorkDraftErpLine[];
+  sourceVoucherCode: string;
+  statusName: string;
+  voucherDate: string;
+  warehouseName: string;
+}
+
+interface OutboundErpVoucherCacheEntry {
+  cachedAt: number;
+  voucher: OutboundWorkDraftErpVoucher;
+}
+
+type OutboundErpVoucherCache = Record<string, OutboundErpVoucherCacheEntry>;
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isOutboundWorkDraftErpVoucher = (value: unknown): value is OutboundWorkDraftErpVoucher => {
+  if (!isPlainRecord(value)) {
     return false;
   }
 
-  const draft = value as OutboundWorkDraft;
+  const voucher = value as unknown as OutboundWorkDraftErpVoucher;
+  return (
+    typeof voucher.accountKey === 'string' &&
+    typeof voucher.accountName === 'string' &&
+    typeof voucher.code === 'string' &&
+    typeof voucher.customerName === 'string' &&
+    typeof voucher.expectedWarehouseName === 'string' &&
+    Array.isArray(voucher.lines) &&
+    voucher.lines.every(
+      (line) =>
+        line &&
+        typeof line === 'object' &&
+        typeof (line as OutboundWorkDraftErpLine).inventoryCode === 'string' &&
+        typeof (line as OutboundWorkDraftErpLine).quantity === 'number'
+    ) &&
+    typeof voucher.warehouseName === 'string'
+  );
+};
+
+const isOutboundWorkDraft = (value: unknown): value is OutboundWorkDraft => {
+  if (!isPlainRecord(value)) {
+    return false;
+  }
+
+  const draft = value as unknown as OutboundWorkDraft;
   return (
     typeof draft.orderNo === 'string' &&
     typeof draft.customerName === 'string' &&
     typeof draft.warehouseId === 'string' &&
     typeof draft.warehouseName === 'string' &&
-    typeof draft.updatedAt === 'string'
+    typeof draft.updatedAt === 'string' &&
+    (draft.erpVoucher === undefined || isOutboundWorkDraftErpVoucher(draft.erpVoucher))
   );
+};
+
+const createErpVoucherSnapshot = (
+  voucher?: SaleDispatchVoucher | null
+): OutboundWorkDraftErpVoucher | undefined => {
+  if (!voucher) {
+    return undefined;
+  }
+
+  return {
+    accountKey: voucher.accountKey,
+    accountName: voucher.accountName,
+    clerkName: voucher.clerkName,
+    code: voucher.code,
+    customerName: voucher.customerName,
+    expectedWarehouseName: voucher.expectedWarehouseName,
+    id: voucher.id,
+    lines: voucher.lines.map((line) => ({
+      inventoryCode: line.inventoryCode,
+      inventoryName: line.inventoryName,
+      quantity: line.quantity,
+      specification: line.specification,
+      unitName: line.unitName,
+    })),
+    sourceVoucherCode: voucher.sourceVoucherCode,
+    statusName: voucher.statusName,
+    voucherDate: voucher.voucherDate,
+    warehouseName: voucher.warehouseName,
+  };
+};
+
+const restoreErpVoucherFromDraft = (
+  voucher: OutboundWorkDraftErpVoucher
+): SaleDispatchVoucher => ({
+  ...voucher,
+  lines: voucher.lines.map((line) => ({
+    ...line,
+    raw: {},
+  })),
+  raw: {},
+});
+
+const isOutboundErpVoucherCache = (value: unknown): value is OutboundErpVoucherCache => {
+  if (!isPlainRecord(value)) {
+    return false;
+  }
+
+  return Object.values(value).every(
+    (entry) =>
+      isPlainRecord(entry) &&
+      typeof entry.cachedAt === 'number' &&
+      Number.isFinite(entry.cachedAt) &&
+      isOutboundWorkDraftErpVoucher(entry.voucher)
+  );
+};
+
+const buildErpVoucherCacheKey = (
+  accountKey: SaleDispatchVoucher['accountKey'],
+  voucherCode: string
+) => `${accountKey}:${normalizeOrderNoCandidate(voucherCode)}`;
+
+const pruneErpVoucherCache = (
+  cache: OutboundErpVoucherCache,
+  now = Date.now()
+): OutboundErpVoucherCache =>
+  Object.fromEntries(
+    Object.entries(cache)
+      .filter(([, entry]) => now - entry.cachedAt <= OUTBOUND_ERP_VOUCHER_CACHE_TTL_MS)
+      .sort(([, a], [, b]) => b.cachedAt - a.cachedAt)
+      .slice(0, OUTBOUND_ERP_VOUCHER_CACHE_MAX_ITEMS)
+  ) as OutboundErpVoucherCache;
+
+const readErpVoucherCache = async (): Promise<OutboundErpVoucherCache> => {
+  const cacheText = await AsyncStorage.getItem(OUTBOUND_ERP_VOUCHER_CACHE_KEY);
+  return cacheText
+    ? safeJsonParseNullable<OutboundErpVoucherCache>(
+        cacheText,
+        'outbound.erpVoucherCache',
+        isOutboundErpVoucherCache
+      ) || {}
+    : {};
+};
+
+const writeErpVoucherCache = async (cache: OutboundErpVoucherCache) => {
+  await AsyncStorage.setItem(OUTBOUND_ERP_VOUCHER_CACHE_KEY, JSON.stringify(cache));
+};
+
+const loadCachedErpVoucher = async (
+  accountKey: SaleDispatchVoucher['accountKey'],
+  voucherCode: string
+): Promise<SaleDispatchVoucher | null> => {
+  const cache = await readErpVoucherCache();
+  const cacheKey = buildErpVoucherCacheKey(accountKey, voucherCode);
+  const entry = cache[cacheKey];
+
+  if (!entry) {
+    return null;
+  }
+
+  if (Date.now() - entry.cachedAt > OUTBOUND_ERP_VOUCHER_CACHE_TTL_MS) {
+    delete cache[cacheKey];
+    writeErpVoucherCache(pruneErpVoucherCache(cache)).catch((error) => {
+      logger.warn('[扫码出库] 清理过期ERP单据缓存失败:', error);
+    });
+    return null;
+  }
+
+  return restoreErpVoucherFromDraft(entry.voucher);
+};
+
+const saveCachedErpVoucher = async (voucher: SaleDispatchVoucher) => {
+  const snapshot = createErpVoucherSnapshot(voucher);
+  if (!snapshot) {
+    return;
+  }
+
+  const cache = pruneErpVoucherCache(await readErpVoucherCache());
+  cache[buildErpVoucherCacheKey(voucher.accountKey, voucher.code)] = {
+    cachedAt: Date.now(),
+    voucher: snapshot,
+  };
+
+  await writeErpVoucherCache(pruneErpVoucherCache(cache));
+};
+
+const loadSaleDispatchVoucher = async (
+  account: ErpAccountConfig,
+  voucherCode: string,
+  options: { bypassProxyCache?: boolean; forceRefresh?: boolean } = {}
+): Promise<{ fromCache: boolean; voucher: SaleDispatchVoucher }> => {
+  if (!options.forceRefresh) {
+    const cachedVoucher = await loadCachedErpVoucher(account.key, voucherCode);
+    if (cachedVoucher) {
+      return {
+        fromCache: true,
+        voucher: cachedVoucher,
+      };
+    }
+  }
+
+  const voucher = await fetchSaleDispatchVoucher(account, voucherCode, {
+    bypassCache: options.bypassProxyCache,
+  });
+  saveCachedErpVoucher(voucher).catch((error) => {
+    logger.warn('[扫码出库] 保存ERP单据缓存失败:', error);
+  });
+
+  return {
+    fromCache: false,
+    voucher,
+  };
+};
+
+type RefreshedErpVoucherState = {
+  voucher: SaleDispatchVoucher;
+  warehouse: Warehouse;
 };
 
 const createOutboundWorkDraft = (
   orderNo: string,
   customerName: string,
-  warehouse: Warehouse
+  warehouse: Warehouse,
+  erpVoucher?: SaleDispatchVoucher | null
 ): OutboundWorkDraft => ({
+  erpVoucher: createErpVoucherSnapshot(erpVoucher),
   orderNo: orderNo.trim(),
   customerName: customerName.trim(),
   warehouseId: warehouse.id,
@@ -177,100 +416,88 @@ const mapQueueItemToMaterialItem = (
   sourceNo: parsed.sourceNo,
   package: parsed.package,
   productionDate: parsed.productionDate,
+  inventoryCode: parsed.inventoryCode,
   customFields: parsed.customFields,
 });
 
-// ========================================
-// React.memo 优化：列表项组件
-// ========================================
-const getRecordRenderSignature = (items: MaterialItem[] = []) =>
-  items
-    .map((item) =>
-      [
-        item.id || '',
-        item.version || '',
-        item.batch || '',
-        item.sourceNo || '',
-        item.package || '',
-        item.productionDate || '',
-        item.quantity ?? '',
-      ].join(':')
-    )
-    .join('|');
+const mapMaterialRecordToMaterialItem = (material: MaterialRecord): MaterialItem => ({
+  id: material.id,
+  model: material.model,
+  batch: material.batch,
+  quantity: String(material.quantity),
+  scannedAt: new Date(material.scanned_at),
+  version: material.version,
+  traceNo: material.traceNo,
+  sourceNo: material.sourceNo,
+  package: material.package,
+  productionDate: material.productionDate,
+  inventoryCode: (material.inventory_code || '').trim(),
+  customFields: material.customFields,
+});
+
+const mapQueueItemToMaterialRecord = (
+  materialId: string,
+  parsed: QueueItemParsedPayload,
+  rawContent: string
+): MaterialRecord => ({
+  id: materialId,
+  order_no: parsed.orderNo,
+  customer_name: parsed.customerName || '',
+  operation_type: 'outbound',
+  model: parsed.model || '',
+  batch: parsed.batch || '',
+  quantity: parseQuantity(parsed.quantity, { min: 0 }) ?? 0,
+  package: parsed.package || '',
+  version: parsed.version || '',
+  productionDate: parsed.productionDate || '',
+  traceNo: parsed.traceNo || '',
+  sourceNo: parsed.sourceNo || '',
+  scanned_at: getISODateTime(),
+  raw_content: rawContent,
+  separator: parsed.separator,
+  rule_id: parsed.ruleId,
+  rule_name: parsed.ruleName,
+  customFields: parsed.customFields,
+  warehouse_id: parsed.warehouseId,
+  warehouse_name: parsed.warehouseName,
+  inventory_code: parsed.inventoryCode || '',
+});
 
 const buildMaterialGroupKey = (item: MaterialItem) =>
-  JSON.stringify([
-    item.model || '',
-    item.version || '',
-  ]);
+  JSON.stringify([item.model || '', item.version || '']);
 
-const RecordItem = React.memo(
-  ({
-    group,
-    isExpanded,
-    onToggle,
-    onDeleteItem,
-    styles,
-  }: {
-    group: AggregatedGroup;
-    isExpanded: boolean;
-    onToggle: (key: string) => void;
-    onDeleteItem: (item: MaterialItem) => void;
-    styles: ReturnType<typeof createStyles>;
-  }) => {
-    return (
-      <View key={group.key}>
-        {/* 聚合项（两行布局） */}
-        <TouchableOpacity
-          style={styles.itemRow}
-          activeOpacity={0.7}
-          onPress={() => onToggle(group.key)}
-        >
-          <View style={styles.itemLeft}>
-            <Text style={styles.itemModel}>
-              {isExpanded ? '▼' : '▶'} {group.model}
-            </Text>
-            <Text style={styles.itemBatch}>版本: {group.version || '-'}</Text>
-          </View>
-          <View style={styles.itemRight}>
-            <Text style={styles.itemQty}>{group.totalQuantity.toLocaleString()}</Text>
-          </View>
-        </TouchableOpacity>
+const normalizeInventoryCode = (value?: string | null) =>
+  (value || '').trim().toUpperCase();
 
-        {/* 展开的明细 */}
-        {isExpanded && (
-          <View style={styles.detailsContainer}>
-            {group.items.map((item) => (
-              <TouchableOpacity
-                key={item.id}
-                style={styles.detailItem}
-                onLongPress={() => onDeleteItem(item)}
-                delayLongPress={500}
-              >
-                <Text style={styles.detailText}>
-                  批次: {item.batch || '-'} | 生产日期: {item.productionDate || '-'} | 数量:{' '}
-                  {parseInt(item.quantity, 10) || 0}
-                </Text>
-                <Text style={styles.detailText}>版本号: {item.version || '-'}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        )}
-      </View>
-    );
-  },
-  (prevProps, nextProps) => {
-    // 自定义比较函数：只有关键属性变化时才重新渲染
-    return (
-      prevProps.group.model === nextProps.group.model &&
-      prevProps.group.version === nextProps.group.version &&
-      prevProps.group.totalQuantity === nextProps.group.totalQuantity &&
-      prevProps.group.boxCount === nextProps.group.boxCount &&
-      prevProps.isExpanded === nextProps.isExpanded &&
-      getRecordRenderSignature(prevProps.group.items) === getRecordRenderSignature(nextProps.group.items)
-    );
-  }
-);
+const buildErpLineProgressKey = (inventoryCode: string) =>
+  `erp:${normalizeInventoryCode(inventoryCode) || 'unknown'}`;
+
+const isOutboundVisibleMaterial = (material: MaterialRecord) =>
+  material.operation_type !== 'inventory';
+
+const mergeMaterialItemsById = (items: MaterialItem[]) => {
+  const mergedItems: MaterialItem[] = [];
+  const indexesById = new Map<string, number>();
+
+  items.forEach((item) => {
+    const existingIndex = indexesById.get(item.id);
+    if (existingIndex === undefined) {
+      indexesById.set(item.id, mergedItems.length);
+      mergedItems.push(item);
+      return;
+    }
+
+    const existing = mergedItems[existingIndex];
+    mergedItems[existingIndex] = {
+      ...item,
+      ...existing,
+      inventoryCode: (existing.inventoryCode || item.inventoryCode || '').trim(),
+      customFields: existing.customFields || item.customFields,
+    };
+  });
+
+  return mergedItems;
+};
 
 export default function PDAScanScreen() {
   const { theme, isDark } = useTheme();
@@ -286,6 +513,12 @@ export default function PDAScanScreen() {
   // 输入
   const inputRef = useRef<TextInput>(null);
   const [inputValue, setInputValue] = useState('');
+  const [isErpOrderLoading, setIsErpOrderLoading] = useState(false);
+  const [pendingOutboundUnpack, setPendingOutboundUnpack] =
+    useState<PendingOutboundUnpack | null>(null);
+  const pendingOutboundUnpackRef = useRef<PendingOutboundUnpack | null>(null);
+  const [outboundUnpackNotes, setOutboundUnpackNotes] = useState('');
+  const [outboundUnpacking, setOutboundUnpacking] = useState(false);
   const processingRef = useRef(false);
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -293,6 +526,7 @@ export default function PDAScanScreen() {
   const screenActiveRef = useRef(true);
   const liveInputValueRef = useRef('');
   const pendingScanCodesRef = useRef<string[]>([]);
+  const processScanRef = useRef<(code: string) => void>(() => undefined);
   const lastScanRef = useRef('');
   const lastScanTimeRef = useRef(0);
   const scannerFocusBlockedRef = useRef(false);
@@ -300,6 +534,19 @@ export default function PDAScanScreen() {
   const customerNameRef = useRef('');
   const currentWarehouseRef = useRef<Warehouse | null>(null);
   const savedOutboundDraftRef = useRef<string | null>(null);
+  const loadOutboundStateRef = useRef<
+    (warehouseList: Warehouse[], explicitWarehouse: Warehouse | null) => Promise<void>
+  >(async () => undefined);
+  const loadOrderMaterialsRef = useRef<
+    (orderNo: string, explicitWarehouseId?: string) => Promise<MaterialItem[]>
+  >(async () => []);
+  const forceRefreshErpVoucherForOrderRef = useRef<
+    (
+      orderNo: string,
+      warehouseList: Warehouse[],
+      options?: { clearOnFailure?: boolean }
+    ) => Promise<RefreshedErpVoucherState | null>
+  >(async () => null);
 
   // 仓库
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
@@ -330,6 +577,39 @@ export default function PDAScanScreen() {
     setCurrentWarehouse(nextWarehouse);
   }, []);
 
+  const erpVoucherRef = useRef<SaleDispatchVoucher | null>(null);
+  const verifiedErpVoucherRef = useRef<SaleDispatchVoucher | null>(null);
+  const erpVoucherRefreshRef = useRef<{
+    key: string;
+    promise: Promise<RefreshedErpVoucherState | null>;
+  } | null>(null);
+  const [erpVoucher, setErpVoucher] = useState<SaleDispatchVoucher | null>(null);
+  const [erpVoucherRecoveryRequired, setErpVoucherRecoveryRequired] = useState(false);
+
+  const setActiveErpVoucher = useCallback((nextVoucher: SaleDispatchVoucher | null) => {
+    if (verifiedErpVoucherRef.current !== nextVoucher) {
+      verifiedErpVoucherRef.current = null;
+    }
+    erpVoucherRef.current = nextVoucher;
+    setErpVoucher(nextVoucher);
+    if (nextVoucher) {
+      setErpVoucherRecoveryRequired(false);
+    }
+  }, []);
+
+  const markErpVoucherVerified = useCallback((voucher: SaleDispatchVoucher) => {
+    verifiedErpVoucherRef.current = voucher;
+  }, []);
+
+  const markErpVoucherUnverified = useCallback(() => {
+    verifiedErpVoucherRef.current = null;
+  }, []);
+
+  const isErpVoucherVerified = useCallback(
+    (voucher: SaleDispatchVoucher) => verifiedErpVoucherRef.current === voucher,
+    []
+  );
+
   // 同步 ref，避免扫码队列连续处理时读到旧闭包
   useEffect(() => {
     orderNoRef.current = orderNo;
@@ -343,6 +623,11 @@ export default function PDAScanScreen() {
 
   // 扫码记录（参考入库实现）
   const [scanRecords, setScanRecords] = useState<MaterialItem[]>([]);
+  const scanRecordsRef = useRef<MaterialItem[]>([]);
+
+  useEffect(() => {
+    scanRecordsRef.current = scanRecords;
+  }, [scanRecords]);
 
   // 聚合展开状态（记录哪些聚合组是展开的）
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
@@ -350,29 +635,36 @@ export default function PDAScanScreen() {
 
   // Toast
   const { showToast, ToastContainer } = useToast();
-  const currentScanStep = !orderNo
-    ? 'order'
-    : customerName.trim()
-      ? 'material'
-      : 'customer';
-  const currentScanPlaceholder =
-    currentScanStep === 'order'
+  const currentScanStep = !orderNo ? 'order' : 'material';
+  const currentScanPlaceholder = isErpOrderLoading
+    ? '正在查询ERP单据...'
+    : erpVoucherRecoveryRequired
+      ? 'ERP单据未验证，请重新扫描订单或点击刷新'
+    : currentScanStep === 'order'
       ? '先扫描订单号'
-      : currentScanStep === 'customer'
-        ? '再扫描客户名称二维码'
-        : '继续扫描物料二维码';
+      : '继续扫描物料二维码';
+  const currentScanStatusLabel = isErpOrderLoading
+    ? '正在读取ERP单据'
+    : erpVoucherRecoveryRequired
+      ? 'ERP单据需要验证'
+    : currentScanStep === 'order'
+      ? '等待出库单号'
+      : '物料扫码录入';
 
   useEffect(() => {
-    scannerFocusBlockedRef.current = showWarehousePicker;
-  }, [showWarehousePicker]);
+    scannerFocusBlockedRef.current = showWarehousePicker || !!pendingOutboundUnpack;
+  }, [pendingOutboundUnpack, showWarehousePicker]);
 
-  const showAlertIfActive = useCallback((title: string, message: string) => {
-    if (!screenActiveRef.current) {
-      return;
-    }
+  const showAlertIfActive = useCallback(
+    (title: string, message: string) => {
+      if (!screenActiveRef.current) {
+        return;
+      }
 
-    alert.showAlert(title, message, [{ text: '知道了' }], 'warning');
-  }, [alert]);
+      alert.showAlert(title, message, [{ text: '知道了' }], 'warning');
+    },
+    [alert]
+  );
 
   const shouldAcceptScanCode = useCallback((code: string) => {
     if (shouldIgnoreRecentDuplicateScan(code, lastScanRef, lastScanTimeRef)) {
@@ -396,6 +688,30 @@ export default function PDAScanScreen() {
     }, delay);
   }, []);
 
+  const resumePendingScanCodes = useCallback(
+    (delay = 0) => {
+      if (postProcessTimerRef.current) {
+        clearTimeout(postProcessTimerRef.current);
+      }
+      postProcessTimerRef.current = setTimeout(() => {
+        postProcessTimerRef.current = null;
+        processingRef.current = false;
+        if (!screenActiveRef.current || pendingOutboundUnpackRef.current) {
+          return;
+        }
+
+        const nextPendingCode = pendingScanCodesRef.current.shift();
+        if (nextPendingCode) {
+          processScanRef.current(nextPendingCode);
+          return;
+        }
+
+        focusScannerInput(0);
+      }, delay);
+    },
+    [focusScannerInput]
+  );
+
   useEffect(
     () => () => {
       if (focusTimerRef.current) {
@@ -418,8 +734,18 @@ export default function PDAScanScreen() {
   }, [focusScannerInput, showWarehousePicker]);
 
   const saveOutboundWorkDraft = useCallback(
-    async (nextOrderNo: string, nextCustomerName: string, warehouse: Warehouse) => {
-      const draft = createOutboundWorkDraft(nextOrderNo, nextCustomerName, warehouse);
+    async (
+      nextOrderNo: string,
+      nextCustomerName: string,
+      warehouse: Warehouse,
+      nextErpVoucher: SaleDispatchVoucher | null = erpVoucherRef.current
+    ) => {
+      const draft = createOutboundWorkDraft(
+        nextOrderNo,
+        nextCustomerName,
+        warehouse,
+        nextErpVoucher
+      );
       const serializedDraft = JSON.stringify(draft);
       if (savedOutboundDraftRef.current === serializedDraft) {
         return;
@@ -438,12 +764,18 @@ export default function PDAScanScreen() {
     []
   );
 
-  const clearOutboundWorkDraft = useCallback(async () => {
-    savedOutboundDraftRef.current = null;
-    await Promise.allSettled([
-      AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT),
-      AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_ORDER_NO),
-    ]);
+  const clearOutboundWorkDraft = useCallback(async (): Promise<boolean> => {
+    try {
+      await Promise.all([
+        AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT),
+        AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_ORDER_NO),
+      ]);
+      savedOutboundDraftRef.current = null;
+      return true;
+    } catch (error) {
+      logger.error('[扫码出库] 清理出库草稿失败:', error);
+      return false;
+    }
   }, []);
 
   const loadSavedOutboundWorkDraft = useCallback(async (): Promise<OutboundWorkDraft | null> => {
@@ -468,184 +800,209 @@ export default function PDAScanScreen() {
       let isActive = true;
 
       const init = async () => {
-        // 1. 设置批量写入函数（数据库写入前强制等待数据库初始化）
-        scanQueue.setBatchWriteFunction(async (items: QueueItem[]) => {
-          logger.log('[ScanQueue] ===== 批量写入开始 =====');
-          logger.log('[ScanQueue] 批量数量:', items.length);
+        let unsubscribe: (() => void) | null = null;
+        let queueStarted = false;
 
-          // 🔥 限制每次批量写入的数量，防止突然扫太多导致卡顿
-          const itemsToProcess = items.slice(0, 10);
-          logger.log('[ScanQueue] 限制后数量:', itemsToProcess.length);
+        try {
+          // 1. 设置批量写入函数（数据库写入前强制等待数据库初始化）
+          scanQueue.setBatchWriteFunction(async (items: QueueItem[]) => {
+            logger.log('[ScanQueue] ===== 批量写入开始 =====');
+            logger.log('[ScanQueue] 批量数量:', items.length);
 
-          // 🔥 强制等待数据库初始化，确保数据库一定 ready
-          logger.log('[ScanQueue] 等待数据库初始化...');
-          await initDatabase();
-          logger.log('[ScanQueue] 数据库初始化完成');
+            // 🔥 限制每次批量写入的数量，防止突然扫太多导致卡顿
+            const itemsToProcess = items.slice(0, 10);
+            logger.log('[ScanQueue] 限制后数量:', itemsToProcess.length);
 
-          const success: boolean[] = [];
-          const materialIds: string[] = [];
-          const errors: (string | null)[] = [];
-          const appendedItems: MaterialItem[] = [];
+            // 🔥 强制等待数据库初始化，确保数据库一定 ready
+            logger.log('[ScanQueue] 等待数据库初始化...');
+            await initDatabase();
+            logger.log('[ScanQueue] 数据库初始化完成');
 
-          logger.log('[ScanQueue] 开始处理队列项...');
+            const success: boolean[] = [];
+            const materialIds: string[] = [];
+            const errors: (string | null)[] = [];
+            const appendedItems: MaterialItem[] = [];
 
-          for (const item of itemsToProcess) {
-            try {
-              const parsed: QueueItemParsedPayload = item.parsed;
-              const orderNo = parsed.orderNo;
-              const warehouseId = parsed.warehouseId;
-              const warehouseName = parsed.warehouseName;
+            logger.log('[ScanQueue] 开始处理队列项...');
 
-              logger.log('[ScanQueue] 处理物料:', {
-                orderNo,
-                model: parsed.model,
-                batch: parsed.batch,
-                warehouseId,
-                warehouseName,
-              });
+            for (const item of itemsToProcess) {
+              try {
+                const parsed: QueueItemParsedPayload = item.parsed;
+                const orderNo = parsed.orderNo;
+                const warehouseId = parsed.warehouseId;
+                const warehouseName = parsed.warehouseName;
 
-              if (!orderNo || typeof orderNo !== 'string' || orderNo.trim() === '') {
-                throw new Error('订单号为空');
-              }
-
-              if (!warehouseId || typeof warehouseId !== 'string' || warehouseId.trim() === '') {
-                logger.error('[ScanQueue] 仓库ID无效，跳过物料:', {
+                logger.log('[ScanQueue] 处理物料:', {
+                  orderNo,
+                  model: parsed.model,
+                  batch: parsed.batch,
                   warehouseId,
                   warehouseName,
-                  currentWarehouse,
-                  parsed,
                 });
-                throw new Error('仓库ID无效');
-              }
 
-              const duplicateCheck = await checkMaterialExists(
-                orderNo,
-                parsed.model || '',
-                parsed.batch || '',
-                parsed.sourceNo,
-                parsed.traceNo,
-                parsed.quantity,
-                warehouseId
+                if (!orderNo || typeof orderNo !== 'string' || orderNo.trim() === '') {
+                  throw new Error('订单号为空');
+                }
+
+                if (!warehouseId || typeof warehouseId !== 'string' || warehouseId.trim() === '') {
+                  logger.error('[ScanQueue] 仓库ID无效，跳过物料:', {
+                    warehouseId,
+                    warehouseName,
+                    currentWarehouse: currentWarehouseRef.current,
+                    parsed,
+                  });
+                  throw new Error('仓库ID无效');
+                }
+
+                const duplicateCheck = await checkMaterialExists(
+                  orderNo,
+                  parsed.model || '',
+                  parsed.batch || '',
+                  parsed.sourceNo,
+                  parsed.traceNo,
+                  parsed.quantity,
+                  warehouseId
+                );
+                if (duplicateCheck.material && !duplicateCheck.canRescan) {
+                  throw new Error(`已存在相同追踪码：${parsed.traceNo || ''}`);
+                }
+
+                // 订单与物料写入放在同一事务中，避免出现半成功状态
+                const materialId = await addMaterialWithOrder(
+                  {
+                    order_no: orderNo,
+                    customer_name: parsed.customerName || '',
+                    operation_type: 'outbound',
+                    model: parsed.model || '',
+                    batch: parsed.batch || '',
+                    quantity: parseQuantity(parsed.quantity || '1') ?? 1,
+                    traceNo: parsed.traceNo,
+                    sourceNo: parsed.sourceNo,
+                    package: parsed.package,
+                    version: parsed.version,
+                    productionDate: parsed.productionDate,
+                    raw_content: item.scanData,
+                    separator: parsed.separator,
+                    rule_id: parsed.ruleId,
+                    rule_name: parsed.ruleName,
+                    customFields: parsed.customFields,
+                    scanned_at: getISODateTime(),
+                    warehouse_id: warehouseId,
+                    warehouse_name: warehouseName,
+                    inventory_code: parsed.inventoryCode || '',
+                  },
+                  parsed.customerName || '',
+                  { id: warehouseId, name: warehouseName }
+                );
+
+                logger.log('[ScanQueue] 物料添加成功:', materialId);
+                logger.log('[ScanQueue] 订单更新成功:', orderNo);
+
+                success.push(true);
+                materialIds.push(materialId);
+                errors.push(null);
+
+                if (orderNo === orderNoRef.current) {
+                  appendedItems.push(mapQueueItemToMaterialItem(materialId, parsed));
+                }
+              } catch (e) {
+                logger.error('[ScanQueue] 批量写入失败:', item.id, e);
+                success.push(false);
+                materialIds.push('');
+                errors.push(e instanceof Error ? e.message : String(e));
+              }
+            }
+
+            if (appendedItems.length > 0 && screenActiveRef.current) {
+              const appendedIds = new Set(appendedItems.map((item) => item.id));
+              setScanRecords((prev) => {
+                const preservedItems = prev.filter((item) => !appendedIds.has(item.id));
+                const nextRecords = [...appendedItems.slice().reverse(), ...preservedItems];
+                scanRecordsRef.current = nextRecords;
+                return nextRecords;
+              });
+            }
+
+            return { success, materialIds, errors };
+          });
+
+          // 3. 启动队列定时器
+          scanQueue.startTimer();
+          queueStarted = true;
+
+          // 4. 订阅队列变化（简化订阅，避免重复刷新）
+          // 注意：批量写入函数中已经统一刷新 UI，这里只用于显示统计信息
+          unsubscribe = scanQueue.subscribe(() => {
+            // 队列变化时，只需要更新统计信息，不需要重新加载数据
+            // 因为批量写入函数中已经统一刷新了 UI
+            const stats = scanQueue.getStats();
+            logger.log('[ScanQueue] 队列状态:', stats);
+          });
+
+          // 5. 加载仓库列表
+          const [list, orderRule, warehouseOrderRules] = await Promise.all([
+            getAllWarehouses(),
+            loadOutboundOrderRule(),
+            loadOutboundWarehouseOrderRules(),
+          ]);
+          setWarehouses(list);
+          setOutboundOrderRule(orderRule);
+          setOutboundWarehouseOrderRules(warehouseOrderRules);
+
+          // 6. 恢复之前选择的仓库，并等待状态更新
+          let warehouse: Warehouse | null = null;
+          const savedWarehouse = await AsyncStorage.getItem(STORAGE_KEYS.GLOBAL_WAREHOUSE);
+          if (savedWarehouse) {
+            const saved = safeJsonParseNullable<Warehouse>(
+              savedWarehouse,
+              'outbound.globalWarehouse'
+            );
+            // 确保仓库仍然存在
+            const latestWarehouse = saved ? list.find((w) => w.id === saved.id) : null;
+            if (latestWarehouse) {
+              warehouse = latestWarehouse;
+              await AsyncStorage.setItem(
+                STORAGE_KEYS.GLOBAL_WAREHOUSE,
+                JSON.stringify(latestWarehouse)
               );
-              if (duplicateCheck.material && !duplicateCheck.canRescan) {
-                throw new Error(`已存在相同追踪码：${parsed.traceNo || ''}`);
-              }
-
-              // 订单与物料写入放在同一事务中，避免出现半成功状态
-              const materialId = await addMaterialWithOrder({
-                order_no: orderNo,
-                customer_name: parsed.customerName || '',
-                operation_type: 'outbound',
-                model: parsed.model || '',
-                batch: parsed.batch || '',
-                quantity: parseQuantity(parsed.quantity || '1') ?? 1,
-                traceNo: parsed.traceNo,
-                sourceNo: parsed.sourceNo,
-                package: parsed.package,
-                version: parsed.version,
-                productionDate: parsed.productionDate,
-                raw_content: item.scanData,
-                separator: parsed.separator,
-                rule_name: parsed.ruleName,
-                customFields: parsed.customFields,
-                scanned_at: getISODateTime(),
-                warehouse_id: warehouseId,
-                warehouse_name: warehouseName,
-                inventory_code: parsed.inventoryCode || '',
-              }, parsed.customerName || '', { id: warehouseId, name: warehouseName });
-
-              logger.log('[ScanQueue] 物料添加成功:', materialId);
-              logger.log('[ScanQueue] 订单更新成功:', orderNo);
-
-              success.push(true);
-              materialIds.push(materialId);
-              errors.push(null);
-
-              if (orderNo === orderNoRef.current) {
-                appendedItems.push(mapQueueItemToMaterialItem(materialId, parsed));
-              }
-            } catch (e) {
-              logger.error('[ScanQueue] 批量写入失败:', item.id, e);
-              success.push(false);
-              materialIds.push('');
-              errors.push(e instanceof Error ? e.message : String(e));
             }
           }
 
-          if (appendedItems.length > 0 && screenActiveRef.current) {
-            const appendedIds = new Set(appendedItems.map((item) => item.id));
-            setScanRecords((prev) => {
-              const preservedItems = prev.filter((item) => !appendedIds.has(item.id));
-              return [...appendedItems.slice().reverse(), ...preservedItems];
-            });
+          // 没有保存的选择，使用默认仓库
+          if (!warehouse) {
+            const def = await getDefaultWarehouse();
+            warehouse = def || list[0] || null;
           }
 
-          return { success, materialIds, errors };
-        });
+          // 7. 设置当前仓库
+          setActiveWarehouse(warehouse);
 
-        // 3. 启动队列定时器
-        scanQueue.startTimer();
+          // 8. 加载扫码出库持久化状态（显式传入仓库，避免读取旧闭包）
+          await loadOutboundStateRef.current(list, warehouse);
 
-        // 4. 订阅队列变化（简化订阅，避免重复刷新）
-        // 注意：批量写入函数中已经统一刷新 UI，这里只用于显示统计信息
-        const unsubscribe = scanQueue.subscribe(() => {
-          // 队列变化时，只需要更新统计信息，不需要重新加载数据
-          // 因为批量写入函数中已经统一刷新了 UI
-          const stats = scanQueue.getStats();
-          logger.log('[ScanQueue] 队列状态:', stats);
-        });
-
-        // 5. 加载仓库列表
-        const [list, orderRule, warehouseOrderRules] = await Promise.all([
-          getAllWarehouses(),
-          loadOutboundOrderRule(),
-          loadOutboundWarehouseOrderRules(),
-        ]);
-        setWarehouses(list);
-        setOutboundOrderRule(orderRule);
-        setOutboundWarehouseOrderRules(warehouseOrderRules);
-
-        // 6. 恢复之前选择的仓库，并等待状态更新
-        let warehouse: Warehouse | null = null;
-        const savedWarehouse = await AsyncStorage.getItem(STORAGE_KEYS.GLOBAL_WAREHOUSE);
-        if (savedWarehouse) {
-          const saved = safeJsonParseNullable<Warehouse>(
-            savedWarehouse,
-            'outbound.globalWarehouse'
-          );
-          // 确保仓库仍然存在
-          const latestWarehouse = saved ? list.find((w) => w.id === saved.id) : null;
-          if (latestWarehouse) {
-            warehouse = latestWarehouse;
-            await AsyncStorage.setItem(
-              STORAGE_KEYS.GLOBAL_WAREHOUSE,
-              JSON.stringify(latestWarehouse)
-            );
+          // 9. 聚焦输入框
+          if (isActive) {
+            focusScannerInput(100);
           }
+
+          // 返回清理函数
+          return () => {
+            scanQueue.stopTimer();
+            unsubscribe?.();
+          };
+        } catch (error) {
+          logger.error('[扫码出库] 初始化失败:', error);
+          if (queueStarted) {
+            scanQueue.stopTimer();
+          }
+          unsubscribe?.();
+
+          if (isActive) {
+            showToast('数据库读取失败，请关闭应用后重试', 'error');
+            focusScannerInput(300);
+          }
+          return undefined;
         }
-
-        // 没有保存的选择，使用默认仓库
-        if (!warehouse) {
-          const def = await getDefaultWarehouse();
-          warehouse = def || list[0] || null;
-        }
-
-        // 7. 设置当前仓库
-        setActiveWarehouse(warehouse);
-
-        // 8. 加载扫码出库持久化状态（显式传入仓库，避免读取旧闭包）
-        await loadOutboundState(list, warehouse);
-
-        // 9. 聚焦输入框
-        if (isActive) {
-          focusScannerInput(100);
-        }
-
-        // 返回清理函数
-        return () => {
-          scanQueue.stopTimer();
-          unsubscribe();
-        };
       };
 
       const cleanupPromise = init();
@@ -673,19 +1030,17 @@ export default function PDAScanScreen() {
           })
           .catch(logger.error);
       };
-    }, [focusScannerInput])
+    }, [focusScannerInput, setActiveWarehouse, showToast])
   );
 
   // 加载扫码出库持久化状态（订单号、仓库、扫码记录）
-  const loadOutboundState = async (
-    warehouseList?: Warehouse[],
-    explicitWarehouse?: Warehouse | null
-  ) => {
-    try {
-      const list = warehouseList || warehouses;
-      let activeWarehouse = explicitWarehouse ?? currentWarehouse;
+  const loadOutboundState = useCallback(
+    async (warehouseList: Warehouse[], explicitWarehouse: Warehouse | null) => {
+      try {
+        const list = warehouseList;
+        let activeWarehouse = explicitWarehouse;
 
-      // 1. 优先恢复新的出库作业草稿。草稿同步保存在 AsyncStorage 和 SQLite，避免覆盖安装后丢现场。
+      // 1. 优先恢复出库作业草稿。草稿只保存现场，实际订单和物料以 SQLite 为准。
       const savedDraft = await loadSavedOutboundWorkDraft();
 
       if (savedDraft) {
@@ -705,24 +1060,75 @@ export default function PDAScanScreen() {
             });
             activeWarehouse = draftWarehouse;
             setActiveWarehouse(draftWarehouse);
-            await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(draftWarehouse));
+            await AsyncStorage.setItem(
+              STORAGE_KEYS.GLOBAL_WAREHOUSE,
+              JSON.stringify(draftWarehouse)
+            );
           }
 
-          const order = await getOrder(draftOrderNo, savedDraft.warehouseId);
-          if (!screenActiveRef.current) {
-            return;
-          }
-
-          const restoredCustomerName = (
-            order?.customer_name ||
+          const cachedErpVoucher = savedDraft.erpVoucher
+            ? restoreErpVoucherFromDraft(savedDraft.erpVoucher)
+            : null;
+          const immediateCustomerName = (
+            cachedErpVoucher?.customerName ||
             savedDraft.customerName ||
             ''
           ).trim();
 
           setActiveOrderNo(draftOrderNo);
-          setActiveCustomerName(restoredCustomerName);
-          await saveOutboundWorkDraft(draftOrderNo, restoredCustomerName, draftWarehouse);
-          await loadOrderMaterials(draftOrderNo, savedDraft.warehouseId);
+          setActiveCustomerName(immediateCustomerName);
+          if (cachedErpVoucher) {
+            markErpVoucherUnverified();
+            setActiveErpVoucher(cachedErpVoucher);
+          } else {
+            setActiveErpVoucher(null);
+          }
+
+          try {
+            await loadOrderMaterialsRef.current(draftOrderNo, draftWarehouse.id);
+          } catch (error) {
+            logger.warn('[loadOutboundState] 快速恢复出库物料失败:', error);
+          }
+
+          void (async () => {
+            const order = await getOrder(draftOrderNo, savedDraft.warehouseId);
+            const restoredCustomerName = (
+              order?.customer_name ||
+              savedDraft.customerName ||
+              ''
+            ).trim();
+            const restoredErpState = await forceRefreshErpVoucherForOrderRef.current(
+              draftOrderNo,
+              list,
+              { clearOnFailure: !cachedErpVoucher }
+            );
+
+            if (!screenActiveRef.current || orderNoRef.current !== draftOrderNo) {
+              return;
+            }
+
+            const workWarehouse = restoredErpState?.warehouse || draftWarehouse;
+            const workCustomerName = (
+              restoredErpState?.voucher.customerName ||
+              restoredCustomerName ||
+              ''
+            ).trim();
+
+            setActiveCustomerName(workCustomerName);
+            await saveOutboundWorkDraft(
+              draftOrderNo,
+              workCustomerName,
+              workWarehouse,
+              restoredErpState?.voucher || null
+            );
+
+            if (workWarehouse.id !== draftWarehouse.id) {
+              await loadOrderMaterialsRef.current(draftOrderNo, workWarehouse.id);
+            }
+          })().catch((error) => {
+            logger.warn('[loadOutboundState] 后台刷新 ERP 出库草稿失败:', error);
+          });
+
           return;
         }
       }
@@ -756,7 +1162,10 @@ export default function PDAScanScreen() {
         const warehouse = list.find((w) => w.id === order.warehouse_id);
         if (!warehouse) {
           logger.log('[loadOutboundState] 订单的仓库已不存在，清空订单号');
-          showAlertIfActive('当前出库作业已清空', '上次暂存订单所属仓库已不存在。已保存的历史订单不会删除，请重新扫描当前仓库订单。');
+          showAlertIfActive(
+            '当前出库作业已清空',
+            '上次暂存订单所属仓库已不存在。已保存的历史订单不会删除，请重新扫描当前仓库订单。'
+          );
           await clearOutboundWorkDraft();
           if (screenActiveRef.current) {
             setActiveOrderNo('');
@@ -782,76 +1191,325 @@ export default function PDAScanScreen() {
 
         setActiveOrderNo(savedOrderNo);
         setActiveCustomerName((order.customer_name || '').trim());
-        await saveOutboundWorkDraft(savedOrderNo, (order.customer_name || '').trim(), warehouse);
-        await loadOrderMaterials(savedOrderNo, order.warehouse_id);
+
+        const restoredErpState = await forceRefreshErpVoucherForOrderRef.current(
+          savedOrderNo,
+          list
+        );
+        if (!screenActiveRef.current || orderNoRef.current !== savedOrderNo) {
+          return;
+        }
+        const workWarehouse = restoredErpState?.warehouse || warehouse;
+        const workCustomerName = (
+          restoredErpState?.voucher.customerName ||
+          order.customer_name ||
+          ''
+        ).trim();
+
+        setActiveCustomerName(workCustomerName);
+        await saveOutboundWorkDraft(savedOrderNo, workCustomerName, workWarehouse);
+        await loadOrderMaterialsRef.current(savedOrderNo, workWarehouse.id);
       }
-    } catch (error) {
-      logger.error('[扫码出库] 加载持久化状态失败:', error);
-    }
-  };
+      } catch (error) {
+        logger.error('[扫码出库] 加载持久化状态失败:', error);
+      }
+    },
+    [
+      clearOutboundWorkDraft,
+      loadSavedOutboundWorkDraft,
+      markErpVoucherUnverified,
+      saveOutboundWorkDraft,
+      setActiveCustomerName,
+      setActiveErpVoucher,
+      setActiveOrderNo,
+      setActiveWarehouse,
+      showAlertIfActive,
+    ]
+  );
 
   // 切换仓库
-  const handleWarehouseChange = async (warehouse: Warehouse) => {
-    // 切换仓库
-    setActiveWarehouse(warehouse);
-    await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(warehouse));
+  const handleWarehouseChange = async (warehouse: Warehouse): Promise<boolean> => {
+    const [draftCleared, recordsCleared] = await Promise.all([
+      clearOutboundWorkDraft(),
+      clearScanRecords(),
+    ]);
+    if (!draftCleared || !recordsCleared) {
+      showToast('当前出库暂存清理失败，已取消切换仓库', 'error');
+      feedbackError();
+      return false;
+    }
 
-    // 清空当前扫码记录（新仓库从零开始）
+    await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(warehouse));
+    setActiveWarehouse(warehouse);
     setActiveOrderNo('');
     setActiveCustomerName('');
+    setActiveErpVoucher(null);
+    setErpVoucherRecoveryRequired(false);
+    scanRecordsRef.current = [];
     setScanRecords([]);
-
-    await clearOutboundWorkDraft();
-    await clearScanRecords();
 
     // 清空展开状态
     expandedGroupsRef.current = new Set();
     setExpandedGroups(new Set());
+    pendingScanCodesRef.current = [];
+    return true;
   };
 
   // 清空扫描记录
-  const clearScanRecords = async () => {
+  const clearScanRecords = async (): Promise<boolean> => {
     try {
       await AsyncStorage.multiRemove([
         STORAGE_KEYS.OUTBOUND_SCAN_RECORDS,
         LEGACY_OUTBOUND_SCAN_RECORDS_KEY,
       ]);
+      return true;
     } catch (error) {
       logger.error('清空扫描记录失败:', error);
+      return false;
     }
   };
 
+  const resolveWarehouseForErpVoucher = useCallback(
+    (voucher: SaleDispatchVoucher, warehouseList: Warehouse[]) => {
+      const expectedNames = [voucher.warehouseName, voucher.expectedWarehouseName].filter(Boolean);
+
+      for (const warehouseName of expectedNames) {
+        const matchedWarehouse = warehouseList.find((warehouse) => warehouse.name === warehouseName);
+        if (matchedWarehouse) {
+          return matchedWarehouse;
+        }
+      }
+
+      return null;
+    },
+    []
+  );
+
+  const refreshErpVoucherForOrder = useCallback(
+    async (
+      nextOrderNo: string,
+      warehouseList: Warehouse[],
+      options: {
+        bypassProxyCache?: boolean;
+        clearOnFailure?: boolean;
+        forceRefresh?: boolean;
+      } = {}
+    ) => {
+      const {
+        bypassProxyCache = false,
+        clearOnFailure = true,
+        forceRefresh = false,
+      } = options;
+      const account = getErpAccountByOutboundOrderNo(nextOrderNo);
+      if (!account) {
+        setActiveErpVoucher(null);
+        setErpVoucherRecoveryRequired(false);
+        return null;
+      }
+
+      try {
+        const { fromCache, voucher } = await loadSaleDispatchVoucher(account, nextOrderNo, {
+          bypassProxyCache,
+          forceRefresh,
+        });
+        if (
+          !screenActiveRef.current ||
+          normalizeOrderNoCandidate(orderNoRef.current) !== normalizeOrderNoCandidate(nextOrderNo)
+        ) {
+          return null;
+        }
+        const matchedWarehouse = resolveWarehouseForErpVoucher(
+          voucher,
+          warehouseList
+        );
+        if (!matchedWarehouse) {
+          throw new Error(
+            `本地未找到ERP仓库：${voucher.warehouseName || voucher.expectedWarehouseName || '-'}`
+          );
+        }
+
+        setActiveErpVoucher(voucher);
+        if (!fromCache) {
+          markErpVoucherVerified(voucher);
+        }
+        setErpVoucherRecoveryRequired(false);
+
+        if (matchedWarehouse && matchedWarehouse.id !== currentWarehouseRef.current?.id) {
+          setActiveWarehouse(matchedWarehouse);
+          await AsyncStorage.setItem(
+            STORAGE_KEYS.GLOBAL_WAREHOUSE,
+            JSON.stringify(matchedWarehouse)
+          );
+        }
+
+        return {
+          voucher,
+          warehouse: matchedWarehouse,
+        };
+      } catch (error) {
+        logger.warn('[扫码出库] 恢复 ERP 销售出库单失败，已阻止继续扫码:', error);
+        if (
+          !screenActiveRef.current ||
+          normalizeOrderNoCandidate(orderNoRef.current) !== normalizeOrderNoCandidate(nextOrderNo)
+        ) {
+          return null;
+        }
+        if (clearOnFailure) {
+          setActiveErpVoucher(null);
+          setErpVoucherRecoveryRequired(true);
+        }
+        return null;
+      }
+    },
+    [
+      markErpVoucherVerified,
+      resolveWarehouseForErpVoucher,
+      setActiveErpVoucher,
+      setActiveWarehouse,
+    ]
+  );
+
+  const forceRefreshErpVoucherForOrder = useCallback(
+    (
+      nextOrderNo: string,
+      warehouseList: Warehouse[],
+      options: { clearOnFailure?: boolean } = {}
+    ): Promise<RefreshedErpVoucherState | null> => {
+      const account = getErpAccountByOutboundOrderNo(nextOrderNo);
+      if (!account) {
+        return Promise.resolve(null);
+      }
+
+      const refreshKey = buildErpVoucherCacheKey(account.key, nextOrderNo);
+      const inFlightRefresh = erpVoucherRefreshRef.current;
+      if (inFlightRefresh?.key === refreshKey) {
+        return inFlightRefresh.promise;
+      }
+
+      const refreshPromise = refreshErpVoucherForOrder(nextOrderNo, warehouseList, {
+        bypassProxyCache: true,
+        clearOnFailure: options.clearOnFailure,
+        forceRefresh: true,
+      }).finally(() => {
+        if (erpVoucherRefreshRef.current?.key === refreshKey) {
+          erpVoucherRefreshRef.current = null;
+        }
+      });
+
+      erpVoucherRefreshRef.current = {
+        key: refreshKey,
+        promise: refreshPromise,
+      };
+      return refreshPromise;
+    },
+    [refreshErpVoucherForOrder]
+  );
+
+  const handleRefreshErpVoucher = useCallback(async () => {
+    const activeVoucher = erpVoucherRef.current;
+    const activeVoucherIsVerified =
+      activeVoucher !== null && isErpVoucherVerified(activeVoucher);
+    const activeOrderNo = orderNoRef.current;
+    const account = activeOrderNo ? getErpAccountByOutboundOrderNo(activeOrderNo) : null;
+    if (!activeOrderNo || isErpOrderLoading || (!activeVoucher && !account)) {
+      focusScannerInput(0);
+      return;
+    }
+
+    setIsErpOrderLoading(true);
+    try {
+      const refreshed = await forceRefreshErpVoucherForOrder(activeOrderNo, warehouses, {
+        clearOnFailure: !activeVoucherIsVerified,
+      });
+      if (!refreshed) {
+        showToast(
+          activeVoucherIsVerified
+            ? 'ERP刷新失败，继续使用当前已验证单据'
+            : 'ERP验证失败，请稍后重试',
+          'warning'
+        );
+        return;
+      }
+
+      const nextCustomerName = refreshed.voucher.customerName.trim();
+      setActiveCustomerName(nextCustomerName);
+      await saveOutboundWorkDraft(
+        activeOrderNo,
+        nextCustomerName,
+        refreshed.warehouse,
+        refreshed.voucher
+      );
+      showToast('ERP销售出库单已刷新', 'success');
+    } finally {
+      setIsErpOrderLoading(false);
+      focusScannerInput(100);
+    }
+  }, [
+    focusScannerInput,
+    forceRefreshErpVoucherForOrder,
+    isErpVoucherVerified,
+    isErpOrderLoading,
+    saveOutboundWorkDraft,
+    setActiveCustomerName,
+    showToast,
+    warehouses,
+  ]);
+
   // 加载订单物料（从数据库加载已保存的记录）
-  const loadOrderMaterials = async (no: string, explicitWarehouseId?: string) => {
-    // 🔥 优先使用显式传入的 warehouseId（解决闭包问题）
-    const warehouseId = explicitWarehouseId || currentWarehouse?.id;
+  const loadOrderMaterials = useCallback(
+    async (no: string, explicitWarehouseId?: string): Promise<MaterialItem[]> => {
+      // 优先使用显式传入的 warehouseId，避免恢复流程读取旧闭包。
+      const warehouseId = explicitWarehouseId || currentWarehouse?.id;
+      const requestedOrderNo = normalizeOrderNoCandidate(no);
 
     // 确保仓库ID有效
     if (!warehouseId || typeof warehouseId !== 'string' || warehouseId.trim() === '') {
       logger.warn('[loadOrderMaterials] 仓库ID无效，无法加载订单物料');
-      return;
+      return [];
     }
 
     // 确保订单号有效
     if (!no || typeof no !== 'string' || no.trim() === '') {
       logger.warn('[loadOrderMaterials] 订单号无效，无法加载订单物料');
-      return;
+      return [];
     }
 
-    let list = await searchMaterials({
-      operation_type: 'outbound',
-      exactOrderNo: no.trim(),
-      warehouse_id: warehouseId.trim(),
-    });
+    let list = (await getMaterialsByOrder(no.trim(), warehouseId.trim())).filter(
+      isOutboundVisibleMaterial
+    );
 
-    if (list.length === 0 && explicitWarehouseId) {
-      const fallbackList = await searchMaterials({
-        operation_type: 'outbound',
-        exactOrderNo: no.trim(),
-      });
+    if (
+      !screenActiveRef.current ||
+      normalizeOrderNoCandidate(orderNoRef.current) !== requestedOrderNo
+    ) {
+      return [];
+    }
+
+    // ERP 单号已经通过账套规则确定仓库，不能被其他仓库中的同号历史记录覆盖。
+    // 仅为旧的非 ERP 本地订单保留跨仓库恢复能力。
+    if (
+      list.length === 0 &&
+      explicitWarehouseId &&
+      !getErpAccountByOutboundOrderNo(requestedOrderNo)
+    ) {
+      const fallbackList = (await getMaterialsByOrder(no.trim())).filter(
+        isOutboundVisibleMaterial
+      );
+      if (
+        !screenActiveRef.current ||
+        normalizeOrderNoCandidate(orderNoRef.current) !== requestedOrderNo
+      ) {
+        return [];
+      }
       const fallbackWarehouseId = fallbackList[0]?.warehouse_id?.trim();
-      if (fallbackList.length > 0 && fallbackWarehouseId && fallbackWarehouseId !== warehouseId.trim()) {
-        const fallbackWarehouse = warehouses.find((warehouse) => warehouse.id === fallbackWarehouseId);
+      if (
+        fallbackList.length > 0 &&
+        fallbackWarehouseId &&
+        fallbackWarehouseId !== warehouseId.trim()
+      ) {
+        const fallbackWarehouse = warehouses.find(
+          (warehouse) => warehouse.id === fallbackWarehouseId
+        );
         if (fallbackWarehouse) {
           logger.warn('[loadOrderMaterials] 当前仓库无物料，已找到同订单的其他仓库物料:', {
             orderNo: no.trim(),
@@ -859,50 +1517,84 @@ export default function PDAScanScreen() {
             fallbackWarehouseId,
           });
           setActiveWarehouse(fallbackWarehouse);
-          await AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(fallbackWarehouse));
+          await AsyncStorage.setItem(
+            STORAGE_KEYS.GLOBAL_WAREHOUSE,
+            JSON.stringify(fallbackWarehouse)
+          );
           await saveOutboundWorkDraft(no.trim(), customerNameRef.current.trim(), fallbackWarehouse);
           showAlertIfActive(
             '已切回订单仓库',
             `当前订单的物料记录在【${fallbackWarehouse.name}】，已自动切回该仓库显示。`
           );
-          list = fallbackList;
+          list = fallbackList.filter(
+            (item) => item.warehouse_id?.trim() === fallbackWarehouseId
+          );
         }
       }
     }
-    if (!screenActiveRef.current) {
-      return;
+    if (
+      !screenActiveRef.current ||
+      normalizeOrderNoCandidate(orderNoRef.current) !== requestedOrderNo
+    ) {
+      return [];
     }
-
 
     // 加载全部数据用于聚合，显示时限制10行
-    const materials = list
-      .slice()
-      .map((m) => ({
-        id: m.id,
-        model: m.model,
-        batch: m.batch,
-        quantity: String(m.quantity),
-        scannedAt: new Date(m.scanned_at),
-        version: m.version,
-        traceNo: m.traceNo,
-        sourceNo: m.sourceNo,
-        package: m.package,
-        productionDate: m.productionDate,
-        customFields: m.customFields,
-      }));
-    if (!screenActiveRef.current) {
-      return;
+    const materials = await Promise.all(
+      list.slice().map(async (material) => {
+        const item = mapMaterialRecordToMaterialItem(material);
+        if ((item.inventoryCode || '').trim() || !item.model.trim()) {
+          return item;
+        }
+
+        try {
+          return {
+            ...item,
+            inventoryCode: ((await getInventoryCodeByModel(item.model, item.version)) || '').trim(),
+          };
+        } catch (error) {
+          logger.warn('[loadOrderMaterials] 补齐存货编码失败:', {
+            error,
+            model: item.model,
+            version: item.version,
+          });
+          return item;
+        }
+      })
+    );
+    if (
+      !screenActiveRef.current ||
+      normalizeOrderNoCandidate(orderNoRef.current) !== requestedOrderNo
+    ) {
+      return [];
     }
 
+    scanRecordsRef.current = materials;
     setScanRecords(materials);
-  };
+    return materials;
+    },
+    [
+      currentWarehouse?.id,
+      saveOutboundWorkDraft,
+      setActiveWarehouse,
+      showAlertIfActive,
+      warehouses,
+    ]
+  );
+
+  useLayoutEffect(() => {
+    loadOutboundStateRef.current = loadOutboundState;
+    loadOrderMaterialsRef.current = loadOrderMaterials;
+    forceRefreshErpVoucherForOrderRef.current = forceRefreshErpVoucherForOrder;
+  }, [forceRefreshErpVoucherForOrder, loadOrderMaterials, loadOutboundState]);
 
   // 处理扫描（带参数版本）
   const processScan = useCallback(
     async (code: string) => {
       const activeOrderNo = orderNoRef.current;
-      const activeCustomerName = customerNameRef.current;
+      let activeCustomerName = customerNameRef.current;
       const activeWarehouse = currentWarehouseRef.current;
+      let activeErpVoucher = erpVoucherRef.current;
       logger.log('[processScan] 开始处理扫码:', code);
       logger.log('[processScan] 当前订单号:', activeOrderNo);
       logger.log('[processScan] 当前客户名称:', activeCustomerName);
@@ -911,6 +1603,10 @@ export default function PDAScanScreen() {
       if (!code || processingRef.current) return;
 
       const normalizedOrderCode = normalizeOrderNoCandidate(code);
+      const matchedErpAccount = getErpAccountByOutboundOrderNo(normalizedOrderCode);
+      const activeErpAccount = activeOrderNo
+        ? getErpAccountByOutboundOrderNo(activeOrderNo)
+        : null;
       const hasWarehouseSampleRules = Object.keys(outboundWarehouseOrderRules).length > 0;
       const matchedWarehouseRules = getMatchingOutboundWarehouseOrderRules(
         normalizedOrderCode,
@@ -923,10 +1619,20 @@ export default function PDAScanScreen() {
       const legacyParsedOrderNo = hasWarehouseSampleRules
         ? null
         : parseOutboundOrderNo(normalizedOrderCode, outboundOrderRule);
-      const isOrderNoScan = matchedAvailableWarehouseRules.length > 0 || legacyParsedOrderNo !== null;
-      const hasCustomerBound = activeCustomerName.trim().length > 0;
-      const waitingForCustomer = !!activeOrderNo && !hasCustomerBound;
-
+      const isOrderNoScan =
+        matchedErpAccount !== null ||
+        matchedAvailableWarehouseRules.length > 0 ||
+        legacyParsedOrderNo !== null;
+      if (erpVoucherRecoveryRequired && activeOrderNo && !isOrderNoScan) {
+        showToast('ERP单据未验证，请重新扫描订单或点击刷新', 'error');
+        feedbackError();
+        return;
+      }
+      if (activeErpAccount && !activeErpVoucher && !isOrderNoScan) {
+        showToast('ERP单据尚未验证，请重新扫描订单或点击刷新', 'error');
+        feedbackError();
+        return;
+      }
       // 如果当前没有订单号，扫描内容必须是订单号格式
       if (!activeOrderNo && !isOrderNoScan) {
         showToast(
@@ -944,135 +1650,167 @@ export default function PDAScanScreen() {
       try {
         // 判断是否是订单号格式
         if (isOrderNoScan) {
-          let matchedWarehouse = activeWarehouse;
-          if (hasWarehouseSampleRules) {
-            if (matchedAvailableWarehouseRules.length > 1) {
-              showToast('出库单号匹配多个仓库，请检查样例规则', 'error');
-              feedbackError();
+          if (matchedErpAccount) {
+            if (
+              activeErpVoucher &&
+              normalizeOrderNoCandidate(activeErpVoucher.code) === normalizedOrderCode
+            ) {
+              const workWarehouse = activeWarehouse || currentWarehouseRef.current;
+              if (workWarehouse) {
+                await saveOutboundWorkDraft(
+                  normalizedOrderCode,
+                  activeCustomerName.trim() || activeErpVoucher.customerName,
+                  workWarehouse,
+                  activeErpVoucher
+                );
+              }
+              showToast('当前ERP单据已恢复，继续扫码', 'success');
+              feedbackSuccess();
               return;
             }
 
-            const matchedWarehouseId = matchedAvailableWarehouseRules[0]?.warehouseId;
-            const boundWarehouse = warehouses.find(
-              (warehouse) => String(warehouse.id) === matchedWarehouseId
+            setIsErpOrderLoading(true);
+            const { fromCache, voucher } = await loadSaleDispatchVoucher(
+              matchedErpAccount,
+              normalizedOrderCode,
+              { bypassProxyCache: true }
             );
-            if (!boundWarehouse) {
-              showToast('出库单号未匹配有效仓库，请检查样例规则', 'error');
+            if (!screenActiveRef.current) {
+              return;
+            }
+            const matchedWarehouse = resolveWarehouseForErpVoucher(
+              voucher,
+              warehouses
+            );
+
+            if (!matchedWarehouse) {
+              showToast(
+                `本地未找到ERP仓库：${voucher.warehouseName || voucher.expectedWarehouseName || '-'}`,
+                'error'
+              );
               feedbackError();
               return;
             }
 
-            matchedWarehouse = boundWarehouse;
-            if (!activeWarehouse || activeWarehouse.id !== boundWarehouse.id) {
-              setActiveWarehouse(boundWarehouse);
+            if (
+              !matchedWarehouse.id ||
+              typeof matchedWarehouse.id !== 'string' ||
+              matchedWarehouse.id.trim() === ''
+            ) {
+              showToast('仓库信息无效，请重新选择仓库', 'error');
+              feedbackError();
+              return;
+            }
+
+            if (!activeWarehouse || activeWarehouse.id !== matchedWarehouse.id) {
+              setActiveWarehouse(matchedWarehouse);
               await AsyncStorage.setItem(
                 STORAGE_KEYS.GLOBAL_WAREHOUSE,
-                JSON.stringify(boundWarehouse)
+                JSON.stringify(matchedWarehouse)
               );
             }
-          }
 
-          // 确保仓库已加载
-          if (!matchedWarehouse) {
-            showToast('请先选择仓库', 'error');
-            feedbackError();
-            return;
-          }
+            const isSameOrder =
+              normalizeOrderNoCandidate(activeOrderNo) === normalizedOrderCode;
+            const isSwitchingOrder =
+              !isSameOrder && scanRecordsRef.current.length > 0;
+            const existing = await getOrder(normalizedOrderCode, matchedWarehouse.id);
+            const nextCustomerName = (voucher.customerName || existing?.customer_name || '').trim();
 
-          // 确保仓库ID有效
-          if (
-            !matchedWarehouse.id ||
-            typeof matchedWarehouse.id !== 'string' ||
-            matchedWarehouse.id.trim() === ''
-          ) {
-            showToast('仓库信息无效，请重新选择仓库', 'error');
-            feedbackError();
-            return;
-          }
+            scanRecordsRef.current = [];
+            setScanRecords([]);
+            expandedGroupsRef.current = new Set();
+            setExpandedGroups(new Set());
+            setActiveOrderNo(normalizedOrderCode);
+            setActiveCustomerName(nextCustomerName);
+            if (fromCache) {
+              markErpVoucherUnverified();
+            }
+            setActiveErpVoucher(voucher);
+            if (!fromCache) {
+              markErpVoucherVerified(voucher);
+            }
+            setErpVoucherRecoveryRequired(false);
 
-          // 切换/新建当前出库作业。草稿只恢复现场，不直接创建空订单。
-          const isSwitchingOrder = !!activeOrderNo && activeOrderNo !== normalizedOrderCode;
-          const isSameOrder = activeOrderNo === normalizedOrderCode;
-          const existing = await getOrder(normalizedOrderCode, matchedWarehouse.id);
+            await Promise.all([
+              upsertOrder(normalizedOrderCode, nextCustomerName, {
+                id: matchedWarehouse.id,
+                name: matchedWarehouse.name,
+              }),
+              saveOutboundWorkDraft(
+                normalizedOrderCode,
+                nextCustomerName,
+                matchedWarehouse,
+                voucher
+              ),
+              loadOrderMaterials(normalizedOrderCode, matchedWarehouse.id),
+            ]);
 
-          setScanRecords([]); // 清空当前列表
-          expandedGroupsRef.current = new Set();
-          setExpandedGroups(new Set());
-          const nextCustomerName = (
-            existing?.customer_name ||
-            (isSameOrder ? activeCustomerName : '') ||
-            ''
-          ).trim();
-          setActiveOrderNo(normalizedOrderCode);
-          setActiveCustomerName(nextCustomerName);
-          await saveOutboundWorkDraft(normalizedOrderCode, nextCustomerName, matchedWarehouse);
+            if (fromCache) {
+              void forceRefreshErpVoucherForOrder(normalizedOrderCode, warehouses)
+                .then(async (refreshed) => {
+                  if (
+                    !refreshed ||
+                    !screenActiveRef.current ||
+                    normalizeOrderNoCandidate(orderNoRef.current) !== normalizedOrderCode
+                  ) {
+                    return;
+                  }
 
-          if (existing) {
-            await loadOrderMaterials(normalizedOrderCode, matchedWarehouse.id);
+                  const refreshedCustomerName = refreshed.voucher.customerName.trim();
+                  setActiveCustomerName(refreshedCustomerName);
+                  await Promise.all([
+                    upsertOrder(normalizedOrderCode, refreshedCustomerName, {
+                      id: refreshed.warehouse.id,
+                      name: refreshed.warehouse.name,
+                    }),
+                    saveOutboundWorkDraft(
+                      normalizedOrderCode,
+                      refreshedCustomerName,
+                      refreshed.warehouse,
+                      refreshed.voucher
+                    ),
+                  ]);
+                  if (refreshed.warehouse.id !== matchedWarehouse.id) {
+                    await loadOrderMaterials(normalizedOrderCode, refreshed.warehouse.id);
+                  }
+                })
+                .catch((error) => {
+                  logger.warn('[扫码出库] 本机缓存载入后的ERP实时核验失败:', error);
+                });
+            }
 
-            if (nextCustomerName) {
-              showToast(
-                isSwitchingOrder
-                  ? '已切换订单，继续扫码'
-                  : '当前订单已恢复，继续扫码',
-                'warning'
-              );
+            let orderLoadedMessage = `${matchedErpAccount.name}单据已载入`;
+            if (isSameOrder) {
+              orderLoadedMessage = fromCache
+                ? '当前ERP单据已恢复，正在核验ERP'
+                : '当前ERP单据已恢复，继续扫码';
+            } else if (isSwitchingOrder) {
+              orderLoadedMessage = fromCache
+                ? `已切换到${matchedErpAccount.name}单据，正在核验ERP`
+                : `已切换到${matchedErpAccount.name}单据`;
+            } else if (fromCache) {
+              orderLoadedMessage = `${matchedErpAccount.name}单据已载入，正在核验ERP`;
+            }
+
+            showToast(
+              orderLoadedMessage,
+              isSwitchingOrder ? 'warning' : 'success'
+            );
+            if (isSameOrder) {
+              feedbackSuccess();
+            } else if (isSwitchingOrder) {
               feedbackSwitchOrder();
             } else {
-              showToast(
-                isSwitchingOrder ? '已切换订单，请扫描客户' : '订单已识别，请扫描客户',
-                'warning'
-              );
-              feedbackNeedCustomerName(false);
+              feedbackNewOrder();
             }
-          } else {
-            showToast(
-              isSwitchingOrder ? '已切换订单，请扫描客户' : '订单已识别，请扫描客户',
-              'success'
-            );
-            feedbackNeedCustomerName(true);
-          }
-          return;
-        }
-
-        if (waitingForCustomer) {
-          const workWarehouse = currentWarehouseRef.current;
-          if (!workWarehouse) {
-            showToast('请选择仓库', 'warning');
-            feedbackWarning();
-            setShowWarehousePicker(true);
             return;
           }
 
-          if (!isValidCustomerNameScan(code, outboundOrderRule, outboundWarehouseOrderRules)) {
-            showToast('请扫描客户名称二维码', 'error');
-            feedbackError();
-            return;
-          }
-
-          const normalizedCustomerName = normalizeCustomerNameScan(code);
-          let orderSaved = true;
-          try {
-            await upsertOrder(activeOrderNo, normalizedCustomerName, {
-              id: workWarehouse.id,
-              name: workWarehouse.name,
-            });
-          } catch (error) {
-            orderSaved = false;
-            logger.warn(
-              '[扫码出库] 客户名称已识别，但订单写入暂时失败，将在首条物料扫码时补写:',
-              error
-            );
-          }
-          setActiveCustomerName(normalizedCustomerName);
-          await saveOutboundWorkDraft(activeOrderNo, normalizedCustomerName, workWarehouse);
-          showToast(
-            orderSaved
-              ? `客户已识别：${normalizedCustomerName}`
-              : `客户已识别：${normalizedCustomerName}，订单将在扫物料时补写`,
-            orderSaved ? 'success' : 'warning'
-          );
-          feedbackCustomerSuccess();
+          setActiveErpVoucher(null);
+          setErpVoucherRecoveryRequired(false);
+          showToast('出库单未匹配到ERP账套，请检查单号规则', 'error');
+          feedbackError();
           return;
         }
 
@@ -1083,7 +1821,7 @@ export default function PDAScanScreen() {
           return;
         }
 
-        const workWarehouse = currentWarehouseRef.current;
+        let workWarehouse = currentWarehouseRef.current;
         if (!workWarehouse) {
           showToast('请选择仓库', 'warning');
           feedbackWarning();
@@ -1102,12 +1840,6 @@ export default function PDAScanScreen() {
           return;
         }
 
-        if (isValidCustomerNameScan(code, outboundOrderRule, outboundWarehouseOrderRules) && !isQRCode(code)) {
-          showToast('当前步骤请扫描物料二维码', 'warning');
-          feedbackWarning();
-          return;
-        }
-
         // 解析
         let parsed: {
           model: string;
@@ -1123,6 +1855,7 @@ export default function PDAScanScreen() {
 
         // 保存扫码时使用的分隔符和规则名称
         let separator = ',';
+        let ruleId = '';
         let ruleName = '';
         let customFields: Record<string, string> = {};
 
@@ -1130,6 +1863,7 @@ export default function PDAScanScreen() {
           const rule = await detectRule(code);
           if (rule) {
             separator = rule.separator || ',';
+            ruleId = rule.id || '';
             ruleName = rule.name || '';
             const { standardFields, customFields: parsedCustomFields } = parseWithRule(code, rule);
             parsed = {
@@ -1144,30 +1878,13 @@ export default function PDAScanScreen() {
             };
             customFields = parsedCustomFields || {};
           }
-          // 静默失败，走兜底逻辑 parseQRCodeSync
         } catch (error) {
-          logger.warn('[扫码出库] 规则解析失败，使用兜底解析:', error);
+          logger.error('[扫码出库] 规则解析失败:', error);
+          throw error;
         }
 
         if (!parsed) {
-          // 兜底：使用 qrcodeParser 的同步解析（不依赖数据库）
-          const fallback = parseQRCodeSync(code);
-          if (fallback) {
-            parsed = {
-              model: fallback.model,
-              batch: fallback.batch,
-              quantity: fallback.quantity,
-              traceNo: fallback.traceNo,
-              sourceNo: fallback.sourceNo,
-              package: fallback.package,
-              version: fallback.version,
-              productionDate: fallback.productionDate,
-            };
-          }
-        }
-
-        if (!parsed) {
-          showToast('未识别到有效内容', 'error');
+          showToast('没有匹配的二维码解析规则，请先在设置中配置', 'error');
           feedbackError();
           return;
         }
@@ -1187,7 +1904,48 @@ export default function PDAScanScreen() {
             quantity: parsed.quantity,
             model: normalizedModel,
           });
+          showToast('二维码数量无效，请重新扫描', 'error');
+          feedbackError();
           return;
+        }
+
+        if (activeErpVoucher) {
+          const latestErpVoucher = erpVoucherRef.current;
+          if (
+            latestErpVoucher &&
+            buildErpVoucherCacheKey(latestErpVoucher.accountKey, latestErpVoucher.code) ===
+              buildErpVoucherCacheKey(activeErpVoucher.accountKey, activeErpVoucher.code) &&
+            isErpVoucherVerified(latestErpVoucher)
+          ) {
+            activeErpVoucher = latestErpVoucher;
+          }
+        }
+
+        if (activeErpVoucher && !isErpVoucherVerified(activeErpVoucher)) {
+          setIsErpOrderLoading(true);
+          const refreshed = await forceRefreshErpVoucherForOrder(activeOrderNo, warehouses);
+          if (!refreshed) {
+            showToast('ERP单据实时核验失败，已阻止本次物料扫码', 'error');
+            feedbackError();
+            return;
+          }
+
+          activeErpVoucher = refreshed.voucher;
+          workWarehouse = refreshed.warehouse;
+          activeCustomerName = refreshed.voucher.customerName.trim();
+          setActiveCustomerName(activeCustomerName);
+          await Promise.all([
+            upsertOrder(activeOrderNo, activeCustomerName, {
+              id: workWarehouse.id,
+              name: workWarehouse.name,
+            }),
+            saveOutboundWorkDraft(
+              activeOrderNo,
+              activeCustomerName,
+              workWarehouse,
+              activeErpVoucher
+            ),
+          ]);
         }
 
         // 检查重复 + 查找存货编码（并行查询，性能优化）
@@ -1208,7 +1966,7 @@ export default function PDAScanScreen() {
             normalizedQuantity.toString(),
             workWarehouse.id
           ),
-          getInventoryCodeByModel(normalizedModel),
+          getInventoryCodeByModel(normalizedModel, parsed.version),
         ]);
         logger.log('[扫码出库] 重复检查结果:', check);
         logger.log('[扫码出库] 存货编码:', inventoryCode);
@@ -1217,6 +1975,98 @@ export default function PDAScanScreen() {
           showToast('已扫过此追溯码', 'warning');
           feedbackDuplicate();
           return;
+        }
+
+        const normalizedInventoryCode = normalizeInventoryCode(inventoryCode);
+        let successToastText = `已扫码：${normalizedModel}`;
+
+        if (activeErpVoucher) {
+          if (!normalizedInventoryCode) {
+            showToast(
+              `未绑定存货编码：${normalizedModel}${parsed.version ? ` / ${parsed.version}` : ''}`,
+              'error'
+            );
+            feedbackNotBound();
+            return;
+          }
+
+          const matchedErpLine = activeErpVoucher.lines.find(
+            (line) => normalizeInventoryCode(line.inventoryCode) === normalizedInventoryCode
+          );
+          const erpRequiredQuantity = activeErpVoucher.lines.reduce(
+            (sum, line) =>
+              normalizeInventoryCode(line.inventoryCode) === normalizedInventoryCode
+                ? sum + line.quantity
+                : sum,
+            0
+          );
+
+          if (!matchedErpLine || erpRequiredQuantity <= 0) {
+            showToast(
+              `不在ERP出库单：${normalizedModel}${parsed.version ? ` / ${parsed.version}` : ''}`,
+              'error'
+            );
+            feedbackNotInOrder();
+            return;
+          }
+
+          const scannedQuantity = scanRecordsRef.current.reduce((sum, item) => {
+            if (normalizeInventoryCode(item.inventoryCode) !== normalizedInventoryCode) {
+              return sum;
+            }
+
+            return sum + (parseQuantity(item.quantity) ?? 0);
+          }, 0);
+
+          if (scannedQuantity + normalizedQuantity > erpRequiredQuantity) {
+            const remainingQuantity = Math.max(0, erpRequiredQuantity - scannedQuantity);
+            if (remainingQuantity <= 0) {
+              showToast(`本物料已扫够：${normalizedModel}`, 'warning');
+              feedbackOverQuantity();
+              return;
+            }
+
+            const splitRemainingQuantity = normalizedQuantity - remainingQuantity;
+            const nextPendingOutboundUnpack: PendingOutboundUnpack = {
+              lineSpecification: matchedErpLine.specification,
+              newTraceNo: await buildNextUnpackTraceNo(parsed.traceNo),
+              originalQuantity: normalizedQuantity,
+              rawContent: code,
+              remainingQuantity: splitRemainingQuantity,
+              savedPayload: {
+                orderNo: activeOrderNo,
+                customerName: activeCustomerName.trim(),
+                model: normalizedModel,
+                batch: parsed.batch || '',
+                quantity: normalizedQuantity.toString(),
+                traceNo: parsed.traceNo,
+                sourceNo: parsed.sourceNo,
+                package: parsed.package,
+                version: parsed.version,
+                productionDate: parsed.productionDate,
+                separator,
+                ruleId,
+                ruleName,
+                customFields,
+                inventoryCode: normalizedInventoryCode,
+                warehouseId: workWarehouse.id,
+                warehouseName: workWarehouse.name,
+              },
+              shippedQuantity: remainingQuantity,
+            };
+            setOutboundUnpackNotes('');
+            pendingOutboundUnpackRef.current = nextPendingOutboundUnpack;
+            setPendingOutboundUnpack(nextPendingOutboundUnpack);
+            showToast('需要拆包确认', 'warning');
+            feedbackWarning();
+            return;
+          }
+
+          const nextRemainingQuantity = Math.max(
+            0,
+            erpRequiredQuantity - scannedQuantity - normalizedQuantity
+          );
+          successToastText = `已扫：${normalizedModel}，剩余 ${nextRemainingQuantity}`;
         }
 
         // 扫码出库必须在数据库提交成功后再提示成功，避免“已扫码”但实际未落库。
@@ -1232,88 +2082,92 @@ export default function PDAScanScreen() {
           version: parsed.version,
           productionDate: parsed.productionDate,
           separator,
+          ruleId,
           ruleName,
           customFields,
-          inventoryCode: inventoryCode || '',
+          inventoryCode: normalizedInventoryCode,
           warehouseId: workWarehouse.id,
           warehouseName: workWarehouse.name,
         };
-        const materialId = await addMaterialWithOrder({
-          order_no: activeOrderNo,
-          customer_name: savedPayload.customerName || '',
-          operation_type: 'outbound',
-          model: savedPayload.model || '',
-          batch: savedPayload.batch || '',
-          quantity: parseQuantity(savedPayload.quantity || '1') ?? 1,
-          traceNo: savedPayload.traceNo,
-          sourceNo: savedPayload.sourceNo,
-          package: savedPayload.package,
-          version: savedPayload.version,
-          productionDate: savedPayload.productionDate,
-          raw_content: code,
-          separator: savedPayload.separator,
-          rule_name: savedPayload.ruleName,
-          customFields: savedPayload.customFields,
-          scanned_at: getISODateTime(),
-          warehouse_id: savedPayload.warehouseId,
-          warehouse_name: savedPayload.warehouseName,
-          inventory_code: savedPayload.inventoryCode || '',
-        }, savedPayload.customerName || '', {
-          id: savedPayload.warehouseId,
-          name: savedPayload.warehouseName,
-        });
+        const materialId = await addMaterialWithOrder(
+          {
+            order_no: activeOrderNo,
+            customer_name: savedPayload.customerName || '',
+            operation_type: 'outbound',
+            model: savedPayload.model || '',
+            batch: savedPayload.batch || '',
+            quantity: parseQuantity(savedPayload.quantity || '1') ?? 1,
+            traceNo: savedPayload.traceNo,
+            sourceNo: savedPayload.sourceNo,
+            package: savedPayload.package,
+            version: savedPayload.version,
+            productionDate: savedPayload.productionDate,
+            raw_content: code,
+            separator: savedPayload.separator,
+            rule_id: savedPayload.ruleId,
+            rule_name: savedPayload.ruleName,
+            customFields: savedPayload.customFields,
+            scanned_at: getISODateTime(),
+            warehouse_id: savedPayload.warehouseId,
+            warehouse_name: savedPayload.warehouseName,
+            inventory_code: savedPayload.inventoryCode || '',
+          },
+          savedPayload.customerName || '',
+          {
+            id: savedPayload.warehouseId,
+            name: savedPayload.warehouseName,
+          }
+        );
 
         await saveOutboundWorkDraft(activeOrderNo, activeCustomerName.trim(), workWarehouse);
 
         if (activeOrderNo === orderNoRef.current) {
           const savedItem = mapQueueItemToMaterialItem(materialId, savedPayload);
-          setScanRecords((prev) => {
-            const preservedItems = prev.filter((item) => item.id !== savedItem.id);
-            return [savedItem, ...preservedItems];
-          });
+          const preservedItems = scanRecordsRef.current.filter(
+            (item) => item.id !== savedItem.id
+          );
+          const nextRecords = [savedItem, ...preservedItems];
+          scanRecordsRef.current = nextRecords;
+          setScanRecords(nextRecords);
         }
 
-        showToast(`已扫码：${normalizedModel}`, 'success');
+        showToast(successToastText, 'success');
         feedbackSuccess();
       } catch (e) {
         logger.error('[扫码出库] 处理失败:', e);
-        const errorMessage = e instanceof Error ? e.message : String(e);
+        const errorMessage = formatUserFacingErrorMessage(e, '扫码处理失败，请重新扫描');
         showToast(`处理失败：${errorMessage}`, 'error');
         feedbackError();
       } finally {
+        setIsErpOrderLoading(false);
         // 给扫码枪留一个很短的输入窗口，避免上一条还在处理时下一条被吞掉。
-        if (postProcessTimerRef.current) {
-          clearTimeout(postProcessTimerRef.current);
-        }
-        postProcessTimerRef.current = setTimeout(() => {
-          postProcessTimerRef.current = null;
-          processingRef.current = false;
-          if (!screenActiveRef.current) {
-            return;
-          }
-
-          const nextPendingCode = pendingScanCodesRef.current.shift();
-          if (nextPendingCode) {
-            processScan(nextPendingCode);
-            return;
-          }
-
-          focusScannerInput(0);
-        }, 170);
+        resumePendingScanCodes(170);
       }
     },
     [
-      focusScannerInput,
+      forceRefreshErpVoucherForOrder,
+      isErpVoucherVerified,
+      loadOrderMaterials,
+      markErpVoucherVerified,
+      markErpVoucherUnverified,
       outboundOrderRule,
       outboundWarehouseOrderRules,
+      erpVoucherRecoveryRequired,
+      resolveWarehouseForErpVoucher,
+      resumePendingScanCodes,
       saveOutboundWorkDraft,
       setActiveCustomerName,
+      setActiveErpVoucher,
       setActiveOrderNo,
       setActiveWarehouse,
       showToast,
       warehouses,
     ]
   );
+
+  useEffect(() => {
+    processScanRef.current = processScan;
+  }, [processScan]);
 
   // 聚合物料（按型号+版本，显示规则与扫码入库保持一致）
   const aggregateMaterials = useMemo(() => {
@@ -1358,72 +2212,131 @@ export default function PDAScanScreen() {
     [aggregateMaterials]
   );
 
-  const workflowMetrics = useMemo<WorkflowMetric[]>(
+  const erpLineProgressItems = useMemo<ErpLineProgress[]>(() => {
+    if (!erpVoucher) {
+      return [];
+    }
+
+    const progressMap = new Map<string, ErpLineProgress>();
+
+    erpVoucher.lines.forEach((line) => {
+      const inventoryCode = normalizeInventoryCode(line.inventoryCode);
+      const key = buildErpLineProgressKey(inventoryCode);
+      const existing = progressMap.get(key);
+
+      if (existing) {
+        existing.requiredQuantity += line.quantity;
+        existing.remainingQuantity += line.quantity;
+        if (!existing.inventoryName && line.inventoryName) {
+          existing.inventoryName = line.inventoryName;
+        }
+        if (!existing.specification && line.specification) {
+          existing.specification = line.specification;
+        }
+        if (!existing.unitName && line.unitName) {
+          existing.unitName = line.unitName;
+        }
+        return;
+      }
+
+      progressMap.set(key, {
+        inventoryCode,
+        inventoryName: line.inventoryName,
+        key,
+        remainingQuantity: line.quantity,
+        requiredQuantity: line.quantity,
+        scannedItems: [],
+        scannedQuantity: 0,
+        specification: line.specification,
+        status: 'pending',
+        unitName: line.unitName || 'PCS',
+      });
+    });
+
+    const scannedByInventoryCode = new Map<string, MaterialItem[]>();
+    scanRecords.forEach((item) => {
+      const inventoryCode = normalizeInventoryCode(item.inventoryCode);
+      if (!inventoryCode) {
+        return;
+      }
+
+      const list = scannedByInventoryCode.get(inventoryCode) || [];
+      list.push(item);
+      scannedByInventoryCode.set(inventoryCode, list);
+    });
+
+    progressMap.forEach((progress) => {
+      const scannedItems = scannedByInventoryCode.get(progress.inventoryCode) || [];
+      const scannedQuantity = scannedItems.reduce(
+        (sum, item) => sum + (parseQuantity(item.quantity, { min: 0 }) ?? 0),
+        0
+      );
+
+      progress.scannedItems = scannedItems.slice().sort((a, b) => b.id.localeCompare(a.id));
+      progress.scannedQuantity = scannedQuantity;
+      progress.remainingQuantity = progress.requiredQuantity - scannedQuantity;
+      progress.status =
+        scannedQuantity > progress.requiredQuantity
+          ? 'over'
+          : scannedQuantity === progress.requiredQuantity
+            ? 'complete'
+            : scannedQuantity > 0
+              ? 'partial'
+              : 'pending';
+    });
+
+    return Array.from(progressMap.values());
+  }, [erpVoucher, scanRecords]);
+
+  const erpRequiredTotal = useMemo(
+    () => erpLineProgressItems.reduce((sum, line) => sum + line.requiredQuantity, 0),
+    [erpLineProgressItems]
+  );
+  const isErpOrderComplete =
+    Boolean(erpVoucher) &&
+    erpLineProgressItems.length > 0 &&
+    erpLineProgressItems.every((line) => line.status === 'complete');
+
+  const workflowSummaryItems = useMemo(
     () => {
-      const workStatus = !orderNo
-        ? { value: '待扫订单', tone: 'default' as const }
-        : !customerName
-          ? { value: '待扫客户', tone: 'warning' as const }
-          : scanRecords.length === 0
-            ? { value: '待扫物料', tone: 'accent' as const }
-            : { value: '作业中', tone: 'success' as const };
+      const inferredAccount = orderNo ? getErpAccountByOutboundOrderNo(orderNo) : null;
 
       return [
         {
-          key: 'status',
-          label: '状态',
-          value: workStatus.value,
-          tone: workStatus.tone,
+          key: 'account',
+          label: '账套',
+          value: erpVoucher?.accountName || inferredAccount?.name || '待识别',
+          icon: 'layers' as const,
+          color: erpVoucher || inferredAccount ? theme.success : theme.textMuted,
         },
         {
           key: 'order',
-          label: '订单',
-          value: orderNo || '—',
-          tone: orderNo ? 'success' : 'default',
+          label: '出库单号',
+          value: orderNo || '待扫描',
+          icon: 'file-text' as const,
+          color: orderNo ? theme.success : theme.textMuted,
         },
         {
           key: 'customer',
           label: '客户',
-          value: customerName || '—',
-          tone: customerName ? 'success' : 'default',
+          value: customerName || (orderNo ? 'ERP未返回' : '待自动带出'),
+          icon: 'user' as const,
+          color: customerName ? theme.success : theme.warning,
         },
       ];
     },
-    [customerName, orderNo, scanRecords.length]
+    [customerName, erpVoucher, orderNo, theme.success, theme.textMuted, theme.warning]
   );
-
-  const outboundListState = useMemo(
-    () => Array.from(expandedGroups).sort().join('|'),
-    [expandedGroups]
-  );
-
-  const renderAggregatedGroup = useCallback(
-    ({ item }: { item: AggregatedGroup }) => {
-      const isExpanded = expandedGroupsRef.current.has(item.key);
-      return (
-        <RecordItem
-          group={item}
-          isExpanded={isExpanded}
-          onToggle={toggleExpand}
-          onDeleteItem={handleDeleteItem}
-          styles={styles}
-        />
-      );
-    },
-    [outboundListState, orderNo, styles]
-  );
-
-  const aggregatedGroupKeyExtractor = useCallback((item: AggregatedGroup) => item.key, []);
 
   // 切换展开/折叠
-  const toggleExpand = (key: string) => {
+  const toggleExpand = useCallback((key: string) => {
     if (expandedGroupsRef.current.has(key)) {
       expandedGroupsRef.current.delete(key);
     } else {
       expandedGroupsRef.current.add(key);
     }
     setExpandedGroups(new Set(expandedGroupsRef.current));
-  };
+  }, []);
 
   // 删除单个物料
   const handleDeleteItem = useCallback(
@@ -1452,8 +2365,170 @@ export default function PDAScanScreen() {
     [alert, loadOrderMaterials, orderNo, showToast]
   );
 
+  const renderOutboundRight = useCallback(
+    (group: AggregatedGroup) => (
+      <View style={styles.itemRight}>
+        <Text style={styles.itemQty}>{group.totalQuantity.toLocaleString()}</Text>
+      </View>
+    ),
+    [styles.itemQty, styles.itemRight]
+  );
+
+  const renderOutboundDetail = useCallback(
+    (item: MaterialItem) => (
+      <TouchableOpacity
+        key={item.id}
+        style={styles.detailItem}
+        onLongPress={() => handleDeleteItem(item)}
+        delayLongPress={500}
+      >
+        <Text style={styles.detailText}>
+          批次: {item.batch || '-'} | 生产日期: {item.productionDate || '-'} | 数量:{' '}
+          {parseInt(item.quantity, 10) || 0}
+        </Text>
+      </TouchableOpacity>
+    ),
+    [handleDeleteItem, styles.detailItem, styles.detailText]
+  );
+
+  const renderErpLineDetail = useCallback(
+    (item: MaterialItem) => (
+      <TouchableOpacity
+        key={item.id}
+        style={styles.erpLineDetailItem}
+        onLongPress={() => handleDeleteItem(item)}
+        delayLongPress={500}
+      >
+        <Text style={styles.detailText}>
+          {item.model || '-'}{item.version ? ` / ${item.version}` : ''} · 数量{' '}
+          {parseQuantity(item.quantity, { min: 0 }) ?? 0}
+        </Text>
+        <Text style={styles.detailText}>
+          批次: {item.batch || '-'} | 追溯码: {item.traceNo || '-'}
+        </Text>
+      </TouchableOpacity>
+    ),
+    [handleDeleteItem, styles.detailText, styles.erpLineDetailItem]
+  );
+
+  const renderErpLineProgress = useCallback(
+    ({ item }: { item: ErpLineProgress }) => {
+      const isExpanded = expandedGroups.has(item.key);
+      const progressRatio =
+        item.requiredQuantity > 0
+          ? Math.min(1, Math.max(0, item.scannedQuantity / item.requiredQuantity))
+          : 0;
+      const statusMeta =
+        item.status === 'complete'
+          ? { label: '完成', color: theme.success }
+          : item.status === 'over'
+            ? { label: '超量', color: theme.error }
+            : item.status === 'partial'
+              ? { label: '进行中', color: theme.primary }
+              : { label: '待扫', color: theme.textMuted };
+
+      return (
+        <View style={styles.erpLineCard}>
+          <TouchableOpacity
+            style={styles.erpLineMain}
+            activeOpacity={0.76}
+            onPress={() => toggleExpand(item.key)}
+          >
+            <View style={styles.erpLineContent}>
+              <Text style={styles.erpLineCode} numberOfLines={2} ellipsizeMode="tail">
+                {item.specification || '物料明细'}
+              </Text>
+              <View style={styles.erpLineProgressTrack}>
+                <View
+                  style={[
+                    styles.erpLineProgressFill,
+                    { backgroundColor: statusMeta.color, flex: progressRatio },
+                  ]}
+                />
+                <View style={{ flex: 1 - progressRatio }} />
+              </View>
+              <View style={styles.erpLineMetaRow}>
+                <Text style={styles.erpLineMetaText}>
+                  应出 {item.requiredQuantity.toLocaleString()} / 已扫{' '}
+                  {item.scannedQuantity.toLocaleString()}
+                </Text>
+                <Text style={[styles.erpLineMetaText, { color: statusMeta.color }]}>
+                  剩余 {Math.max(0, item.remainingQuantity).toLocaleString()} · {statusMeta.label}
+                </Text>
+              </View>
+            </View>
+            <Feather
+              name={isExpanded ? 'chevron-up' : 'chevron-down'}
+              size={17}
+              color={theme.textMuted}
+            />
+          </TouchableOpacity>
+
+          {isExpanded ? (
+            <View style={styles.erpLineDetails}>
+              {item.scannedItems.length > 0 ? (
+                item.scannedItems.map(renderErpLineDetail)
+              ) : (
+                <Text style={styles.erpLineEmptyText}>暂无已扫明细</Text>
+              )}
+            </View>
+          ) : null}
+        </View>
+      );
+    },
+    [
+      expandedGroups,
+      renderErpLineDetail,
+      styles,
+      theme.error,
+      theme.primary,
+      theme.success,
+      theme.textMuted,
+      toggleExpand,
+    ]
+  );
+
+  const renderAggregatedGroup = useCallback(
+    ({ item }: { item: AggregatedGroup }) => {
+      const isExpanded = expandedGroups.has(item.key);
+      return (
+        <AggregatedRecordItem
+          groupKey={item.key}
+          model={item.model}
+          version={item.version}
+          totalQuantity={item.totalQuantity}
+          records={item.items}
+          isExpanded={isExpanded}
+          onToggle={toggleExpand}
+          recordSignatureFields={MATERIAL_ITEM_SIGNATURE_FIELDS}
+          compareValues={[item.boxCount]}
+          containerStyle={styles.itemContainer}
+          rowStyle={styles.itemRow}
+          contentStyle={styles.itemLeft}
+          titleStyle={styles.itemModel}
+          subtitleStyle={styles.itemBatch}
+          detailsContainerStyle={styles.detailsContainer}
+          chevronColor={theme.textPrimary}
+          renderRight={() => renderOutboundRight(item)}
+          renderDetail={renderOutboundDetail}
+        />
+      );
+    },
+    [
+      expandedGroups,
+      renderOutboundDetail,
+      renderOutboundRight,
+      styles,
+      theme.textPrimary,
+      toggleExpand,
+    ]
+  );
+
+  const aggregatedGroupKeyExtractor = useCallback((item: AggregatedGroup) => item.key, []);
+  const erpLineKeyExtractor = useCallback((item: ErpLineProgress) => item.key, []);
+
   const normalizeScannerInput = useCallback((rawText: string): string => {
-    return sanitizeScannerInput(rawText);
+    return sanitizeStructuredScannerInput(rawText);
   }, []);
 
   const flushScannerInput = useCallback(
@@ -1502,14 +2577,30 @@ export default function PDAScanScreen() {
 
       // 如果当前有输入内容，启动定时器检测扫码完成
       if (text.length > 0) {
-        autoSubmitTimerRef.current = setTimeout(() => {
-          autoSubmitTimerRef.current = null;
-          flushScannerInput(text);
-        }, 150); // 150ms 防抖，等待扫码器输入完成
+        const normalizedOrderText = normalizeOrderNoCandidate(text);
+        const shouldFastSubmitOrder =
+          currentScanStep === 'order' &&
+          (Boolean(getErpAccountByOutboundOrderNo(normalizedOrderText)) ||
+            getMatchingOutboundWarehouseOrderRules(
+              normalizedOrderText,
+              outboundWarehouseOrderRules
+            ).length > 0 ||
+            (Object.keys(outboundWarehouseOrderRules).length === 0 &&
+              isOutboundOrderNo(normalizedOrderText, outboundOrderRule)));
+
+        autoSubmitTimerRef.current = setTimeout(
+          () => {
+            autoSubmitTimerRef.current = null;
+            flushScannerInput(text);
+          },
+          shouldFastSubmitOrder
+            ? ORDER_SCAN_FAST_SUBMIT_DEBOUNCE_MS
+            : SCAN_AUTO_SUBMIT_DEBOUNCE_MS
+        );
         return;
       }
     },
-    [flushScannerInput]
+    [currentScanStep, flushScannerInput, outboundOrderRule, outboundWarehouseOrderRules]
   );
 
   // 扫码完成确认（焦点录入模式：用户手动按回车）
@@ -1521,6 +2612,171 @@ export default function PDAScanScreen() {
 
     flushScannerInput();
   }, [flushScannerInput]);
+
+  const closePendingOutboundUnpack = useCallback(() => {
+    if (outboundUnpacking) {
+      return;
+    }
+    scannerFocusBlockedRef.current = false;
+    pendingOutboundUnpackRef.current = null;
+    setPendingOutboundUnpack(null);
+    setOutboundUnpackNotes('');
+    setOutboundUnpacking(false);
+    resumePendingScanCodes(120);
+  }, [outboundUnpacking, resumePendingScanCodes]);
+
+  const handleConfirmOutboundUnpack = useCallback(async () => {
+    const pending = pendingOutboundUnpack;
+    if (!pending || outboundUnpacking) {
+      return;
+    }
+
+    const { savedPayload } = pending;
+    const warehouse = {
+      id: savedPayload.warehouseId,
+      name: savedPayload.warehouseName,
+    };
+
+    if (!warehouse.id || !savedPayload.orderNo) {
+      showToast('拆包数据缺少订单或仓库信息', 'error');
+      feedbackError();
+      return;
+    }
+
+    const materialId = generateId();
+    let unpackSaved = false;
+    let pendingSync: { remainingRecord: UnpackRecord; shippedRecord: UnpackRecord } | null = null;
+    setOutboundUnpacking(true);
+
+    try {
+      const materialRecord = mapQueueItemToMaterialRecord(
+        materialId,
+        savedPayload,
+        pending.rawContent
+      );
+      const resolvedNewTraceNo =
+        pending.newTraceNo || (await buildNextUnpackTraceNo(savedPayload.traceNo));
+      const unpackResult = await saveUnpackOperation({
+        material: materialRecord,
+        createMaterial: {
+          material: {
+            id: materialId,
+            order_no: savedPayload.orderNo,
+            customer_name: savedPayload.customerName || '',
+            operation_type: 'outbound',
+            model: savedPayload.model || '',
+            batch: savedPayload.batch || '',
+            quantity: pending.originalQuantity,
+            traceNo: savedPayload.traceNo,
+            sourceNo: savedPayload.sourceNo,
+            package: savedPayload.package,
+            version: savedPayload.version,
+            productionDate: savedPayload.productionDate,
+            raw_content: pending.rawContent,
+            separator: savedPayload.separator,
+            rule_id: savedPayload.ruleId,
+            rule_name: savedPayload.ruleName,
+            customFields: savedPayload.customFields,
+            scanned_at: getISODateTime(),
+            warehouse_id: warehouse.id,
+            warehouse_name: warehouse.name,
+            inventory_code: savedPayload.inventoryCode || '',
+          },
+          customerName: savedPayload.customerName || '',
+          warehouse,
+        },
+        shippedQuantity: pending.shippedQuantity,
+        remainingQuantity: pending.remainingQuantity,
+        newTraceNo: resolvedNewTraceNo,
+        notes: outboundUnpackNotes,
+      });
+      unpackSaved = true;
+
+      pendingSync = {
+        remainingRecord: unpackResult.remainingRecord,
+        shippedRecord: unpackResult.shippedRecord,
+      };
+      const shippedScanItem = mapQueueItemToMaterialItem(materialId, {
+        ...savedPayload,
+        quantity: pending.shippedQuantity.toString(),
+        traceNo: unpackResult.shippedRecord.new_traceNo || savedPayload.traceNo,
+      });
+
+      await saveOutboundWorkDraft(savedPayload.orderNo, savedPayload.customerName || '', warehouse);
+      if (savedPayload.orderNo === orderNoRef.current) {
+        const recordsBeforeRefresh = scanRecordsRef.current;
+        let refreshedItems: MaterialItem[] = [];
+        try {
+          refreshedItems = await loadOrderMaterials(savedPayload.orderNo, warehouse.id);
+        } catch (refreshError) {
+          logger.warn('[扫码出库] 拆包完成后刷新本单物料失败:', refreshError);
+        }
+        setScanRecords((currentRecords) => {
+          const mergedRecords = mergeMaterialItemsById([
+            shippedScanItem,
+            ...recordsBeforeRefresh,
+            ...refreshedItems,
+            ...currentRecords,
+          ]);
+          scanRecordsRef.current = mergedRecords;
+          return mergedRecords;
+        });
+      }
+
+      scannerFocusBlockedRef.current = false;
+      pendingOutboundUnpackRef.current = null;
+      setPendingOutboundUnpack(null);
+      setOutboundUnpackNotes('');
+      setOutboundUnpacking(false);
+      showToast(
+        `拆包完成：出库 ${pending.shippedQuantity}，剩余 ${pending.remainingQuantity}`,
+        'success'
+      );
+      feedbackSuccess();
+      resumePendingScanCodes(120);
+    } catch (error) {
+      logger.error('[扫码出库] 拆包出库失败:', error);
+      const message = formatUserFacingErrorMessage(error, '请稍后重试');
+      showToast(
+        unpackSaved ? `拆包已完成，但后续处理失败：${message}` : `拆包失败：${message}`,
+        unpackSaved ? 'warning' : 'error'
+      );
+      if (unpackSaved) {
+        scannerFocusBlockedRef.current = false;
+        pendingOutboundUnpackRef.current = null;
+        setPendingOutboundUnpack(null);
+        setOutboundUnpackNotes('');
+        feedbackWarning();
+        resumePendingScanCodes(120);
+      } else {
+        feedbackError();
+      }
+    } finally {
+      setOutboundUnpacking(false);
+    }
+
+    if (pendingSync) {
+      syncUnpackRecordsToComputer([pendingSync.shippedRecord, pendingSync.remainingRecord])
+        .then(() => {
+          logger.log('[扫码出库] 拆包标签已同步，电脑端已按供应商模板策略处理');
+        })
+        .catch((syncError) => {
+          logger.warn('[扫码出库] 拆包标签自动打印失败:', syncError);
+          showToast(
+            `拆包已完成，但标签自动打印失败：${getUnpackSyncFailureMessage(syncError)}`,
+            'warning'
+          );
+        });
+    }
+  }, [
+    loadOrderMaterials,
+    outboundUnpackNotes,
+    outboundUnpacking,
+    pendingOutboundUnpack,
+    resumePendingScanCodes,
+    saveOutboundWorkDraft,
+    showToast,
+  ]);
 
   // 选择仓库
   const selectWarehouse = async (wh: Warehouse) => {
@@ -1536,16 +2792,18 @@ export default function PDAScanScreen() {
     }
 
     const switchWarehouse = async () => {
-      await handleWarehouseChange(wh);
+      const switched = await handleWarehouseChange(wh);
+      if (!switched) {
+        return;
+      }
+      scannerFocusBlockedRef.current = false;
       setShowWarehousePicker(false);
       showToast(`仓库已切换：${wh.name}`, 'success');
       focusScannerInput(100);
     };
 
     const hasActiveOutboundWork =
-      !!orderNoRef.current ||
-      customerNameRef.current.trim().length > 0 ||
-      scanRecords.length > 0;
+      !!orderNoRef.current || customerNameRef.current.trim().length > 0 || scanRecords.length > 0;
 
     if (hasActiveOutboundWork) {
       alert.showConfirm(
@@ -1566,132 +2824,113 @@ export default function PDAScanScreen() {
     <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
       <View style={styles.container}>
         <View style={styles.topPanel}>
-          {/* 顶部：仓库 + 订单 */}
-          <View style={styles.topBar}>
-            <TouchableOpacity
-              style={styles.backButton}
-              activeOpacity={0.7}
-              onPress={() => router.back()}
-            >
-              <Feather name="arrow-left" size={24} color={theme.textPrimary} />
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.warehouseBtn}
-              activeOpacity={0.7}
-              onPress={() => setShowWarehousePicker(true)}
-            >
-              <FontAwesome6 name="warehouse" size={14} color={theme.textPrimary} />
-              <Text style={styles.warehouseText} numberOfLines={1} ellipsizeMode="tail">
-                {currentWarehouse?.name || '仓库'}
-              </Text>
-              <FontAwesome6 name="chevron-down" size={10} color={theme.textMuted} />
-            </TouchableOpacity>
-            <View
-              style={[
-                styles.stepTag,
-                currentScanStep !== 'order' && styles.stepTagActive,
-              ]}
-            >
-              <FontAwesome6
-                name={
-                  currentScanStep === 'order'
-                    ? 'barcode'
-                    : currentScanStep === 'customer'
-                      ? 'user'
-                      : 'cube'
-                }
-                size={12}
-                color={
-                  currentScanStep !== 'order'
-                    ? theme.primary
-                    : theme.textMuted
-                }
-              />
-              <Text
-                style={[
-                  styles.stepText,
-                  currentScanStep !== 'order' && styles.stepTextActive,
-                ]}
-                numberOfLines={1}
-                ellipsizeMode="tail"
-              >
-                {currentScanStep === 'order'
-                  ? '待扫订单'
-                  : currentScanStep === 'customer'
-                    ? '待扫客户'
-                    : scanRecords.length === 0
-                      ? '待扫物料'
-                      : '继续扫物料'}
-              </Text>
-            </View>
-          </View>
+          <UiPageHeader
+            title="出库扫描"
+            onBack={() => router.back()}
+            rightIcon={erpVoucher || erpVoucherRecoveryRequired ? 'refresh-cw' : 'crosshair'}
+            rightLabel={
+              erpVoucher || erpVoucherRecoveryRequired ? '刷新ERP销售出库单' : '聚焦扫码输入框'
+            }
+            rightDisabled={isErpOrderLoading}
+            onRightPress={() => {
+              if (erpVoucher || erpVoucherRecoveryRequired) {
+                void handleRefreshErpVoucher();
+                return;
+              }
+              focusScannerInput(0);
+            }}
+          />
 
-          <ScanWorkflowPanel metrics={workflowMetrics} />
+          <UiWorkflowSummary items={workflowSummaryItems} />
         </View>
 
         {/* 扫码输入 */}
-        <View style={[styles.scanBox, inputValue.length > 0 && styles.scanBoxActive]}>
-          <TextInput
-            ref={inputRef}
-            style={styles.scanInput}
-            value={inputValue}
-            onChangeText={handleInputChange}
-            onSubmitEditing={handleSubmitEditing}
-            onBlur={() => focusScannerInput(120)}
-            placeholder={currentScanPlaceholder}
-            placeholderTextColor={theme.textMuted}
-            autoCapitalize="characters"
-            autoCorrect={false}
-            autoFocus={false}
-            showSoftInputOnFocus={false}
-          />
-        </View>
+        <UiScanBox
+          inputRef={inputRef}
+          active={inputValue.length > 0 || isErpOrderLoading}
+          processing={isErpOrderLoading}
+          statusLabel={currentScanStatusLabel}
+          value={inputValue}
+          onChangeText={handleInputChange}
+          onSubmitEditing={handleSubmitEditing}
+          onBlur={() => focusScannerInput(120)}
+          placeholder={currentScanPlaceholder}
+          placeholderTextColor={theme.textMuted}
+          autoCapitalize="none"
+          autoFocus={false}
+          showSoftInputOnFocus={false}
+        />
+
+        {isErpOrderComplete ? (
+          <View style={styles.completionBanner}>
+            <Feather name="check-circle" size={18} color={theme.success} />
+            <Text style={styles.completionBannerText}>
+              本单物料已全部扫完，请扫描下一张出库单
+            </Text>
+          </View>
+        ) : null}
 
         {/* 物料列表 */}
         <View style={styles.listSection}>
           <View style={styles.listHeader}>
             <Text style={styles.listTitle}>本单物料</Text>
             <Text style={styles.listCount}>
-              {aggregateTotals.modelCount} 型号 / {aggregateTotals.totalQuantity.toLocaleString()}{' '}
-              PCS
+              {erpVoucher
+                ? `${erpLineProgressItems.length} 明细 / ${aggregateTotals.totalQuantity.toLocaleString()}/${erpRequiredTotal.toLocaleString()} PCS`
+                : `${aggregateTotals.modelCount} 型号 / ${aggregateTotals.totalQuantity.toLocaleString()} PCS`}
             </Text>
           </View>
-          <FlatList
-            data={aggregateMaterials}
-            keyExtractor={aggregatedGroupKeyExtractor}
-            renderItem={renderAggregatedGroup}
-            extraData={outboundListState}
-            style={styles.list}
-            contentContainerStyle={
-              scanRecords.length === 0 ? styles.listEmptyContent : styles.listContent
-            }
-            initialNumToRender={12}
-            maxToRenderPerBatch={16}
-            windowSize={7}
-            removeClippedSubviews={Platform.OS === 'android'}
-            keyboardShouldPersistTaps="handled"
-            ListEmptyComponent={
-              <AppEmptyState
-                icon="package"
-                title={
-                  !orderNo
-                    ? '等待订单'
-                    : !customerName
-                      ? '等待客户'
-                      : '暂无物料'
-                }
-                description={
-                  !orderNo
-                    ? '先扫描订单二维码'
-                    : !customerName
-                      ? '扫描客户名称二维码'
-                      : '继续扫描物料二维码'
-                }
-                compact
-                style={styles.empty}
-              />
-            }
-          />
+          {erpVoucher ? (
+            <FlatList
+              data={erpLineProgressItems}
+              keyExtractor={erpLineKeyExtractor}
+              renderItem={renderErpLineProgress}
+              extraData={expandedGroups}
+              style={styles.list}
+              contentContainerStyle={
+                erpLineProgressItems.length === 0 ? styles.listEmptyContent : styles.listContent
+              }
+              initialNumToRender={12}
+              maxToRenderPerBatch={16}
+              windowSize={7}
+              removeClippedSubviews={Platform.OS === 'android'}
+              keyboardShouldPersistTaps="handled"
+              ListEmptyComponent={
+                <AppEmptyState
+                  icon="package"
+                  title="ERP单据无明细"
+                  description="请确认销售出库单是否已有物料行"
+                  compact
+                  style={styles.empty}
+                />
+              }
+            />
+          ) : (
+            <FlatList
+              data={aggregateMaterials}
+              keyExtractor={aggregatedGroupKeyExtractor}
+              renderItem={renderAggregatedGroup}
+              extraData={expandedGroups}
+              style={styles.list}
+              contentContainerStyle={
+                scanRecords.length === 0 ? styles.listEmptyContent : styles.listContent
+              }
+              initialNumToRender={12}
+              maxToRenderPerBatch={16}
+              windowSize={7}
+              removeClippedSubviews={Platform.OS === 'android'}
+              keyboardShouldPersistTaps="handled"
+              ListEmptyComponent={
+                <AppEmptyState
+                  icon="package"
+                  title={!orderNo ? '等待出库单' : '暂无物料'}
+                  description={!orderNo ? '先扫描销售出库单号' : '继续扫描物料二维码'}
+                  compact
+                  style={styles.empty}
+                />
+              }
+            />
+          )}
         </View>
 
         {/* 仓库选择器 */}
@@ -1724,6 +2963,97 @@ export default function PDAScanScreen() {
             </View>
           </View>
         )}
+
+        <Modal
+          visible={!!pendingOutboundUnpack}
+          transparent
+          animationType="fade"
+          onRequestClose={closePendingOutboundUnpack}
+        >
+          <View style={styles.modalOverlay}>
+            <AppModalCard
+              title="拆包出库"
+              subtitle="按本单剩余数量拆出，并生成剩余标签"
+              onClose={closePendingOutboundUnpack}
+              style={styles.outboundUnpackModalContent}
+              bodyStyle={styles.modalBody}
+              size="largeForm"
+              stretchBody
+              footer={
+                <AppModalActions
+                  containerStyle={styles.modalActions}
+                  secondaryLabel="取消"
+                  onSecondaryPress={outboundUnpacking ? undefined : closePendingOutboundUnpack}
+                  primaryLabel={outboundUnpacking ? '处理中...' : '确认拆包'}
+                  primaryDisabled={outboundUnpacking}
+                  onPrimaryPress={handleConfirmOutboundUnpack}
+                />
+              }
+            >
+              <KeyboardAwareFormScrollView
+                contentContainerStyle={styles.outboundUnpackBodyContent}
+                bottomOffset={32}
+                showsVerticalScrollIndicator
+              >
+                <AppFormField label="型号">
+                  <View style={[styles.unpackTextInput, styles.readOnlyInputContent]}>
+                    <Text style={styles.unpackReadOnlyText} numberOfLines={2}>
+                      {pendingOutboundUnpack?.savedPayload.model || '-'}
+                    </Text>
+                  </View>
+                </AppFormField>
+
+                <AppFormField label="规格/型号描述">
+                  <View style={[styles.unpackTextInput, styles.readOnlyInputContent]}>
+                    <Text style={styles.unpackReadOnlyText} numberOfLines={3}>
+                      {pendingOutboundUnpack?.lineSpecification || '-'}
+                    </Text>
+                  </View>
+                </AppFormField>
+
+                <View style={styles.unpackQuantityGrid}>
+                  <View style={styles.unpackQuantityCell}>
+                    <Text style={styles.unpackQuantityLabel}>当前标签</Text>
+                    <Text style={styles.unpackQuantityValue}>
+                      {pendingOutboundUnpack?.originalQuantity.toLocaleString() || '0'}
+                    </Text>
+                  </View>
+                  <View style={styles.unpackQuantityCell}>
+                    <Text style={styles.unpackQuantityLabel}>本单出库</Text>
+                    <Text style={styles.unpackQuantityValuePrimary}>
+                      {pendingOutboundUnpack?.shippedQuantity.toLocaleString() || '0'}
+                    </Text>
+                  </View>
+                  <View style={styles.unpackQuantityCell}>
+                    <Text style={styles.unpackQuantityLabel}>剩余标签</Text>
+                    <Text style={styles.unpackQuantityValue}>
+                      {pendingOutboundUnpack?.remainingQuantity.toLocaleString() || '0'}
+                    </Text>
+                  </View>
+                </View>
+
+                <AppFormField label="新追踪码（自动生成）">
+                  <View style={[styles.unpackTextInput, styles.readOnlyInputContent]}>
+                    <Text style={styles.unpackTraceText} numberOfLines={2}>
+                      {pendingOutboundUnpack?.newTraceNo || '-'}
+                    </Text>
+                  </View>
+                </AppFormField>
+
+                <AppFormField label="备注">
+                  <TextInput
+                    style={[styles.unpackTextInput, styles.unpackNotesInput]}
+                    placeholder="可填写拆包原因"
+                    placeholderTextColor={theme.textMuted}
+                    value={outboundUnpackNotes}
+                    onChangeText={setOutboundUnpackNotes}
+                    multiline
+                  />
+                </AppFormField>
+              </KeyboardAwareFormScrollView>
+            </AppModalCard>
+          </View>
+        </Modal>
         <ToastContainer />
         {alert.AlertComponent}
       </View>

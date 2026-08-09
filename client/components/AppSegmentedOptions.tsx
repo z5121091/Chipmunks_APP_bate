@@ -2,8 +2,10 @@ import React from 'react';
 import { Text, TouchableOpacity, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
-import { BorderRadius, BorderWidth, Spacing } from '@/constants/theme';
+import { BorderWidth, Spacing, Typography } from '@/constants/theme';
+import { UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 import { withAlpha } from '@/utils/colors';
+import { MIN_TOUCH_TARGET } from '@/utils/responsive';
 
 interface AppSegmentedOption<T extends string> {
   value: T;
@@ -30,7 +32,7 @@ export function AppSegmentedOptions<T extends string>({
         flexDirection: 'row',
         gap: Spacing.xs,
         padding: 4,
-        borderRadius: BorderRadius.xl,
+        borderRadius: UI_REDESIGN_TOKENS.radius.card,
         backgroundColor: theme.backgroundTertiary,
         borderWidth: BorderWidth.normal,
         borderColor: theme.border,
@@ -44,10 +46,10 @@ export function AppSegmentedOptions<T extends string>({
             key={option.value}
             style={{
               flex: 1,
-              minHeight: 42,
+              minHeight: MIN_TOUCH_TARGET,
               paddingHorizontal: Spacing.sm,
               paddingVertical: Spacing.sm - 1,
-              borderRadius: BorderRadius.lg,
+              borderRadius: UI_REDESIGN_TOKENS.radius.control,
               alignItems: 'center',
               justifyContent: 'center',
               flexDirection: 'row',
@@ -57,6 +59,8 @@ export function AppSegmentedOptions<T extends string>({
               borderColor: active ? withAlpha(theme.primary, 0.26) : 'transparent',
             }}
             activeOpacity={0.82}
+            accessibilityRole="button"
+            accessibilityState={{ selected: active }}
             onPress={() => onChange(option.value)}
           >
             {option.icon ? (
@@ -68,7 +72,7 @@ export function AppSegmentedOptions<T extends string>({
             ) : null}
             <Text
               style={{
-                fontSize: 13,
+                ...Typography.captionMedium,
                 fontWeight: active ? '700' : '600',
                 color: active ? theme.primary : theme.textPrimary,
               }}

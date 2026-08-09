@@ -5,7 +5,10 @@ import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
 import { rs, rf } from '@/utils/responsive';
 
 // 动态计算更新弹窗内容区域的最大高度
-const calculateUpdateModalBodyMaxHeight = (screenHeight: number, insets: { top: number; bottom: number }): number => {
+const calculateUpdateModalBodyMaxHeight = (
+  screenHeight: number,
+  insets: { top: number; bottom: number }
+): number => {
   // 计算各部分高度：
   // - Header: 约 70px (paddingVertical: 16 + 内容约 38px)
   // - Footer: 约 120px (padding: 16 + 内容约 104px)
@@ -17,7 +20,8 @@ const calculateUpdateModalBodyMaxHeight = (screenHeight: number, insets: { top: 
   const safeAreaHeight = insets.top + insets.bottom;
 
   // 计算可用高度
-  const availableHeight = screenHeight - headerHeight - footerHeight - modalPadding - safeAreaHeight;
+  const availableHeight =
+    screenHeight - headerHeight - footerHeight - modalPadding - safeAreaHeight;
 
   // 确保最小高度为 200px
   return Math.max(availableHeight, 200);
@@ -38,58 +42,149 @@ const getBaseStyles = (theme: Theme) => {
       backgroundColor: theme.backgroundRoot,
     },
     scrollContent: {
-      padding: Spacing.md,
+      paddingHorizontal: Spacing.md,
+      paddingTop: Spacing.sm,
       paddingBottom: 150,
     },
-    header: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      marginBottom: Spacing.md,
-      padding: Spacing.lg,
-      borderRadius: BorderRadius['2xl'],
-      backgroundColor: theme.backgroundElevated,
+    settingsPageHeader: {
+      marginBottom: Spacing.sm,
+      paddingHorizontal: 0,
+    },
+    settingsOverview: {
+      gap: Spacing.sm,
+    },
+    settingsGroupPanel: {
+      gap: Spacing.xs,
+      paddingHorizontal: Spacing.xs,
+      paddingBottom: Spacing.xs,
+    },
+    autoBackupDiagnosticCard: {
+      gap: Spacing.xs,
+      padding: Spacing.md,
+      borderRadius: BorderRadius.lg,
+      backgroundColor: theme.backgroundDefault,
       borderWidth: BorderWidth.normal,
       borderColor: theme.border,
-      shadowColor: theme.shadowColor,
-      shadowOffset: { width: 0, height: 12 },
-      shadowOpacity: theme.isDark ? 0.2 : 0.08,
-      shadowRadius: 18,
-      elevation: 4,
     },
-    backButton: {
-      padding: Spacing.sm,
-      marginRight: Spacing.sm,
-      minWidth: 44,
-      minHeight: 44,
-      justifyContent: 'center',
+    autoBackupDiagnosticHeader: {
+      flexDirection: 'row',
       alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: Spacing.sm,
+      marginBottom: 2,
     },
-    headerContent: {
+    autoBackupDiagnosticTitle: {
       flex: 1,
-    },
-    title: {
-      fontSize: rf(20),
+      minWidth: 0,
+      fontSize: rf(13),
       fontWeight: '800',
       color: theme.textPrimary,
-      letterSpacing: -0.5,
     },
-    subtitle: {
+    autoBackupDiagnosticBadge: {
+      minHeight: 26,
+      paddingHorizontal: Spacing.sm,
+      borderRadius: BorderRadius.full,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    autoBackupDiagnosticBadgeText: {
+      fontSize: rf(11),
+      fontWeight: '800',
+    },
+    autoBackupDiagnosticBadgeSuccess: {
+      backgroundColor: withAlpha(theme.success, theme.isDark ? 0.2 : 0.12),
+    },
+    autoBackupDiagnosticBadgeWarning: {
+      backgroundColor: withAlpha(theme.warning, theme.isDark ? 0.22 : 0.14),
+    },
+    autoBackupDiagnosticBadgeError: {
+      backgroundColor: withAlpha(theme.error, theme.isDark ? 0.2 : 0.1),
+    },
+    autoBackupDiagnosticBadgeTextSuccess: {
+      color: theme.success,
+    },
+    autoBackupDiagnosticBadgeTextWarning: {
+      color: theme.warning,
+    },
+    autoBackupDiagnosticBadgeTextError: {
+      color: theme.error,
+    },
+    autoBackupDiagnosticRow: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      gap: Spacing.sm,
+      paddingTop: 2,
+    },
+    autoBackupDiagnosticLabel: {
+      width: 66,
+      fontSize: rf(11),
+      lineHeight: rf(17),
+      fontWeight: '700',
+      color: theme.textMuted,
+    },
+    autoBackupDiagnosticValue: {
+      flex: 1,
+      minWidth: 0,
+      textAlign: 'right',
       fontSize: rf(12),
+      lineHeight: rf(17),
       color: theme.textSecondary,
+    },
+    autoBackupDiagnosticValueError: {
+      color: theme.error,
+    },
+    autoBackupDiagnosticDivider: {
+      height: BorderWidth.thin,
+      marginVertical: Spacing.xs,
+      backgroundColor: theme.borderLight,
+    },
+    autoBackupProtectionBox: {
+      gap: Spacing.xs,
+      marginTop: Spacing.xs,
+      padding: Spacing.sm,
+      borderRadius: BorderRadius.md,
+      backgroundColor: withAlpha(theme.primary, theme.isDark ? 0.16 : 0.08),
+      borderWidth: BorderWidth.thin,
+      borderColor: withAlpha(theme.primary, theme.isDark ? 0.26 : 0.16),
+    },
+    autoBackupProtectionTitle: {
+      fontSize: rf(12),
+      lineHeight: rf(18),
+      fontWeight: '800',
+      color: theme.textPrimary,
+    },
+    autoBackupProtectionText: {
+      fontSize: rf(11),
+      lineHeight: rf(17),
+      color: theme.textSecondary,
+    },
+    autoBackupProtectionButton: {
+      minHeight: 40,
+      alignItems: 'center',
+      justifyContent: 'center',
+      alignSelf: 'flex-start',
       marginTop: 2,
+      paddingHorizontal: Spacing.md,
+      borderRadius: BorderRadius.md,
+      backgroundColor: theme.primary,
+    },
+    autoBackupProtectionButtonText: {
+      fontSize: rf(12),
+      fontWeight: '800',
+      color: theme.buttonPrimaryText,
     },
     // 模块标题
     sectionHeader: {
       flexDirection: 'row',
       justifyContent: 'space-between',
       alignItems: 'center',
-      marginBottom: Spacing.sm,
+      marginBottom: Spacing.xs,
       marginTop: Spacing.lg,
     },
     sectionTitle: {
       fontSize: rf(13),
-      fontWeight: '600',
-      color: theme.textSecondary,
+      fontWeight: '800',
+      color: theme.textPrimary,
     },
     addButton: {
       backgroundColor: theme.primary,
@@ -106,26 +201,26 @@ const getBaseStyles = (theme: Theme) => {
     exportCard: {
       flexDirection: 'row',
       alignItems: 'center',
-      paddingVertical: Spacing.xs,
-      paddingHorizontal: Spacing.sm,
+      minHeight: 58,
+      paddingVertical: Spacing.sm,
+      paddingHorizontal: Spacing.md,
     },
     exportCardContainer: {
-      backgroundColor: theme.backgroundElevated,
-      borderRadius: BorderRadius.xl,
+      backgroundColor: theme.backgroundDefault,
+      borderRadius: BorderRadius.lg,
       borderWidth: BorderWidth.normal,
       borderColor: theme.border,
-      paddingVertical: Spacing.xs,
       overflow: 'hidden',
       shadowColor: theme.shadowColor,
-      shadowOffset: { width: 0, height: 10 },
-      shadowOpacity: theme.isDark ? 0.18 : 0.06,
-      shadowRadius: 16,
-      elevation: 3,
+      shadowOffset: { width: 0, height: 4 },
+      shadowOpacity: theme.isDark ? 0.12 : 0.03,
+      shadowRadius: 10,
+      elevation: 2,
     },
     exportIcon: {
-      width: rs(36),
-      height: rs(36),
-      borderRadius: BorderRadius.sm,
+      width: rs(38),
+      height: rs(38),
+      borderRadius: BorderRadius.md,
       backgroundColor: withAlpha(theme.primary, 0.06),
       justifyContent: 'center',
       alignItems: 'center',
@@ -136,7 +231,7 @@ const getBaseStyles = (theme: Theme) => {
     },
     exportTitle: {
       fontSize: rf(14),
-      fontWeight: '600',
+      fontWeight: '700',
       color: theme.textPrimary,
       marginBottom: 1,
     },
@@ -262,7 +357,7 @@ const getBaseStyles = (theme: Theme) => {
     },
     emptyContainer: {
       alignItems: 'center',
-      paddingVertical: Spacing["4xl"],
+      paddingVertical: Spacing['4xl'],
     },
     emptyText: {
       fontSize: rf(14),
@@ -827,17 +922,17 @@ const getBaseStyles = (theme: Theme) => {
     },
     // 电脑同步样式
     syncConfigCard: {
-      backgroundColor: theme.backgroundElevated,
-      borderRadius: BorderRadius.xl,
-      borderWidth: BorderWidth.thick,
+      backgroundColor: theme.backgroundDefault,
+      borderRadius: BorderRadius.lg,
+      borderWidth: BorderWidth.normal,
       borderColor: theme.border,
       padding: Spacing.md,
-      marginBottom: Spacing.md,
+      marginBottom: Spacing.sm,
       shadowColor: theme.shadowColor,
-      shadowOffset: { width: 0, height: 10 },
-      shadowOpacity: theme.isDark ? 0.18 : 0.06,
-      shadowRadius: 16,
-      elevation: 3,
+      shadowOffset: { width: 0, height: 4 },
+      shadowOpacity: theme.isDark ? 0.12 : 0.03,
+      shadowRadius: 10,
+      elevation: 2,
     },
     syncAssistantHeader: {
       flexDirection: 'row',
@@ -1122,11 +1217,17 @@ const getBaseStyles = (theme: Theme) => {
       marginBottom: Spacing.xl,
       alignItems: 'center',
     },
+    restartModalWarningTitleRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: Spacing.xs,
+      marginBottom: Spacing.xs,
+    },
     restartModalWarning: {
       fontSize: rf(17),
       color: theme.warning,
       fontWeight: '700',
-      marginBottom: Spacing.xs,
       textAlign: 'center',
     },
     restartModalWarningSub: {
@@ -1135,7 +1236,6 @@ const getBaseStyles = (theme: Theme) => {
       textAlign: 'center',
       lineHeight: rf(20),
     },
-
   });
   return cachedBaseStyles!;
 };
@@ -1165,19 +1265,20 @@ const getDynamicStyles = (
   const isCompactScreen = sw <= 390 || sh <= 760;
   const styles = {
     scrollContent: {
-      padding: isCompactScreen ? Spacing.sm : Spacing.md,
+      paddingHorizontal: isCompactScreen ? Spacing.sm : Spacing.md,
+      paddingTop: isCompactScreen ? Spacing.xs : Spacing.sm,
       paddingBottom: isCompactScreen ? 120 : 150,
     },
-    header: {
+    settingsPageHeader: {
       marginBottom: isCompactScreen ? Spacing.sm : Spacing.md,
-      padding: isCompactScreen ? Spacing.md : Spacing.lg,
     },
     sectionHeader: {
-      marginTop: isCompactScreen ? Spacing.md : Spacing.lg,
+      marginTop: Spacing.md,
     },
     exportCard: {
-      paddingVertical: isCompactScreen ? 4 : Spacing.xs,
-      paddingHorizontal: Spacing.sm,
+      minHeight: isCompactScreen ? 54 : 58,
+      paddingVertical: isCompactScreen ? 6 : Spacing.sm,
+      paddingHorizontal: Spacing.md,
     },
     exportIcon: {
       width: isCompactScreen ? rs(32) : rs(36),
@@ -1188,8 +1289,8 @@ const getDynamicStyles = (
       marginBottom: isCompactScreen ? Spacing.md : Spacing.lg,
     },
     ruleItem: {
-      padding: isCompactScreen ? Spacing.lg : Spacing.xl,
-      marginBottom: isCompactScreen ? Spacing.md : Spacing.lg,
+      padding: isCompactScreen ? Spacing.md : Spacing.lg,
+      marginBottom: isCompactScreen ? Spacing.sm : Spacing.md,
     },
     syncConfigCard: {
       padding: isCompactScreen ? Spacing.sm : Spacing.md,
@@ -1199,9 +1300,8 @@ const getDynamicStyles = (
       height: isCompactScreen ? rs(36) : rs(40),
     },
     updateModalBody: {
-      maxHeight: screenHeight && insets
-        ? calculateUpdateModalBodyMaxHeight(screenHeight, insets)
-        : 525,
+      maxHeight:
+        screenHeight && insets ? calculateUpdateModalBodyMaxHeight(screenHeight, insets) : 525,
       paddingTop: 0,
     },
   } as const;
@@ -1215,6 +1315,8 @@ interface StylesCache {
   theme: Theme;
   sw: number;
   sh: number;
+  // StyleSheet keys intentionally mix ViewStyle/TextStyle/ImageStyle.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   result: Record<string, any>;
 }
 let stylesCache: StylesCache | null = null;
@@ -1241,9 +1343,12 @@ export const createStyles = (
   const base = getBaseStyles(theme);
   const dynamic = getDynamicStyles(theme, screenWidth, screenHeight, insets);
 
+  // Preserve the exact runtime merge used by React Native StyleSheet.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const merged = { ...base } as Record<string, any>;
   for (const key of Object.keys(dynamic)) {
     if (key in merged) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       merged[key] = { ...merged[key], ...(dynamic as any)[key] };
     }
   }

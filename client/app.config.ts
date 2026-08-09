@@ -4,7 +4,43 @@ import updateServerConfig from './update-server.json';
 
 const projectId = process.env.COZE_PROJECT_ID || process.env.EXPO_PUBLIC_COZE_PROJECT_ID;
 const slugAppName = projectId ? `app${projectId}` : 'myapp';
-const defaultUpdateServer = updateServerConfig.defaultServer.replace(/\/+$/, '');
+const configuredUpdateServer = (
+  process.env.UPDATE_SERVER_URL ||
+  process.env.EXPO_PUBLIC_UPDATE_SERVER_URL ||
+  updateServerConfig.defaultServer
+).trim();
+
+const restoreMatchingUpdateServerCredentials = (
+  candidate: string,
+  credentialSource: string
+): string => {
+  try {
+    const candidateUrl = new URL(candidate);
+    const sourceUrl = new URL(credentialSource);
+    const candidatePath = candidateUrl.pathname.replace(/\/+$/, '');
+    const sourcePath = sourceUrl.pathname.replace(/\/+$/, '');
+    const sameEndpoint =
+      candidateUrl.protocol === sourceUrl.protocol &&
+      candidateUrl.host.toLowerCase() === sourceUrl.host.toLowerCase() &&
+      candidatePath === sourcePath &&
+      candidateUrl.search === sourceUrl.search;
+
+    if (sameEndpoint) {
+      candidateUrl.username ||= sourceUrl.username;
+      candidateUrl.password ||= sourceUrl.password;
+      return candidateUrl.toString();
+    }
+  } catch {
+    // 由运行时的更新检查继续给出可理解的地址错误。
+  }
+
+  return candidate;
+};
+
+const defaultUpdateServer = restoreMatchingUpdateServerCredentials(
+  configuredUpdateServer,
+  updateServerConfig.defaultServer
+).replace(/\/+$/, '');
 
 export default function appConfig({ config }: ConfigContext): ExpoConfig {
   return {
@@ -31,7 +67,7 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
       }
     },
     "android": {
-      "package": "com.chipmunks.traceability",
+      "package": "com.chipmunks.traceabilityBeta",
       "versionCode": versionConfig.versionCode,
       "permissions": [
         "android.permission.INTERNET",

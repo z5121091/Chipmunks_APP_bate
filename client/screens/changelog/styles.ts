@@ -1,6 +1,7 @@
 import { StyleSheet } from 'react-native';
 import { withAlpha } from '@/utils/colors';
 import { Spacing, BorderRadius, Theme, BorderWidth } from '@/constants/theme';
+import { rf } from '@/utils/responsive';
 
 export const createStyles = (theme: Theme) => {
   return StyleSheet.create({
@@ -26,7 +27,7 @@ export const createStyles = (theme: Theme) => {
       alignItems: 'center',
     },
     title: {
-      fontSize: 20,
+      fontSize: rf(20),
       fontWeight: '700',
       color: theme.textPrimary,
     },
@@ -42,12 +43,12 @@ export const createStyles = (theme: Theme) => {
       marginBottom: Spacing.md,
     },
     versionText: {
-      fontSize: 15,
+      fontSize: rf(15),
       fontWeight: '700',
       color: theme.primary,
     },
     dateText: {
-      fontSize: 12,
+      fontSize: rf(12),
       color: theme.textMuted,
       marginLeft: Spacing.sm,
     },
@@ -74,23 +75,23 @@ export const createStyles = (theme: Theme) => {
       backgroundColor: withAlpha(theme.primary, 0.08),
     },
     tagTextFeat: {
-      fontSize: 10,
+      fontSize: rf(10),
       fontWeight: '600',
       color: theme.success,
     },
     tagTextFix: {
-      fontSize: 10,
+      fontSize: rf(10),
       fontWeight: '600',
       color: theme.error,
     },
     tagTextImprove: {
-      fontSize: 10,
+      fontSize: rf(10),
       fontWeight: '600',
       color: theme.primary,
     },
     changeText: {
       flex: 1,
-      fontSize: 13,
+      fontSize: rf(13),
       lineHeight: 20,
       color: theme.textSecondary,
     },

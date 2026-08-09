@@ -44,13 +44,13 @@ export const createStyles = (theme: Theme) => {
       flex: 1,
     },
     title: {
-      fontSize: 20,
+      fontSize: rf(20),
       fontWeight: '800',
       color: theme.textPrimary,
       letterSpacing: -0.5,
     },
     subtitle: {
-      fontSize: 12,
+      fontSize: rf(12),
       color: theme.textSecondary,
       marginTop: 2,
     },
@@ -61,7 +61,7 @@ export const createStyles = (theme: Theme) => {
       borderRadius: BorderRadius.md,
     },
     addButtonText: {
-      fontSize: 13,
+      fontSize: rf(13),
       fontWeight: '600',
       color: theme.buttonPrimaryText,
     },
@@ -80,13 +80,13 @@ export const createStyles = (theme: Theme) => {
       marginBottom: Spacing.lg,
     },
     emptyTitle: {
-      fontSize: 16,
+      fontSize: rf(16),
       fontWeight: '600',
       color: theme.textPrimary,
       marginBottom: Spacing.sm,
     },
     emptyText: {
-      fontSize: 14,
+      fontSize: rf(14),
       color: theme.textMuted,
       textAlign: 'center',
       lineHeight: 20,
@@ -179,12 +179,12 @@ export const createStyles = (theme: Theme) => {
       borderBottomColor: theme.border,
     },
     modalTitle: {
-      fontSize: 18,
+      fontSize: rf(18),
       fontWeight: '600',
       color: theme.textPrimary,
     },
     modalClose: {
-      fontSize: 20,
+      fontSize: rf(20),
       color: theme.textSecondary,
     },
     modalBody: {
@@ -194,14 +194,14 @@ export const createStyles = (theme: Theme) => {
       paddingBottom: Spacing['3xl'],
     },
     inputLabel: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '500',
       color: theme.textPrimary,
       marginBottom: Spacing.sm,
       marginTop: Spacing.md,
     },
     textInput: {
-      fontSize: 16,
+      fontSize: rf(16),
       color: theme.textPrimary,
       paddingVertical: Spacing.md,
       paddingHorizontal: Spacing.lg,
@@ -235,7 +235,7 @@ export const createStyles = (theme: Theme) => {
       borderColor: theme.primary,
     },
     separatorBtnText: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '600',
       color: theme.textPrimary,
     },
@@ -260,7 +260,7 @@ export const createStyles = (theme: Theme) => {
       borderColor: theme.primary,
     },
     fieldBtnText: {
-      fontSize: 14,
+      fontSize: rf(14),
       color: theme.textPrimary,
     },
     fieldBtnTextActive: {
@@ -274,7 +274,7 @@ export const createStyles = (theme: Theme) => {
       padding: Spacing.md,
     },
     selectedFieldsLabel: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '500',
       color: theme.textPrimary,
       marginBottom: Spacing.sm,
@@ -285,12 +285,12 @@ export const createStyles = (theme: Theme) => {
       paddingVertical: Spacing.xs,
     },
     selectedFieldIndex: {
-      fontSize: 14,
+      fontSize: rf(14),
       color: theme.textSecondary,
       width: 24,
     },
     selectedFieldName: {
-      fontSize: 14,
+      fontSize: rf(14),
       color: theme.textPrimary,
       flex: 1,
     },
@@ -301,7 +301,7 @@ export const createStyles = (theme: Theme) => {
       marginLeft: Spacing.xs,
     },
     customTagText: {
-      fontSize: 10,
+      fontSize: rf(10),
       fontWeight: '500',
     },
     selectedFieldActions: {
@@ -309,7 +309,7 @@ export const createStyles = (theme: Theme) => {
       gap: Spacing.md,
     },
     moveBtn: {
-      fontSize: 16,
+      fontSize: rf(16),
       color: theme.textSecondary,
       paddingHorizontal: Spacing.sm,
     },
@@ -321,7 +321,7 @@ export const createStyles = (theme: Theme) => {
       borderTopColor: theme.border,
     },
     sectionHint: {
-      fontSize: 12,
+      fontSize: rf(12),
       color: theme.textMuted,
       marginBottom: Spacing.lg,
       marginTop: Spacing.xs,
@@ -341,12 +341,12 @@ export const createStyles = (theme: Theme) => {
       marginBottom: Spacing.sm,
     },
     conditionText: {
-      fontSize: 15,
+      fontSize: rf(15),
       color: theme.textPrimary,
       flex: 1,
     },
     removeConditionBtn: {
-      fontSize: 16,
+      fontSize: rf(16),
       color: theme.error,
       width: 28,
       textAlign: 'center',
@@ -367,18 +367,18 @@ export const createStyles = (theme: Theme) => {
       marginBottom: Spacing.sm,
     },
     inputRowLabel: {
-      fontSize: 15,
+      fontSize: rf(15),
       color: theme.textSecondary,
       width: 75,
       flexShrink: 0,
     },
     inputRowField: {
       flex: 1,
-      fontSize: 15,
+      fontSize: rf(15),
       color: theme.textPrimary,
     },
     conditionLabel: {
-      fontSize: 15,
+      fontSize: rf(15),
       color: theme.textSecondary,
       flexShrink: 0,
     },
@@ -388,13 +388,13 @@ export const createStyles = (theme: Theme) => {
       flex: 1,
     },
     fieldSelectText: {
-      fontSize: 15,
+      fontSize: rf(15),
       color: theme.textPrimary,
       marginRight: 4,
     },
     conditionKeywordInput: {
       flex: 1,
-      fontSize: 15,
+      fontSize: rf(15),
       color: theme.textPrimary,
     },
     addConditionBtn: {
@@ -408,12 +408,12 @@ export const createStyles = (theme: Theme) => {
       marginLeft: Spacing.sm,
     },
     addConditionBtnText: {
-      fontSize: 16,
+      fontSize: rf(16),
       fontWeight: '600',
       color: theme.buttonPrimaryText,
     },
     noFieldsHint: {
-      fontSize: 13,
+      fontSize: rf(13),
       color: theme.textMuted,
       marginTop: Spacing.sm,
     },
@@ -431,7 +431,7 @@ export const createStyles = (theme: Theme) => {
     },
     // 提示文字
     hint: {
-      fontSize: 13,
+      fontSize: rf(13),
       color: theme.textMuted,
       marginTop: Spacing.sm,
     },

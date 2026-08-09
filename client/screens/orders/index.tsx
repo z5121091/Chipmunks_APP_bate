@@ -14,7 +14,6 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from 'expo-router';
 import { Feather, FontAwesome6 } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as XLSX from 'xlsx';
 import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
 import { AppModalActions } from '@/components/AppModalActions';
@@ -32,28 +31,18 @@ import {
   deleteOrder,
   getMaterialsByOrder,
   deleteMaterial,
-  getNextUnpackIndex,
   updateMaterial,
-  saveUnpackOperation,
   Order,
   MaterialRecord,
-  UnpackRecord,
   Warehouse,
   getAllWarehouses,
   getDefaultWarehouse,
 } from '@/utils/database';
-import {
-  decodeBase64ToBytes,
-  formatSyncErrorMessage,
-  parseJsonResponse,
-  toBinaryBody,
-} from '@/utils/excel';
 import { safeJsonParseNullable } from '@/utils/json';
-import { STORAGE_KEYS, SyncConfig } from '@/constants/config';
+import { STORAGE_KEYS } from '@/constants/config';
 import { formatDate, formatTime } from '@/utils/time';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
-import { Spacing, BorderRadius, BorderWidth, Typography } from '@/constants/theme';
-import { rf } from '@/utils/responsive';
+import { Spacing, BorderRadius, Typography } from '@/constants/theme';
 import { parseQuantity } from '@/utils/quantity';
 import { logger } from '@/utils/logger';
 
@@ -252,38 +241,6 @@ export default function OrdersScreen() {
     };
   }, [editModalVisible]);
 
-  // 拆包弹窗
-  const [unpackModalVisible, setUnpackModalVisible] = useState(false);
-  const [unpackingMaterial, setUnpackingMaterial] = useState<MaterialRecord | null>(null);
-  const [unpackNewQuantity, setUnpackNewQuantity] = useState('');
-  const [unpackNewTraceNo, setUnpackNewTraceNo] = useState('');
-  const [unpackNotes, setUnpackNotes] = useState('');
-  const [unpacking, setUnpacking] = useState(false);
-
-
-  // 拆包数量输入框 ref
-  const unpackQuantityRef = useRef<TextInput>(null);
-  // 拆包备注输入框 ref
-  const unpackNotesRef = useRef<TextInput>(null);
-  const unpackFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // 拆包弹窗打开后聚焦输入框
-  useEffect(() => {
-    if (unpackModalVisible && unpackQuantityRef.current) {
-      unpackFocusTimerRef.current = setTimeout(() => {
-        unpackQuantityRef.current?.focus();
-        unpackFocusTimerRef.current = null;
-      }, 300);
-    }
-
-    return () => {
-      if (unpackFocusTimerRef.current) {
-        clearTimeout(unpackFocusTimerRef.current);
-        unpackFocusTimerRef.current = null;
-      }
-    };
-  }, [unpackModalVisible]);
-
   // 编辑物料弹窗
   const [editMaterialModalVisible, setEditMaterialModalVisible] = useState(false);
   const [editingMaterial, setEditingMaterial] = useState<MaterialRecord | null>(null);
@@ -315,24 +272,10 @@ export default function OrdersScreen() {
     [clearDeferredActionTimers, clearExpandedMaterialsTimer]
   );
 
-  // 同步配置
-  const [syncConfig, setSyncConfig] = useState<SyncConfig>({ ip: '', port: '8080' });
-  // 加载同步配置
-  const loadSyncConfig = useCallback(async () => {
-    const savedSyncConfig = await AsyncStorage.getItem(STORAGE_KEYS.SYNC_CONFIG);
-    if (savedSyncConfig) {
-      const parsedConfig = safeJsonParseNullable<SyncConfig>(savedSyncConfig, 'orders.syncConfig');
-      if (parsedConfig) {
-        setSyncConfig(parsedConfig);
-      }
-    }
-  }, []);
-
-  // 页面加载时获取同步配置
+  // 页面聚焦时恢复活动状态
   useFocusEffect(
     useCallback(() => {
       screenActiveRef.current = true;
-      loadSyncConfig();
 
       return () => {
         screenActiveRef.current = false;
@@ -340,73 +283,7 @@ export default function OrdersScreen() {
         expandedMaterialsRequestRef.current += 1;
         clearExpandedMaterialsTimer();
       };
-    }, [clearDeferredActionTimers, clearExpandedMaterialsTimer, loadSyncConfig])
-  );
-
-  // 拆包弹窗样式
-  const unpackModalStyles = useMemo(
-    () => ({
-      modalOverlay: {
-        flex: 1,
-        backgroundColor: theme.overlay,
-        justifyContent: 'center' as const,
-        alignItems: 'center' as const,
-        padding: Spacing.md,
-      },
-      modalContent: {
-        width: '100%' as const,
-        maxWidth: APP_MODAL_MAX_WIDTH,
-        maxHeight: '82%' as const,
-      },
-      modalBody: {
-        paddingBottom: 0,
-      },
-      modalBodyContent: {
-        paddingBottom: Spacing['2xl'],
-      },
-      modalActions: {
-        marginTop: 0,
-      },
-      sectionTitle: {
-        fontSize: rf(14),
-        fontWeight: '500' as const,
-        color: theme.textPrimary,
-        marginBottom: Spacing.sm,
-      },
-      textInput: {
-        fontSize: rf(16),
-        color: theme.textPrimary,
-        paddingVertical: Spacing.md,
-        paddingHorizontal: Spacing.lg,
-        minHeight: 48,
-        backgroundColor: theme.backgroundTertiary,
-        borderRadius: BorderRadius.md,
-        borderWidth: BorderWidth.normal,
-        borderColor: theme.border,
-      },
-      infoBox: {
-        backgroundColor: theme.backgroundTertiary,
-        borderRadius: BorderRadius.md,
-        padding: Spacing.lg,
-        marginBottom: Spacing.lg,
-      },
-      infoRow: {
-        flexDirection: 'row' as const,
-        marginBottom: Spacing.sm,
-      },
-      infoLabel: {
-        width: 60,
-        fontSize: rf(13),
-        color: theme.textSecondary,
-      },
-      infoValue: {
-        flex: 1,
-        fontSize: rf(14),
-        color: theme.textPrimary,
-        fontWeight: '500' as const,
-      },
-    }),
-    [theme]
+    }, [clearDeferredActionTimers, clearExpandedMaterialsTimer])
   );
 
   // 加载仓库数据
@@ -766,25 +643,70 @@ export default function OrdersScreen() {
       setExpandedMaterials([]);
       setExpandedMaterialsLoadingId(null);
       void loadCurrentOrder(currentWarehouse?.id);
+    } else {
+      // 切换到 today / all 列表视图时，重新加载订单列表数据
+      // （否则列表还是旧数据甚至为空，用户会以为没切成功）
+      void loadDataForWarehouse(currentWarehouse?.id);
     }
-  }, [clearExpandedMaterialsTimer, currentWarehouse?.id, loadCurrentOrder]);
+  }, [clearExpandedMaterialsTimer, currentWarehouse?.id, loadCurrentOrder, loadDataForWarehouse]);
 
-  // 处理从扫描页面跳转过来的参数（自动展开订单）
+  // 处理从首页/其他页面跳转过来的 orderNo 参数
+  // 逻辑：将目标订单设为"当前订单"，停留在 current 视图，方便查看出库明细
   useEffect(() => {
-    if (params.orderNo && orders.length > 0) {
-      // 找到对应的订单
-      const targetOrder = orders.find((o) => o.order_no === params.orderNo);
-      if (targetOrder && targetOrder.id !== expandedOrderId) {
-        // 展开该订单
-        setExpandedOrderId(targetOrder.id);
-        setExpandedMaterials([]);
-        void loadExpandedMaterials(targetOrder, {
-          warehouseId: currentWarehouse?.id,
-          delay: 120,
-        });
-      }
+    if (!params.orderNo) {
+      return;
     }
-  }, [currentWarehouse?.id, expandedOrderId, loadExpandedMaterials, orders, params.orderNo]);
+
+    const targetOrderNo = params.orderNo.trim();
+    if (!targetOrderNo) {
+      return;
+    }
+
+    // 如果目标订单已经是当前订单，不需要重复切换
+    if (currentOrderNo === targetOrderNo) {
+      return;
+    }
+
+    // 把目标订单写入 AsyncStorage，作为新的"当前出库单"
+    //    同时加载该订单数据，覆盖 currentOrder / currentOrderMaterials
+    const switchCurrentOrder = async () => {
+      try {
+        await AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_ORDER_NO, targetOrderNo);
+        // 草稿要清空，避免用旧草稿的数量/仓库污染新订单
+        await AsyncStorage.removeItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT);
+
+        if (!screenActiveRef.current) {
+          return;
+        }
+
+        setTimeFilter('current');
+        setCurrentOrderNo(targetOrderNo);
+        setCurrentOrderLoading(true);
+
+        const [order, materials] = await Promise.all([
+          getOrder(targetOrderNo, currentWarehouse?.id),
+          getMaterialsByOrder(targetOrderNo, currentWarehouse?.id),
+        ]);
+
+        if (!screenActiveRef.current) {
+          return;
+        }
+
+        setCurrentOrder(order);
+        setCurrentOrderMaterials(order ? materials : []);
+      } catch (error) {
+        logger.error('切换当前订单失败:', error);
+      } finally {
+        if (screenActiveRef.current) {
+          setCurrentOrderLoading(false);
+        }
+      }
+    };
+
+    void switchCurrentOrder();
+    // 只在 orderNo 变化时触发，避免 currentOrderNo 变化导致循环
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params.orderNo]);
 
   // 点击订单 - 展开/收起显示物料列表
   const handleToggleOrder = async (order: Order) => {
@@ -988,278 +910,18 @@ export default function OrdersScreen() {
     );
   };
 
-  // 打开拆包弹窗
-  const handleOpenUnpack = async (material: MaterialRecord) => {
-    setUnpackingMaterial(material);
-    setUnpackNewQuantity('');
-    setUnpackNotes('');
-
-    // 获取拆包历史和下一个序号
-    try {
-      setUnpackNewTraceNo(await buildNextUnpackTraceNo(material.traceNo));
-    } catch (error) {
-      logger.error('获取拆包信息失败:', error);
-      setUnpackNewTraceNo('');
-    }
-
-    setUnpackModalVisible(true);
-  };
-
-  const buildNextUnpackTraceNo = async (traceNo?: string | null) => {
-    const baseTraceNo = traceNo ? traceNo.replace(/-\d+$/, '') : '';
-    if (!baseTraceNo) {
-      return '';
-    }
-
-    const nextIndex = await getNextUnpackIndex(traceNo || '');
-    return `${baseTraceNo}-${nextIndex}`;
-  };
-
-  // 确认拆包
-  const handleConfirmUnpack = async () => {
-    if (!unpackingMaterial) return;
-
-    const newQty = parseQuantity(unpackNewQuantity);
-    if (!unpackNewQuantity.trim() || newQty === null) {
-      showCustomAlert(
-        '错误',
-        '请输入有效的拆出数量',
-        [{ text: '确定', style: 'destructive' }],
-        'error'
-      );
-      return;
-    }
-
-    // 使用剩余数量作为当前可用数量（已拆包物料使用 remaining_quantity，新物料使用 quantity）
-    const availableQty = parseQuantity(
-      unpackingMaterial.remaining_quantity || (unpackingMaterial.quantity || 0).toString(),
-      { min: 0 }
-    );
-    if (availableQty !== null && newQty > availableQty) {
-      showCustomAlert(
-        '错误',
-        `拆出数量不能大于当前数量（${availableQty}个）`,
-        [{ text: '确定', style: 'destructive' }],
-        'error'
-      );
-      return;
-    }
-
-    const remainingQty = (availableQty ?? 0) - newQty;
-
-    setUnpacking(true);
-    try {
-      const resolvedNewTraceNo =
-        (await buildNextUnpackTraceNo(unpackingMaterial.traceNo)) || unpackNewTraceNo.trim();
-      setUnpackNewTraceNo(resolvedNewTraceNo);
-
-      const unpackResult = await saveUnpackOperation({
-        material: unpackingMaterial,
-        shippedQuantity: newQty,
-        remainingQuantity: remainingQty,
-        newTraceNo: resolvedNewTraceNo,
-        notes: unpackNotes,
-      });
-
-      // 2. 刷新物料列表（短暂延迟确保 AsyncStorage 写入完成）
-      if (!(await waitForUiFlush())) {
-        return;
-      }
-      const materials = await getMaterialsByOrder(unpackingMaterial.order_no, currentWarehouse?.id);
-      setExpandedMaterials(materials);
-      await loadData();
-
-      setUnpackModalVisible(false);
-
-      showCustomAlert(
-        '拆包成功',
-        `已生成 2 条标签：\n• 发货标签：${resolvedNewTraceNo || '-'}（${newQty}个）\n• 剩余标签：${resolvedNewTraceNo || '-'}（${remainingQty}个）`,
-        [
-          { text: '完成', style: 'cancel' },
-          {
-            text: '同步到电脑',
-            onPress: async () => {
-              handleSyncUnpackToComputer(unpackResult.shippedRecord, unpackResult.remainingRecord);
-            },
-          },
-        ],
-        'success'
-      );
-    } catch (error) {
-      logger.error('拆包失败:', error);
-      const message = error instanceof Error && error.message
-        ? error.message
-        : '拆包失败，请稍后重试';
-      showCustomAlert(
-        '错误',
-        message,
-        [{ text: '确定', style: 'destructive' }],
-        'error'
-      );
-    } finally {
-      setUnpacking(false);
-    }
-  };
-
-  // 同步单次拆包数据到电脑
-  const handleSyncUnpackToComputer = async (
-    shippedRecord: UnpackRecord,
-    remainingRecord: UnpackRecord
-  ) => {
-    if (!syncConfig.ip) {
-      showCustomAlert('提示', '请先在设置页面配置电脑IP地址', [{ text: '确定' }], 'warning');
-      return;
-    }
-
-    try {
-      // 定义表头（与设置页同步标签数据格式保持一致，确保BarTender能正确识别）
-      const headers = [
-        '仓库名称',
-        '标签类型',
-        '订单号',
-        '客户',
-        '型号',
-        '存货编码',
-        '批次',
-        '封装',
-        '版本',
-        '原数量',
-        '标签数量',
-        '生产日期',
-        '追踪码',
-        '箱号',
-        '拆包时间',
-        '备注',
-      ];
-
-      // 构建数据行（发货标签和剩余标签）
-      const rows = [
-        [
-          shippedRecord.warehouse_name || '',
-          '发货标签',
-          shippedRecord.order_no || '',
-          shippedRecord.customer_name || '',
-          shippedRecord.model || '',
-          shippedRecord.inventory_code || '',
-          shippedRecord.batch || '',
-          shippedRecord.package || '',
-          shippedRecord.version || '',
-          parseQuantity(shippedRecord.original_quantity, { min: 0 }) ?? 0,
-          parseQuantity(shippedRecord.new_quantity, { min: 0 }) ?? 0,
-          shippedRecord.productionDate || '',
-          shippedRecord.new_traceNo || shippedRecord.traceNo || '',
-          shippedRecord.sourceNo || '',
-          formatTime(shippedRecord.unpacked_at),
-          shippedRecord.notes || '',
-        ],
-        [
-          remainingRecord.warehouse_name || '',
-          '剩余标签',
-          remainingRecord.order_no || '',
-          remainingRecord.customer_name || '',
-          remainingRecord.model || '',
-          remainingRecord.inventory_code || '',
-          remainingRecord.batch || '',
-          remainingRecord.package || '',
-          remainingRecord.version || '',
-          parseQuantity(remainingRecord.original_quantity, { min: 0 }) ?? 0,
-          parseQuantity(remainingRecord.new_quantity, { min: 0 }) ?? 0,
-          remainingRecord.productionDate || '',
-          remainingRecord.new_traceNo || remainingRecord.traceNo || '',
-          remainingRecord.sourceNo || '',
-          formatTime(remainingRecord.unpacked_at),
-          remainingRecord.notes || '',
-        ],
-      ];
-
-      // 创建Excel
-      const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
-
-      // 计算列宽
-      const colWidths = headers.map((header, colIdx) => {
-        let maxWidth = header.length;
-        rows.forEach((row) => {
-          const cellValue = String(row[colIdx] || '');
-          const width = cellValue.split('').reduce((acc, char) => {
-            return acc + (char.charCodeAt(0) > 127 ? 2 : 1);
-          }, 0);
-          if (width > maxWidth) maxWidth = width;
-        });
-        return { wch: Math.min(maxWidth + 2, 50) };
-      });
-      ws['!cols'] = colWidths;
-
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, '标签数据');
-      const wbout = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
-      const bytes = decodeBase64ToBytes(wbout);
-      const body = toBinaryBody(bytes);
-
-      // 发送到电脑（添加订单号作为name_suffix，与设置页同步格式保持一致）
-      const baseUrl = `http://${syncConfig.ip}:${syncConfig.port || '8080'}/labels`;
-      const nameSuffix = shippedRecord.order_no || '拆包标签';
-      const url = `${baseUrl}?name_suffix=${encodeURIComponent(nameSuffix)}`;
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000);
-
-      let response: Response;
-      try {
-        response = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          },
-          body,
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timeoutId);
-      }
-
-      // 检查响应状态
-      if (!response.ok) {
-        const errorText = await response.text();
-        logger.error('服务器响应错误:', response.status, errorText);
-        throw new Error(`服务器错误 (${response.status})`);
-      }
-
-      // 尝试解析JSON响应
-      const result = await parseJsonResponse<{
-        success?: boolean;
-        message?: string;
-        fileName?: string;
-      }>(response, '服务器返回格式错误，请检查同步服务是否正常运行');
-
-      if (result.success) {
-        showCustomAlert(
-          '同步成功',
-          '已同步 2 条标签到电脑',
-          [{ text: '确定' }],
-          'success'
-        );
-      } else {
-        showCustomAlert(
-          '同步失败',
-          formatSyncErrorMessage(result.message, '未知错误'),
-          [{ text: '确定', style: 'destructive' }],
-          'error'
-        );
-      }
-    } catch (error: any) {
-      logger.error('同步失败:', error);
-      const errorMsg =
-        error.name === 'AbortError'
-          ? '连接超时，请检查网络'
-          : error.message?.includes('服务器')
-            ? error.message
-            : `同步失败：${formatSyncErrorMessage(error.message, '请检查网络和同步服务')}`;
-      showCustomAlert('同步失败', errorMsg, [{ text: '确定', style: 'destructive' }], 'error');
-    }
-  };
-
   // 打开编辑物料弹窗
   const handleOpenEditMaterial = (material: MaterialRecord) => {
+    if (material.isUnpacked) {
+      showCustomAlert(
+        '拆包物料不可直接修改',
+        '该数量与拆包标签成对关联，请回到扫码出库重新处理。',
+        [{ text: '确定' }],
+        'warning'
+      );
+      return;
+    }
+
     setEditingMaterial(material);
     setEditMaterialData({
       model: material.model || '',
@@ -1282,6 +944,15 @@ export default function OrdersScreen() {
   // 确认编辑物料
   const handleConfirmEditMaterial = async () => {
     if (!editingMaterial) return;
+    if (editingMaterial.isUnpacked) {
+      showCustomAlert(
+        '拆包物料不可直接修改',
+        '请关闭弹窗并回到扫码出库重新处理。',
+        [{ text: '确定' }],
+        'warning'
+      );
+      return;
+    }
 
     // 验证数量
     const newQty = parseQuantity(editMaterialData.quantity);
@@ -1310,6 +981,7 @@ export default function OrdersScreen() {
       return;
     }
 
+    let shouldNavigateToOutbound = false;
     setSavingMaterial(true);
     try {
       // 只更新数量字段，其他字段不可修改
@@ -1326,7 +998,7 @@ export default function OrdersScreen() {
       await loadData();
 
       setEditMaterialModalVisible(false);
-      showCustomAlert('成功', '物料数量已更新', [{ text: '确定' }], 'success');
+      shouldNavigateToOutbound = true;
     } catch (error) {
       logger.error('更新物料失败:', error);
       showCustomAlert(
@@ -1337,6 +1009,10 @@ export default function OrdersScreen() {
       );
     } finally {
       setSavingMaterial(false);
+    }
+
+    if (shouldNavigateToOutbound) {
+      router.replace('/outbound');
     }
   };
 
@@ -1357,35 +1033,22 @@ export default function OrdersScreen() {
           <Text style={styles.materialDate}>{formatDate(material.scanned_at)}</Text>
         </TouchableOpacity>
 
-        <View style={{ flexDirection: 'row', gap: Spacing.sm }}>
-          <TouchableOpacity
-            style={[styles.unpackBtn, { backgroundColor: theme.backgroundTertiary }]}
-            activeOpacity={0.7}
-            onPress={() => handleOpenEditMaterial(material)}
-          >
-            <Feather name="edit-2" size={14} color={theme.textPrimary} />
-            <Text style={[styles.unpackBtnText, { color: theme.textPrimary }]}>编辑</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.unpackBtn}
-            activeOpacity={0.7}
-            onPress={() => handleOpenUnpack(material)}
-          >
-            <Feather name="scissors" size={14} color={theme.primary} />
-            <Text style={styles.unpackBtnText}>拆包</Text>
-          </TouchableOpacity>
-        </View>
+        <TouchableOpacity
+          style={[styles.unpackBtn, { backgroundColor: theme.backgroundTertiary }]}
+          activeOpacity={0.7}
+          onPress={() => handleOpenEditMaterial(material)}
+        >
+          <Feather name="edit-2" size={14} color={theme.textPrimary} />
+          <Text style={[styles.unpackBtnText, { color: theme.textPrimary }]}>编辑</Text>
+        </TouchableOpacity>
       </View>
     ),
     [
       handleDeleteMaterial,
       handleOpenEditMaterial,
-      handleOpenUnpack,
       handleViewMaterial,
       styles,
       theme.backgroundTertiary,
-      theme.primary,
       theme.textPrimary,
     ]
   );
@@ -1623,8 +1286,15 @@ export default function OrdersScreen() {
           </TouchableOpacity>
           <View style={styles.headerContent}>
             <Text style={styles.title}>出库订单</Text>
-            <Text style={styles.subtitle}>展开订单查看物料，按需拆包</Text>
+            <Text style={styles.subtitle}>展开订单查看物料，长按可删除，按需编辑数量</Text>
           </View>
+          <TouchableOpacity
+            style={styles.headerActionButton}
+            activeOpacity={0.7}
+            onPress={() => router.push('/outbound')}
+          >
+            <Feather name="plus" size={20} color={theme.buttonPrimaryText} />
+          </TouchableOpacity>
         </View>
 
         {timeFilter !== 'current' && (
@@ -1652,7 +1322,7 @@ export default function OrdersScreen() {
         )}
 
         {/* 仓库选择器 + 视图筛选 + 搜索类型 */}
-        <View style={{ paddingHorizontal: Spacing.md, marginBottom: Spacing.sm }}>
+        <View style={styles.filterCard}>
           {/* 第一行：仓库 + 订单视图 */}
           <View style={styles.filterRow}>
             <TouchableOpacity
@@ -1742,7 +1412,7 @@ export default function OrdersScreen() {
                 onPress={() => handleSearchTypeChange('order')}
               >
                 <FontAwesome6
-                  name="file-alt"
+                  name="file-lines"
                   size={12}
                   color={searchType === 'order' ? theme.buttonPrimaryText : theme.textMuted}
                   style={styles.searchTypeBtnIcon}
@@ -1879,7 +1549,7 @@ export default function OrdersScreen() {
         onRequestClose={closeCustomerModal}
         hardwareAccelerated
       >
-        <View style={unpackModalStyles.modalOverlay}>
+        <View style={styles.modalOverlay}>
           <KeyboardAwareModalContainer extraScrollHeight={12}>
             <AppModalCard
               title={editingOrder?.customer_name ? '编辑客户名称' : '设置客户名称'}
@@ -1891,7 +1561,7 @@ export default function OrdersScreen() {
               stretchBody
               footer={
                 <AppModalActions
-                  containerStyle={unpackModalStyles.modalActions}
+                  containerStyle={styles.modalActions}
                   secondaryLabel="取消"
                   onSecondaryPress={closeCustomerModal}
                   primaryLabel="保存"
@@ -1902,7 +1572,7 @@ export default function OrdersScreen() {
               <AppFormField label="客户名称">
                 <TextInput
                   ref={customerNameInputRef}
-                  style={unpackModalStyles.textInput}
+                  style={styles.unpackTextInput}
                   placeholder="输入客户名称"
                   placeholderTextColor={theme.textMuted}
                   value={editCustomerName}
@@ -1920,145 +1590,6 @@ export default function OrdersScreen() {
         </View>
       </Modal>
 
-      {/* 拆包弹窗 */}
-      <Modal
-        visible={unpackModalVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setUnpackModalVisible(false)}
-      >
-        <View style={unpackModalStyles.modalOverlay}>
-          <AppModalCard
-            title="拆包打印"
-            subtitle="填写拆出数量并生成拆包标签"
-            onClose={() => setUnpackModalVisible(false)}
-            style={unpackModalStyles.modalContent}
-            bodyStyle={unpackModalStyles.modalBody}
-            size="largeForm"
-            stretchBody
-            footer={
-              <AppModalActions
-                containerStyle={unpackModalStyles.modalActions}
-                secondaryLabel="取消"
-                onSecondaryPress={() => setUnpackModalVisible(false)}
-                primaryLabel={unpacking ? '处理中...' : '确认拆包'}
-                primaryDisabled={unpacking}
-                onPrimaryPress={handleConfirmUnpack}
-              />
-            }
-          >
-            <KeyboardAwareFormScrollView
-              contentContainerStyle={unpackModalStyles.modalBodyContent}
-              bottomOffset={32}
-              showsVerticalScrollIndicator={true}
-            >
-              <AppFormField label="型号">
-                <View style={[unpackModalStyles.textInput, { justifyContent: 'center' }]}>
-                  <Text style={{ fontSize: rf(15), color: theme.textSecondary }}>
-                    {unpackingMaterial?.model || '-'}
-                  </Text>
-                </View>
-              </AppFormField>
-
-              <AppFormField label="批次">
-                <View style={[unpackModalStyles.textInput, { justifyContent: 'center' }]}>
-                  <Text style={{ fontSize: rf(15), color: theme.textSecondary }}>
-                    {unpackingMaterial?.batch || '-'}
-                  </Text>
-                </View>
-              </AppFormField>
-
-              <AppFormField label="当前可拆数量">
-                <View style={[unpackModalStyles.textInput, { justifyContent: 'center' }]}>
-                  <Text style={{ fontSize: rf(15), fontWeight: '700', color: theme.primary }}>
-                    {unpackingMaterial?.remaining_quantity ||
-                      (unpackingMaterial?.quantity || 0).toString()}
-                  </Text>
-                </View>
-              </AppFormField>
-
-              {/* 新追踪码（自动生成） */}
-              <AppFormField label="新追踪码（自动生成）">
-                <View style={[unpackModalStyles.textInput, { justifyContent: 'center' }]}>
-                  <Text style={{ fontSize: rf(16), fontWeight: '600', color: theme.primary }}>
-                    {unpackNewTraceNo || '-'}
-                  </Text>
-                </View>
-              </AppFormField>
-
-              {/* 拆出数量 */}
-              <AppFormField
-                label="拆出数量"
-                required
-                hint={`可拆 ${
-                  unpackingMaterial?.remaining_quantity ||
-                  (unpackingMaterial?.quantity || 0).toString()
-                } 个`}
-              >
-                <TextInput
-                  ref={unpackQuantityRef}
-                  style={unpackModalStyles.textInput}
-                  placeholder="输入要拆出的数量"
-                  placeholderTextColor={theme.textMuted}
-                  value={unpackNewQuantity}
-                  onChangeText={(text) => {
-                    const numeric = text.replace(/[^0-9]/g, '');
-                    setUnpackNewQuantity(numeric);
-                  }}
-                  keyboardType="number-pad"
-                />
-              </AppFormField>
-
-              {/* 剩余数量预览 */}
-              {unpackNewQuantity && parseQuantity(unpackNewQuantity) !== null && (
-                <View
-                  style={{
-                    flexDirection: 'row',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    paddingHorizontal: Spacing.md,
-                    paddingVertical: Spacing.md,
-                    marginTop: Spacing.sm,
-                  }}
-                >
-                  <Text style={{ fontSize: rf(14), color: theme.textSecondary }}>剩余标签数量</Text>
-                  <Text style={{ fontSize: rf(16), fontWeight: '600', color: theme.textPrimary }}>
-                    {Math.max(
-                      0,
-                      (parseQuantity(
-                        String(
-                          unpackingMaterial?.remaining_quantity ||
-                            unpackingMaterial?.quantity ||
-                            '0'
-                        ),
-                        { min: 0 }
-                      ) ?? 0) - (parseQuantity(unpackNewQuantity) ?? 0)
-                    )}{' '}
-                    个
-                  </Text>
-                </View>
-              )}
-
-              {/* 备注 */}
-              <AppFormField label="备注">
-                <TextInput
-                  ref={unpackNotesRef}
-                  style={[
-                    unpackModalStyles.textInput,
-                    { minHeight: 88, textAlignVertical: 'top' },
-                  ]}
-                  placeholder="添加备注信息"
-                  placeholderTextColor={theme.textMuted}
-                  value={unpackNotes}
-                  onChangeText={setUnpackNotes}
-                  multiline
-                />
-              </AppFormField>
-            </KeyboardAwareFormScrollView>
-          </AppModalCard>
-        </View>
-      </Modal>
-
       {/* 编辑物料弹窗 */}
       <Modal
         visible={editMaterialModalVisible}
@@ -2066,18 +1597,18 @@ export default function OrdersScreen() {
         animationType="fade"
         onRequestClose={() => setEditMaterialModalVisible(false)}
       >
-        <View style={unpackModalStyles.modalOverlay}>
+        <View style={styles.modalOverlay}>
           <AppModalCard
             title="编辑物料"
             subtitle="仅可修改数量"
             onClose={() => setEditMaterialModalVisible(false)}
-            style={unpackModalStyles.modalContent}
-            bodyStyle={unpackModalStyles.modalBody}
+            style={styles.unpackModalContent}
+            bodyStyle={styles.modalBody}
             size="form"
             stretchBody
             footer={
               <AppModalActions
-                containerStyle={unpackModalStyles.modalActions}
+                containerStyle={styles.modalActions}
                 secondaryLabel="取消"
                 onSecondaryPress={() => setEditMaterialModalVisible(false)}
                 primaryLabel={savingMaterial ? '保存中...' : '保存'}
@@ -2089,17 +1620,8 @@ export default function OrdersScreen() {
             <KeyboardAwareFormScrollView bottomOffset={16} extraScrollHeight={8}>
               {/* 型号（只读） */}
               <AppFormField label="型号">
-                <View
-                  style={[
-                    unpackModalStyles.textInput,
-                    {
-                      justifyContent: 'center',
-                      backgroundColor: theme.backgroundTertiary,
-                      opacity: 0.7,
-                    },
-                  ]}
-                >
-                  <Text style={{ fontSize: rf(16), color: theme.textSecondary }}>
+                <View style={[styles.unpackTextInput, styles.editReadOnlyInput]}>
+                  <Text style={styles.editReadOnlyText}>
                     {editMaterialData.model || '-'}
                   </Text>
                 </View>
@@ -2107,17 +1629,8 @@ export default function OrdersScreen() {
 
               {/* 批次（只读） */}
               <AppFormField label="批次">
-                <View
-                  style={[
-                    unpackModalStyles.textInput,
-                    {
-                      justifyContent: 'center',
-                      backgroundColor: theme.backgroundTertiary,
-                      opacity: 0.7,
-                    },
-                  ]}
-                >
-                  <Text style={{ fontSize: rf(16), color: theme.textSecondary }}>
+                <View style={[styles.unpackTextInput, styles.editReadOnlyInput]}>
+                  <Text style={styles.editReadOnlyText}>
                     {editMaterialData.batch || '-'}
                   </Text>
                 </View>
@@ -2127,12 +1640,12 @@ export default function OrdersScreen() {
               <AppFormField label="数量" required>
                 <TextInput
                   ref={quantityInputRef}
-                  style={unpackModalStyles.textInput}
+                  style={styles.unpackTextInput}
                   placeholder={`最多 ${editingMaterial?.original_quantity || editingMaterial?.quantity || 0} 个`}
                   placeholderTextColor={theme.textMuted}
                   value={editMaterialData.quantity}
                   onChangeText={(text) => {
-                    const numeric = text.replace(/[^0-9]/g, '');
+                    const numeric = text.replace(/\D/g, '');
                     setEditMaterialData((prev) => ({ ...prev, quantity: numeric }));
                   }}
                   keyboardType="number-pad"

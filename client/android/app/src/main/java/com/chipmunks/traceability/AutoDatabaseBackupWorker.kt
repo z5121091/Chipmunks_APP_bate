@@ -32,6 +32,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import org.json.JSONObject
 
 object AutoDatabaseBackupScheduler {
   private const val UNIQUE_WORK_NAME = "auto_database_backup"
@@ -82,7 +83,7 @@ object AutoDatabaseBackupScheduler {
 
     WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
       UNIQUE_WORK_NAME,
-      ExistingWorkPolicy.KEEP,
+      ExistingWorkPolicy.REPLACE,
       request
     )
   }
@@ -114,16 +115,31 @@ object AutoDatabaseBackupScheduler {
       .getString(LAST_SUCCESS_DATE_KEY, null)
   }
 
-  fun markSuccess(context: Context, date: String, databaseFile: File) {
-    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+  fun markSuccess(
+    context: Context,
+    date: String,
+    databaseFile: File,
+    sourceSignature: String?
+  ) {
+    val editor = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
       .edit()
       .putString(LAST_SUCCESS_DATE_KEY, date)
       .putLong(LAST_SUCCESS_AT_MS_KEY, System.currentTimeMillis())
-      .putLong(LAST_SUCCESS_DATABASE_MODIFIED_KEY, databaseFile.lastModified())
-      .putLong(LAST_SUCCESS_DATABASE_SIZE_KEY, databaseFile.length())
-      .putString(LAST_SUCCESS_DATABASE_SIGNATURE_KEY, buildDatabaseSignature(databaseFile))
       .remove(FORCE_NEXT_BACKUP_KEY)
-      .commit()
+
+    if (sourceSignature == null) {
+      editor
+        .putLong(LAST_SUCCESS_DATABASE_MODIFIED_KEY, -1L)
+        .putLong(LAST_SUCCESS_DATABASE_SIZE_KEY, -1L)
+        .remove(LAST_SUCCESS_DATABASE_SIGNATURE_KEY)
+    } else {
+      editor
+        .putLong(LAST_SUCCESS_DATABASE_MODIFIED_KEY, databaseFile.lastModified())
+        .putLong(LAST_SUCCESS_DATABASE_SIZE_KEY, databaseFile.length())
+        .putString(LAST_SUCCESS_DATABASE_SIGNATURE_KEY, sourceSignature)
+    }
+
+    editor.commit()
   }
 
   fun requestBackup(context: Context, force: Boolean = false) {
@@ -150,7 +166,7 @@ object AutoDatabaseBackupScheduler {
   }
 
   fun getDatabaseFile(context: Context): File {
-    return File(context.filesDir, "SQLite/warehouse.db")
+    return File(context.filesDir, "SQLite/palm_warehouse_v2.db")
   }
 
   fun hasSuccessfulBackupForCurrentDatabase(
@@ -166,7 +182,7 @@ object AutoDatabaseBackupScheduler {
     val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     val lastSignature = prefs.getString(LAST_SUCCESS_DATABASE_SIGNATURE_KEY, null)
     if (lastSignature != null) {
-      return buildDatabaseSignature(databaseFile) != lastSignature
+      return getDatabaseSignature(databaseFile) != lastSignature
     }
 
     val lastModified = prefs.getLong(LAST_SUCCESS_DATABASE_MODIFIED_KEY, -1L)
@@ -190,11 +206,10 @@ object AutoDatabaseBackupScheduler {
       TimeUnit.MINUTES.toMillis(MIN_CHANGED_BACKUP_INTERVAL_MINUTES)
   }
 
-  private fun buildDatabaseSignature(databaseFile: File): String {
+  fun getDatabaseSignature(databaseFile: File): String {
     return listOf(
       databaseFile,
-      File("${databaseFile.absolutePath}-wal"),
-      File("${databaseFile.absolutePath}-shm")
+      File("${databaseFile.absolutePath}-wal")
     ).joinToString("|") { file ->
       if (file.exists()) {
         "${file.name}:${file.lastModified()}:${file.length()}"
@@ -215,6 +230,46 @@ object AutoDatabaseBackupScheduler {
       .putString(LAST_NO_DATA_DATE_KEY, date)
       .remove(FORCE_NEXT_BACKUP_KEY)
       .commit()
+  }
+
+  fun writeStatus(
+    context: Context,
+    status: String,
+    trigger: String,
+    reason: String? = null,
+    fileName: String? = null,
+    errorMessage: String? = null
+  ) {
+    try {
+      val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      val payload = JSONObject()
+        .put("source", "native-workmanager")
+        .put("checkedAtMs", System.currentTimeMillis())
+        .put("status", status)
+        .put("trigger", trigger)
+
+      reason?.let { payload.put("reason", it) }
+      fileName?.let { payload.put("fileName", it) }
+      errorMessage?.let { payload.put("errorMessage", it) }
+
+      val lastSuccessAt = prefs.getLong(LAST_SUCCESS_AT_MS_KEY, -1L)
+      if (lastSuccessAt > 0L) {
+        payload.put("lastSuccessAtMs", lastSuccessAt)
+      }
+      prefs.getString(LAST_SUCCESS_DATE_KEY, null)?.let {
+        payload.put("lastSuccessDate", it)
+      }
+
+      val statusDir = File(context.filesDir, "auto-db-backup").apply {
+        mkdirs()
+      }
+      File(statusDir, "native-status.json").writeText(
+        payload.toString(),
+        StandardCharsets.UTF_8
+      )
+    } catch (error: Exception) {
+      Log.w("AutoDbBackup", "Failed to write native backup status", error)
+    }
   }
 
   private fun scheduleDailyAlarm(context: Context) {
@@ -274,11 +329,18 @@ class AutoDatabaseBackupWorker(
     return try {
       val today = AutoDatabaseBackupScheduler.todayBeijing()
       Log.i(TAG, "Auto database backup worker started for $today")
+      AutoDatabaseBackupScheduler.writeStatus(applicationContext, "running", "workmanager")
 
       val databaseFile = AutoDatabaseBackupScheduler.getDatabaseFile(applicationContext)
       if (!databaseFile.exists() || databaseFile.length() <= 0L) {
         Log.w(TAG, "SQLite database file does not exist, skip auto backup: ${databaseFile.absolutePath}")
         AutoDatabaseBackupScheduler.markNoData(applicationContext, today)
+        AutoDatabaseBackupScheduler.writeStatus(
+          applicationContext,
+          "skipped",
+          "workmanager",
+          "database-missing"
+        )
         return Result.success()
       }
       Log.i(TAG, "SQLite database file found: ${databaseFile.absolutePath}, size=${databaseFile.length()}")
@@ -293,6 +355,12 @@ class AutoDatabaseBackupWorker(
         )
       ) {
         Log.i(TAG, "Auto database backup already completed for current database today, skip")
+        AutoDatabaseBackupScheduler.writeStatus(
+          applicationContext,
+          "skipped",
+          "workmanager",
+          "already-current"
+        )
         return Result.success()
       }
 
@@ -302,69 +370,61 @@ class AutoDatabaseBackupWorker(
         !AutoDatabaseBackupScheduler.hasChangedBackupIntervalElapsed(applicationContext)
       ) {
         Log.i(TAG, "Auto database backup changed too recently, skip until interval elapses")
+        AutoDatabaseBackupScheduler.writeStatus(
+          applicationContext,
+          "skipped",
+          "workmanager",
+          "interval-not-elapsed"
+        )
         return Result.success()
       }
-
-      checkpointWal(databaseFile)
 
       if (!hasBusinessData(databaseFile)) {
         Log.w(TAG, "SQLite database has no business data, skip auto backup to avoid overwriting a valid remote file")
         AutoDatabaseBackupScheduler.markNoData(applicationContext, today)
+        AutoDatabaseBackupScheduler.writeStatus(
+          applicationContext,
+          "skipped",
+          "workmanager",
+          "no-business-data"
+        )
         return Result.success()
       }
 
-      val backupFile = uploadBackup(databaseFile, today)
-      AutoDatabaseBackupScheduler.markSuccess(applicationContext, today, databaseFile)
-      Log.i(TAG, "Auto database backup completed: ${backupFile.name}")
+      val backupSnapshot = uploadBackup(databaseFile, today)
+      AutoDatabaseBackupScheduler.markSuccess(
+        applicationContext,
+        today,
+        databaseFile,
+        backupSnapshot.sourceSignature
+      )
+      AutoDatabaseBackupScheduler.writeStatus(
+        applicationContext,
+        "success",
+        "workmanager",
+        fileName = backupSnapshot.file.name
+      )
+      Log.i(TAG, "Auto database backup completed: ${backupSnapshot.file.name}")
       Result.success()
     } catch (error: Exception) {
       Log.w(TAG, "Auto database backup failed", error)
+      AutoDatabaseBackupScheduler.writeStatus(
+        applicationContext,
+        "failed",
+        "workmanager",
+        errorMessage = error.message ?: "Unknown error"
+      )
       Result.retry()
     }
   }
 
-  private fun checkpointWal(databaseFile: File) {
-    var lastBusyMessage: String? = null
-    repeat(5) { attempt ->
-      val busyMessage = tryCheckpointWal(databaseFile)
-      if (busyMessage == null) {
-        return
-      }
-
-      lastBusyMessage = busyMessage
-      Log.w(TAG, "WAL checkpoint busy, retry ${attempt + 1}/5: $busyMessage")
-      Thread.sleep(2_000)
-    }
-
-    throw IllegalStateException("WAL checkpoint is busy after retries: $lastBusyMessage")
-  }
-
-  private fun tryCheckpointWal(databaseFile: File): String? {
-    SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
-      .use { database ->
-        database.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { cursor ->
-          if (!cursor.moveToFirst()) {
-            throw IllegalStateException("WAL checkpoint returned no result")
-          }
-          val busy = cursor.getInt(0)
-          val log = cursor.getInt(1)
-          val checkpointed = cursor.getInt(2)
-          Log.d(TAG, "WAL checkpoint result: $busy, $log, $checkpointed")
-          if (busy != 0) {
-            return "log=$log, checkpointed=$checkpointed"
-          }
-        }
-      }
-    return null
-  }
-
   private fun hasBusinessData(databaseFile: File): Boolean {
     val businessTables = listOf(
-      "orders",
-      "materials",
-      "inbound_records",
-      "inventory_check_records",
-      "unpack_records"
+      "出库单",
+      "出库明细",
+      "入库记录",
+      "盘点记录",
+      "拆包记录"
     )
 
     SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
@@ -390,20 +450,44 @@ class AutoDatabaseBackupWorker(
     }
   }
 
-  private fun copyDatabaseSnapshot(databaseFile: File, backupFileName: String): File {
+  private data class DatabaseBackupSnapshot(
+    val file: File,
+    val sourceSignature: String?
+  )
+
+  private fun createDatabaseSnapshot(
+    databaseFile: File,
+    backupFileName: String
+  ): DatabaseBackupSnapshot {
     val backupDir = File(applicationContext.cacheDir, "auto-db-backup").apply {
       mkdirs()
     }
     val backupFile = File(backupDir, backupFileName)
-    databaseFile.copyTo(backupFile, overwrite = true)
-    return backupFile
+    if (backupFile.exists() && !backupFile.delete()) {
+      throw IllegalStateException("Unable to replace stale database snapshot: ${backupFile.absolutePath}")
+    }
+
+    val signatureBefore = AutoDatabaseBackupScheduler.getDatabaseSignature(databaseFile)
+    val escapedPath = backupFile.absolutePath.replace("'", "''")
+    SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
+      .use { database ->
+        database.execSQL("VACUUM INTO '$escapedPath'")
+      }
+
+    if (!backupFile.exists() || backupFile.length() <= 0L) {
+      throw IllegalStateException("SQLite did not create a valid database snapshot")
+    }
+
+    val signatureAfter = AutoDatabaseBackupScheduler.getDatabaseSignature(databaseFile)
+    return DatabaseBackupSnapshot(
+      file = backupFile,
+      sourceSignature = signatureBefore.takeIf { it == signatureAfter }
+    )
   }
 
-  private fun uploadBackup(databaseFile: File, date: String): File {
+  private fun uploadBackup(databaseFile: File, date: String): DatabaseBackupSnapshot {
     val server = WebDavServer.from(DEFAULT_UPDATE_SERVER)
     val backupDirectoryUrl = "${server.cleanBaseUrl}/backup/"
-
-    ensureRemoteDirectory(server, backupDirectoryUrl)
 
     for (sequence in 1..999) {
       val backupFileName = buildBackupFileName(date, sequence)
@@ -412,57 +496,16 @@ class AutoDatabaseBackupWorker(
         continue
       }
 
-      val backupFile = copyDatabaseSnapshot(databaseFile, backupFileName)
+      val backupSnapshot = createDatabaseSnapshot(databaseFile, backupFileName)
+      val backupFile = backupSnapshot.file
       Log.i(TAG, "Database snapshot created: ${backupFile.absolutePath}, size=${backupFile.length()}")
       Log.i(TAG, "Uploading database backup to: $backupFileUrl")
       if (putFile(server, backupFileUrl, backupFile)) {
-        return backupFile
+        return backupSnapshot
       }
     }
 
-    throw IllegalStateException("No available WebDAV backup file name for $date")
-  }
-
-  private fun ensureRemoteDirectory(server: WebDavServer, directoryUrl: String) {
-    val connection = openConnection(server, directoryUrl, "MKCOL")
-    try {
-      val responseCode = connection.responseCode
-      if (
-        responseCode in 200..299 ||
-        responseCode == HttpURLConnection.HTTP_BAD_METHOD ||
-        responseCode == HttpURLConnection.HTTP_CONFLICT
-      ) {
-        Log.i(TAG, "WebDAV backup directory ready after MKCOL: $responseCode")
-        return
-      }
-      if (
-        responseCode == HttpURLConnection.HTTP_FORBIDDEN ||
-        responseCode == HttpURLConnection.HTTP_NOT_IMPLEMENTED
-      ) {
-        Log.w(TAG, "WebDAV MKCOL unavailable: $responseCode, fallback to PROPFIND")
-        if (remoteDirectoryExistsByPropfind(server, directoryUrl)) {
-          return
-        }
-      }
-      throw IllegalStateException("WebDAV backup directory create/check failed: $responseCode ${connection.responseMessage}")
-    } finally {
-      connection.disconnect()
-    }
-  }
-
-  private fun remoteDirectoryExistsByPropfind(server: WebDavServer, directoryUrl: String): Boolean {
-    val connection = openConnection(server, directoryUrl, "PROPFIND")
-    connection.setRequestProperty("Depth", "0")
-    try {
-      val responseCode = connection.responseCode
-      return when {
-        responseCode in 200..299 -> true
-        responseCode == HttpURLConnection.HTTP_NOT_FOUND -> false
-        else -> throw IllegalStateException("WebDAV directory PROPFIND failed: $responseCode ${connection.responseMessage}")
-      }
-    } finally {
-      connection.disconnect()
-    }
+    throw IllegalStateException("NAS 当日数据库备份序号已超过 999：$date")
   }
 
   private fun remoteFileExists(server: WebDavServer, targetUrl: String): Boolean {
@@ -475,25 +518,12 @@ class AutoDatabaseBackupWorker(
         responseCode == HttpURLConnection.HTTP_FORBIDDEN ||
           responseCode == HttpURLConnection.HTTP_BAD_METHOD ||
           responseCode == HttpURLConnection.HTTP_NOT_IMPLEMENTED -> {
-          Log.w(TAG, "WebDAV HEAD unsupported for existence check: $responseCode, fallback to PROPFIND")
-          remoteFileExistsByPropfind(server, targetUrl)
+          Log.w(TAG, "WebDAV HEAD unsupported for existence check: $responseCode, rely on PUT precondition")
+          false
         }
-        else -> throw IllegalStateException("WebDAV HEAD failed: $responseCode ${connection.responseMessage}")
-      }
-    } finally {
-      connection.disconnect()
-    }
-  }
-
-  private fun remoteFileExistsByPropfind(server: WebDavServer, targetUrl: String): Boolean {
-    val connection = openConnection(server, targetUrl, "PROPFIND")
-    connection.setRequestProperty("Depth", "0")
-    try {
-      val responseCode = connection.responseCode
-      return when {
-        responseCode in 200..299 -> true
-        responseCode == HttpURLConnection.HTTP_NOT_FOUND -> false
-        else -> throw IllegalStateException("WebDAV PROPFIND failed: $responseCode ${connection.responseMessage}")
+        else -> throw IllegalStateException(
+          "NAS 备份文件检查失败：HTTP $responseCode ${connection.responseMessage}"
+        )
       }
     } finally {
       connection.disconnect()
@@ -515,15 +545,19 @@ class AutoDatabaseBackupWorker(
       }
 
       val responseCode = connection.responseCode
-      if (
-        responseCode == HttpURLConnection.HTTP_CONFLICT ||
-        responseCode == HttpURLConnection.HTTP_PRECON_FAILED
-      ) {
+      if (responseCode == HttpURLConnection.HTTP_PRECON_FAILED) {
         Log.w(TAG, "WebDAV target already exists, try next file name: $responseCode")
         return false
       }
+      if (responseCode == HttpURLConnection.HTTP_CONFLICT) {
+        throw IllegalStateException(
+          "NAS 备份目录不存在或无写入权限：HTTP $responseCode ${connection.responseMessage}"
+        )
+      }
       if (responseCode !in 200..299) {
-        throw IllegalStateException("WebDAV PUT failed: $responseCode ${connection.responseMessage}")
+        throw IllegalStateException(
+          "NAS 数据库备份上传失败：HTTP $responseCode ${connection.responseMessage}"
+        )
       }
       Log.i(TAG, "WebDAV PUT completed: $responseCode")
       return true

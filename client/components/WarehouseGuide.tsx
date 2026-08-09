@@ -104,15 +104,11 @@ export function WarehouseGuide({ visible, onSkip, onGoToSettings }: WarehouseGui
   );
 }
 
-export async function shouldShowWarehouseGuide(options: {
+export function shouldShowWarehouseGuide(options: {
   hasBusinessData: boolean;
   hasWarehouseConfig: boolean;
-}): Promise<boolean> {
+}): boolean {
   return !options.hasBusinessData && !options.hasWarehouseConfig;
-}
-
-export async function markWarehouseGuideShown(): Promise<void> {
-  return;
 }
 
 const styles = StyleSheet.create({

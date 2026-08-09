@@ -2,6 +2,7 @@ import { Platform, StyleSheet } from 'react-native';
 import { Spacing, BorderRadius, Theme, BorderWidth } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
 import { withAlpha } from '@/utils/colors';
+import { rf } from '@/utils/responsive';
 
 export const createStyles = (theme: Theme) => {
   return StyleSheet.create({
@@ -27,7 +28,7 @@ export const createStyles = (theme: Theme) => {
       elevation: 5,
     },
     title: {
-      fontSize: 24,
+      fontSize: rf(24),
       fontWeight: '800',
       color: theme.textPrimary,
       letterSpacing: -0.6,
@@ -46,7 +47,7 @@ export const createStyles = (theme: Theme) => {
       elevation: 3,
     },
     cardTitle: {
-      fontSize: 12,
+      fontSize: rf(12),
       fontWeight: '700',
       color: theme.textMuted,
       textTransform: 'uppercase',
@@ -70,25 +71,25 @@ export const createStyles = (theme: Theme) => {
       borderBottomWidth: 0,
     },
     fieldLabel: {
-      fontSize: 13,
+      fontSize: rf(13),
       color: theme.textSecondary,
       marginBottom: Spacing.xs,
     },
     fieldValue: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '600',
       color: theme.textPrimary,
       flex: 1,
       textAlign: 'right',
     },
     fieldValueLong: {
-      fontSize: 13,
+      fontSize: rf(13),
       fontWeight: '600',
       color: theme.textPrimary,
       lineHeight: 20,
     },
     modelValue: {
-      fontSize: 19,
+      fontSize: rf(19),
       fontWeight: '800',
       color: theme.textPrimary,
     },
@@ -96,13 +97,13 @@ export const createStyles = (theme: Theme) => {
       marginTop: Spacing.md,
     },
     rawContentText: {
-      fontSize: 11,
+      fontSize: rf(11),
       color: theme.textMuted,
       fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
       lineHeight: 16,
     },
     noDataText: {
-      fontSize: 13,
+      fontSize: rf(13),
       color: theme.textMuted,
       textAlign: 'center',
       paddingVertical: Spacing.md,
@@ -119,7 +120,7 @@ export const createStyles = (theme: Theme) => {
       minHeight: 50,
     },
     buttonText: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '600',
       color: theme.buttonPrimaryText,
     },
@@ -134,7 +135,7 @@ export const createStyles = (theme: Theme) => {
       minHeight: 50,
     },
     secondaryButtonText: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '600',
       color: theme.textPrimary,
     },
@@ -150,7 +151,7 @@ export const createStyles = (theme: Theme) => {
       alignItems: 'center',
     },
     loadingText: {
-      fontSize: 14,
+      fontSize: rf(14),
       color: theme.textSecondary,
     },
     errorContainer: {
@@ -160,7 +161,7 @@ export const createStyles = (theme: Theme) => {
       padding: Spacing.md,
     },
     errorText: {
-      fontSize: 14,
+      fontSize: rf(14),
       color: theme.error,
       textAlign: 'center',
       marginBottom: Spacing.md,
@@ -172,7 +173,7 @@ export const createStyles = (theme: Theme) => {
       paddingHorizontal: Spacing.lg,
     },
     backButtonText: {
-      fontSize: 14,
+      fontSize: rf(14),
       fontWeight: '600',
       color: theme.buttonPrimaryText,
     },
@@ -202,7 +203,7 @@ export const createStyles = (theme: Theme) => {
       borderRadius: BorderRadius.lg,
       paddingHorizontal: Spacing.md,
       paddingVertical: Spacing.sm + 2,
-      fontSize: 14,
+      fontSize: rf(14),
       color: theme.textPrimary,
       borderWidth: BorderWidth.normal,
       borderColor: theme.border,
@@ -225,7 +226,7 @@ export const createStyles = (theme: Theme) => {
       borderColor: theme.primary,
     },
     optionButtonText: {
-      fontSize: 13,
+      fontSize: rf(13),
       color: theme.textPrimary,
     },
     optionButtonTextActive: {

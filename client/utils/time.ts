@@ -22,7 +22,8 @@ export const getISODateTime = (date: Date = new Date()): string => {
 };
 
 /**
- * 获取当前时间（用于导出/备份）- 别名，兼容旧代码
+ * 导出/备份文件命名使用的时间戳。
+ * 保留这个别名是为了让调用点表达“导出”语义，底层格式与 getISODateTime 保持一致。
  */
 export const getExportDateTime = getISODateTime;
 

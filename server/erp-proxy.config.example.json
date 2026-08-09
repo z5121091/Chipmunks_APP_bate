@@ -1,0 +1,17 @@
+{
+  "target": "",
+  "targets": {
+    "wuxi-duneng": "https://erp-wuxi.example.com",
+    "shanghai-chipmunk": "https://erp-shanghai.example.com"
+  },
+  "backendAccessKeys": {
+    "wuxi-duneng": "replace-with-wuxi-backend-access-key",
+    "shanghai-chipmunk": "replace-with-shanghai-backend-access-key"
+  },
+  "clientAccessKey": "",
+  "hostAccounts": {
+    "erp-wuxi.example.com": "wuxi-duneng",
+    "erp-shanghai.example.com": "shanghai-chipmunk"
+  },
+  "backendAccessKey": ""
+}

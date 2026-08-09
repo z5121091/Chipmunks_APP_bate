@@ -10,6 +10,7 @@ import { Screen } from '@/components/Screen';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
+import { logger } from '@/utils/logger';
 import { getAllWarehouses, type Warehouse } from '@/utils/database';
 import {
   clearOutboundWarehouseOrderRule,
@@ -75,14 +76,17 @@ export default function OutboundOrderRulesScreen() {
       ]);
       setWarehouses(warehouseList);
       setWarehouseRules(savedWarehouseRules);
+    } catch (error) {
+      logger.error('加载出库单号规则失败:', error);
+      alert.showError('出库单号规则加载失败，请重试');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [alert.showError]);
 
   useFocusEffect(
     useCallback(() => {
-      loadData();
+      void loadData();
     }, [loadData])
   );
 
@@ -154,6 +158,9 @@ export default function OutboundOrderRulesScreen() {
       setActiveWarehouse(null);
       setActiveSampleText('');
       alert.showSuccess(`已清空 ${activeWarehouse.name} 的出库单号样例`);
+    } catch (error) {
+      logger.error('清空出库单号规则失败:', error);
+      alert.showWarning(error instanceof Error ? error.message : '清空样例失败');
     } finally {
       setSaving(false);
     }
@@ -355,6 +362,7 @@ export default function OutboundOrderRulesScreen() {
               onPrimaryPress={handleSaveWarehouseRule}
               secondaryLabel="清空样例"
               onSecondaryPress={handleClearWarehouseRule}
+              secondaryDisabled={saving}
               primaryDisabled={saving || !activeParseResult.rule}
               containerStyle={styles.editorActions}
             />
