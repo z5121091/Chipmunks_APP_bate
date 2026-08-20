@@ -1,3 +1,5 @@
+import { shouldUseErpPublicGateway } from '@/utils/backendApi';
+
 export type ErpAccountKey = 'wuxi-duneng' | 'shanghai-chipmunk';
 
 export interface ErpAccountConfig {
@@ -20,20 +22,25 @@ const getEnvBool = (key: string): boolean | null => {
   return null;
 };
 
-// ⚠️ 默认后端地址（兜底用）
-// 扣子部署环境变量不会注入前端 APK 构建，APK 里 EXPO_PUBLIC_* 是空的，
-// 所以这里硬编码一个默认值，保证 APK 安装后能直接连上云服务器。
-// 以后换服务器时改这里重新打包即可。
-const DEFAULT_BACKEND_BASE_URL = 'http://114.55.15.45:8080';
+// APK 构建没有注入 EXPO_PUBLIC_* 时使用稳定的 HTTPS 域名。
+// 后续迁移服务器只需要修改 DNS，不需要为了更换 IP 重新打包 APK。
+const DEFAULT_BACKEND_BASE_URL = 'https://erp.chipmunks.fun';
 
 const COMMON_BACKEND_BASE_URL = getEnv('EXPO_PUBLIC_BACKEND_BASE_URL') || DEFAULT_BACKEND_BASE_URL;
+const ERP_PUBLIC_GATEWAY_BASE_URL =
+  process.env.EXPO_PUBLIC_ERP_PUBLIC_GATEWAY_BASE_URL?.trim() || DEFAULT_BACKEND_BASE_URL;
+const USE_ERP_PUBLIC_GATEWAY = shouldUseErpPublicGateway();
 
 const normalizeBaseUrl = (value?: string): string => value?.trim().replace(/\/+$/, '') || '';
 
 const WUXI_DUNENG_BASE_URL =
-  getEnv('EXPO_PUBLIC_ERP_WUXI_DUNENG_BASE_URL') || COMMON_BACKEND_BASE_URL;
+  (USE_ERP_PUBLIC_GATEWAY
+    ? ERP_PUBLIC_GATEWAY_BASE_URL
+    : getEnv('EXPO_PUBLIC_ERP_WUXI_DUNENG_BASE_URL')) || COMMON_BACKEND_BASE_URL;
 const SHANGHAI_CHIPMUNK_BASE_URL =
-  getEnv('EXPO_PUBLIC_ERP_SHANGHAI_CHIPMUNK_BASE_URL') || COMMON_BACKEND_BASE_URL;
+  (USE_ERP_PUBLIC_GATEWAY
+    ? getEnv('EXPO_PUBLIC_ERP_SHANGHAI_CHIPMUNK_PUBLIC_GATEWAY_BASE_URL')
+    : getEnv('EXPO_PUBLIC_ERP_SHANGHAI_CHIPMUNK_BASE_URL')) || COMMON_BACKEND_BASE_URL;
 
 const WUXI_DUNENG_ENABLED = getEnvBool('EXPO_PUBLIC_ERP_WUXI_DUNENG_ENABLED') ?? true;
 const SHANGHAI_CHIPMUNK_ENABLED = getEnvBool('EXPO_PUBLIC_ERP_SHANGHAI_CHIPMUNK_ENABLED') ?? false;

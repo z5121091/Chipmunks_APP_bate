@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, it } from 'node:test';
 import {
+  createOAuthStateChallenge,
   getOpenTokenExpiresAtMs,
   getRefreshTokenExpiresAtMs,
   getTokenRefreshDueAtMs,
+  isOAuthStateChallengeValid,
   type ChanjetState,
 } from '../erp.ts';
 
@@ -46,5 +48,30 @@ describe('Chanjet token refresh timing', () => {
     };
 
     assert.equal(getTokenRefreshDueAtMs(state), receivedAt + 3 * DAY_MS);
+  });
+});
+
+describe('Chanjet OAuth state', () => {
+  it('accepts one generated challenge only before its deadline', () => {
+    const now = Date.parse('2026-08-19T12:00:00.000Z');
+    const challenge = createOAuthStateChallenge(now);
+
+    assert.equal(
+      isOAuthStateChallengeValid(challenge.value, challenge.hash, challenge.expiresAt, now),
+      true
+    );
+    assert.equal(
+      isOAuthStateChallengeValid('forged', challenge.hash, challenge.expiresAt, now),
+      false
+    );
+    assert.equal(
+      isOAuthStateChallengeValid(
+        challenge.value,
+        challenge.hash,
+        challenge.expiresAt,
+        Date.parse(challenge.expiresAt)
+      ),
+      false
+    );
   });
 });

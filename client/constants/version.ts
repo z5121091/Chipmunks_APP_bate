@@ -16,7 +16,11 @@ export const IOS_BUILD_NUMBER = versionConfig.buildNumber;
 export const APP_NAME = versionConfig.appName;
 export const COMPANY_NAME = versionConfig.companyName;
 export const COMPANY_WEBSITE = versionConfig.companyWebsite;
+export const PRIVACY_POLICY_URL = versionConfig.privacyPolicyUrl;
 export const AUTHOR = versionConfig.author;
+export const ICP_FILING_NUMBER = versionConfig.icpFilingNumber;
+export const ICP_FILING_URL = versionConfig.icpFilingUrl;
+export const SELF_UPDATE_ENABLED = process.env.EXPO_PUBLIC_ENABLE_SELF_UPDATE !== 'false';
 
 // 更新日志（从 version.json 读取，所有页面统一使用）
 export const CHANGELOG_DATA = versionConfig.changelog || [];

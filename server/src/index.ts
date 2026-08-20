@@ -10,6 +10,9 @@ import { inflateSync, strFromU8 } from 'fflate';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { request as httpRequest, type IncomingMessage } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import {
   DEFAULT_ERP_ACCOUNT_KEY,
@@ -20,6 +23,8 @@ import {
   SERVER_ERP_ACCOUNTS,
 } from './erpAccounts.ts';
 import { registerErpRoutes } from './erp.ts';
+import { HOME_PAGE_HTML, PRIVACY_POLICY_HTML } from './publicPages.ts';
+import { SERVER_RELEASE } from './release.ts';
 
 type ErpProxyFileConfig = {
   backendAccessKey?: string;
@@ -27,6 +32,8 @@ type ErpProxyFileConfig = {
   clientAccessKey?: string;
   hostAccounts?: Record<string, ErpAccountKey>;
   target?: string;
+  targetAddress?: string;
+  targetAddresses?: Partial<Record<ErpAccountKey, string>>;
   targets?: Partial<Record<ErpAccountKey, string>>;
 };
 
@@ -49,6 +56,12 @@ const readErpProxyFileConfig = (): ErpProxyFileConfig => {
     const rawTargets =
       record.targets && typeof record.targets === 'object' && !Array.isArray(record.targets)
         ? (record.targets as Record<string, unknown>)
+        : {};
+    const rawTargetAddresses =
+      record.targetAddresses &&
+      typeof record.targetAddresses === 'object' &&
+      !Array.isArray(record.targetAddresses)
+        ? (record.targetAddresses as Record<string, unknown>)
         : {};
     const rawBackendAccessKeys =
       record.backendAccessKeys &&
@@ -86,6 +99,18 @@ const readErpProxyFileConfig = (): ErpProxyFileConfig => {
         typeof record.clientAccessKey === 'string' ? record.clientAccessKey.trim() : '',
       hostAccounts,
       target: typeof record.target === 'string' ? record.target.trim() : '',
+      targetAddress:
+        typeof record.targetAddress === 'string' ? record.targetAddress.trim() : '',
+      targetAddresses: {
+        'wuxi-duneng':
+          typeof rawTargetAddresses['wuxi-duneng'] === 'string'
+            ? rawTargetAddresses['wuxi-duneng'].trim()
+            : '',
+        'shanghai-chipmunk':
+          typeof rawTargetAddresses['shanghai-chipmunk'] === 'string'
+            ? rawTargetAddresses['shanghai-chipmunk'].trim()
+            : '',
+      },
       targets: {
         'wuxi-duneng':
           typeof rawTargets['wuxi-duneng'] === 'string'
@@ -110,6 +135,15 @@ const readErpProxyFileConfig = (): ErpProxyFileConfig => {
 
 const erpProxyFileConfig = readErpProxyFileConfig();
 const app = express();
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
 const port = Number(process.env.PORT || 8080);
 const host = process.env.HOST?.trim() || '0.0.0.0';
 const configuredErpProxyTimeoutMs = Number(process.env.ERP_PROXY_TIMEOUT_MS);
@@ -150,6 +184,26 @@ const cozeErpProxyTargets: Record<ErpAccountKey, string> = {
   ).replace(/\/+$/, ''),
   'shanghai-chipmunk': configuredCozeErpProxyTargets['shanghai-chipmunk'].replace(/\/+$/, ''),
 };
+const legacyCozeErpProxyAddress =
+  process.env.CHANJET_PROXY_ADDRESS?.trim() || erpProxyFileConfig.targetAddress || '';
+const configuredCozeErpProxyAddresses: Record<ErpAccountKey, string> = {
+  'wuxi-duneng':
+    process.env.CHANJET_PROXY_ADDRESS_WUXI_DUNENG?.trim() ||
+    erpProxyFileConfig.targetAddresses?.['wuxi-duneng'] ||
+    legacyCozeErpProxyAddress,
+  'shanghai-chipmunk':
+    process.env.CHANJET_PROXY_ADDRESS_SHANGHAI_CHIPMUNK?.trim() ||
+    erpProxyFileConfig.targetAddresses?.['shanghai-chipmunk'] ||
+    '',
+};
+const cozeErpProxyAddresses: Record<ErpAccountKey, string> = {
+  'wuxi-duneng': isIP(configuredCozeErpProxyAddresses['wuxi-duneng'])
+    ? configuredCozeErpProxyAddresses['wuxi-duneng']
+    : '',
+  'shanghai-chipmunk': isIP(configuredCozeErpProxyAddresses['shanghai-chipmunk'])
+    ? configuredCozeErpProxyAddresses['shanghai-chipmunk']
+    : '',
+};
 const legacyCozeErpProxyAccessKey =
   process.env.BACKEND_PROXY_ACCESS_KEY?.trim() ||
   erpProxyFileConfig.backendAccessKey ||
@@ -181,6 +235,7 @@ const configuredCorsOrigins = (process.env.CORS_ORIGINS || '')
   .map((origin) => origin.trim())
   .filter(Boolean);
 const allowLocalhostCors = process.env.CORS_ALLOW_LOCALHOST !== 'false';
+const allowCozeCors = process.env.CORS_ALLOW_COZE !== 'false';
 const allowedUploadContentTypes = new Set([
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'application/octet-stream',
@@ -199,7 +254,30 @@ const cozeProxyClientAccessKey =
   erpProxyFileConfig.clientAccessKey ||
   '';
 const allowCozeKeylessCompatibility =
-  isCozeRuntime && process.env.COZE_PROXY_ALLOW_KEYLESS_COMPATIBILITY !== 'false';
+  shouldProxyCozeErp && process.env.COZE_PROXY_ALLOW_KEYLESS_COMPATIBILITY !== 'false';
+
+const readRateLimitSetting = (
+  envName: string,
+  fallback: number,
+  minimum: number,
+  maximum: number
+): number => {
+  const value = Number(process.env[envName]);
+  return Number.isInteger(value) && value >= minimum && value <= maximum ? value : fallback;
+};
+
+const cozeKeylessRateLimitMax = readRateLimitSetting(
+  'COZE_PROXY_KEYLESS_RATE_LIMIT_MAX',
+  120,
+  30,
+  1_000
+);
+const cozeKeylessRateLimitWindowMs = readRateLimitSetting(
+  'COZE_PROXY_KEYLESS_RATE_LIMIT_WINDOW_MS',
+  60 * 60_000,
+  60_000,
+  24 * 60 * 60_000
+);
 
 const readHeader = (req: Request, name: string): string => {
   const value = req.headers[name.toLowerCase()];
@@ -321,6 +399,7 @@ const createRateLimiter = (
     res.setHeader('RateLimit-Reset', String(Math.ceil(entry.resetAt / 1000)));
 
     if (entry.count >= maxRequests) {
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil((entry.resetAt - now) / 1000))));
       res.status(429).json({
         success: false,
         message: '请求过于频繁，请稍后再试',
@@ -350,7 +429,11 @@ const requireCozeProxyClientAccessKey = requireKey(
   'COZE_PROXY_CLIENT_ACCESS_KEY'
 );
 const businessRateLimiter = createRateLimiter('business', 120, 60_000);
-const cozeKeylessRateLimiter = createRateLimiter('coze-keyless-business', 30, 60 * 60_000);
+const cozeKeylessRateLimiter = createRateLimiter(
+  'coze-keyless-business',
+  cozeKeylessRateLimitMax,
+  cozeKeylessRateLimitWindowMs
+);
 const adminRateLimiter = createRateLimiter('admin', 20, 15 * 60_000);
 const messageRateLimiter = createRateLimiter('message', 300, 15 * 60_000);
 const uploadRateLimiter = createRateLimiter('upload', 30, 60 * 60_000);
@@ -377,6 +460,22 @@ const isLocalhostOrigin = (origin: string): boolean => {
   }
 };
 
+const isCozeOrigin = (origin: string): boolean => {
+  try {
+    const url = new URL(origin);
+    const hostname = url.hostname.toLowerCase();
+    return (
+      url.protocol === 'https:' &&
+      (hostname === 'coze.site' ||
+        hostname.endsWith('.coze.site') ||
+        hostname === 'coze.cn' ||
+        hostname.endsWith('.coze.cn'))
+    );
+  } catch {
+    return false;
+  }
+};
+
 const corsOptions: CorsOptions = {
   origin(origin, callback) {
     if (!origin) {
@@ -385,6 +484,11 @@ const corsOptions: CorsOptions = {
     }
 
     if (allowLocalhostCors && isLocalhostOrigin(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    if (allowCozeCors && isCozeOrigin(origin)) {
       callback(null, true);
       return;
     }
@@ -412,6 +516,7 @@ const corsOptions: CorsOptions = {
     'X-Cache',
     'X-Erp-Account-Key',
     'X-Proxy-Auth-Mode',
+    'X-Proxy-Network-Mode',
   ],
 };
 
@@ -423,6 +528,153 @@ class ProxyRequestError extends Error {
     this.statusCode = statusCode;
   }
 }
+
+type ProxyFetchResult = {
+  response: globalThis.Response;
+  usedAddressFallback: boolean;
+};
+
+const readNetworkErrorCode = (error: unknown): string => {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (typeof current === 'object') {
+      const record = current as Record<string, unknown>;
+      if (typeof record.code === 'string' && record.code.trim()) {
+        return record.code.trim().toUpperCase();
+      }
+      if (typeof record.name === 'string' && record.name === 'TimeoutError') {
+        return 'TIMEOUT';
+      }
+      current = record.cause;
+      continue;
+    }
+    break;
+  }
+
+  return error instanceof Error && error.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK_ERROR';
+};
+
+class ErpProxyConnectionError extends Error {
+  constructor(targetHost: string, primaryError: unknown, fallbackError?: unknown) {
+    const primaryCode = readNetworkErrorCode(primaryError);
+    const fallbackSuffix = fallbackError
+      ? `，备用地址连接：${readNetworkErrorCode(fallbackError)}`
+      : '';
+    super(`无法连接ERP后端（${targetHost}；域名连接：${primaryCode}${fallbackSuffix}）`);
+    this.name = 'ErpProxyConnectionError';
+  }
+}
+
+const buildResponseFromIncomingMessage = async (
+  incoming: IncomingMessage
+): Promise<globalThis.Response> => {
+  const chunks: Buffer[] = [];
+  for await (const chunk of incoming) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const responseHeaders = new Headers();
+  for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
+    const name = incoming.rawHeaders[index];
+    const value = incoming.rawHeaders[index + 1];
+    if (name && value !== undefined) {
+      responseHeaders.append(name, value);
+    }
+  }
+
+  return new Response(Buffer.concat(chunks), {
+    headers: responseHeaders,
+    status: incoming.statusCode || 502,
+    statusText: incoming.statusMessage,
+  });
+};
+
+const fetchUsingConfiguredAddress = (
+  urlValue: string,
+  address: string,
+  method: string,
+  headers: Headers,
+  body: Buffer | undefined,
+  signal: AbortSignal
+): Promise<globalThis.Response> => {
+  return new Promise((resolve, reject) => {
+    const targetUrl = new URL(urlValue);
+    const outgoingHeaders = Object.fromEntries(headers.entries());
+    outgoingHeaders.host = targetUrl.host;
+    const commonOptions = {
+      headers: outgoingHeaders,
+      hostname: address,
+      method,
+      path: `${targetUrl.pathname}${targetUrl.search}`,
+      port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
+      signal,
+    };
+    const handleResponse = (incoming: IncomingMessage) => {
+      void buildResponseFromIncomingMessage(incoming).then(resolve, reject);
+    };
+    const request =
+      targetUrl.protocol === 'https:'
+        ? httpsRequest(
+            {
+              ...commonOptions,
+              servername: targetUrl.hostname,
+            },
+            handleResponse
+          )
+        : httpRequest(commonOptions, handleResponse);
+
+    request.once('error', reject);
+    if (body) {
+      request.write(body);
+    }
+    request.end();
+  });
+};
+
+const fetchProxyUpstream = async (
+  urlValue: string,
+  method: string,
+  headers: Headers,
+  body: Buffer | undefined,
+  fallbackAddress: string
+): Promise<ProxyFetchResult> => {
+  try {
+    return {
+      response: await fetch(urlValue, {
+        body,
+        headers,
+        method,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(erpProxyTimeoutMs),
+      }),
+      usedAddressFallback: false,
+    };
+  } catch (primaryError) {
+    const targetHost = new URL(urlValue).hostname;
+    if (!fallbackAddress) {
+      throw new ErpProxyConnectionError(targetHost, primaryError);
+    }
+
+    console.warn(
+      `[Coze ERP proxy] domain connection failed for ${targetHost} (${readNetworkErrorCode(primaryError)}); retrying configured address`
+    );
+    try {
+      return {
+        response: await fetchUsingConfiguredAddress(
+          urlValue,
+          fallbackAddress,
+          method,
+          headers,
+          body,
+          AbortSignal.timeout(erpProxyTimeoutMs)
+        ),
+        usedAddressFallback: true,
+      };
+    } catch (fallbackError) {
+      throw new ErpProxyConnectionError(targetHost, primaryError, fallbackError);
+    }
+  }
+};
 
 const MAX_ERP_PROXY_BODY_BYTES = 5 * 1024 * 1024;
 
@@ -622,13 +874,18 @@ const proxyCozeErpRequest = async (
     }
     headers.set(ERP_ACCOUNT_HEADER, accountKey);
 
-    const upstreamResponse = await fetch(`${proxyTarget}${downstreamPath}`, {
-      body,
+    const upstreamResult = await fetchProxyUpstream(
+      `${proxyTarget}${downstreamPath}`,
+      req.method,
       headers,
-      method: req.method,
-      redirect: 'manual',
-      signal: AbortSignal.timeout(erpProxyTimeoutMs),
-    });
+      body,
+      cozeErpProxyAddresses[accountKey]
+    );
+    const upstreamResponse = upstreamResult.response;
+    res.setHeader(
+      'X-Proxy-Network-Mode',
+      upstreamResult.usedAddressFallback ? 'configured-address' : 'dns'
+    );
 
     // 复制响应头
     ['cache-control', 'content-disposition', 'content-type', 'ratelimit-limit',
@@ -704,7 +961,9 @@ const proxyCozeErpRequest = async (
       res.status(statusCode).json({
         success: false,
         message:
-          error instanceof ProxyRequestError ? error.message : 'ERP代理请求失败，请检查后端服务',
+          error instanceof ProxyRequestError || error instanceof ErpProxyConnectionError
+            ? error.message
+            : 'ERP代理请求失败，请检查后端服务',
       });
     } else {
       res.end();
@@ -761,12 +1020,28 @@ const guardAndProxyCozeErpRequest = (
   const applyBusinessRateLimit = () => {
     businessRateLimiter(req, res, forwardRequest);
   };
+
+  if (!isPrefixedCozePath) {
+    requireBackendAccessKey(req, res, applyBusinessRateLimit);
+    return;
+  }
+
   if (cozeProxyClientAccessKey) {
     requireCozeProxyClientAccessKey(req, res, applyBusinessRateLimit);
     return;
   }
 
-  if (isPrefixedCozePath && allowCozeKeylessCompatibility) {
+  const isLocalStatePath =
+    pathname === '/api/erp/health' ||
+    pathname === '/api/erp/messages/latest' ||
+    pathname === '/api/erp/tplus/purchase-receive/statuses';
+  if (allowCozeKeylessCompatibility && isLocalStatePath) {
+    res.setHeader('X-Proxy-Auth-Mode', 'coze-keyless-local-state');
+    applyBusinessRateLimit();
+    return;
+  }
+
+  if (allowCozeKeylessCompatibility) {
     res.setHeader('X-Proxy-Auth-Mode', 'coze-keyless-rate-limited');
     cozeKeylessRateLimiter(req, res, applyBusinessRateLimit);
     return;
@@ -778,6 +1053,31 @@ const guardAndProxyCozeErpRequest = (
       '扣子代理访问密钥未配置；无密钥访问仅允许使用扣子兼容接口路径',
   });
 };
+
+const sendPublicPage = (
+  res: Response,
+  html: string,
+  frameAncestors = "'none'"
+): void => {
+  if (frameAncestors !== "'none'") {
+    res.removeHeader('X-Frame-Options');
+  }
+  res.setHeader(
+    'Content-Security-Policy',
+    `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors ${frameAncestors}; form-action 'none'`
+  );
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.status(200).type('html').send(html);
+};
+
+app.get('/', (_req, res) => sendPublicPage(res, HOME_PAGE_HTML));
+app.get(['/privacy', '/privacy-policy'], (_req, res) =>
+  sendPublicPage(
+    res,
+    PRIVACY_POLICY_HTML,
+    "'self' https: http://localhost:* http://127.0.0.1:*"
+  )
+);
 
 app.use(cors(corsOptions));
 app.use((req, res, next) => {
@@ -1221,10 +1521,16 @@ const handleServiceHealth: RequestHandler = (_req, res) => {
         .filter(([, target]) => Boolean(target))
         .map(([accountKey]) => accountKey)
     : [];
+  const proxyAddressFallbackAccounts = shouldProxyCozeErp
+    ? Object.entries(cozeErpProxyAddresses)
+        .filter(([, address]) => Boolean(address))
+        .map(([accountKey]) => accountKey)
+    : [];
 
   res.status(200).json({
     success: true,
     status: 'ok',
+    backendRelease: SERVER_RELEASE,
     host,
     port,
     deploymentMode: shouldProxyCozeErp ? 'erp-proxy' : 'erp-account',
@@ -1233,6 +1539,7 @@ const handleServiceHealth: RequestHandler = (_req, res) => {
       ? undefined
       : SERVER_ERP_ACCOUNTS[localErpAccountKey].displayName,
     proxyAccounts,
+    proxyAddressFallbackAccounts,
   });
 };
 
@@ -1252,7 +1559,14 @@ app.listen(port, host, () => {
       .filter(([, target]) => Boolean(target))
       .map(([accountKey]) => accountKey)
       .join(', ');
+    const configuredAddressFallbackAccounts = Object.entries(cozeErpProxyAddresses)
+      .filter(([, address]) => Boolean(address))
+      .map(([accountKey]) => accountKey)
+      .join(', ');
     console.log(`[ERP deployment] mode=proxy accounts=${configuredAccounts || 'none'}`);
+    console.log(
+      `[ERP proxy network] address-fallback-accounts=${configuredAddressFallbackAccounts || 'none'}`
+    );
     console.log(
       `[ERP proxy access] mode=${
         cozeProxyClientAccessKey

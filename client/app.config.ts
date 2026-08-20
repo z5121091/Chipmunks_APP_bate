@@ -41,6 +41,7 @@ const defaultUpdateServer = restoreMatchingUpdateServerCredentials(
   configuredUpdateServer,
   updateServerConfig.defaultServer
 ).replace(/\/+$/, '');
+const selfUpdateEnabled = process.env.EXPO_PUBLIC_ENABLE_SELF_UPDATE !== 'false';
 
 export default function appConfig({ config }: ConfigContext): ExpoConfig {
   return {
@@ -50,7 +51,7 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
     "version": versionConfig.version,
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "myapp",
+    "scheme": "chipmunkswarehouse",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "splash": {
@@ -73,11 +74,22 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
         "android.permission.INTERNET",
         "android.permission.ACCESS_NETWORK_STATE",
         "android.permission.ACCESS_WIFI_STATE",
-        "android.permission.REQUEST_INSTALL_PACKAGES"
+        ...(selfUpdateEnabled ? ["android.permission.REQUEST_INSTALL_PACKAGES"] : [])
       ],
       "blockedPermissions": [
         "android.permission.WRITE_EXTERNAL_STORAGE",
-        "android.permission.READ_EXTERNAL_STORAGE"
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.CAMERA",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        ...(!selfUpdateEnabled ? ["android.permission.REQUEST_INSTALL_PACKAGES"] : [])
       ],
       "splash": {
         "image": "./assets/images/splash-universal.png",
@@ -108,14 +120,6 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
         }
       ],
       [
-        "expo-media-library",
-        {
-          "photosPermission": "允许掌上仓库保存 APK 到下载文件夹以便安装更新",
-          "savePhotosPermission": "允许掌上仓库保存备份文件到您的设备",
-          "isAccessMediaLocationGranted": true
-        }
-      ],
-      [
         "expo-document-picker",
         {
           "iCloudContainerEnvironment": "Production"
@@ -132,7 +136,8 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
     ],
     "extra": {
       ...(config.extra || {}),
-      "updateServerUrl": defaultUpdateServer
+      "updateServerUrl": defaultUpdateServer,
+      "selfUpdateEnabled": selfUpdateEnabled
     },
     "experiments": {
       "typedRoutes": true

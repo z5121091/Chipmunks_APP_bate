@@ -114,6 +114,7 @@ interface UiPageHeaderProps {
   title: string;
   onBack: () => void;
   backLabel?: string;
+  backIcon?: IconName;
   rightIcon?: IconName;
   rightLabel?: string;
   rightDisabled?: boolean;
@@ -146,6 +147,7 @@ export function UiPageHeader({
   title,
   onBack,
   backLabel = '返回',
+  backIcon = 'arrow-left',
   rightIcon,
   rightLabel,
   rightDisabled,
@@ -164,7 +166,7 @@ export function UiPageHeader({
         accessibilityRole="button"
         accessibilityLabel={backLabel}
       >
-        <Feather name="arrow-left" size={20} color={theme.textPrimary} />
+        <Feather name={backIcon} size={20} color={theme.textPrimary} />
       </TouchableOpacity>
 
       <Text style={styles.pageHeaderTitle} numberOfLines={1}>

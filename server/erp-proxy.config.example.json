@@ -4,6 +4,10 @@
     "wuxi-duneng": "https://erp-wuxi.example.com",
     "shanghai-chipmunk": "https://erp-shanghai.example.com"
   },
+  "targetAddresses": {
+    "wuxi-duneng": "",
+    "shanghai-chipmunk": ""
+  },
   "backendAccessKeys": {
     "wuxi-duneng": "replace-with-wuxi-backend-access-key",
     "shanghai-chipmunk": "replace-with-shanghai-backend-access-key"

@@ -20,7 +20,6 @@ import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
 import * as IntentLauncher from 'expo-intent-launcher';
-import * as MediaLibrary from 'expo-media-library';
 import { logger } from '@/utils/logger';
 import {
   getAllUnpackRecords,
@@ -52,7 +51,16 @@ import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { Feather } from '@expo/vector-icons';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { rs } from '@/utils/responsive';
-import { APP_VERSION, APP_NAME, COMPANY_NAME, COMPANY_WEBSITE, AUTHOR } from '@/constants/version';
+import {
+  APP_VERSION,
+  APP_NAME,
+  COMPANY_NAME,
+  COMPANY_WEBSITE,
+  AUTHOR,
+  ICP_FILING_NUMBER,
+  ICP_FILING_URL,
+  SELF_UPDATE_ENABLED,
+} from '@/constants/version';
 import { setSoundEnabled as setSoundEnabledFn, initSoundSetting } from '@/utils/feedback';
 import { formatSyncErrorMessage, syncExcelToComputer, type ExcelSheet } from '@/utils/excel';
 import {
@@ -1279,93 +1287,17 @@ export default function SettingsScreen() {
         encoding: FileSystem.EncodingType.UTF8,
       });
 
-      // 检测 Android 版本（API 26 = Android 8.0）
-      const isAndroid8OrAbove = Platform.OS === 'android' && Platform.Version >= 26;
-
-      if (isAndroid8OrAbove) {
-        // Android 8.0+：直接使用 Sharing 分享
-        if (await Sharing.isAvailableAsync()) {
-          await Sharing.shareAsync(filePath, {
-            mimeType: 'application/json',
-            dialogTitle: '保存配置备份',
-            UTI: 'public.json',
-          });
-          alert.showSuccess(
-            `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n请妥善保管备份文件！`
-          );
-        } else {
-          alert.showError('当前设备不支持文件分享，未能导出配置备份');
-        }
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(filePath, {
+          mimeType: 'application/json',
+          dialogTitle: '保存配置备份',
+          UTI: 'public.json',
+        });
+        alert.showSuccess(
+          `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n物料绑定请使用独立的 Excel 导入/导出。\n请妥善保管备份文件！`
+        );
       } else {
-        // Android 7.0 及以下：保存到 Downloads 文件夹
-        try {
-          // 请求媒体库权限
-          const { status } = await MediaLibrary.requestPermissionsAsync();
-          if (status !== 'granted') {
-            alert.showError('需要存储权限才能保存备份');
-            // 备选方案：使用 Sharing
-            if (await Sharing.isAvailableAsync()) {
-              await Sharing.shareAsync(filePath, {
-                mimeType: 'application/json',
-                dialogTitle: '保存配置备份',
-                UTI: 'public.json',
-              });
-            }
-            return;
-          }
-
-          // 将文件保存到媒体库
-          const asset = await MediaLibrary.createAssetAsync(filePath);
-
-          // 获取 Downloads 相册
-          try {
-            const albums = await MediaLibrary.getAlbumsAsync();
-            let downloadAlbum = albums.find(
-              (album) => album.title === 'Download' || album.title === 'Downloads'
-            );
-
-            if (!downloadAlbum) {
-              downloadAlbum = await MediaLibrary.createAlbumAsync('Downloads', asset, false);
-            } else {
-              await MediaLibrary.addAssetsToAlbumAsync([asset], downloadAlbum.id, false);
-            }
-          } catch (albumError) {
-            logger.warn('保存到媒体库失败，继续保留 Downloads 目录文件:', albumError);
-          }
-
-          // 尝试打开 Downloads 文件夹
-          try {
-            await Linking.openURL('content://downloads/all_downloads');
-          } catch {
-            try {
-              await Linking.openURL(
-                'content://com.android.providers.downloads.documents/root/downloads'
-              );
-            } catch {
-              // 都打不开就算了
-            }
-          }
-
-          alert.showSuccess(
-            `备份已保存到 Downloads 文件夹:\n${fileName}\n\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}`
-          );
-        } catch (mediaError) {
-          logger.error('保存到Downloads失败:', mediaError);
-
-          // 备选方案：使用 Sharing
-          if (await Sharing.isAvailableAsync()) {
-            await Sharing.shareAsync(filePath, {
-              mimeType: 'application/json',
-              dialogTitle: '保存配置备份',
-              UTI: 'public.json',
-            });
-            alert.showSuccess(
-              `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}`
-            );
-          } else {
-            alert.showError('备份失败，请重试');
-          }
-        }
+        alert.showError('当前设备不支持文件分享，未能导出配置备份');
       }
     } catch (error) {
       logger.error('备份失败:', error);
@@ -1420,7 +1352,7 @@ export default function SettingsScreen() {
 
       alert.showConfirm(
         '确认恢复配置',
-        `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n即将恢复以下配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 物料绑定: ${backupData.inventoryBindings?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === undefined ? '沿用当前设置' : backupData.soundEnabled ? '开启' : '关闭'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n[注意] 恢复前会替换当前配置数据，业务数据（订单、物料、拆包记录等）不受影响；被历史业务引用的仓库会保留。此操作不可撤销！`,
+        `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n即将恢复以下配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === undefined ? '沿用当前设置' : backupData.soundEnabled ? '开启' : '关闭'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n[说明] 物料绑定不会恢复或覆盖，请在物料绑定页面使用 Excel 导入。\n[注意] 恢复前会替换上述配置数据，业务数据（订单、物料、拆包记录等）不受影响；被历史业务引用的仓库会保留。此操作不可撤销！`,
         async () => {
           setRestoreLoading(true);
           try {
@@ -1431,7 +1363,7 @@ export default function SettingsScreen() {
                 : result.stats?.syncConfigRestored
                   ? '已恢复'
                   : '恢复失败';
-              const summary = `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n恢复成功:\n• 解析规则: ${result.stats?.rules || 0} 条\n• 占位字段: ${result.stats?.customFields || 0} 个\n• 物料绑定: ${result.stats?.inventoryBindings || 0} 条\n• 仓库: ${result.stats?.warehouses || 0} 个\n• 出库单号规则: ${result.stats?.outboundWarehouseOrderRules || 0} 条\n• 同步服务器: ${syncConfigStatus}`;
+              const summary = `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n恢复成功:\n• 解析规则: ${result.stats?.rules || 0} 条\n• 占位字段: ${result.stats?.customFields || 0} 个\n• 仓库: ${result.stats?.warehouses || 0} 个\n• 出库单号规则: ${result.stats?.outboundWarehouseOrderRules || 0} 条\n• 同步服务器: ${syncConfigStatus}\n\n物料绑定保持当前数据不变。`;
 
               if (result.warnings?.length) {
                 alert.showWarning(`${summary}\n\n注意:\n• ${result.warnings.join('\n• ')}`);
@@ -2218,7 +2150,7 @@ export default function SettingsScreen() {
             <View style={styles.settingsGroupPanel}>
               {renderMenuCard(
                 '备份配置',
-                '备份规则、字段、绑定、仓库、单号规则、声音与服务器',
+                '备份规则、字段、仓库、单号规则、声音与服务器',
                 'save',
                 theme.cyan,
                 handleBackup,
@@ -2291,9 +2223,13 @@ export default function SettingsScreen() {
                 <View style={styles.aboutDetailIconWrapper}>
                   <Feather name="briefcase" size={rs(14)} color={theme.textSecondary} />
                 </View>
-                <Text style={styles.aboutDetailLabel}>公司</Text>
+                <Text style={styles.aboutDetailLabel} numberOfLines={1}>
+                  公司
+                </Text>
                 <View style={styles.aboutDetailRight}>
-                  <Text style={styles.aboutDetailValue}>{COMPANY_NAME}</Text>
+                  <Text style={styles.aboutDetailValue} numberOfLines={1}>
+                    {COMPANY_NAME}
+                  </Text>
                   <Feather name="external-link" size={rs(12)} color={theme.textMuted} />
                 </View>
               </AnimatedButton>
@@ -2302,27 +2238,76 @@ export default function SettingsScreen() {
                 <View style={styles.aboutDetailIconWrapper}>
                   <Feather name="user" size={rs(14)} color={theme.textSecondary} />
                 </View>
-                <Text style={styles.aboutDetailLabel}>作者</Text>
-                <Text style={styles.aboutDetailValue}>{AUTHOR}</Text>
+                <Text style={styles.aboutDetailLabel} numberOfLines={1}>
+                  作者
+                </Text>
+                <View style={styles.aboutDetailRight}>
+                  <Text style={styles.aboutDetailValue} numberOfLines={1}>
+                    {AUTHOR}
+                  </Text>
+                  <View style={styles.aboutDetailAccessorySpacer} />
+                </View>
               </View>
+
+              {SELF_UPDATE_ENABLED && (
+                <AnimatedButton
+                  style={styles.aboutDetailRow}
+                  activeOpacity={0.7}
+                  disabled={checkingUpdate}
+                  onPress={checkForUpdate}
+                >
+                  <View style={styles.aboutDetailIconWrapper}>
+                    {checkingUpdate ? (
+                      <ActivityIndicator size="small" color={theme.success} />
+                    ) : (
+                      <Feather name="refresh-cw" size={rs(14)} color={theme.success} />
+                    )}
+                  </View>
+                  <Text style={styles.aboutDetailLabel} numberOfLines={1}>
+                    检查更新
+                  </Text>
+                  <View style={styles.aboutDetailRight}>
+                    <Text style={styles.aboutDetailValue} numberOfLines={1}>
+                      {checkingUpdate ? '检查中' : `当前 ${APP_VERSION}`}
+                    </Text>
+                    <Feather name="chevron-right" size={rs(12)} color={theme.textMuted} />
+                  </View>
+                </AnimatedButton>
+              )}
 
               <AnimatedButton
                 style={styles.aboutDetailRow}
                 activeOpacity={0.7}
-                disabled={checkingUpdate}
-                onPress={checkForUpdate}
+                onPress={() => Linking.openURL(ICP_FILING_URL)}
               >
                 <View style={styles.aboutDetailIconWrapper}>
-                  {checkingUpdate ? (
-                    <ActivityIndicator size="small" color={theme.success} />
-                  ) : (
-                    <Feather name="refresh-cw" size={rs(14)} color={theme.success} />
-                  )}
+                  <Feather name="shield" size={rs(14)} color={theme.textSecondary} />
                 </View>
-                <Text style={styles.aboutDetailLabel}>检查更新</Text>
+                <Text style={styles.aboutDetailLabel} numberOfLines={1}>
+                  备案号
+                </Text>
                 <View style={styles.aboutDetailRight}>
-                  <Text style={styles.aboutDetailValue}>
-                    {checkingUpdate ? '检查中' : `当前 ${APP_VERSION}`}
+                  <Text style={styles.aboutDetailValue} numberOfLines={1}>
+                    {ICP_FILING_NUMBER}
+                  </Text>
+                  <Feather name="external-link" size={rs(12)} color={theme.textMuted} />
+                </View>
+              </AnimatedButton>
+
+              <AnimatedButton
+                style={styles.aboutDetailRow}
+                activeOpacity={0.7}
+                onPress={() => router.push('/privacy-policy')}
+              >
+                <View style={styles.aboutDetailIconWrapper}>
+                  <Feather name="lock" size={rs(14)} color={theme.textSecondary} />
+                </View>
+                <Text style={styles.aboutDetailLabel} numberOfLines={1}>
+                  隐私政策
+                </Text>
+                <View style={styles.aboutDetailRight}>
+                  <Text style={styles.aboutDetailValue} numberOfLines={1}>
+                    查看
                   </Text>
                   <Feather name="chevron-right" size={rs(12)} color={theme.textMuted} />
                 </View>

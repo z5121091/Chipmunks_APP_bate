@@ -57,6 +57,7 @@ const STACK_ROUTES = [
   'settings',
   'help',
   'changelog',
+  'privacy-policy',
 ] as const;
 
 const getErrorMessage = (error: unknown): string => {

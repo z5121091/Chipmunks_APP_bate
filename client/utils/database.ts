@@ -546,8 +546,6 @@ export interface BackupData {
   // 只包含配置数据，不包含业务数据
   rules: QRCodeRule[];
   customFields: CustomField[];
-  // V3.0 新增
-  inventoryBindings: InventoryBinding[];
   warehouses: Warehouse[];
   outboundOrderRule?: OutboundOrderRuleConfig;
   outboundWarehouseOrderRules?: OutboundWarehouseSampleRuleMap;
@@ -556,7 +554,6 @@ export interface BackupData {
   stats?: {
     rules: number;
     customFields: number;
-    inventoryBindings: number;
     warehouses: number;
     hasOutboundOrderRule?: boolean;
     outboundWarehouseOrderRules?: number;
@@ -662,19 +659,6 @@ const isCustomFieldShape = (value: unknown): value is CustomField => {
   );
 };
 
-const isInventoryBindingShape = (value: unknown): value is InventoryBinding => {
-  return (
-    isPlainObject(value) &&
-    typeof value.id === 'string' &&
-    typeof value.scan_model === 'string' &&
-    isOptionalStringLike(value.version) &&
-    typeof value.inventory_code === 'string' &&
-    typeof value.created_at === 'string' &&
-    isOptionalStringLike(value.supplier) &&
-    isOptionalStringLike(value.description)
-  );
-};
-
 const isWarehouseShape = (value: unknown): value is Warehouse => {
   return (
     isPlainObject(value) &&
@@ -707,7 +691,6 @@ const isBackupStatsShape = (
     isPlainObject(value) &&
     typeof value.rules === 'number' &&
     typeof value.customFields === 'number' &&
-    typeof value.inventoryBindings === 'number' &&
     typeof value.warehouses === 'number' &&
     (value.hasOutboundOrderRule === undefined ||
       typeof value.hasOutboundOrderRule === 'boolean') &&
@@ -728,8 +711,6 @@ export const isBackupDataShape = (value: unknown): value is BackupData => {
     value.rules.every((item) => isQRCodeRuleShape(item)) &&
     Array.isArray(value.customFields) &&
     value.customFields.every((item) => isCustomFieldShape(item)) &&
-    Array.isArray(value.inventoryBindings) &&
-    value.inventoryBindings.every((item) => isInventoryBindingShape(item)) &&
     Array.isArray(value.warehouses) &&
     value.warehouses.every((item) => isWarehouseShape(item)) &&
     (value.outboundOrderRule === undefined ||
@@ -6664,7 +6645,8 @@ export const getInventoryCheckExportSummaryRows = async (
 };
 
 export const getInventoryCheckDocumentSummaries = async (
-  warehouseId?: string
+  warehouseId?: string,
+  erpAccountKey?: string
 ): Promise<InventoryCheckDocumentSummary[]> => {
   try {
     let sql = `
@@ -6692,9 +6674,17 @@ export const getInventoryCheckDocumentSummaries = async (
       FROM inventory_check_records`;
     const params: any[] = [];
 
+    const conditions: string[] = [];
     if (warehouseId) {
-      sql += ' WHERE warehouse_id = ?';
+      conditions.push('warehouse_id = ?');
       params.push(warehouseId);
+    }
+    if (erpAccountKey) {
+      conditions.push('erp_account_key = ?');
+      params.push(erpAccountKey);
+    }
+    if (conditions.length > 0) {
+      sql += ` WHERE ${conditions.join(' AND ')}`;
     }
 
     sql += `
@@ -8076,7 +8066,6 @@ export const exportBackupData = async (): Promise<BackupData> => {
     const [
       rules,
       customFields,
-      inventoryBindings,
       warehouses,
       outboundOrderRule,
       outboundWarehouseOrderRules,
@@ -8085,7 +8074,6 @@ export const exportBackupData = async (): Promise<BackupData> => {
     ] = await Promise.all([
       getAllRules(),
       getAllCustomFields(),
-      getAllInventoryBindings(),
       getAllWarehouses(),
       loadOutboundOrderRule(),
       loadOutboundWarehouseOrderRules(),
@@ -8112,8 +8100,6 @@ export const exportBackupData = async (): Promise<BackupData> => {
       // 只导出配置数据
       rules,
       customFields,
-      // V3.0 新增
-      inventoryBindings,
       warehouses,
       outboundOrderRule,
       outboundWarehouseOrderRules,
@@ -8121,7 +8107,6 @@ export const exportBackupData = async (): Promise<BackupData> => {
       stats: {
         rules: rules.length,
         customFields: customFields.length,
-        inventoryBindings: inventoryBindings.length,
         warehouses: warehouses.length,
         hasOutboundOrderRule: true,
         outboundWarehouseOrderRules: Object.keys(outboundWarehouseOrderRules).length,
@@ -8148,7 +8133,6 @@ export const importBackupData = async (
   stats?: {
     rules: number;
     customFields: number;
-    inventoryBindings: number;
     warehouses: number;
     outboundWarehouseOrderRules?: number;
     hasSyncConfig?: boolean;
@@ -8187,31 +8171,6 @@ export const importBackupData = async (
       assertValidQRCodeRuleConfiguration(rule, customFieldIds);
     });
 
-    const bindingIds = new Set<string>();
-    const bindingCodes = new Set<string>();
-    const bindingModels = new Set<string>();
-    backup.inventoryBindings.forEach((binding) => {
-      const id = binding.id.trim();
-      const model = binding.scan_model.trim();
-      const version = binding.version?.trim() || '';
-      const inventoryCode = binding.inventory_code.trim();
-      if (!id || !model || !inventoryCode) {
-        throw new Error('备份中的物料绑定 ID、型号或存货编码为空');
-      }
-      const normalizedCode = inventoryCode.toLocaleLowerCase();
-      const normalizedModelVersion = `${model.toLocaleLowerCase()}\u0000${version.toLocaleLowerCase()}`;
-      if (
-        bindingIds.has(id) ||
-        bindingCodes.has(normalizedCode) ||
-        bindingModels.has(normalizedModelVersion)
-      ) {
-        throw new Error(`备份中存在重复的物料绑定：${model}${version ? ` / ${version}` : ''}`);
-      }
-      bindingIds.add(id);
-      bindingCodes.add(normalizedCode);
-      bindingModels.add(normalizedModelVersion);
-    });
-
     const warehouseIds = new Set<string>();
     const warehouseNames = new Set<string>();
     backup.warehouses.forEach((warehouse) => {
@@ -8232,8 +8191,7 @@ export const importBackupData = async (
     const hasConfigData =
       (currentStats.warehouses ?? 0) > 0 ||
       currentStats.rules > 0 ||
-      currentStats.customFields > 0 ||
-      (currentStats.inventoryBindings ?? 0) > 0;
+      currentStats.customFields > 0;
 
     // 2. 统一在事务里替换配置，避免删旧后导入失败留下半套配置
     if (hasConfigData) {
@@ -8266,7 +8224,7 @@ export const importBackupData = async (
     const preservedLocalWarehouseIds = referencedWarehouseIds.filter((id) => !backupWarehouseIds.has(id));
 
     await runExclusiveWriteTransaction(database, 'importBackupData', async (transactionDatabase) => {
-      await transactionDatabase.runAsync('DELETE FROM inventory_bindings');
+      // 物料绑定由独立的 Excel 导入/导出管理，配置恢复不得清空或覆盖现有绑定。
       await transactionDatabase.runAsync('DELETE FROM qr_code_rules');
       await transactionDatabase.runAsync('DELETE FROM custom_fields');
 
@@ -8283,7 +8241,7 @@ export const importBackupData = async (
         await transactionDatabase.runAsync('UPDATE warehouses SET is_default = 0');
       }
 
-      // 3. 导入仓库（因为物料绑定依赖仓库）
+      // 3. 导入仓库
       if (backupWarehouses.length > 0) {
         for (const [index, warehouse] of backupWarehouses.entries()) {
           try {
@@ -8371,29 +8329,6 @@ export const importBackupData = async (
         }
       }
 
-      // 6. 导入物料绑定
-      if (backup.inventoryBindings && backup.inventoryBindings.length > 0) {
-        for (const binding of backup.inventoryBindings) {
-          try {
-            await transactionDatabase.runAsync(
-              'INSERT INTO inventory_bindings (id, scan_model, version, inventory_code, supplier, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-              [
-                binding.id,
-                binding.scan_model,
-                binding.version || '',
-                binding.inventory_code,
-                binding.supplier || null,
-                binding.description || null,
-                binding.created_at || getISODateTime(),
-              ]
-            );
-          } catch (e) {
-            logger.error('导入物料绑定失败:', binding, e);
-            throw new Error(`导入物料绑定失败: ${binding.scan_model} - ${e}`);
-          }
-        }
-      }
-
       const defaultWarehouse = await transactionDatabase.getFirstAsync<{ id: string }>(
         'SELECT id FROM warehouses WHERE is_default = 1 LIMIT 1'
       );
@@ -8461,7 +8396,7 @@ export const importBackupData = async (
       }
     }
 
-    // 7. 导入同步服务器配置
+    // 6. 导入同步服务器配置
     if (backup.syncConfig) {
       const syncConfigError = getSyncConfigError(backup.syncConfig);
       if (syncConfigError) {
@@ -8503,7 +8438,6 @@ export const importBackupData = async (
       stats: {
         rules: backup.rules?.length || 0,
         customFields: backup.customFields?.length || 0,
-        inventoryBindings: backup.inventoryBindings?.length || 0,
         warehouses: backup.warehouses?.length || 0,
         outboundWarehouseOrderRules: Object.keys(backup.outboundWarehouseOrderRules || {}).length,
         hasSyncConfig: !!backup.syncConfig,

@@ -22,14 +22,17 @@ import {
   deleteInventoryCheckDocument,
   deleteInventoryCheckRecord,
   DocumentSyncStatus,
-  getAllWarehouses,
   getInventoryCheckDocumentSummaries,
   getInventoryCheckRecordsByNo,
   InventoryCheckDocumentSummary,
   InventoryCheckRecord,
   updateInventoryCheckDocumentSyncStatus,
-  Warehouse,
 } from '@/utils/database';
+import {
+  ERP_ACCOUNTS,
+  type ErpAccountConfig,
+  type ErpAccountKey,
+} from '@/utils/erpAccounts';
 import { formatSyncErrorMessage, syncExcelToComputer } from '@/utils/excel';
 import {
   buildInventoryExportFileNameFromNo,
@@ -90,14 +93,13 @@ export default function InventoryRecordsScreen() {
   const alert = useCustomAlert();
   const styles = useMemo(() => createStyles(theme), [theme]);
 
-  const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
-  const [selectedWarehouseId, setSelectedWarehouseId] = useState<string | null>(null);
+  const [selectedAccountKey, setSelectedAccountKey] = useState<ErpAccountKey | null>(null);
   const [documents, setDocuments] = useState<InventoryCheckDocumentSummary[]>([]);
   const [detailsByKey, setDetailsByKey] = useState<DetailMap>({});
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
   const [expandedDetailGroupKeys, setExpandedDetailGroupKeys] = useState<Set<string>>(new Set());
   const [loadingKeys, setLoadingKeys] = useState<Set<string>>(new Set());
-  const [showWarehousePicker, setShowWarehousePicker] = useState(false);
+  const [showAccountPicker, setShowAccountPicker] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [syncingKeys, setSyncingKeys] = useState<Set<string>>(new Set());
@@ -124,17 +126,17 @@ export default function InventoryRecordsScreen() {
     };
   }, []);
 
-  const selectedWarehouseName = useMemo(() => {
-    if (!selectedWarehouseId) return '全部仓库';
-    return warehouses.find((item) => item.id === selectedWarehouseId)?.name || '当前仓库';
-  }, [selectedWarehouseId, warehouses]);
+  const selectedAccountName = useMemo(() => {
+    if (!selectedAccountKey) return '全部账套';
+    return ERP_ACCOUNTS.find((item) => item.key === selectedAccountKey)?.name || '当前账套';
+  }, [selectedAccountKey]);
 
   const totalInfo = useMemo(() => {
     const documentCount = documents.length;
     return { documentCount };
   }, [documents]);
 
-  const loadDocuments = useCallback(async (warehouseId: string | null, asRefresh = false) => {
+  const loadDocuments = useCallback(async (accountKey: ErpAccountKey | null, asRefresh = false) => {
     if (asRefresh) {
       setRefreshing(true);
     } else {
@@ -142,7 +144,7 @@ export default function InventoryRecordsScreen() {
     }
 
     try {
-      const rows = await getInventoryCheckDocumentSummaries(warehouseId || undefined);
+      const rows = await getInventoryCheckDocumentSummaries(undefined, accountKey || undefined);
       setDocuments(rows);
     } catch (error) {
       showNotice('盘点记录加载失败', 'error');
@@ -152,24 +154,18 @@ export default function InventoryRecordsScreen() {
     }
   }, [showNotice]);
 
-  const loadWarehouses = useCallback(async () => {
-    const rows = await getAllWarehouses();
-    setWarehouses(rows);
-  }, []);
-
   useFocusEffect(
     useCallback(() => {
       let cancelled = false;
 
       const run = async () => {
         setLoading(true);
-        const [warehouseRows, documentRows] = await Promise.all([
-          getAllWarehouses(),
-          getInventoryCheckDocumentSummaries(selectedWarehouseId || undefined),
-        ]);
+        const documentRows = await getInventoryCheckDocumentSummaries(
+          undefined,
+          selectedAccountKey || undefined
+        );
 
         if (cancelled) return;
-        setWarehouses(warehouseRows);
         setDocuments(documentRows);
         setLoading(false);
       };
@@ -184,19 +180,16 @@ export default function InventoryRecordsScreen() {
       return () => {
         cancelled = true;
       };
-    }, [selectedWarehouseId, showNotice])
+    }, [selectedAccountKey, showNotice])
   );
 
   const handleRefresh = useCallback(async () => {
-    await Promise.all([
-      loadWarehouses(),
-      loadDocuments(selectedWarehouseId, true),
-    ]);
-  }, [loadDocuments, loadWarehouses, selectedWarehouseId]);
+    await loadDocuments(selectedAccountKey, true);
+  }, [loadDocuments, selectedAccountKey]);
 
-  const handleWarehouseSelect = useCallback((warehouseId: string | null) => {
-    setSelectedWarehouseId(warehouseId);
-    setShowWarehousePicker(false);
+  const handleAccountSelect = useCallback((accountKey: ErpAccountKey | null) => {
+    setSelectedAccountKey(accountKey);
+    setShowAccountPicker(false);
     setExpandedKeys(new Set());
     setExpandedDetailGroupKeys(new Set());
     setDetailsByKey({});
@@ -240,7 +233,10 @@ export default function InventoryRecordsScreen() {
     documentKey?: string,
     document?: InventoryCheckDocumentSummary
   ) => {
-    const nextDocuments = await getInventoryCheckDocumentSummaries(selectedWarehouseId || undefined);
+    const nextDocuments = await getInventoryCheckDocumentSummaries(
+      undefined,
+      selectedAccountKey || undefined
+    );
     setDocuments(nextDocuments);
 
     if (!documentKey || !document) {
@@ -273,7 +269,7 @@ export default function InventoryRecordsScreen() {
 
     const records = await getInventoryCheckRecordsByNo(document.check_no, document.warehouse_id);
     setDetailsByKey((prev) => ({ ...prev, [documentKey]: records }));
-  }, [selectedWarehouseId]);
+  }, [selectedAccountKey]);
 
   const handleDeleteDocument = useCallback((item: InventoryCheckDocumentSummary) => {
     const key = getDocumentKey(item);
@@ -328,9 +324,12 @@ export default function InventoryRecordsScreen() {
   }, [alert, reloadAfterDelete, showNotice]);
 
   const refreshDocumentSummaries = useCallback(async () => {
-    const nextDocuments = await getInventoryCheckDocumentSummaries(selectedWarehouseId || undefined);
+    const nextDocuments = await getInventoryCheckDocumentSummaries(
+      undefined,
+      selectedAccountKey || undefined
+    );
     setDocuments(nextDocuments);
-  }, [selectedWarehouseId]);
+  }, [selectedAccountKey]);
 
   const getSyncStatusMeta = useCallback((status: DocumentSyncStatus) => {
     if (status === 'success') {
@@ -466,32 +465,32 @@ export default function InventoryRecordsScreen() {
     });
   }, []);
 
-  const renderWarehousePickerItem = useCallback(({ item }: { item: Warehouse | null }) => {
-    const warehouse = item;
-    const isAll = warehouse === null;
-    const id = warehouse?.id || null;
-    const active = selectedWarehouseId === id;
+  const renderAccountPickerItem = useCallback(({ item }: { item: ErpAccountConfig | null }) => {
+    const account = item;
+    const isAll = account === null;
+    const key = account?.key || null;
+    const active = selectedAccountKey === key;
     return (
       <TouchableOpacity
-        key={warehouse?.id || 'all'}
+        key={account?.key || 'all'}
         style={[styles.pickerItem, active && styles.pickerItemActive]}
         activeOpacity={0.72}
-        onPress={() => handleWarehouseSelect(id)}
+        onPress={() => handleAccountSelect(key)}
       >
         <View style={styles.pickerItemLeft}>
           <FontAwesome6
-            name={isAll ? 'layer-group' : 'warehouse'}
+            name={isAll ? 'layer-group' : 'building'}
             size={14}
             color={active ? theme.primary : theme.textSecondary}
           />
           <Text style={[styles.pickerItemText, active && styles.pickerItemTextActive]}>
-            {isAll ? '全部仓库' : warehouse.name}
+            {isAll ? '全部账套' : account.name}
           </Text>
         </View>
         {active ? <FontAwesome6 name="check" size={14} color={theme.primary} /> : null}
       </TouchableOpacity>
     );
-  }, [handleWarehouseSelect, selectedWarehouseId, styles, theme.primary, theme.textSecondary]);
+  }, [handleAccountSelect, selectedAccountKey, styles, theme.primary, theme.textSecondary]);
 
   const renderDetail = useCallback((
     record: InventoryCheckRecord,
@@ -717,11 +716,11 @@ export default function InventoryRecordsScreen() {
             <TouchableOpacity
               style={styles.warehouseSelectButton}
               activeOpacity={0.72}
-              onPress={() => setShowWarehousePicker(true)}
+              onPress={() => setShowAccountPicker(true)}
             >
               <View style={styles.warehouseIconBox}>
                 <FontAwesome6
-                  name={selectedWarehouseId ? 'warehouse' : 'layer-group'}
+                  name={selectedAccountKey ? 'building' : 'layer-group'}
                   size={14}
                   color={theme.primary}
                 />
@@ -729,7 +728,7 @@ export default function InventoryRecordsScreen() {
               <View style={styles.warehouseSelectTextBlock}>
                 <Text style={styles.filterLabel}>当前范围</Text>
                 <Text style={styles.filterTitle} numberOfLines={1} ellipsizeMode="tail">
-                  {selectedWarehouseName}
+                  {selectedAccountName}
                 </Text>
               </View>
               <Feather name="chevron-down" size={18} color={theme.textMuted} />
@@ -777,21 +776,21 @@ export default function InventoryRecordsScreen() {
           removeClippedSubviews
         />
 
-        {showWarehousePicker ? (
+        {showAccountPicker ? (
           <View style={styles.pickerOverlay}>
             <View style={styles.pickerBox}>
-              <Text style={styles.pickerTitle}>选择仓库</Text>
+              <Text style={styles.pickerTitle}>选择账套</Text>
               <FlatList
-                data={[null, ...warehouses] as (Warehouse | null)[]}
-                keyExtractor={(item) => item?.id || 'all'}
-                renderItem={renderWarehousePickerItem}
+                data={[null, ...ERP_ACCOUNTS] as (ErpAccountConfig | null)[]}
+                keyExtractor={(item) => item?.key || 'all'}
+                renderItem={renderAccountPickerItem}
                 showsVerticalScrollIndicator={false}
                 contentContainerStyle={styles.pickerList}
               />
               <TouchableOpacity
                 style={styles.pickerClose}
                 activeOpacity={0.72}
-                onPress={() => setShowWarehousePicker(false)}
+                onPress={() => setShowAccountPicker(false)}
               >
                 <Text style={styles.pickerCloseText}>关闭</Text>
               </TouchableOpacity>

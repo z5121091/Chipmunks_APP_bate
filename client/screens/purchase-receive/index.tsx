@@ -5,7 +5,6 @@ import {
   Platform,
   RefreshControl,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -14,6 +13,7 @@ import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { Screen } from '@/components/Screen';
 import { UiWorkflowSummary } from '@/components/UiRedesign';
+import { WarehouseScanInput } from '@/components/WarehouseScanInput';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
 import { getInboundDocumentSummaries } from '@/utils/database';
@@ -50,6 +50,8 @@ const normalizeVoucherCode = (value: string) => value.trim().toUpperCase();
 const PURCHASE_RECEIVE_STATUS_POLL_INTERVAL_MS = 30_000;
 const PURCHASE_RECEIVE_REQUIRED_FRESHNESS_MS = 5 * 60_000;
 const PURCHASE_RECEIVE_LIST_AUTO_REFRESH_MS = 5 * 60_000;
+const PURCHASE_RECEIVE_LOOKUP_AUTO_SUBMIT_MS = 180;
+const STANDARD_PURCHASE_RECEIVE_CODE_PATTERN = /^II-\d{4}-\d{2}-\d{2}-\d{3}$/i;
 
 type PendingListLoadOptions = {
   forceRefresh?: boolean;
@@ -64,6 +66,8 @@ export default function PurchaseReceiveScreen() {
   const completionRequestIdRef = useRef(0);
   const statusRequestIdRef = useRef(0);
   const detailRequestIdRef = useRef(0);
+  const manualLookupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const manualLookupInProgressRef = useRef('');
   const [selectedAccount, setSelectedAccount] = useState<ErpAccountConfig>(ERP_ACCOUNTS[0]);
   const [items, setItems] = useState<PurchaseReceiveListItem[]>([]);
   const [updatedAt, setUpdatedAt] = useState('');
@@ -230,6 +234,10 @@ export default function PurchaseReceiveScreen() {
 
       return () => {
         clearInterval(statusTimer);
+        if (manualLookupTimerRef.current) {
+          clearTimeout(manualLookupTimerRef.current);
+          manualLookupTimerRef.current = null;
+        }
       };
     }, [
       loadCompletedVoucherCodes,
@@ -301,10 +309,15 @@ export default function PurchaseReceiveScreen() {
   );
 
   const handleAccountPress = useCallback((account: ErpAccountConfig) => {
+    if (manualLookupTimerRef.current) {
+      clearTimeout(manualLookupTimerRef.current);
+      manualLookupTimerRef.current = null;
+    }
     requestIdRef.current += 1;
     completionRequestIdRef.current += 1;
     statusRequestIdRef.current += 1;
     detailRequestIdRef.current += 1;
+    manualLookupInProgressRef.current = '';
     setSelectedAccount(account);
     setItems([]);
     setCompletedVoucherCodes(new Set());
@@ -317,6 +330,7 @@ export default function PurchaseReceiveScreen() {
     setLoadingDetailCode('');
     setDetails({});
     setDetailLoadedAt({});
+    setManualVoucherCode('');
   }, []);
 
   const handleRefresh = useCallback(() => {
@@ -434,9 +448,20 @@ export default function PurchaseReceiveScreen() {
     [auditedVoucherCodes, completedVoucherCodes, loadVoucherDetail, router]
   );
 
-  const handleManualLookup = useCallback(async () => {
-    const voucherCode = manualVoucherCode.trim().toUpperCase();
-    if (!voucherCode || !selectedAccountAvailable || loadingDetailCode) {
+  const handleManualLookup = useCallback(async (nextVoucherCode?: string) => {
+    if (manualLookupTimerRef.current) {
+      clearTimeout(manualLookupTimerRef.current);
+      manualLookupTimerRef.current = null;
+    }
+
+    const voucherCode = normalizeVoucherCode(nextVoucherCode ?? manualVoucherCode);
+    const requestKey = `${selectedAccount.key}:${voucherCode}`;
+    if (
+      !voucherCode ||
+      !selectedAccountAvailable ||
+      loadingDetailCode ||
+      manualLookupInProgressRef.current
+    ) {
       return;
     }
     if (auditedVoucherCodes.has(voucherCode)) {
@@ -450,6 +475,7 @@ export default function PurchaseReceiveScreen() {
       return;
     }
 
+    manualLookupInProgressRef.current = requestKey;
     const probe: PurchaseReceiveListItem = {
       accountKey: selectedAccount.key,
       code: voucherCode,
@@ -462,30 +488,36 @@ export default function PurchaseReceiveScreen() {
       warehouseCode: '',
       warehouseName: '',
     };
-    const voucher = await loadVoucherDetail(probe, { requireFresh: true });
-    if (!voucher) {
-      return;
-    }
+    try {
+      const voucher = await loadVoucherDetail(probe, { requireFresh: true });
+      if (!voucher) {
+        return;
+      }
 
-    const listItem: PurchaseReceiveListItem = {
-      accountKey: voucher.accountKey,
-      code: voucher.code,
-      id: voucher.id,
-      partnerCode: voucher.partnerCode,
-      partnerName: voucher.partnerName,
-      stateCode: voucher.stateCode,
-      stateName: voucher.stateName,
-      voucherDate: voucher.voucherDate,
-      warehouseCode: voucher.warehouseCode,
-      warehouseName: voucher.warehouseName,
-    };
-    setItems((current) => [listItem, ...current.filter((item) => item.code !== voucher.code)]);
-    setManualVoucherCode('');
-    setErrorMessage('');
-    router.push('/inbound', {
-      accountKey: voucher.accountKey,
-      voucherCode: voucher.code,
-    });
+      const listItem: PurchaseReceiveListItem = {
+        accountKey: voucher.accountKey,
+        code: voucher.code,
+        id: voucher.id,
+        partnerCode: voucher.partnerCode,
+        partnerName: voucher.partnerName,
+        stateCode: voucher.stateCode,
+        stateName: voucher.stateName,
+        voucherDate: voucher.voucherDate,
+        warehouseCode: voucher.warehouseCode,
+        warehouseName: voucher.warehouseName,
+      };
+      setItems((current) => [listItem, ...current.filter((item) => item.code !== voucher.code)]);
+      setManualVoucherCode('');
+      setErrorMessage('');
+      router.push('/inbound', {
+        accountKey: voucher.accountKey,
+        voucherCode: voucher.code,
+      });
+    } finally {
+      if (manualLookupInProgressRef.current === requestKey) {
+        manualLookupInProgressRef.current = '';
+      }
+    }
   }, [
     auditedVoucherCodes,
     completedVoucherCodes,
@@ -496,6 +528,34 @@ export default function PurchaseReceiveScreen() {
     selectedAccount,
     selectedAccountAvailable,
   ]);
+
+  const handleManualVoucherCodeChange = useCallback(
+    (text: string) => {
+      if (manualLookupTimerRef.current) {
+        clearTimeout(manualLookupTimerRef.current);
+        manualLookupTimerRef.current = null;
+      }
+
+      setManualVoucherCode(text);
+      const voucherCode = normalizeVoucherCode(text);
+      if (!voucherCode || !selectedAccountAvailable || loadingDetailCode) {
+        return;
+      }
+
+      const matchesLoadedVoucher = items.some(
+        (item) => normalizeVoucherCode(item.code) === voucherCode
+      );
+      if (!matchesLoadedVoucher && !STANDARD_PURCHASE_RECEIVE_CODE_PATTERN.test(voucherCode)) {
+        return;
+      }
+
+      manualLookupTimerRef.current = setTimeout(() => {
+        manualLookupTimerRef.current = null;
+        void handleManualLookup(voucherCode);
+      }, PURCHASE_RECEIVE_LOOKUP_AUTO_SUBMIT_MS);
+    },
+    [handleManualLookup, items, loadingDetailCode, selectedAccountAvailable]
+  );
 
   const renderItem = useCallback(
     ({ item }: { item: PurchaseReceiveListItem }) => {
@@ -652,37 +712,30 @@ export default function PurchaseReceiveScreen() {
           })}
         </View>
 
-        <View style={styles.manualLookupBar}>
-          <TextInput
-            style={styles.manualLookupInput}
-            value={manualVoucherCode}
-            onChangeText={setManualVoucherCode}
-            onSubmitEditing={() => {
-              void handleManualLookup();
-            }}
-            editable={selectedAccountAvailable && !loadingDetailCode}
-            placeholder="扫描或输入采购入库单号"
-            placeholderTextColor={theme.textMuted}
-            autoCapitalize="characters"
-            autoCorrect={false}
-            returnKeyType="search"
-          />
-          <TouchableOpacity
-            style={styles.manualLookupButton}
-            activeOpacity={0.76}
-            accessibilityLabel="打开采购入库单并开始扫码"
-            disabled={!manualVoucherCode.trim() || !selectedAccountAvailable || Boolean(loadingDetailCode)}
-            onPress={() => {
-              void handleManualLookup();
-            }}
-          >
-            {loadingDetailCode && loadingDetailCode === manualVoucherCode.trim().toUpperCase() ? (
-              <ActivityIndicator size="small" color={theme.buttonPrimaryText} />
-            ) : (
-              <Feather name="maximize" size={19} color={theme.buttonPrimaryText} />
-            )}
-          </TouchableOpacity>
-        </View>
+        <WarehouseScanInput
+          active={manualVoucherCode.trim().length > 0}
+          processing={Boolean(loadingDetailCode)}
+          statusLabel="采购入库单号查询"
+          value={manualVoucherCode}
+          onChangeText={handleManualVoucherCodeChange}
+          onSubmitEditing={() => {
+            void handleManualLookup();
+          }}
+          editable={selectedAccountAvailable}
+          placeholder="扫描或输入采购入库单号"
+          placeholderTextColor={theme.textMuted}
+          autoCapitalize="characters"
+          returnKeyType="search"
+          actionLabel="打开采购入库单并开始扫码"
+          actionDisabled={!manualVoucherCode.trim() || !selectedAccountAvailable}
+          actionLoading={
+            Boolean(loadingDetailCode) &&
+            loadingDetailCode === manualVoucherCode.trim().toUpperCase()
+          }
+          onActionPress={() => {
+            void handleManualLookup();
+          }}
+        />
 
         {errorMessage ? (
           <View style={styles.errorCard}>

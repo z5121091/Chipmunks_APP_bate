@@ -14,10 +14,10 @@ import { AggregatedRecordItem } from '@/components/AggregatedRecordItem';
 import {
   UiPageHeader,
   UiSafeBottomBar,
-  UiScanBox,
   UiToolbarButton,
   UiWorkflowSummary,
 } from '@/components/UiRedesign';
+import { WarehouseScanInput } from '@/components/WarehouseScanInput';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { createStyles } from './styles';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
@@ -50,7 +50,6 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { safeJsonParseNullable } from '@/utils/json';
 import { formatDateTime, formatDate, getISODateTime } from '@/utils/time';
 import { STORAGE_KEYS, SyncConfig } from '@/constants/config';
-import { getErrorDetail } from '@/utils/errorTypes';
 import { formatSyncErrorMessage, syncExcelToComputer } from '@/utils/excel';
 import {
   buildInventoryExportFileNameFromNo,
@@ -181,7 +180,6 @@ export default function InventoryScreen() {
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const postProcessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const errorActionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const screenActiveRef = useRef(true);
   const scannerFocusBlockedRef = useRef(false);
   // 扫码队列 - 暂存处理中的新扫码
@@ -273,7 +271,7 @@ export default function InventoryScreen() {
     []
   );
 
-  // 每个账套、每个本地仓库拥有独立盘点草稿。
+  // 每个 ERP 账套拥有独立盘点草稿；仓库由账套固定映射。
   const loadCheckRecords = useCallback(
     async (warehouse: Warehouse | null | undefined, account: ErpAccountConfig) => {
       try {
@@ -422,9 +420,6 @@ export default function InventoryScreen() {
       if (postProcessTimerRef.current) {
         clearTimeout(postProcessTimerRef.current);
       }
-      if (errorActionTimerRef.current) {
-        clearTimeout(errorActionTimerRef.current);
-      }
     },
     []
   );
@@ -531,10 +526,6 @@ export default function InventoryScreen() {
           clearTimeout(postProcessTimerRef.current);
           postProcessTimerRef.current = null;
         }
-        if (errorActionTimerRef.current) {
-          clearTimeout(errorActionTimerRef.current);
-          errorActionTimerRef.current = null;
-        }
       };
     }, [focusScannerInput, loadCheckRecords, showToast])
   );
@@ -566,10 +557,12 @@ export default function InventoryScreen() {
         }
 
         const nextWarehouse = getInventoryWarehouseForAccount(nextAccount);
+        const nextRecords = await getDraftRecords(nextWarehouse, nextAccount.key);
+
         selectedAccountRef.current = nextAccount;
         setSelectedAccount(nextAccount);
         setCurrentWarehouse(nextWarehouse);
-        replaceScanRecords([]);
+        replaceScanRecords(nextRecords);
         expandedGroupsRef.current = new Set();
         setExpandedGroups(new Set());
         setEditingRecord(null);
@@ -577,14 +570,17 @@ export default function InventoryScreen() {
         setQuantityModalVisible(false);
         scanQueueRef.current = [];
 
-        const nextRecords = await getDraftRecords(nextWarehouse, nextAccount.key);
-        replaceScanRecords(nextRecords);
-
         if (!isErpAccountAvailable(nextAccount)) {
           showToast(`${nextAccount.name}账套暂未开放`, 'warning');
+        } else if (nextRecords.length > 0) {
+          showToast(`已切换到 ${nextAccount.name}，恢复 ${nextRecords.length} 条暂存`, 'success');
         } else {
           showToast(`已切换到 ${nextAccount.name}`, 'success');
         }
+      } catch (error) {
+        logger.error('[盘点] 切换账套失败:', error);
+        showToast('切换账套失败，当前盘点暂存未改变', 'error');
+        feedbackError();
       } finally {
         accountSwitchInProgressRef.current = false;
         setSwitchingAccount(false);
@@ -605,21 +601,8 @@ export default function InventoryScreen() {
     async (code: string) => {
       if (!code || processingRef.current) return;
 
-      if (!currentWarehouse) {
-        const errorDetail = getErrorDetail('ERR_NO_WAREHOUSE', undefined, router);
-        showToast(errorDetail.title, 'error');
-        if (errorDetail.action && errorDetail.onPress) {
-          if (errorActionTimerRef.current) {
-            clearTimeout(errorActionTimerRef.current);
-          }
-          errorActionTimerRef.current = setTimeout(() => {
-            errorActionTimerRef.current = null;
-            if (screenActiveRef.current) {
-              errorDetail.onPress?.();
-            }
-          }, 500);
-        }
-        feedbackError();
+      if (switchingAccount) {
+        showToast('正在切换账套，请稍候', 'warning');
         return;
       }
 
@@ -726,12 +709,11 @@ export default function InventoryScreen() {
       }
     },
     [
-      currentWarehouse,
       resumeQueuedScans,
-      router,
       selectedAccount.name,
       selectedAccountAvailable,
       showToast,
+      switchingAccount,
       updateScanRecords,
     ]
   );
@@ -877,12 +859,7 @@ export default function InventoryScreen() {
   };
 
   const performSaveInventory = async () => {
-    if (saveInProgressRef.current) {
-      return;
-    }
-    if (!currentWarehouse) {
-      showToast('请先选择仓库', 'warning');
-      feedbackWarning();
+    if (saveInProgressRef.current || switchingAccount) {
       return;
     }
     if (!selectedAccountAvailable) {
@@ -1040,12 +1017,7 @@ export default function InventoryScreen() {
 
   // 完成盘点前明确告知本次将消耗多少次ERP查询，避免误触。
   const handleSaveInventory = () => {
-    if (saveInProgressRef.current || saving) {
-      return;
-    }
-    if (!currentWarehouse) {
-      showToast('请先选择仓库', 'warning');
-      feedbackWarning();
+    if (saveInProgressRef.current || saving || switchingAccount) {
       return;
     }
     if (scanRecords.length === 0) {
@@ -1075,10 +1047,10 @@ export default function InventoryScreen() {
 
   // 清空记录
   const handleClearRecords = () => {
-    if (scanRecords.length === 0) return;
+    if (scanRecords.length === 0 || switchingAccount) return;
     alert.showConfirm(
       '清空盘点记录',
-      `将清空 ${selectedAccount.name} 当前仓库的 ${scanRecords.length} 条盘点暂存，确定继续吗？`,
+      `将清空 ${selectedAccount.name} 的 ${scanRecords.length} 条盘点暂存，确定继续吗？`,
       () => {
         void (async () => {
           const cleared = await clearCheckRecords(currentWarehouse, selectedAccount.key);
@@ -1125,7 +1097,9 @@ export default function InventoryScreen() {
         ? 'adjust'
         : 'review';
   const currentInventoryPlaceholder =
-    !selectedAccountAvailable
+    switchingAccount
+      ? '正在切换账套…'
+      : !selectedAccountAvailable
       ? `${selectedAccount.name}账套暂未开放`
       : currentInventoryStep === 'scan'
       ? '持续扫描盘点二维码'
@@ -1187,15 +1161,14 @@ export default function InventoryScreen() {
       },
       {
         key: 'warehouse',
-        label: '仓库',
-        value: currentWarehouse?.name || '请选择仓库',
+        label: 'ERP仓库',
+        value: currentWarehouse.name,
         icon: 'archive' as const,
         color: theme.primary,
-        onPress: () => setShowWarehousePicker(true),
       },
     ],
     [
-      currentWarehouse?.name,
+      currentWarehouse.name,
       scanRecords.length,
       theme.primary,
       theme.success,
@@ -1352,8 +1325,8 @@ export default function InventoryScreen() {
                     style={[styles.typeBtn, active && styles.typeBtnActive]}
                     activeOpacity={0.82}
                     accessibilityRole="button"
-                    accessibilityState={{ selected: active, disabled: saving }}
-                    disabled={saving}
+                    accessibilityState={{ selected: active, disabled: saving || switchingAccount }}
+                    disabled={saving || switchingAccount}
                     onPress={() => {
                       void handleAccountChange(account);
                     }}
@@ -1375,11 +1348,13 @@ export default function InventoryScreen() {
         </View>
 
         {/* 扫码输入 */}
-        <UiScanBox
+        <WarehouseScanInput
           inputRef={inputRef}
           active={inputValue.length > 0}
           statusLabel={
-            !selectedAccountAvailable
+            switchingAccount
+              ? '正在切换账套'
+              : !selectedAccountAvailable
               ? '当前账套暂未开放'
               : currentInventoryStep === 'scan'
               ? '盘点扫码录入'
@@ -1388,7 +1363,7 @@ export default function InventoryScreen() {
                 : '继续扫码或确认盘点'
           }
           value={inputValue}
-          editable={selectedAccountAvailable && !saving}
+          editable={selectedAccountAvailable && !saving && !switchingAccount}
           onChangeText={handleInputChange}
           onSubmitEditing={handleSubmitEditing}
           onBlur={() => focusScannerInput(120)}
@@ -1397,6 +1372,16 @@ export default function InventoryScreen() {
           autoCapitalize="none"
           autoFocus={false}
           showSoftInputOnFocus={false}
+          actionLabel="提交盘点扫码内容"
+          actionDisabled={!selectedAccountAvailable || saving || switchingAccount}
+          actionLoading={saving || switchingAccount}
+          onActionPress={() => {
+            if (inputValue.trim()) {
+              handleSubmitEditing();
+              return;
+            }
+            focusScannerInput(0);
+          }}
         />
 
         {/* 物料列表 */}
@@ -1440,7 +1425,7 @@ export default function InventoryScreen() {
                   label="清空盘点"
                   icon="trash-2"
                   variant="secondary"
-                  disabled={saving || scanRecords.length === 0}
+                  disabled={saving || switchingAccount || scanRecords.length === 0}
                   onPress={handleClearRecords}
                   style={styles.actionButton}
                 />
@@ -1452,45 +1437,13 @@ export default function InventoryScreen() {
                   variant="primary"
                   loading={saving}
                   onPress={handleSaveInventory}
-                  disabled={saving}
+                  disabled={saving || switchingAccount}
                   style={styles.actionButton}
                 />
               </View>
             </UiSafeBottomBar>
           )}
         </View>
-
-        {/* 仓库选择器 */}
-        {showWarehousePicker && (
-          <View style={styles.pickerOverlay}>
-            <View style={styles.pickerBox}>
-              <Text style={styles.pickerTitle}>选择仓库</Text>
-              {warehouses.map((wh) => (
-                <TouchableOpacity
-                  key={wh.id}
-                  style={[
-                    styles.pickerItem,
-                    currentWarehouse?.id === wh.id && styles.pickerItemActive,
-                  ]}
-                  activeOpacity={0.7}
-                  onPress={() => selectWarehouse(wh)}
-                >
-                  <Text style={styles.pickerItemText}>{wh.name}</Text>
-                  {currentWarehouse?.id === wh.id && (
-                    <FontAwesome6 name="check" size={16} color={theme.primary} />
-                  )}
-                </TouchableOpacity>
-              ))}
-              <TouchableOpacity
-                style={styles.pickerClose}
-                activeOpacity={0.7}
-                onPress={() => setShowWarehousePicker(false)}
-              >
-                <Text style={styles.pickerCloseText}>关闭</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        )}
 
         {/* 实盘数量修改弹窗 */}
         <Modal

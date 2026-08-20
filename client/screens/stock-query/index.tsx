@@ -12,7 +12,8 @@ import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { Screen } from '@/components/Screen';
-import { UiScanBox, UiWorkflowSummary } from '@/components/UiRedesign';
+import { UiWorkflowSummary } from '@/components/UiRedesign';
+import { WarehouseScanInput } from '@/components/WarehouseScanInput';
 import { useTheme } from '@/hooks/useTheme';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import {
@@ -345,7 +346,7 @@ export default function StockQueryScreen() {
 
         <View style={styles.accountPanel}>{ERP_ACCOUNTS.map(renderAccountButton)}</View>
 
-        <UiScanBox
+        <WarehouseScanInput
           inputRef={inputRef}
           active={inputValue.length > 0 || querying}
           processing={querying}
@@ -374,6 +375,16 @@ export default function StockQueryScreen() {
           autoFocus={false}
           editable={selectedAccountAvailable}
           showSoftInputOnFocus={false}
+          actionLabel="查询ERP库存"
+          actionDisabled={!selectedAccountAvailable}
+          actionLoading={querying}
+          onActionPress={() => {
+            if (inputValue.trim()) {
+              void handleQuery();
+              return;
+            }
+            focusScannerInput(0);
+          }}
         />
 
         <View style={styles.resultSection}>

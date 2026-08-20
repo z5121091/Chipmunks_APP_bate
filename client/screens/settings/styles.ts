@@ -721,10 +721,11 @@ const getBaseStyles = (theme: Theme) => {
     aboutDetailLabel: {
       fontSize: rf(13),
       color: theme.textSecondary,
-      width: 50,
+      width: rs(64),
     },
     aboutDetailRight: {
       flex: 1,
+      minWidth: 0,
       flexDirection: 'row',
       alignItems: 'center',
       gap: Spacing.xs,
@@ -734,6 +735,10 @@ const getBaseStyles = (theme: Theme) => {
       color: theme.textPrimary,
       fontWeight: '500',
       flex: 1,
+      textAlign: 'center',
+    },
+    aboutDetailAccessorySpacer: {
+      width: rs(12),
     },
     // 使用说明和更新日志入口 - 水平排列
     helpRow: {

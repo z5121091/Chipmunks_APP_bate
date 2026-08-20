@@ -13,7 +13,8 @@ import { AppFormField } from '@/components/AppFormField';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
 import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
-import { UiPageHeader, UiScanBox, UiWorkflowSummary } from '@/components/UiRedesign';
+import { UiPageHeader, UiWorkflowSummary } from '@/components/UiRedesign';
+import { WarehouseScanInput } from '@/components/WarehouseScanInput';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { createStyles } from './styles';
 import {
@@ -125,6 +126,7 @@ interface ErpLineProgress {
   requiredQuantity: number;
   scannedItems: MaterialItem[];
   scannedQuantity: number;
+  sourceLineCount: number;
   specification: string;
   status: 'complete' | 'partial' | 'pending' | 'over';
   unitName: string;
@@ -2225,6 +2227,7 @@ export default function PDAScanScreen() {
       const existing = progressMap.get(key);
 
       if (existing) {
+        existing.sourceLineCount += 1;
         existing.requiredQuantity += line.quantity;
         existing.remainingQuantity += line.quantity;
         if (!existing.inventoryName && line.inventoryName) {
@@ -2247,6 +2250,7 @@ export default function PDAScanScreen() {
         requiredQuantity: line.quantity,
         scannedItems: [],
         scannedQuantity: 0,
+        sourceLineCount: 1,
         specification: line.specification,
         status: 'pending',
         unitName: line.unitName || 'PCS',
@@ -2438,6 +2442,11 @@ export default function PDAScanScreen() {
               <Text style={styles.erpLineCode} numberOfLines={2} ellipsizeMode="tail">
                 {item.specification || '物料明细'}
               </Text>
+              {item.sourceLineCount > 1 ? (
+                <Text style={styles.erpLineMergeHint}>
+                  ERP {item.sourceLineCount} 行合并
+                </Text>
+              ) : null}
               <View style={styles.erpLineProgressTrack}>
                 <View
                   style={[
@@ -2845,7 +2854,7 @@ export default function PDAScanScreen() {
         </View>
 
         {/* 扫码输入 */}
-        <UiScanBox
+        <WarehouseScanInput
           inputRef={inputRef}
           active={inputValue.length > 0 || isErpOrderLoading}
           processing={isErpOrderLoading}
@@ -2859,6 +2868,15 @@ export default function PDAScanScreen() {
           autoCapitalize="none"
           autoFocus={false}
           showSoftInputOnFocus={false}
+          actionLabel="提交出库扫码内容"
+          actionLoading={isErpOrderLoading}
+          onActionPress={() => {
+            if (inputValue.trim()) {
+              handleSubmitEditing();
+              return;
+            }
+            focusScannerInput(0);
+          }}
         />
 
         {isErpOrderComplete ? (

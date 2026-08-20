@@ -1,7 +1,36 @@
 import {
+  ERP_ACCOUNTS,
   getErpAccountByOutboundOrderNo,
   getOutboundOrderSequenceLength,
 } from '../erpAccounts';
+import { resolveErpPublicGatewayMode } from '../backendApi';
+
+describe('ERP account backend defaults', () => {
+  it('uses HTTPS so web previews and APKs do not make mixed-content requests', () => {
+    expect(ERP_ACCOUNTS[0]?.backendBaseUrl).toBe('https://erp.chipmunks.fun');
+  });
+
+  it('bypasses the Coze backend sandbox for ERP requests', () => {
+    expect(
+      resolveErpPublicGatewayMode({
+        backendBaseUrl: 'https://project.dev.coze.site',
+        cozeProjectId: 'coze-project',
+      })
+    ).toBe(true);
+  });
+
+  it('keeps the local web backend proxy outside Coze', () => {
+    expect(
+      resolveErpPublicGatewayMode({
+        backendBaseUrl: 'http://localhost:19007',
+      })
+    ).toBe(false);
+  });
+
+  it('uses the public ERP gateway for standalone APK builds without a backend URL', () => {
+    expect(resolveErpPublicGatewayMode({})).toBe(true);
+  });
+});
 
 describe('ERP account routing by outbound voucher number', () => {
   test.each([

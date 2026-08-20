@@ -1,4 +1,4 @@
-import { createDecipheriv, createHash } from 'node:crypto';
+import { createDecipheriv, createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -8,6 +8,7 @@ import {
   parseErpAccountKey,
   resolveErpAccountKey,
 } from './erpAccounts.ts';
+import { SERVER_RELEASE } from './release.ts';
 
 const DEFAULT_OPENAPI_BASE_URL = 'https://openapi.chanjet.com';
 const DEFAULT_MARKET_BASE_URL = 'https://market.chanjet.com';
@@ -19,6 +20,7 @@ const REFRESH_TOKEN_LIFETIME_MS = 29 * DAY_MS;
 const DEFAULT_TOKEN_REFRESH_LEAD_MS = DAY_MS;
 const DEFAULT_TOKEN_REFRESH_MAX_AGE_MS = 5 * DAY_MS;
 const DEFAULT_TOKEN_REFRESH_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 const TOKEN_REFRESH_START_DELAY_MS = 3 * 1000;
 const TOKEN_REFRESH_LOCK_STALE_MS = 2 * 60 * 1000;
 const TOKEN_REFRESH_LOCK_WAIT_MS = 25 * 1000;
@@ -69,6 +71,9 @@ export type ChanjetState = {
   lastMessageType?: string;
   openToken?: string;
   openTokenReceivedAt?: string;
+  pendingOAuthReturnState?: string;
+  pendingOAuthStateExpiresAt?: string;
+  pendingOAuthStateHash?: string;
   purchaseReceiveVoucherStatuses?: Record<string, PurchaseReceiveVoucherStatus>;
   refreshToken?: string;
   refreshTokenExpiresIn?: unknown;
@@ -425,6 +430,73 @@ const updateChanjetState = (
     () => undefined
   );
   return update;
+};
+
+type OAuthStateChallenge = {
+  expiresAt: string;
+  hash: string;
+  value: string;
+};
+
+const hashOAuthState = (value: string): string =>
+  createHash('sha256').update(value, 'utf8').digest('hex');
+
+export const createOAuthStateChallenge = (now = Date.now()): OAuthStateChallenge => {
+  const value = randomBytes(32).toString('base64url');
+  return {
+    expiresAt: new Date(now + OAUTH_STATE_TTL_MS).toISOString(),
+    hash: hashOAuthState(value),
+    value,
+  };
+};
+
+export const isOAuthStateChallengeValid = (
+  value: string | undefined,
+  expectedHash: string | undefined,
+  expiresAt: string | undefined,
+  now = Date.now()
+): boolean => {
+  if (!value || !expectedHash || !expiresAt || Date.parse(expiresAt) <= now) {
+    return false;
+  }
+
+  const actual = Buffer.from(hashOAuthState(value), 'hex');
+  const expected = Buffer.from(expectedHash, 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+};
+
+const issueOAuthState = async (returnState?: string): Promise<string> => {
+  const challenge = createOAuthStateChallenge();
+  await updateChanjetState({
+    pendingOAuthReturnState: returnState,
+    pendingOAuthStateExpiresAt: challenge.expiresAt,
+    pendingOAuthStateHash: challenge.hash,
+  });
+  return challenge.value;
+};
+
+const consumeOAuthState = async (value: string | undefined): Promise<string | undefined> => {
+  let returnState: string | undefined;
+  await updateChanjetState((current) => {
+    if (
+      !isOAuthStateChallengeValid(
+        value,
+        current.pendingOAuthStateHash,
+        current.pendingOAuthStateExpiresAt
+      )
+    ) {
+      throw new ErpInputError('授权 state 无效或已过期，请重新生成授权地址');
+    }
+
+    returnState = current.pendingOAuthReturnState;
+    return {
+      ...current,
+      pendingOAuthReturnState: undefined,
+      pendingOAuthStateExpiresAt: undefined,
+      pendingOAuthStateHash: undefined,
+    };
+  });
+  return returnState;
 };
 
 const acquireTokenRefreshFileLock = async (): Promise<() => Promise<void>> => {
@@ -1176,7 +1248,6 @@ const sendError = (res: Response, error: unknown): void => {
       success: false,
       message: error.message,
       upstreamStatus: error.statusCode,
-      details: error.details,
     });
     return;
   }
@@ -1418,22 +1489,21 @@ export const registerErpRoutes = (
         publicBaseUrlConfigured: Boolean(getPublicBaseUrl()),
         redirectUriConfigured: Boolean(getRedirectUri()),
         stateIsolation: 'account-key',
+        backendRelease: SERVER_RELEASE,
+        oauthStateProtection: 'one-time-persisted',
       });
     })
   );
 
   app.get(
     '/api/erp/auth/open-app-url',
-    route((req, res) => {
+    route(async (req, res) => {
       const url = new URL('/app/v2/openApp', getMarketBaseUrl());
       url.searchParams.set('appKey', getAppKey());
 
-      const state = getQueryString(req, 'state');
+      const state = await issueOAuthState(getQueryString(req, 'state'));
       const orgId = getQueryString(req, 'orgId');
-
-      if (state) {
-        url.searchParams.set('state', state);
-      }
+      url.searchParams.set('state', state);
 
       if (orgId) {
         url.searchParams.set('orgId', orgId);
@@ -1448,7 +1518,7 @@ export const registerErpRoutes = (
 
   app.get(
     '/api/erp/auth/authorize-url',
-    route((req, res) => {
+    route(async (req, res) => {
       const orgId = getQueryString(req, 'orgId');
 
       if (!orgId) {
@@ -1461,10 +1531,8 @@ export const registerErpRoutes = (
       url.searchParams.set('appName', getQueryString(req, 'appName') || getDefaultAppName());
       url.searchParams.set('scope', getQueryString(req, 'scope') || getDefaultScope());
 
-      const state = getQueryString(req, 'state');
-      if (state) {
-        url.searchParams.set('state', state);
-      }
+      const state = await issueOAuthState(getQueryString(req, 'state'));
+      url.searchParams.set('state', state);
 
       res.status(200).json({
         success: true,
@@ -1488,11 +1556,13 @@ export const registerErpRoutes = (
         return;
       }
 
+      const returnState = await consumeOAuthState(state);
+
       if (trimEnv('CHANJET_EXCHANGE_ON_CALLBACK') !== 'true') {
         res.status(200).json({
           success: true,
           code,
-          state,
+          state: returnState,
           next: 'POST /api/erp/auth/exchange-code',
         });
         return;
@@ -1520,7 +1590,7 @@ export const registerErpRoutes = (
 
       res.status(200).json({
         success: true,
-        state,
+        state: returnState,
         status: 'authorized',
       });
     })

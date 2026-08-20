@@ -68,7 +68,7 @@ Zx512Erp20260605
 
 ```text
 消息秘钥：Zx512Erp20260605
-消息接收地址：https://erp.zx5121091.pw/api/erp/messages
+消息接收地址：https://erp.chipmunks.fun/api/erp/messages
 ```
 
 保存消息接收地址时，畅捷通会发送 `APP_TEST` 验证消息；之后每 10 分钟会发送 `APP_TICKET` 消息。后端会自动解密消息并保存最近的 `appTicket`。
@@ -76,13 +76,13 @@ Zx512Erp20260605
 如果想立即触发 appTicket 推送，可以调用：
 
 ```bash
-curl -X POST "https://erp.zx5121091.pw/api/erp/auth/resend-app-ticket"
+curl -X POST "https://erp.chipmunks.fun/api/erp/auth/resend-app-ticket"
 ```
 
 拿到自建应用管理员授权后的软证书 `certificate` 后，换取 `openToken`：
 
 ```bash
-curl -X POST "https://erp.zx5121091.pw/api/erp/auth/self-built-token" \
+curl -X POST "https://erp.chipmunks.fun/api/erp/auth/self-built-token" \
   -H "Content-Type: application/json" \
   -d "{\"certificate\":\"你的软证书\"}"
 ```
@@ -166,16 +166,18 @@ curl -X POST "https://erp.zx5121091.pw/api/erp/auth/self-built-token" \
 
 ## ECS 部署记录
 
-当前第一版后端已经部署到 ECS：
+当前后端已经迁移到正式 ECS：
 
 ```text
-公网 IP：114.55.15.45
+公网 IP：47.116.37.183
 服务目录：/opt/palm-warehouse/server
 systemd 服务：palm-warehouse-server
 本机监听：127.0.0.1:8080
-Nginx 反向代理：80 -> 127.0.0.1:8080
-计划域名：erp.zx5121091.pw
-HTTPS：Let's Encrypt 已配置，证书到期日 2026-09-03，certbot 已配置自动续期
+无锡笃能账套服务：palm-warehouse-erp@wuxi-duneng（127.0.0.1:18081）
+上海花栗鼠账套服务：palm-warehouse-erp@shanghai-chipmunk（配置预留，暂未启用）
+Nginx 反向代理：HTTPS -> 127.0.0.1:8080
+稳定后端域名：https://erp.chipmunks.fun
+HTTPS：Let's Encrypt 已配置，当前证书有效期至 2026-11-10，自动续期模拟已通过；客户端只使用域名，后续迁移服务器无需重新打包 APK
 ```
 
 需要在阿里云安全组放行：
@@ -190,26 +192,29 @@ TCP 443 来源 0.0.0.0/0
 ```text
 主机记录：erp
 记录类型：A
-记录值：114.55.15.45
+记录值：47.116.37.183
 ```
 
 DNS 生效后，执行证书配置：
 
 ```bash
-certbot --nginx -d erp.zx5121091.pw
+certbot certonly --webroot \
+  -w /var/www/letsencrypt \
+  -d erp.chipmunks.fun \
+  --cert-name erp.chipmunks.fun
 ```
 
 当前证书已配置完成，以下地址已验证可访问：
 
 ```text
-https://erp.zx5121091.pw/CHANJET_CHECK.txt
-https://erp.zx5121091.pw/api/erp/health
+https://erp.chipmunks.fun/CHANJET_CHECK.txt
+https://erp.chipmunks.fun/api/erp/health
 ```
 
 证书配置完成后，畅捷通后台填写：
 
 ```text
-可信域名：erp.zx5121091.pw
-OAuth回调地址：https://erp.zx5121091.pw/api/erp/auth/callback
-消息接收地址：https://erp.zx5121091.pw/api/erp/messages
+可信域名：erp.chipmunks.fun
+OAuth回调地址：https://erp.chipmunks.fun/api/erp/auth/callback
+消息接收地址：https://erp.chipmunks.fun/api/erp/messages
 ```

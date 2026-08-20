@@ -6,14 +6,11 @@ import {
   FlatList,
   TextInput,
   Modal,
-  Platform,
-  Linking,
 } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
-import * as MediaLibrary from 'expo-media-library';
 import * as XLSX from 'xlsx';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
@@ -396,7 +393,7 @@ export default function InventoryBindingScreen() {
     }
   };
 
-  // 导出导入模板（兼容 Android 7.0）
+  // 导出导入模板
   const handleExportTemplate = async () => {
     try {
       // 模板表头 + 示例数据行
@@ -419,75 +416,14 @@ export default function InventoryBindingScreen() {
         encoding: FileSystem.EncodingType.Base64,
       });
 
-      // 检测 Android 版本（API 26 = Android 8.0）
-      const isAndroid8OrAbove = Platform.OS === 'android' && Platform.Version >= 26;
-
-      if (isAndroid8OrAbove) {
-        // Android 8.0+：直接使用 Sharing 分享
-        if (await Sharing.isAvailableAsync()) {
-          await Sharing.shareAsync(filePath, {
-            mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            dialogTitle: '导出导入模板',
-          });
-          alert.showSuccess('模板已导出\n\n请按照模板格式填写数据后导入');
-        }
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(filePath, {
+          mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          dialogTitle: '导出导入模板',
+        });
+        alert.showSuccess('模板已导出\n\n请按照模板格式填写数据后导入');
       } else {
-        // Android 7.0 及以下：保存到 Downloads 文件夹
-        try {
-          // 请求媒体库权限
-          const { status } = await MediaLibrary.requestPermissionsAsync();
-          if (status !== 'granted') {
-            alert.showError('需要存储权限才能保存模板');
-            return;
-          }
-
-          // 将文件保存到媒体库
-          const asset = await MediaLibrary.createAssetAsync(filePath);
-
-          // 获取 Downloads 相册
-          try {
-            const albums = await MediaLibrary.getAlbumsAsync();
-            let downloadAlbum = albums.find(
-              (album) => album.title === 'Download' || album.title === 'Downloads'
-            );
-
-            if (!downloadAlbum) {
-              downloadAlbum = await MediaLibrary.createAlbumAsync('Downloads', asset, false);
-            } else {
-              await MediaLibrary.addAssetsToAlbumAsync([asset], downloadAlbum.id, false);
-            }
-          } catch (_albumError) {
-            // 相册操作失败没关系，文件已经保存到媒体库了
-          }
-
-          // 尝试打开 Downloads 文件夹
-          try {
-            await Linking.openURL('content://downloads/all_downloads');
-          } catch {
-            try {
-              await Linking.openURL(
-                'content://com.android.providers.downloads.documents/root/downloads'
-              );
-            } catch {
-              // 都打不开就算了
-            }
-          }
-
-          alert.showSuccess('模板已保存到下载文件夹\n请在文件管理器中找到并打开\n（用于导入数据）');
-        } catch (mediaError) {
-          logger.error('保存到下载文件夹失败:', mediaError);
-
-          // 备选方案：使用 Sharing
-          if (await Sharing.isAvailableAsync()) {
-            await Sharing.shareAsync(filePath, {
-              mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-              dialogTitle: '导出导入模板',
-            });
-            alert.showSuccess('模板已导出');
-          } else {
-            alert.showError('导出失败，请重试');
-          }
-        }
+        alert.showError('当前设备不支持文件分享，未能导出模板');
       }
     } catch (error) {
       logger.error('导出模板失败:', error);

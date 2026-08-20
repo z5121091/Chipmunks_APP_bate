@@ -15,10 +15,10 @@ import { AggregatedRecordItem } from '@/components/AggregatedRecordItem';
 import {
   UiPageHeader,
   UiSafeBottomBar,
-  UiScanBox,
   UiToolbarButton,
   UiWorkflowSummary,
 } from '@/components/UiRedesign';
+import { WarehouseScanInput } from '@/components/WarehouseScanInput';
 import { createStyles } from './styles';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
@@ -1853,7 +1853,7 @@ export default function InboundScreen() {
         </View>
 
         {/* 扫码输入 */}
-        <UiScanBox
+        <WarehouseScanInput
           inputRef={inputRef}
           active={inputValue.length > 0}
           processing={erpVoucherLoading}
@@ -1876,6 +1876,16 @@ export default function InboundScreen() {
           autoFocus={false}
           editable={!erpVoucherLoading && Boolean(erpVoucher)}
           showSoftInputOnFocus={false}
+          actionLabel="提交入库扫码内容"
+          actionDisabled={!erpVoucher || saving}
+          actionLoading={erpVoucherLoading}
+          onActionPress={() => {
+            if (inputValue.trim()) {
+              handleSubmitEditing();
+              return;
+            }
+            focusScannerInput(0);
+          }}
         />
 
         {/* 物料列表 */}

@@ -171,32 +171,6 @@ export const createStyles = (theme: Theme) => {
     fontWeight: '600',
   },
 
-  // 扫码框（包含输入框和 Toast）
-  scanBox: {
-    marginHorizontal: isCompactScreen ? 10 : Spacing.sm,
-    height: isCompactScreen ? rf(56) : rf(60),
-    backgroundColor: theme.backgroundDefault,
-    borderWidth: BorderWidth.normal,
-    borderColor: theme.primary,
-    borderRadius: BorderRadius.lg,
-    overflow: 'hidden', // 隐藏超出的内容
-  },
-
-  scanBoxActive: {
-    borderColor: theme.success,
-    backgroundColor: withAlpha(theme.success, 0.06),
-  },
-
-  scanInput: {
-    width: '100%',
-    height: '100%',
-    backgroundColor: 'transparent', // 透明，让容器背景显示
-    paddingHorizontal: Spacing.lg,
-    ...Typography.body,
-    color: theme.textPrimary,
-    textAlign: 'center',
-  },
-
   completionBanner: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -375,6 +349,12 @@ export const createStyles = (theme: Theme) => {
     flex: 1,
     minWidth: 0,
     flexShrink: 1,
+  },
+
+  erpLineMergeHint: {
+    ...Typography.caption,
+    color: theme.textSecondary,
+    marginTop: 2,
   },
 
   erpLineProgressTrack: {

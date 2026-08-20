@@ -420,11 +420,11 @@ class AutoDatabaseBackupWorker(
 
   private fun hasBusinessData(databaseFile: File): Boolean {
     val businessTables = listOf(
-      "出库单",
-      "出库明细",
-      "入库记录",
-      "盘点记录",
-      "拆包记录"
+      "orders",
+      "materials",
+      "inbound_records",
+      "inventory_check_records",
+      "unpack_records"
     )
 
     SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY)

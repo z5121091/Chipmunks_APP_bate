@@ -96,7 +96,7 @@ export const createStyles = (theme: Theme) => {
     resultSection: {
       flex: 1,
       marginHorizontal: isCompactScreen ? 10 : Spacing.sm,
-      marginTop: Spacing.sm,
+      marginTop: 0,
       marginBottom: Spacing.sm,
       borderRadius: BorderRadius.xl,
       backgroundColor: theme.backgroundElevated,

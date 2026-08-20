@@ -10,7 +10,31 @@ const normalizePath = (path: string): string => {
 
 const BACKEND_BASE_URL = normalizeBaseUrl(process.env.EXPO_PUBLIC_BACKEND_BASE_URL);
 const BACKEND_ACCESS_KEY = process.env.EXPO_PUBLIC_BACKEND_ACCESS_KEY?.trim() || '';
-const COZE_ERP_PROXY_PREFIX = process.env.EXPO_PUBLIC_COZE_PROJECT_ID?.trim()
+const configuredPublicGatewayMode =
+  process.env.EXPO_PUBLIC_ERP_USE_PUBLIC_GATEWAY?.trim().toLowerCase();
+
+export const resolveErpPublicGatewayMode = ({
+  backendBaseUrl,
+  cozeProjectId,
+  configuredMode,
+}: {
+  backendBaseUrl?: string;
+  cozeProjectId?: string;
+  configuredMode?: string;
+}): boolean => {
+  const normalizedMode = configuredMode?.trim().toLowerCase();
+  return (
+    normalizedMode === 'true' ||
+    (normalizedMode !== 'false' && (!backendBaseUrl?.trim() || Boolean(cozeProjectId?.trim())))
+  );
+};
+
+const SHOULD_USE_ERP_PUBLIC_GATEWAY = resolveErpPublicGatewayMode({
+  backendBaseUrl: BACKEND_BASE_URL,
+  cozeProjectId: process.env.EXPO_PUBLIC_COZE_PROJECT_ID,
+  configuredMode: configuredPublicGatewayMode,
+});
+const ERP_PUBLIC_GATEWAY_PREFIX = SHOULD_USE_ERP_PUBLIC_GATEWAY
   ? '/api/v1/tplus-proxy'
   : '';
 
@@ -91,8 +115,12 @@ export const buildBackendUrl = (path: string, options: BackendUrlOptions = {}): 
 
 export const buildErpProxyPath = (path: string): string => {
   const normalizedPath = normalizePath(path);
-  return COZE_ERP_PROXY_PREFIX ? `${COZE_ERP_PROXY_PREFIX}${normalizedPath}` : normalizedPath;
+  return ERP_PUBLIC_GATEWAY_PREFIX
+    ? `${ERP_PUBLIC_GATEWAY_PREFIX}${normalizedPath}`
+    : normalizedPath;
 };
+
+export const shouldUseErpPublicGateway = (): boolean => SHOULD_USE_ERP_PUBLIC_GATEWAY;
 
 const parseResponsePayload = async (response: Response): Promise<unknown> => {
   const text = await response.text();

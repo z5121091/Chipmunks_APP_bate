@@ -7,7 +7,10 @@
   "appName": "掌上仓库测试版",
   "companyName": "上海花栗鼠科技有限公司",
   "companyWebsite": "http://www.chipmunks.com.cn/",
+  "privacyPolicyUrl": "https://erp.chipmunks.fun/privacy",
   "author": "zx5121091",
+  "icpFilingNumber": "苏ICP备2026059103号",
+  "icpFilingUrl": "https://beian.miit.gov.cn/",
   "changelog": [
     {
       "version": "V3.0",

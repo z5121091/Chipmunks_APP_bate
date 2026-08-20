@@ -139,32 +139,6 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     flexShrink: 1,
   },
 
-  // 扫码框（包含输入框和 Toast）
-  scanBox: {
-    marginHorizontal: Spacing.sm,
-    height: rf(60),
-    backgroundColor: theme.backgroundDefault,
-    borderWidth: BorderWidth.normal,
-    borderColor: theme.primary,
-    borderRadius: BorderRadius.lg,
-    overflow: 'hidden', // 隐藏超出的内容
-  },
-
-  scanBoxActive: {
-    borderColor: theme.success,
-    backgroundColor: withAlpha(theme.success, 0.06),
-  },
-
-  scanInput: {
-    width: '100%',
-    height: '100%',
-    backgroundColor: 'transparent', // 透明，让容器背景显示
-    paddingHorizontal: Spacing.lg,
-    ...Typography.body,
-    color: theme.textPrimary,
-    textAlign: 'center',
-  },
-
   // 列表
   listSection: {
     flex: 1,
@@ -380,71 +354,6 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     width: '100%',
     minHeight: 56,
     borderRadius: BorderRadius.lg,
-  },
-
-  // 仓库选择器
-  pickerOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: theme.overlay,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: Spacing.md,
-  },
-
-  pickerBox: {
-    width: '100%',
-    maxWidth: APP_MODAL_MAX_WIDTH,
-    backgroundColor: theme.backgroundDefault,
-    borderRadius: BorderRadius.lg,
-    borderWidth: BorderWidth.normal,
-    borderColor: theme.border,
-    padding: Spacing.md,
-    shadowColor: theme.shadowColor,
-    shadowOffset: { width: 0, height: 16 },
-    shadowOpacity: theme.isDark ? 0.28 : 0.12,
-    shadowRadius: 24,
-    elevation: 8,
-  },
-
-  pickerTitle: {
-    fontSize: rf(15),
-    fontWeight: '600',
-    color: theme.textPrimary,
-    textAlign: 'center',
-    marginBottom: Spacing.sm,
-  },
-
-  pickerItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: Spacing.sm,
-    paddingHorizontal: Spacing.sm,
-    borderRadius: BorderRadius.sm,
-  },
-
-  pickerItemActive: {
-    backgroundColor: withAlpha(theme.primary, 0.06),
-  },
-
-  pickerItemText: {
-    fontSize: rf(14),
-    color: theme.textPrimary,
-  },
-
-  pickerClose: {
-    marginTop: Spacing.sm,
-    paddingVertical: Spacing.sm,
-    alignItems: 'center',
-  },
-
-  pickerCloseText: {
-    fontSize: rf(13),
-    color: theme.textSecondary,
   },
 
   // Modal

@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$DefaultBackendBaseUrl = ''
+$DefaultBackendBaseUrl = 'https://erp.chipmunks.fun'
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
 $ClientDir = Join-Path $RepoRoot 'client'
 $Url = 'http://localhost:{0}' -f $Port
