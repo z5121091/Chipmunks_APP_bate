@@ -1057,7 +1057,8 @@ const guardAndProxyCozeErpRequest = (
 const sendPublicPage = (
   res: Response,
   html: string,
-  frameAncestors = "'none'"
+  frameAncestors = "'none'",
+  cacheControl = 'public, max-age=300'
 ): void => {
   if (frameAncestors !== "'none'") {
     res.removeHeader('X-Frame-Options');
@@ -1066,7 +1067,7 @@ const sendPublicPage = (
     'Content-Security-Policy',
     `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors ${frameAncestors}; form-action 'none'`
   );
-  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.setHeader('Cache-Control', cacheControl);
   res.status(200).type('html').send(html);
 };
 
@@ -1075,7 +1076,8 @@ app.get(['/privacy', '/privacy-policy'], (_req, res) =>
   sendPublicPage(
     res,
     PRIVACY_POLICY_HTML,
-    "'self' https: http://localhost:* http://127.0.0.1:*"
+    "'self' https: http://localhost:* http://127.0.0.1:*",
+    'no-store'
   )
 );
 

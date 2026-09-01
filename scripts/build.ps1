@@ -57,6 +57,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Step '[2/4] Checking icon...'
 $iconPath = Join-Path $PSScriptRoot 'icon.ico'
 $logoPath = Join-Path $PSScriptRoot 'assets\geehy-logo.png'
+$boyaLogoPath = Join-Path $PSScriptRoot 'assets\boya-logo.png'
 $pbIconPath = Join-Path $PSScriptRoot 'assets\pb-logo.png'
 $appName = '掌上仓库ERP版同步助手'
 $pyInstallerArgs = @(
@@ -86,6 +87,12 @@ if (-not (Test-Path -LiteralPath $logoPath)) {
 }
 Write-Host '[OK] Found Geehy logo asset'
 $pyInstallerArgs += @('--add-data', "$logoPath;assets")
+
+if (-not (Test-Path -LiteralPath $boyaLogoPath)) {
+    throw 'Boya logo asset was not found: scripts\assets\boya-logo.png'
+}
+Write-Host '[OK] Found Boya logo asset'
+$pyInstallerArgs += @('--add-data', "$boyaLogoPath;assets")
 
 if (-not (Test-Path -LiteralPath $pbIconPath)) {
     throw 'Pb icon asset was not found: scripts\assets\pb-logo.png'

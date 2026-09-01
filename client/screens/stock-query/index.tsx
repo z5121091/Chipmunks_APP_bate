@@ -177,6 +177,7 @@ export default function StockQueryScreen() {
         return;
       }
 
+      setInputValue('');
       queryingRef.current = true;
       setQuerying(true);
       setErrorMessage('');
@@ -209,7 +210,6 @@ export default function StockQueryScreen() {
           specification: result.rows.find((row) => row.specification)?.specification || '-',
         });
         setStockRows(result.rows);
-        setInputValue('');
       } catch (error) {
         logger.error('[库存查询] 查询失败:', error);
         setErrorMessage(formatUserFacingErrorMessage(error, '库存查询失败，请稍后重试'));

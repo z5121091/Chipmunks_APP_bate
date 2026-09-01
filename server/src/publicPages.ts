@@ -65,14 +65,13 @@ export const PRIVACY_POLICY_HTML = page(
     <p>我们不出售数据，不接入广告或行为分析服务。数据保存期限由企业业务需要和用户配置决定。用户可在应用中清理业务记录，或删除应用以移除设备本地数据；服务器、NAS 和 ERP 中的数据由对应系统管理员管理。</p>
 
     <h2>五、联系我们</h2>
-    <p>如需查询、更正或删除相关数据，请通过以下方式联系我们。</p>
     <p>
       联系人：刘龙<br>
       手机：17366453168<br>
       邮箱：liulong@chipmunks.com.cn<br>
-      Shanghai Chipmunks Technology Co.Ltd | 上海花栗鼠科技有限公司<br>
-      Chipmunks online: www.chipmunks.com.cn<br>
-      Add: 江苏省无锡市惠山区国慧商务广场A栋17楼1712室
+      上海花栗鼠科技有限公司<br>
+      官网：www.chipmunks.com.cn<br>
+      地址：江苏省无锡市惠山区国慧商务广场A栋17楼1712室
     </p>
   </main>
   <footer>

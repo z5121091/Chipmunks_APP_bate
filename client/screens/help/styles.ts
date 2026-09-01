@@ -1,106 +1,338 @@
 import { StyleSheet } from 'react-native';
-import { withAlpha } from '@/utils/colors';
 import { Spacing, BorderRadius, Theme, BorderWidth } from '@/constants/theme';
+import { getUiRedesignShadow, UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
+import { withAlpha } from '@/utils/colors';
 import { rf } from '@/utils/responsive';
 
-export const createStyles = (theme: Theme) => {
-  return StyleSheet.create({
+export const createStyles = (theme: Theme) =>
+  StyleSheet.create({
     container: {
       flex: 1,
       backgroundColor: theme.backgroundRoot,
     },
-    scrollContent: {
-      padding: Spacing.md,
-      paddingBottom: Spacing["4xl"],
-    },
-    header: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      marginBottom: Spacing.lg,
-    },
-    backButton: {
-      padding: Spacing.sm,
-      marginRight: Spacing.sm,
-      minWidth: 44,
-      minHeight: 44,
-      justifyContent: 'center',
-      alignItems: 'center',
-    },
-    title: {
-      fontSize: rf(20),
-      fontWeight: '700',
-      color: theme.textPrimary,
-    },
-    
-    // 模块块
-    moduleBlock: {
-      marginBottom: Spacing.xl,
-      paddingBottom: Spacing.md,
+    headerShell: {
+      backgroundColor: theme.backgroundRoot,
       borderBottomWidth: BorderWidth.thin,
       borderBottomColor: theme.borderLight,
     },
-    moduleHeader: {
+    scrollContent: {
+      paddingTop: Spacing.sm,
+      paddingHorizontal: UI_REDESIGN_TOKENS.spacing.pageX,
+    },
+    heroCard: {
+      padding: Spacing.md,
+      borderRadius: UI_REDESIGN_TOKENS.radius.card,
+      backgroundColor: theme.backgroundDefault,
+      borderWidth: UI_REDESIGN_TOKENS.border.width,
+      borderColor: theme.border,
+      ...getUiRedesignShadow(theme),
+    },
+    heroHeader: {
       flexDirection: 'row',
       alignItems: 'center',
-      marginBottom: Spacing.md,
+      gap: Spacing.sm,
     },
-    moduleIcon: {
-      width: 28,
-      height: 28,
-      borderRadius: BorderRadius.sm,
-      backgroundColor: withAlpha(theme.primary, 0.08),
-      justifyContent: 'center',
+    heroIcon: {
+      width: 56,
+      height: 56,
+      flexShrink: 0,
       alignItems: 'center',
-      marginRight: Spacing.sm,
+      justifyContent: 'center',
+      borderRadius: UI_REDESIGN_TOKENS.radius.card,
+      backgroundColor: withAlpha(theme.primary, theme.isDark ? 0.18 : 0.08),
     },
-    moduleTitle: {
-      fontSize: rf(15),
+    heroHeading: {
+      flex: 1,
+      minWidth: 0,
+    },
+    heroEyebrow: {
+      marginBottom: 3,
+      fontSize: rf(10),
+      lineHeight: rf(14),
       fontWeight: '700',
       color: theme.primary,
+      includeFontPadding: false,
     },
-    
-    // 子项
-    itemContainer: {
-      marginBottom: Spacing.md,
-    },
-    itemHeader: {
-      flexDirection: 'row',
-      alignItems: 'flex-start',
-    },
-    itemNumber: {
-      fontSize: rf(11),
-      fontWeight: '600',
-      color: theme.primary,
-      marginRight: Spacing.xs,
-      minWidth: 28,
-      marginTop: 1,
-    },
-    itemContent: {
-      flex: 1,
-    },
-    itemTitle: {
-      fontSize: rf(14),
-      fontWeight: '600',
+    heroTitle: {
+      fontSize: rf(17),
+      lineHeight: rf(24),
+      fontWeight: '800',
       color: theme.textPrimary,
+      includeFontPadding: false,
+    },
+    heroDescription: {
+      marginTop: Spacing.sm,
+      fontSize: rf(13),
+      lineHeight: rf(21),
+      color: theme.textSecondary,
+      includeFontPadding: false,
+    },
+    workflowStrip: {
+      flexDirection: 'row',
+      marginTop: Spacing.md,
+      paddingTop: Spacing.sm,
+      borderTopWidth: BorderWidth.thin,
+      borderTopColor: theme.borderLight,
+    },
+    workflowItem: {
+      flex: 1,
+      minWidth: 0,
+      alignItems: 'center',
+      paddingHorizontal: 4,
+    },
+    workflowItemSeparated: {
+      borderLeftWidth: BorderWidth.thin,
+      borderLeftColor: theme.borderLight,
+    },
+    workflowIcon: {
+      width: 30,
+      height: 30,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: BorderRadius.sm,
+      marginBottom: 5,
+    },
+    workflowLabel: {
+      fontSize: rf(11),
+      lineHeight: rf(15),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      includeFontPadding: false,
+      textAlign: 'center',
+    },
+    workflowValue: {
+      marginTop: 2,
+      fontSize: rf(10),
+      lineHeight: rf(14),
+      color: theme.textMuted,
+      includeFontPadding: false,
+      textAlign: 'center',
+    },
+    sectionHeading: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginTop: Spacing.xl,
+      marginBottom: Spacing.sm,
+      paddingHorizontal: 2,
+      gap: Spacing.sm,
+    },
+    sectionTitle: {
+      fontSize: rf(17),
+      lineHeight: rf(23),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      includeFontPadding: false,
+    },
+    sectionSubtitle: {
+      marginTop: 2,
+      fontSize: rf(11),
+      lineHeight: rf(15),
+      color: theme.textMuted,
+      includeFontPadding: false,
+    },
+    sectionCount: {
+      paddingHorizontal: 9,
+      paddingVertical: 5,
+      borderRadius: UI_REDESIGN_TOKENS.radius.pill,
+      backgroundColor: theme.backgroundTertiary,
+      borderWidth: BorderWidth.thin,
+      borderColor: theme.borderLight,
+    },
+    sectionCountText: {
+      fontSize: rf(10),
+      lineHeight: rf(14),
+      fontWeight: '700',
+      color: theme.textMuted,
+      includeFontPadding: false,
+    },
+    moduleBlock: {
+      marginBottom: Spacing.sm,
+      borderRadius: UI_REDESIGN_TOKENS.radius.card,
+      backgroundColor: theme.backgroundDefault,
+      borderWidth: UI_REDESIGN_TOKENS.border.width,
+      ...getUiRedesignShadow(theme),
+    },
+    moduleBlockExpanded: {
+      shadowOpacity: theme.isDark ? 0.16 : 0.06,
+      elevation: 3,
+    },
+    moduleHeader: {
+      minHeight: 78,
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: Spacing.sm,
+      paddingVertical: Spacing.sm,
+      gap: Spacing.sm,
+    },
+    moduleIcon: {
+      width: 50,
+      height: 50,
+      flexShrink: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: UI_REDESIGN_TOKENS.radius.card,
+    },
+    moduleHeadingText: {
+      flex: 1,
+      minWidth: 0,
+    },
+    moduleTitleRow: {
+      minWidth: 0,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+    },
+    moduleTitle: {
+      flexShrink: 1,
+      fontSize: rf(15),
+      lineHeight: rf(21),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      includeFontPadding: false,
+    },
+    expandedBadge: {
+      flexShrink: 0,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+      borderRadius: UI_REDESIGN_TOKENS.radius.pill,
+    },
+    expandedBadgeText: {
+      fontSize: rf(9),
+      lineHeight: rf(12),
+      fontWeight: '800',
+      includeFontPadding: false,
+    },
+    moduleSummary: {
+      marginTop: 3,
+      fontSize: rf(11),
+      lineHeight: rf(16),
+      color: theme.textMuted,
+      includeFontPadding: false,
+    },
+    moduleAction: {
+      width: 32,
+      flexShrink: 0,
+      alignItems: 'center',
+      gap: 4,
+    },
+    moduleIndex: {
+      fontSize: rf(9),
+      lineHeight: rf(12),
+      fontWeight: '800',
+      includeFontPadding: false,
+    },
+    chevronBox: {
+      width: 28,
+      height: 28,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: UI_REDESIGN_TOKENS.radius.control,
+    },
+    moduleContent: {
+      marginHorizontal: Spacing.sm,
+      paddingHorizontal: Spacing.xs,
+      borderTopWidth: BorderWidth.thin,
+    },
+    itemContainer: {
+      paddingVertical: Spacing.md,
+      borderBottomWidth: BorderWidth.thin,
+      borderBottomColor: theme.borderLight,
+    },
+    itemContainerLast: {
+      borderBottomWidth: 0,
+      paddingBottom: Spacing.lg,
+    },
+    itemHeadingRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.sm,
       marginBottom: Spacing.xs,
     },
+    itemMarker: {
+      width: 7,
+      height: 7,
+      flexShrink: 0,
+      borderRadius: BorderRadius.full,
+    },
+    itemTitle: {
+      flex: 1,
+      minWidth: 0,
+      fontSize: rf(14),
+      lineHeight: rf(20),
+      fontWeight: '800',
+      color: theme.textPrimary,
+      includeFontPadding: false,
+    },
     itemDescription: {
+      marginLeft: 7 + Spacing.sm,
       fontSize: rf(13),
+      lineHeight: rf(21),
       color: theme.textSecondary,
-      lineHeight: 20,
+      includeFontPadding: false,
     },
-    
-    // 提示框
-    tipBox: {
-      marginTop: Spacing.xs,
+    stepRow: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      marginTop: Spacing.sm,
+      marginLeft: 7 + Spacing.sm,
+    },
+    stepNumber: {
+      width: 22,
+      height: 22,
+      flexShrink: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: BorderRadius.full,
+      marginRight: Spacing.sm,
+    },
+    stepNumberText: {
+      fontSize: rf(10),
+      lineHeight: rf(14),
+      fontWeight: '800',
+      includeFontPadding: false,
+    },
+    stepText: {
+      flex: 1,
+      minWidth: 0,
+      fontSize: rf(13),
+      lineHeight: rf(20),
+      color: theme.textSecondary,
+      includeFontPadding: false,
+    },
+    noteRow: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      marginTop: Spacing.sm,
+      marginLeft: 7 + Spacing.sm,
       padding: Spacing.sm,
-      backgroundColor: theme.backgroundTertiary,
-      borderRadius: BorderRadius.sm,
+      borderLeftWidth: 3,
+      borderRadius: BorderRadius.xs,
+      gap: Spacing.sm,
     },
-    tipText: {
+    noteIcon: {
+      width: 26,
+      height: 26,
+      flexShrink: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: BorderRadius.full,
+    },
+    noteContent: {
+      flex: 1,
+      minWidth: 0,
+    },
+    noteLabel: {
+      marginBottom: 2,
+      fontSize: rf(10),
+      lineHeight: rf(14),
+      fontWeight: '800',
+      includeFontPadding: false,
+    },
+    noteText: {
       fontSize: rf(12),
-      color: theme.textMuted,
-      lineHeight: 18,
+      lineHeight: rf(19),
+      color: theme.textSecondary,
+      includeFontPadding: false,
     },
   });
-};

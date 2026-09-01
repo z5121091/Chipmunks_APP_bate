@@ -26,7 +26,7 @@ SYNC_SERVICE_ID = 'palm-warehouse-sync'
 SYNC_API_VERSION = 2
 SYNC_DISPLAY_NAME = '掌上仓库 ERP版同步助手'
 SYNC_EDITION = 'ERP'
-SYNC_VERSION = '3.4.0'
+SYNC_VERSION = '3.5.0'
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_FILE_NAME_LENGTH = 120
 DIRECT_PRINT_PRINTER_NAME = (
@@ -70,6 +70,12 @@ NATIVE_LABEL_PB_POSITION = (
     NATIVE_LABEL_RIGHT_EDGE_X - NATIVE_LABEL_PB_SIZE_DOTS,
     NATIVE_LABEL_COMPLIANCE_FIRST_Y + 86,
 )
+NATIVE_LABEL_BOYA_LOGO_RELATIVE_PATH = os.path.join('assets', 'boya-logo.png')
+NATIVE_LABEL_BOYA_LOGO_WIDTH_DOTS = 70
+NATIVE_LABEL_BOYA_LOGO_POSITION = (28, 8)
+NATIVE_LABEL_BOYA_QR_X = 610
+NATIVE_LABEL_BOYA_QR_Y = 190
+NATIVE_LABEL_BOYA_QR_CELL_DOTS = 5
 NATIVE_LABEL_LEFT_VALUE_X = 150
 NATIVE_LABEL_RIGHT_VALUE_X = 455
 RAW_PRINT_CHUNK_BYTES = 64 * 1024
@@ -83,9 +89,15 @@ NATIVE_LABEL_TEMPLATE_LEADCORE = {
     'name': '珠海领芯',
     'include_logo': False,
 }
+NATIVE_LABEL_TEMPLATE_BOYA = {
+    'key': 'boya',
+    'name': '珠海博雅',
+    'include_logo': False,
+}
 NATIVE_LABEL_TEMPLATE_BY_SUPPLIER = {
     '珠海极海半导体有限公司': NATIVE_LABEL_TEMPLATE_GEEHY,
     '珠海领芯科技有限公司': NATIVE_LABEL_TEMPLATE_LEADCORE,
+    '珠海博雅科技股份有限公司': NATIVE_LABEL_TEMPLATE_BOYA,
 }
 
 
@@ -244,23 +256,6 @@ def get_installed_printer_names():
     )
 
 
-def build_tspl_test_label():
-    """生成一张 100x50mm 的英文测试标签，避免中文编码影响直连验证。"""
-    return '\r\n'.join([
-        'SIZE 100 mm,50 mm',
-        'GAP 3 mm,0 mm',
-        'DIRECTION 1',
-        'CLS',
-        'TEXT 30,30,"3",0,1,1,"PALM WAREHOUSE"',
-        'TEXT 30,70,"3",0,1,1,"TSPL DIRECT PRINT TEST"',
-        'BARCODE 30,120,"128",80,1,0,2,2,"APM-TEST-001"',
-        'TEXT 30,220,"2",0,1,1,"NO BARTENDER REQUIRED"',
-        'QRCODE 580,30,L,5,A,0,M2,S7,"APM-TEST-001"',
-        'PRINT 1,1',
-        '',
-    ])
-
-
 def send_raw_tspl_to_printer(printer_name, commands, job_name):
     """通过 Windows RAW 打印队列把 TSPL 指令发送到指定的 TSC 打印机。"""
     try:
@@ -315,17 +310,6 @@ def send_raw_tspl_to_printer(printer_name, commands, job_name):
                 except Exception:
                     pass
             win32print.ClosePrinter(handle)
-
-
-def print_native_test_label():
-    """提交原生 TSPL 测试标签；不读取、不修改任何 PDA 或 Excel 数据。"""
-    job_id = send_raw_tspl_to_printer(
-        DIRECT_PRINT_PRINTER_NAME,
-        build_tspl_test_label(),
-        'Palm Warehouse TSPL Test',
-    )
-    log(f'原生 TSPL 测试标签已提交: {DIRECT_PRINT_PRINTER_NAME}，任务号 {job_id}')
-    return job_id
 
 
 def get_excel_cell_text(value):
@@ -383,7 +367,7 @@ def get_native_label_records(workbook):
         }
         missing_values = [
             label
-            for label, key in (('型号', 'model'), ('标签数量', 'quantity'), ('追溯码', 'trace_no'))
+            for label, key in (('型号', 'model'), ('标签数量', 'quantity'))
             if not record[key]
         ]
         if missing_values:
@@ -519,7 +503,21 @@ def get_native_pb_mask():
     )
 
 
-def build_native_text_bitmap(text_items, include_logo=True):
+def get_native_boya_logo_mask():
+    """读取珠海博雅 BYT 原始 Logo。"""
+    return get_native_image_mask(
+        'boya-logo',
+        NATIVE_LABEL_BOYA_LOGO_RELATIVE_PATH,
+        NATIVE_LABEL_BOYA_LOGO_WIDTH_DOTS,
+    )
+
+
+def build_native_text_bitmap(
+    text_items,
+    include_logo=True,
+    include_pb=True,
+    include_boya_marks=False,
+):
     """把 Arial 文字栅格化为 TSPL BITMAP，避免打印机下载字体后进入错误状态。"""
     try:
         from PIL import Image, ImageDraw
@@ -534,7 +532,13 @@ def build_native_text_bitmap(text_items, include_logo=True):
     draw = ImageDraw.Draw(image)
     if include_logo:
         image.paste(get_native_logo_mask(), NATIVE_LABEL_LOGO_POSITION)
-    image.paste(get_native_pb_mask(), NATIVE_LABEL_PB_POSITION)
+    if include_pb:
+        image.paste(get_native_pb_mask(), NATIVE_LABEL_PB_POSITION)
+    if include_boya_marks:
+        image.paste(get_native_boya_logo_mask(), NATIVE_LABEL_BOYA_LOGO_POSITION)
+        draw.ellipse((694, 92, 770, 168), outline=1, width=3)
+        draw.ellipse((500, 215, 576, 291), outline=1, width=3)
+        draw.line((500, 253, 576, 253), fill=1, width=2)
     for x, y, text, bold in text_items:
         draw.text(
             (x, y),
@@ -564,7 +568,8 @@ def build_native_apm_label(record, template):
     batch = normalize_tspl_value(record.get('batch'), 18)
     production_date = normalize_tspl_value(record.get('production_date'), 10)
     package = normalize_tspl_value(record.get('package'), 18)
-    trace_no = normalize_tspl_value(record.get('trace_no'), 28)
+    raw_trace_no = get_excel_cell_text(record.get('trace_no'))
+    trace_no = normalize_tspl_value(raw_trace_no, 28) if raw_trace_no else ''
     source_no = normalize_tspl_value(record.get('source_no'), 18)
     raw_version = get_excel_cell_text(record.get('version'))
     raw_inventory_code = get_excel_cell_text(record.get('inventory_code'))
@@ -603,7 +608,7 @@ def build_native_apm_label(record, template):
         (30, 242, 'PKG:', False),
         (NATIVE_LABEL_LEFT_VALUE_X, 242, package, False),
         (350, 242, 'T/C:', False),
-        (NATIVE_LABEL_RIGHT_VALUE_X, 242, trace_no, False),
+        (NATIVE_LABEL_RIGHT_VALUE_X, 242, trace_no or '-', False),
         (30, 320, 'P/N:', False),
         (NATIVE_LABEL_LEFT_VALUE_X, 320, part_number, False),
         (350, 320, 'BOX ID:', False),
@@ -640,7 +645,7 @@ def build_native_apm_label(record, template):
         f'BARCODE 30,190,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{batch}"',
         f'BARCODE 350,190,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{production_date}"',
         f'BARCODE 30,268,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{package}"',
-        f'BARCODE 350,268,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{trace_no}"',
+        *(([f'BARCODE 350,268,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{trace_no}"']) if trace_no else []),
         f'BARCODE 30,346,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{part_number}"',
         f'BARCODE 350,346,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_STRICT_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_STRICT_WIDTH_DOTS},"{source_no}"',
         f'QRCODE {NATIVE_LABEL_QR_X},{NATIVE_LABEL_QR_Y},L,{NATIVE_LABEL_QR_CELL_DOTS},A,0,{NATIVE_LABEL_QR_MODEL},{NATIVE_LABEL_QR_MASK},"{scan_payload}"',
@@ -655,6 +660,72 @@ def build_native_apm_label(record, template):
         )
         + print_commands
     )
+
+
+def build_native_boya_label(record):
+    """按珠海博雅原标签版式生成 100x50mm 拆包标签。"""
+    model = normalize_tspl_value(record.get('model'), 22)
+    quantity = normalize_tspl_value(record.get('quantity'), 12)
+    batch = normalize_tspl_value(record.get('batch'), 18)
+    production_date = normalize_tspl_value(record.get('production_date'), 10)
+    package = normalize_tspl_value(record.get('package'), 18)
+    source_no = normalize_tspl_value(record.get('source_no'), 18)
+    scan_payload = '/'.join(field.replace('/', '-') for field in (
+        model,
+        package,
+        quantity,
+        batch,
+        production_date,
+        source_no,
+    ))
+
+    text_items = [
+        (115, 22, 'BOYA MICROELECTRONICS', False),
+        (28, 80, 'PART NO.:', False),
+        (210, 80, model, False),
+        (28, 130, 'PACKAGE:', False),
+        (210, 130, package, False),
+        (28, 180, 'QUANTITY:', False),
+        (210, 180, quantity, False),
+        (28, 230, 'LOT ID:', False),
+        (210, 230, batch, False),
+        (28, 280, 'DATE CODE:', False),
+        (210, 280, production_date, False),
+        (28, 330, 'Track ID:', False),
+        (210, 330, source_no, False),
+        (28, 365, 'MSL3', True),
+        (701, 116, 'RoHS', True),
+        (508, 220, 'PASS', True),
+        (507, 255, 'QC03', True),
+    ]
+    setup_commands = '\r\n'.join([
+        'SIZE 100 mm,50 mm',
+        'GAP 3 mm,0 mm',
+        'DIRECTION 1',
+        'CLS',
+        '',
+    ]).encode('ascii')
+    print_commands = '\r\n'.join([
+        f'QRCODE {NATIVE_LABEL_BOYA_QR_X},{NATIVE_LABEL_BOYA_QR_Y},L,{NATIVE_LABEL_BOYA_QR_CELL_DOTS},A,0,{NATIVE_LABEL_QR_MODEL},{NATIVE_LABEL_QR_MASK},"{scan_payload}"',
+        f'PRINT 1,{NATIVE_LABEL_COPIES}',
+        '',
+    ]).encode('ascii')
+    return (
+        setup_commands
+        + build_native_text_bitmap(
+            text_items,
+            include_logo=False,
+            include_pb=False,
+            include_boya_marks=True,
+        )
+        + print_commands
+    )
+
+
+def build_native_label(record, template):
+    if template.get('key') == NATIVE_LABEL_TEMPLATE_BOYA['key']:
+        return build_native_boya_label(record)
+    return build_native_apm_label(record, template)
 
 
 def load_native_print_history():
@@ -761,7 +832,7 @@ def submit_native_unpack_labels(records, print_job_id):
             }
 
         commands = b''.join(
-            build_native_apm_label(record, template)
+            build_native_label(record, template)
             for record, template in printable_records
         )
         spool_job_id = send_raw_tspl_to_printer(
@@ -1415,29 +1486,6 @@ class TrayIcon:
         except Exception as e:
             log(f"打开日志失败: {e}")
 
-    def notify(self, title, message):
-        """尽量显示托盘通知；不支持通知时仍在日志中保留结果。"""
-        log(f'{title}: {message}')
-        if not self.icon:
-            return
-
-        try:
-            self.icon.notify(message, title)
-        except Exception as error:
-            log(f'托盘通知失败: {error}')
-
-    def print_native_test_label(self, _icon=None, _item=None):
-        """从托盘菜单异步提交测试标签，避免阻塞菜单界面。"""
-        thread = threading.Thread(target=self._print_native_test_label, daemon=True)
-        thread.start()
-
-    def _print_native_test_label(self):
-        try:
-            job_id = print_native_test_label()
-            self.notify('原生标签已提交', f'已发送到 {DIRECT_PRINT_PRINTER_NAME}，任务号 {job_id}')
-        except Exception as error:
-            self.notify('原生标签打印失败', str(error))
-
     def open_week_converter(self):
         """打开周次转换工具窗口"""
         with self.week_converter_lock:
@@ -1700,7 +1748,6 @@ class TrayIcon:
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("生产周次转换", self.open_week_converter),
                 pystray.MenuItem("打开同步文件夹", lambda: self.open_folder(DATA_ROOT)),
-                pystray.MenuItem("打印原生 TSPL 测试标签", self.print_native_test_label),
                 pystray.MenuItem("查看运行日志", self.open_logs),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("退出 ERP版同步助手", self.quit_app),

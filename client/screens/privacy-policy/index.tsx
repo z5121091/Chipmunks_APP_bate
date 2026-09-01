@@ -1,6 +1,7 @@
-import { createElement, useMemo, useState } from 'react';
+import { createElement, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  AppState,
   Linking,
   Platform,
   StyleSheet,
@@ -17,7 +18,10 @@ import { BorderRadius, Spacing, Typography, type Theme } from '@/constants/theme
 import { PRIVACY_POLICY_URL } from '@/constants/version';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
-import { shouldLoadPrivacyPolicyInsideApp } from '@/utils/privacyPolicyNavigation';
+import {
+  buildPrivacyPolicyUrl,
+  shouldLoadPrivacyPolicyInsideApp,
+} from '@/utils/privacyPolicyNavigation';
 import { logger } from '@/utils/logger';
 import { MIN_TOUCH_TARGET } from '@/utils/responsive';
 
@@ -28,7 +32,17 @@ export default function PrivacyPolicyScreen() {
   const router = useSafeRouter();
   const [loadFailed, setLoadFailed] = useState(false);
   const [reloadKey, setReloadKey] = useState(() => Date.now());
-  const policyUrl = `${PRIVACY_POLICY_URL}?app=${reloadKey}`;
+  const policyUrl = buildPrivacyPolicyUrl(PRIVACY_POLICY_URL, reloadKey);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState !== 'active') return;
+      setLoadFailed(false);
+      setReloadKey(Date.now());
+    });
+
+    return () => subscription.remove();
+  }, []);
 
   const retry = () => {
     setLoadFailed(false);

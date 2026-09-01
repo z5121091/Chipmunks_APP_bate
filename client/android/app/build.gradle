@@ -115,7 +115,7 @@ android {
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
 
         ndk {
-            abiFilters 'armeabi-v7a', 'arm64-v8a'
+            abiFilters 'arm64-v8a'
         }
     }
     signingConfigs {
@@ -154,9 +154,9 @@ android {
         jniLibs {
             def enableLegacyPackaging = findProperty('expo.useLegacyPackaging') ?: 'false'
             useLegacyPackaging enableLegacyPackaging.toBoolean()
-            // 显式排除 x86 / x86_64 架构的 so（模拟器专用），
-            // 避免第三方预编译 AAR（react-android、hermes 等）自带的 4 架构 so 被打进 APK
-            excludes += ['**/x86/**', '**/x86_64/**']
+            // 显式排除 x86 / x86_64 / armeabi-v7a 架构的 so，
+            // 避免第三方预编译 AAR（react-android、hermes 等）自带的多架构 so 被打进 APK
+            excludes += ['**/x86/**', '**/x86_64/**', '**/armeabi-v7a/**']
         }
     }
     androidResources {

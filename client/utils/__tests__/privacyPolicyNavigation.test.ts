@@ -1,8 +1,20 @@
-import { shouldLoadPrivacyPolicyInsideApp } from '../privacyPolicyNavigation';
+import {
+  buildPrivacyPolicyUrl,
+  shouldLoadPrivacyPolicyInsideApp,
+} from '../privacyPolicyNavigation';
 
 const POLICY_URL = 'https://erp.chipmunks.fun/privacy';
 
 describe('privacy policy navigation', () => {
+  it('creates a fresh cache-busting URL without losing existing parameters', () => {
+    expect(buildPrivacyPolicyUrl(POLICY_URL, 123)).toBe(
+      'https://erp.chipmunks.fun/privacy?app=123'
+    );
+    expect(buildPrivacyPolicyUrl(`${POLICY_URL}?lang=zh-CN`, 'new version')).toBe(
+      'https://erp.chipmunks.fun/privacy?lang=zh-CN&app=new%20version'
+    );
+  });
+
   it('keeps policy pages inside the app', () => {
     expect(
       shouldLoadPrivacyPolicyInsideApp(

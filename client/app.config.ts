@@ -115,7 +115,9 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
             // 最低 Android 版本
             "minSdkVersion": 30, // Android 11
             // 允许 HTTP 明文流量（电脑同步和 NAS 更新源需要）
-            "usesCleartextTraffic": true
+            "usesCleartextTraffic": true,
+            // 只编译 arm64 架构，减小 APK 体积
+            "buildArchs": ["arm64-v8a"]
           }
         }
       ],
