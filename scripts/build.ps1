@@ -56,9 +56,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Step '[2/4] Checking icon...'
 $iconPath = Join-Path $PSScriptRoot 'icon.ico'
-$logoPath = Join-Path $PSScriptRoot 'assets\geehy-logo.png'
-$boyaLogoPath = Join-Path $PSScriptRoot 'assets\boya-logo.png'
-$pbIconPath = Join-Path $PSScriptRoot 'assets\pb-logo.png'
+$labelAssetsPath = Join-Path $PSScriptRoot 'assets'
 $appName = '掌上仓库ERP版同步助手'
 $pyInstallerArgs = @(
     '--noconfirm',
@@ -82,23 +80,17 @@ if (Test-Path -LiteralPath $iconPath) {
     Write-Host '[INFO] icon.ico was not found. The default icon will be used.'
 }
 
-if (-not (Test-Path -LiteralPath $logoPath)) {
-    throw 'Geehy logo asset was not found: scripts\assets\geehy-logo.png'
+if (-not (Test-Path -LiteralPath $labelAssetsPath -PathType Container)) {
+    throw 'Label asset directory was not found: scripts\assets'
 }
-Write-Host '[OK] Found Geehy logo asset'
-$pyInstallerArgs += @('--add-data', "$logoPath;assets")
-
-if (-not (Test-Path -LiteralPath $boyaLogoPath)) {
-    throw 'Boya logo asset was not found: scripts\assets\boya-logo.png'
+foreach ($assetName in @('geehy-logo.png', 'boya-logo.png', 'pb-logo.png')) {
+    $assetPath = Join-Path $labelAssetsPath $assetName
+    if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf)) {
+        throw "Label asset was not found: scripts\assets\$assetName"
+    }
 }
-Write-Host '[OK] Found Boya logo asset'
-$pyInstallerArgs += @('--add-data', "$boyaLogoPath;assets")
-
-if (-not (Test-Path -LiteralPath $pbIconPath)) {
-    throw 'Pb icon asset was not found: scripts\assets\pb-logo.png'
-}
-Write-Host '[OK] Found Pb icon asset'
-$pyInstallerArgs += @('--add-data', "$pbIconPath;assets")
+Write-Host '[OK] Found label assets'
+$pyInstallerArgs += @('--add-data', "$labelAssetsPath;assets")
 
 $pyInstallerArgs += (Join-Path $PSScriptRoot 'label_sync_server.py')
 

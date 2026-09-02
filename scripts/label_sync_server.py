@@ -17,16 +17,33 @@ import threading
 import uuid
 import logging
 from logging.handlers import RotatingFileHandler
-from openpyxl import Workbook, load_workbook
+from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, Border, Side
+
+try:
+    from .label_templates import (
+        NATIVE_LABEL_COPIES,
+        build_native_label,
+        get_excel_cell_text,
+        get_native_label_records,
+        get_native_label_template,
+    )
+except ImportError:
+    from label_templates import (
+        NATIVE_LABEL_COPIES,
+        build_native_label,
+        get_excel_cell_text,
+        get_native_label_records,
+        get_native_label_template,
+    )
 
 # ==================== 配置 ====================
 SYNC_SERVICE_ID = 'palm-warehouse-sync'
 SYNC_API_VERSION = 2
 SYNC_DISPLAY_NAME = '掌上仓库 ERP版同步助手'
 SYNC_EDITION = 'ERP'
-SYNC_VERSION = '3.5.0'
+SYNC_VERSION = '3.6.1'
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_FILE_NAME_LENGTH = 120
 DIRECT_PRINT_PRINTER_NAME = (
@@ -39,66 +56,8 @@ SUPPORTED_NATIVE_LABEL_PRINT_MODES = {
     NATIVE_LABEL_PRINT_MODE,
     LEGACY_NATIVE_LABEL_PRINT_MODE,
 }
-NATIVE_LABEL_COPIES = 2
 MAX_NATIVE_PRINT_HISTORY = 500
-NATIVE_LABEL_FONT_SIZE_PT = 8
-NATIVE_LABEL_DPI = 203
-NATIVE_LABEL_WIDTH_DOTS = 800
-NATIVE_LABEL_HEIGHT_DOTS = 400
-NATIVE_LABEL_FONT_SIZE_PIXELS = round(NATIVE_LABEL_FONT_SIZE_PT * NATIVE_LABEL_DPI / 72)
-NATIVE_LABEL_BARCODE_HEIGHT_DOTS = 32
-NATIVE_LABEL_BARCODE_STRICT_WIDTH_DOTS = 1
-NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS = 2
-NATIVE_LABEL_QR_CELL_DOTS = 6
-NATIVE_LABEL_QR_MODEL = 'M2'
-NATIVE_LABEL_QR_MASK = 'S7'
-NATIVE_LABEL_QR_X = 575
-NATIVE_LABEL_QR_Y = 20
-NATIVE_LABEL_QR_MODULE_COUNT = 33
-NATIVE_LABEL_QR_SIZE_DOTS = NATIVE_LABEL_QR_MODULE_COUNT * NATIVE_LABEL_QR_CELL_DOTS
-NATIVE_LABEL_RIGHT_EDGE_X = NATIVE_LABEL_QR_X + NATIVE_LABEL_QR_SIZE_DOTS
-NATIVE_LABEL_COMPLIANCE_FIRST_Y = NATIVE_LABEL_QR_Y + NATIVE_LABEL_QR_SIZE_DOTS + 2
-NATIVE_LABEL_COMPLIANCE_ROW_GAP_DOTS = 28
-NATIVE_LABEL_FONT_CACHE = {}
-NATIVE_LABEL_IMAGE_CACHE = {}
-NATIVE_LABEL_LOGO_RELATIVE_PATH = os.path.join('assets', 'geehy-logo.png')
-NATIVE_LABEL_LOGO_WIDTH_DOTS = 200
-NATIVE_LABEL_LOGO_POSITION = (30, 5)
-NATIVE_LABEL_PB_RELATIVE_PATH = os.path.join('assets', 'pb-logo.png')
-NATIVE_LABEL_PB_SIZE_DOTS = 40
-NATIVE_LABEL_PB_POSITION = (
-    NATIVE_LABEL_RIGHT_EDGE_X - NATIVE_LABEL_PB_SIZE_DOTS,
-    NATIVE_LABEL_COMPLIANCE_FIRST_Y + 86,
-)
-NATIVE_LABEL_BOYA_LOGO_RELATIVE_PATH = os.path.join('assets', 'boya-logo.png')
-NATIVE_LABEL_BOYA_LOGO_WIDTH_DOTS = 70
-NATIVE_LABEL_BOYA_LOGO_POSITION = (28, 8)
-NATIVE_LABEL_BOYA_QR_X = 610
-NATIVE_LABEL_BOYA_QR_Y = 190
-NATIVE_LABEL_BOYA_QR_CELL_DOTS = 5
-NATIVE_LABEL_LEFT_VALUE_X = 150
-NATIVE_LABEL_RIGHT_VALUE_X = 455
 RAW_PRINT_CHUNK_BYTES = 64 * 1024
-NATIVE_LABEL_TEMPLATE_GEEHY = {
-    'key': 'geehy',
-    'name': '极海',
-    'include_logo': True,
-}
-NATIVE_LABEL_TEMPLATE_LEADCORE = {
-    'key': 'leadcore',
-    'name': '珠海领芯',
-    'include_logo': False,
-}
-NATIVE_LABEL_TEMPLATE_BOYA = {
-    'key': 'boya',
-    'name': '珠海博雅',
-    'include_logo': False,
-}
-NATIVE_LABEL_TEMPLATE_BY_SUPPLIER = {
-    '珠海极海半导体有限公司': NATIVE_LABEL_TEMPLATE_GEEHY,
-    '珠海领芯科技有限公司': NATIVE_LABEL_TEMPLATE_LEADCORE,
-    '珠海博雅科技股份有限公司': NATIVE_LABEL_TEMPLATE_BOYA,
-}
 
 
 def get_default_data_root():
@@ -122,8 +81,6 @@ DATA_ROOT = os.path.abspath(
     os.environ.get('PALM_WAREHOUSE_SYNC_DIR', '').strip() or get_default_data_root()
 )
 NATIVE_PRINT_HISTORY_FILE = os.path.join(DATA_ROOT, 'native-label-print-history.json')
-# 发货序列号文件路径
-SCAN_FILE = f'{DATA_ROOT}/发货序列号.xlsx'
 # 入库单文件路径
 INBOUND_FILE = f'{DATA_ROOT}/入库单.xlsx'
 # 出库单文件路径
@@ -312,422 +269,6 @@ def send_raw_tspl_to_printer(printer_name, commands, job_name):
             win32print.ClosePrinter(handle)
 
 
-def get_excel_cell_text(value):
-    """把 Excel 单元格转换为稳定文本，避免数量被写成 2500.0。"""
-    if value is None:
-        return ''
-    if isinstance(value, datetime.datetime):
-        return value.strftime('%Y-%m-%d %H:%M:%S')
-    if isinstance(value, datetime.date):
-        return value.strftime('%Y-%m-%d')
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value).strip()
-
-
-def get_native_label_records(workbook):
-    """从拆包标签 Excel 提取原生 TSC 标签需要的数据。"""
-    sheet = workbook.active
-    header_values = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
-    if not header_values:
-        raise ValueError('标签 Excel 缺少表头')
-
-    header_indexes = {
-        get_excel_cell_text(header).replace(' ', ''): index
-        for index, header in enumerate(header_values)
-        if get_excel_cell_text(header)
-    }
-    required_headers = ('型号', '标签数量', '追溯码')
-    missing_headers = [header for header in required_headers if header not in header_indexes]
-    if missing_headers:
-        missing_header_text = '、'.join(missing_headers)
-        raise ValueError(f'标签 Excel 缺少字段：{missing_header_text}')
-
-    def get_value(row, header):
-        index = header_indexes.get(header)
-        return get_excel_cell_text(row[index]) if index is not None and index < len(row) else ''
-
-    records = []
-    for row_number, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
-        if not any(value is not None and get_excel_cell_text(value) for value in row):
-            continue
-
-        record = {
-            'model': get_value(row, '型号'),
-            'quantity': get_value(row, '标签数量'),
-            'batch': get_value(row, '批次'),
-            'production_date': get_value(row, '生产日期'),
-            'package': get_value(row, '封装'),
-            'trace_no': get_value(row, '追溯码'),
-            'inventory_code': get_value(row, '存货编码'),
-            'source_no': get_value(row, '箱号'),
-            'version': get_value(row, '版本号'),
-            'label_type': get_value(row, '标签类型'),
-            'supplier': get_value(row, '供应商'),
-        }
-        missing_values = [
-            label
-            for label, key in (('型号', 'model'), ('标签数量', 'quantity'))
-            if not record[key]
-        ]
-        if missing_values:
-            missing_value_text = '、'.join(missing_values)
-            raise ValueError(f'标签 Excel 第 {row_number} 行缺少：{missing_value_text}')
-        records.append(record)
-
-    if not records:
-        raise ValueError('标签 Excel 没有可打印的数据')
-    return records
-
-
-def normalize_tspl_value(value, max_length):
-    """限制为安全 ASCII，避免字段内容破坏 TSPL 指令或超出标签可读范围。"""
-    text = ' '.join(str(value or '').replace('\r', ' ').replace('\n', ' ').split())
-    text = ''.join(character for character in text if ord(character) >= 32)
-    text = text.replace('"', "'")
-    ascii_text = text.encode('ascii', 'replace').decode('ascii')
-    return (ascii_text[:max_length] or '-')
-
-
-def build_native_scan_payload(
-    model,
-    batch,
-    package,
-    version,
-    quantity,
-    production_date,
-    trace_no,
-    source_no,
-):
-    """按 PDA 现有二维码规则的固定顺序重建拆包后可继续扫描的内容。"""
-    fields = [
-        model,
-        batch,
-        package,
-        version,
-        quantity,
-        production_date,
-        trace_no,
-        source_no,
-    ]
-    return '/'.join(field.replace('/', '-') for field in fields)
-
-
-def get_native_arial_font(bold=False):
-    """读取电脑端 Arial；字体只用于生成标签位图，不会下载到打印机。"""
-    cache_key = 'bold' if bold else 'regular'
-    cached_font = NATIVE_LABEL_FONT_CACHE.get(cache_key)
-    if cached_font is not None:
-        return cached_font
-
-    try:
-        from PIL import ImageFont
-    except ImportError as error:
-        raise RuntimeError('缺少 Pillow，无法生成 Arial 标签文字') from error
-
-    windows_root = os.environ.get('WINDIR') or os.environ.get('SystemRoot') or 'C:/Windows'
-    font_path = os.path.join(
-        windows_root,
-        'Fonts',
-        'arialbd.ttf' if bold else 'arial.ttf',
-    )
-    if not os.path.isfile(font_path):
-        raise RuntimeError(f'未找到 Windows 字体文件：{font_path}')
-
-    font = ImageFont.truetype(font_path, NATIVE_LABEL_FONT_SIZE_PIXELS)
-    NATIVE_LABEL_FONT_CACHE[cache_key] = font
-    return font
-
-
-def get_native_right_aligned_text_x(text, bold=False):
-    """计算文字左坐标，使文字右边缘与标签指定位置对齐。"""
-    text_width = get_native_arial_font(bold=bold).getlength(text)
-    return max(0, NATIVE_LABEL_RIGHT_EDGE_X - int(text_width + 0.999))
-
-
-def get_native_image_mask(cache_key, relative_path, target_width, target_height=None):
-    """读取图片资源并转换为适合热转印标签的单色蒙版。"""
-    cached_image = NATIVE_LABEL_IMAGE_CACHE.get(cache_key)
-    if cached_image is not None:
-        return cached_image
-
-    try:
-        from PIL import Image
-    except ImportError as error:
-        raise RuntimeError('缺少 Pillow，无法生成标签图片') from error
-
-    image_path = resource_path(relative_path)
-    if not os.path.isfile(image_path):
-        raise RuntimeError(f'未找到标签图片文件：{image_path}')
-
-    with Image.open(image_path) as source_image:
-        rgba_image = source_image.convert('RGBA')
-        white_background = Image.new('RGBA', rgba_image.size, (255, 255, 255, 255))
-        white_background.alpha_composite(rgba_image)
-        grayscale_image = white_background.convert('L')
-
-    if target_height is None:
-        target_height = max(
-            1,
-            round(grayscale_image.height * target_width / grayscale_image.width),
-        )
-    resampling = getattr(Image, 'Resampling', Image)
-    resized_image = grayscale_image.resize(
-        (target_width, target_height),
-        resampling.LANCZOS,
-    )
-    image_mask = resized_image.point(
-        lambda value: 255 if value < 224 else 0,
-        mode='1',
-    )
-    NATIVE_LABEL_IMAGE_CACHE[cache_key] = image_mask
-    return image_mask
-
-
-def get_native_logo_mask():
-    """读取 Geehy 原始 Logo。"""
-    return get_native_image_mask(
-        'geehy-logo',
-        NATIVE_LABEL_LOGO_RELATIVE_PATH,
-        NATIVE_LABEL_LOGO_WIDTH_DOTS,
-    )
-
-
-def get_native_pb_mask():
-    """读取 Pb 合规图标，并固定为 5 x 5 毫米。"""
-    return get_native_image_mask(
-        'pb-logo',
-        NATIVE_LABEL_PB_RELATIVE_PATH,
-        NATIVE_LABEL_PB_SIZE_DOTS,
-        NATIVE_LABEL_PB_SIZE_DOTS,
-    )
-
-
-def get_native_boya_logo_mask():
-    """读取珠海博雅 BYT 原始 Logo。"""
-    return get_native_image_mask(
-        'boya-logo',
-        NATIVE_LABEL_BOYA_LOGO_RELATIVE_PATH,
-        NATIVE_LABEL_BOYA_LOGO_WIDTH_DOTS,
-    )
-
-
-def build_native_text_bitmap(
-    text_items,
-    include_logo=True,
-    include_pb=True,
-    include_boya_marks=False,
-):
-    """把 Arial 文字栅格化为 TSPL BITMAP，避免打印机下载字体后进入错误状态。"""
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError as error:
-        raise RuntimeError('缺少 Pillow，无法生成 Arial 标签文字') from error
-
-    image = Image.new(
-        '1',
-        (NATIVE_LABEL_WIDTH_DOTS, NATIVE_LABEL_HEIGHT_DOTS),
-        0,
-    )
-    draw = ImageDraw.Draw(image)
-    if include_logo:
-        image.paste(get_native_logo_mask(), NATIVE_LABEL_LOGO_POSITION)
-    if include_pb:
-        image.paste(get_native_pb_mask(), NATIVE_LABEL_PB_POSITION)
-    if include_boya_marks:
-        image.paste(get_native_boya_logo_mask(), NATIVE_LABEL_BOYA_LOGO_POSITION)
-        draw.ellipse((694, 92, 770, 168), outline=1, width=3)
-        draw.ellipse((500, 215, 576, 291), outline=1, width=3)
-        draw.line((500, 253, 576, 253), fill=1, width=2)
-    for x, y, text, bold in text_items:
-        draw.text(
-            (x, y),
-            text,
-            font=get_native_arial_font(bold=bold),
-            fill=1,
-            anchor='lt',
-        )
-
-    width_bytes = (NATIVE_LABEL_WIDTH_DOTS + 7) // 8
-    # TTP-244 Pro 的 BITMAP 位值是 0 打印、1 留白，与 Pillow 的蒙版相反。
-    bitmap_data = bytes(value ^ 0xFF for value in image.tobytes())
-    expected_size = width_bytes * NATIVE_LABEL_HEIGHT_DOTS
-    if len(bitmap_data) != expected_size:
-        raise RuntimeError('Arial 标签文字位图尺寸异常')
-
-    command = (
-        f'BITMAP 0,0,{width_bytes},{NATIVE_LABEL_HEIGHT_DOTS},0,'.encode('ascii')
-    )
-    return command + bitmap_data + b'\r\n'
-
-
-def build_native_apm_label(record, template):
-    """生成 100x50mm APM 拆包标签，每条记录由打印机直接输出两份。"""
-    model = normalize_tspl_value(record.get('model'), 22)
-    quantity = normalize_tspl_value(record.get('quantity'), 12)
-    batch = normalize_tspl_value(record.get('batch'), 18)
-    production_date = normalize_tspl_value(record.get('production_date'), 10)
-    package = normalize_tspl_value(record.get('package'), 18)
-    raw_trace_no = get_excel_cell_text(record.get('trace_no'))
-    trace_no = normalize_tspl_value(raw_trace_no, 28) if raw_trace_no else ''
-    source_no = normalize_tspl_value(record.get('source_no'), 18)
-    raw_version = get_excel_cell_text(record.get('version'))
-    raw_inventory_code = get_excel_cell_text(record.get('inventory_code'))
-    version_is_apm_part_number = len(raw_version) == 12 and raw_version.isdigit()
-    version = (
-        ''
-        if version_is_apm_part_number or not raw_version
-        else normalize_tspl_value(raw_version, 12)
-    )
-    part_number = normalize_tspl_value(
-        raw_version if version_is_apm_part_number else raw_inventory_code,
-        18,
-    )
-    scan_identifier = version or part_number
-    scan_payload = build_native_scan_payload(
-        model,
-        batch,
-        package,
-        scan_identifier,
-        quantity,
-        production_date,
-        trace_no,
-        source_no,
-    )
-
-    text_items = [
-        *(([(300, 22, f'VER: {version}', False)]) if version else []),
-        (30, 82, 'DEVICE:', False),
-        (NATIVE_LABEL_LEFT_VALUE_X, 82, model, False),
-        (350, 82, 'QTY:', False),
-        (NATIVE_LABEL_RIGHT_VALUE_X, 82, quantity, False),
-        (30, 164, 'LOT NO:', False),
-        (NATIVE_LABEL_LEFT_VALUE_X, 164, batch, False),
-        (350, 164, 'DATE:', False),
-        (NATIVE_LABEL_RIGHT_VALUE_X, 164, production_date, False),
-        (30, 242, 'PKG:', False),
-        (NATIVE_LABEL_LEFT_VALUE_X, 242, package, False),
-        (350, 242, 'T/C:', False),
-        (NATIVE_LABEL_RIGHT_VALUE_X, 242, trace_no or '-', False),
-        (30, 320, 'P/N:', False),
-        (NATIVE_LABEL_LEFT_VALUE_X, 320, part_number, False),
-        (350, 320, 'BOX ID:', False),
-        (NATIVE_LABEL_RIGHT_VALUE_X, 320, source_no, False),
-        (
-            get_native_right_aligned_text_x('COO:CN', True),
-            NATIVE_LABEL_COMPLIANCE_FIRST_Y,
-            'COO:CN',
-            True,
-        ),
-        (
-            get_native_right_aligned_text_x('RoHS', True),
-            NATIVE_LABEL_COMPLIANCE_FIRST_Y + NATIVE_LABEL_COMPLIANCE_ROW_GAP_DOTS,
-            'RoHS',
-            True,
-        ),
-        (
-            get_native_right_aligned_text_x('MSL3', True),
-            NATIVE_LABEL_COMPLIANCE_FIRST_Y + NATIVE_LABEL_COMPLIANCE_ROW_GAP_DOTS * 2,
-            'MSL3',
-            True,
-        ),
-    ]
-    setup_commands = '\r\n'.join([
-        'SIZE 100 mm,50 mm',
-        'GAP 3 mm,0 mm',
-        'DIRECTION 1',
-        'CLS',
-        '',
-    ]).encode('ascii')
-    print_commands = '\r\n'.join([
-        f'BARCODE 30,108,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_STRICT_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_STRICT_WIDTH_DOTS},"{model}"',
-        f'BARCODE 350,108,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{quantity}"',
-        f'BARCODE 30,190,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{batch}"',
-        f'BARCODE 350,190,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{production_date}"',
-        f'BARCODE 30,268,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{package}"',
-        *(([f'BARCODE 350,268,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{trace_no}"']) if trace_no else []),
-        f'BARCODE 30,346,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_EXPANDED_WIDTH_DOTS},"{part_number}"',
-        f'BARCODE 350,346,"128",{NATIVE_LABEL_BARCODE_HEIGHT_DOTS},0,0,{NATIVE_LABEL_BARCODE_STRICT_WIDTH_DOTS},{NATIVE_LABEL_BARCODE_STRICT_WIDTH_DOTS},"{source_no}"',
-        f'QRCODE {NATIVE_LABEL_QR_X},{NATIVE_LABEL_QR_Y},L,{NATIVE_LABEL_QR_CELL_DOTS},A,0,{NATIVE_LABEL_QR_MODEL},{NATIVE_LABEL_QR_MASK},"{scan_payload}"',
-        f'PRINT 1,{NATIVE_LABEL_COPIES}',
-        '',
-    ]).encode('ascii')
-    return (
-        setup_commands
-        + build_native_text_bitmap(
-            text_items,
-            include_logo=bool(template.get('include_logo')),
-        )
-        + print_commands
-    )
-
-
-def build_native_boya_label(record):
-    """按珠海博雅原标签版式生成 100x50mm 拆包标签。"""
-    model = normalize_tspl_value(record.get('model'), 22)
-    quantity = normalize_tspl_value(record.get('quantity'), 12)
-    batch = normalize_tspl_value(record.get('batch'), 18)
-    production_date = normalize_tspl_value(record.get('production_date'), 10)
-    package = normalize_tspl_value(record.get('package'), 18)
-    source_no = normalize_tspl_value(record.get('source_no'), 18)
-    scan_payload = '/'.join(field.replace('/', '-') for field in (
-        model,
-        package,
-        quantity,
-        batch,
-        production_date,
-        source_no,
-    ))
-
-    text_items = [
-        (115, 22, 'BOYA MICROELECTRONICS', False),
-        (28, 80, 'PART NO.:', False),
-        (210, 80, model, False),
-        (28, 130, 'PACKAGE:', False),
-        (210, 130, package, False),
-        (28, 180, 'QUANTITY:', False),
-        (210, 180, quantity, False),
-        (28, 230, 'LOT ID:', False),
-        (210, 230, batch, False),
-        (28, 280, 'DATE CODE:', False),
-        (210, 280, production_date, False),
-        (28, 330, 'Track ID:', False),
-        (210, 330, source_no, False),
-        (28, 365, 'MSL3', True),
-        (701, 116, 'RoHS', True),
-        (508, 220, 'PASS', True),
-        (507, 255, 'QC03', True),
-    ]
-    setup_commands = '\r\n'.join([
-        'SIZE 100 mm,50 mm',
-        'GAP 3 mm,0 mm',
-        'DIRECTION 1',
-        'CLS',
-        '',
-    ]).encode('ascii')
-    print_commands = '\r\n'.join([
-        f'QRCODE {NATIVE_LABEL_BOYA_QR_X},{NATIVE_LABEL_BOYA_QR_Y},L,{NATIVE_LABEL_BOYA_QR_CELL_DOTS},A,0,{NATIVE_LABEL_QR_MODEL},{NATIVE_LABEL_QR_MASK},"{scan_payload}"',
-        f'PRINT 1,{NATIVE_LABEL_COPIES}',
-        '',
-    ]).encode('ascii')
-    return (
-        setup_commands
-        + build_native_text_bitmap(
-            text_items,
-            include_logo=False,
-            include_pb=False,
-            include_boya_marks=True,
-        )
-        + print_commands
-    )
-
-
-def build_native_label(record, template):
-    if template.get('key') == NATIVE_LABEL_TEMPLATE_BOYA['key']:
-        return build_native_boya_label(record)
-    return build_native_apm_label(record, template)
-
-
 def load_native_print_history():
     """读取已提交任务，用于网络重试时避免重复出纸。"""
     if not os.path.exists(NATIVE_PRINT_HISTORY_FILE):
@@ -762,11 +303,6 @@ def normalize_native_print_job_id(value):
     if len(job_id) > 120 or any(ord(character) < 32 for character in job_id):
         raise ValueError('原生打印任务标识无效')
     return job_id
-
-
-def get_native_label_template(record):
-    supplier = get_excel_cell_text(record.get('supplier')).strip()
-    return NATIVE_LABEL_TEMPLATE_BY_SUPPLIER.get(supplier)
 
 
 def get_native_print_policy(records):
@@ -982,41 +518,6 @@ def apply_excel_styles(sheet):
         sheet.column_dimensions[get_column_letter(col)].width = min(max(max_width + 2, EXCEL_DEFAULT_COLUMN_WIDTH), 30)
 
 
-def parse_week_code(week_code):
-    """解析芯片周次编码，支持 2601、2602S、202601、2026-W01 等常见写法"""
-    raw_value = str(week_code or '').strip().upper()
-    digits = ''.join(ch for ch in raw_value if ch.isdigit())
-
-    if len(digits) >= 6 and digits[:2] in ('19', '20', '21'):
-        year = int(digits[:4])
-        week = int(digits[4:6])
-        normalized = f'{year}{week:02d}'
-    elif len(digits) >= 4:
-        year = 2000 + int(digits[:2])
-        week = int(digits[2:4])
-        normalized = f'{str(year)[-2:]}{week:02d}'
-    else:
-        raise ValueError('请输入 4 位周次，例如 2601')
-
-    if week < 1 or week > 53:
-        raise ValueError('周次必须在 01 到 53 之间')
-
-    try:
-        monday = datetime.date.fromisocalendar(year, week, 1)
-    except ValueError:
-        raise ValueError(f'{year} 年没有第 {week:02d} 周')
-
-    sunday = monday + datetime.timedelta(days=6)
-
-    return {
-        'normalized': normalized,
-        'year': year,
-        'week': week,
-        'monday': monday,
-        'sunday': sunday,
-    }
-
-
 # ==================== CORS跨域支持 ====================
 def enable_cors():
     """启用CORS跨域支持"""
@@ -1054,69 +555,6 @@ class Health:
             'nativePrintModes': sorted(SUPPORTED_NATIVE_LABEL_PRINT_MODES),
             'maxUploadBytes': MAX_UPLOAD_BYTES,
         })
-
-
-# ==================== 发货序列号接口 ====================
-class Scans:
-    exposed = True
-
-    def OPTIONS(self):
-        """处理预检请求"""
-        enable_cors()
-        return b''
-
-    def POST(self, **kwargs):
-        enable_cors()
-        try:
-            content = kwargs.get("content", "unknown content")
-            if str(content).startswith(('=', '+', '-', '@')):
-                content = f"'{content}"
-            date = datetime.datetime.now().strftime('%Y-%m-%d')
-            month = datetime.datetime.now().strftime('%Y-%m')
-
-            with EXCEL_WRITE_LOCK:
-                if not os.path.exists(SCAN_FILE):
-                    workbook = Workbook()
-                    sheet = workbook.active
-                    sheet.title = month
-                    sheet.append(["日期", "序列号"])
-                    self.set_header_styles(sheet)
-                else:
-                    workbook = load_workbook(SCAN_FILE)
-                    if month not in workbook.sheetnames:
-                        sheet = workbook.create_sheet(title=month)
-                        sheet.append(["日期", "序列号"])
-                        self.set_header_styles(sheet)
-                    else:
-                        sheet = workbook[month]
-
-                row_num = sheet.max_row + 1
-                sheet.append([date, content])
-                self.set_row_styles(sheet, row_num)
-                sheet.column_dimensions[get_column_letter(1)].width = 15
-                sheet.column_dimensions[get_column_letter(2)].width = 100
-                save_workbook_atomically(workbook, SCAN_FILE)
-
-            log(f"已保存序列号: {content}")
-            return json_response({'success': True, 'message': '保存成功', 'date': date, 'content': content})
-        except Exception as e:
-            log(f"错误: {str(e)}")
-            return json_response({'success': False, 'message': str(e)})
-
-    def set_header_styles(self, sheet):
-        thin = Side(border_style="thin", color="000000")
-        for cell in sheet[1]:
-            cell.font = Font(name='微软雅黑', color="000000", bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    def set_row_styles(self, sheet, row_num):
-        thin = Side(border_style="thin", color="000000")
-        for col in range(1, 3):
-            cell = sheet.cell(row=row_num, column=col)
-            cell.font = Font(name='微软雅黑', color="000000")
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
 # ==================== 入库单接口 ====================
@@ -1439,8 +877,6 @@ class TrayIcon:
         self.icon = None
         self.running = True
         self.ip_address = get_ip()
-        self.week_converter_running = False
-        self.week_converter_lock = threading.Lock()
         
     def create_icon_image(self):
         """创建托盘图标"""
@@ -1486,196 +922,15 @@ class TrayIcon:
         except Exception as e:
             log(f"打开日志失败: {e}")
 
-    def open_week_converter(self):
-        """打开周次转换工具窗口"""
-        with self.week_converter_lock:
-            if self.week_converter_running:
-                log("周次转换工具已打开")
-                return
-            self.week_converter_running = True
-
-        thread = threading.Thread(target=self.show_week_converter_window, daemon=True)
-        thread.start()
-
-    def show_week_converter_window(self):
-        """显示周次转换工具，方便从托盘菜单直接使用"""
+    def notify(self, title, message):
+        log(f'{title}: {message}')
+        if not self.icon:
+            return
         try:
-            import tkinter as tk
-            from tkinter import ttk, messagebox
+            self.icon.notify(message, title)
+        except Exception as error:
+            log(f'托盘通知失败: {error}')
 
-            window = tk.Tk()
-            window.title("周次转换工具")
-            window.resizable(False, False)
-            window.configure(bg="#F3F6FA")
-            icon_path = resource_path('icon.ico')
-            if os.path.exists(icon_path):
-                try:
-                    window.iconbitmap(icon_path)
-                except Exception as e:
-                    log(f"设置周次工具窗口图标失败: {e}")
-
-            width = 480
-            height = 360
-            screen_width = window.winfo_screenwidth()
-            screen_height = window.winfo_screenheight()
-            x = int((screen_width - width) / 2)
-            y = int((screen_height - height) / 2)
-            window.geometry(f"{width}x{height}+{x}+{y}")
-            window.attributes("-topmost", True)
-            window.after(600, lambda: window.attributes("-topmost", False))
-
-            input_var = tk.StringVar()
-            result_var = tk.StringVar(value="输入周次后点击转换，结果格式：2026-01-05")
-            copy_value = {"text": ""}
-
-            style = ttk.Style(window)
-            style.theme_use("clam")
-            style.configure("TFrame", background="#F3F6FA")
-            style.configure("Card.TFrame", background="#FFFFFF", relief="flat")
-            style.configure("Title.TLabel", background="#F3F6FA", foreground="#1F2937", font=("Microsoft YaHei UI", 15, "bold"))
-            style.configure("Hint.TLabel", background="#F3F6FA", foreground="#6B7280", font=("Microsoft YaHei UI", 9))
-            style.configure("Body.TLabel", background="#FFFFFF", foreground="#1F2937", font=("Microsoft YaHei UI", 11))
-            style.configure("Result.TLabel", background="#FFFFFF", foreground="#0F766E", font=("Microsoft YaHei UI", 12, "bold"))
-            style.configure("Primary.TButton", font=("Microsoft YaHei UI", 10, "bold"))
-            style.configure("Secondary.TButton", font=("Microsoft YaHei UI", 10))
-
-            root = ttk.Frame(window, padding=18)
-            root.pack(fill="both", expand=True)
-
-            ttk.Label(root, text="周次转换工具", style="Title.TLabel").pack(anchor="w")
-            ttk.Label(
-                root,
-                text="按 ISO 周次计算，周一作为一周开始；结果按 2026-01-05 格式输出。\n公司：上海花栗鼠科技有限公司    作者：zx5121091",
-                style="Hint.TLabel",
-            ).pack(anchor="w", pady=(4, 12))
-
-            card = ttk.Frame(root, style="Card.TFrame", padding=16)
-            card.pack(fill="both", expand=True)
-
-            ttk.Label(card, text="生产周次", style="Body.TLabel").pack(anchor="w")
-            entry = ttk.Entry(card, textvariable=input_var, font=("Microsoft YaHei UI", 13))
-            entry.pack(fill="x", pady=(6, 12), ipady=6)
-            entry.focus_set()
-
-            result_frame = tk.Frame(card, bg="#FFFFFF", height=58)
-            result_frame.pack(fill="x", pady=(0, 12))
-            result_frame.pack_propagate(False)
-
-            result_label = ttk.Label(
-                result_frame,
-                textvariable=result_var,
-                style="Result.TLabel",
-                wraplength=360,
-                justify="left",
-            )
-            result_label.pack(fill="both", expand=True)
-
-            def convert():
-                try:
-                    parsed = parse_week_code(input_var.get())
-                    monday = parsed["monday"].strftime("%Y-%m-%d")
-                    sunday = parsed["sunday"].strftime("%Y-%m-%d")
-                    result_text = (
-                        f"{parsed['normalized']} → {monday}\n"
-                        f"第 {parsed['week']:02d} 周：{monday} 至 {sunday}"
-                    )
-                    result_var.set(result_text)
-                    copy_value["text"] = monday
-                except Exception as error:
-                    copy_value["text"] = ""
-                    result_var.set(str(error))
-
-            def copy_result():
-                if not copy_value["text"]:
-                    convert()
-
-                if not copy_value["text"]:
-                    messagebox.showwarning("无法复制", "请先输入有效周次")
-                    return
-
-                window.clipboard_clear()
-                window.clipboard_append(copy_value["text"])
-                window.update()
-                result_var.set(f"已复制：{copy_value['text']}")
-                input_var.set("")
-                copy_value["text"] = ""
-                entry.focus_set()
-
-            def clear_input():
-                input_var.set("")
-                copy_value["text"] = ""
-                result_var.set("输入周次后点击转换，结果格式：2026-01-05")
-                entry.focus_set()
-
-            button_row = tk.Frame(card, bg="#FFFFFF", height=72)
-            button_row.pack(anchor="center", fill="x")
-            button_row.pack_propagate(False)
-
-            def create_button(parent, text, command, bg, fg, hover_bg, press_bg):
-                label = tk.Label(
-                    parent,
-                    text=text,
-                    width=11,
-                    height=3,
-                    font=("Microsoft YaHei UI", 11, "bold"),
-                    bg=bg,
-                    fg=fg,
-                    relief="flat",
-                    cursor="hand2",
-                    padx=10,
-                    pady=10,
-                )
-
-                label.bind("<Enter>", lambda _event: label.configure(bg=hover_bg))
-                label.bind("<Leave>", lambda _event: label.configure(bg=bg))
-                label.bind("<ButtonPress-1>", lambda _event: label.configure(bg=press_bg))
-                label.bind(
-                    "<ButtonRelease-1>",
-                    lambda _event: (label.configure(bg=hover_bg), command()),
-                )
-                return label
-
-            create_button(
-                button_row,
-                "转换",
-                convert,
-                "#2563EB",
-                "#FFFFFF",
-                "#1D4ED8",
-                "#1E40AF",
-            ).pack(side="left", expand=True, fill="both", padx=(0, 10), pady=4)
-            create_button(
-                button_row,
-                "复制",
-                copy_result,
-                "#0F766E",
-                "#FFFFFF",
-                "#115E59",
-                "#134E4A",
-            ).pack(side="left", expand=True, fill="both", padx=(0, 10), pady=4)
-            create_button(
-                button_row,
-                "清空",
-                clear_input,
-                "#E5E7EB",
-                "#374151",
-                "#D1D5DB",
-                "#9CA3AF",
-            ).pack(side="left", expand=True, fill="both", pady=4)
-
-            entry.bind("<Return>", lambda _event: convert())
-
-            def close_window():
-                window.destroy()
-
-            window.protocol("WM_DELETE_WINDOW", close_window)
-            window.mainloop()
-        except Exception as e:
-            log(f"打开周次转换工具失败: {e}")
-        finally:
-            with self.week_converter_lock:
-                self.week_converter_running = False
-    
     def set_autostart(self, enable=True):
         """设置开机自启动"""
         try:
@@ -1746,7 +1001,6 @@ class TrayIcon:
                 pystray.MenuItem(f"版本: {SYNC_EDITION} v{SYNC_VERSION}", None, enabled=False),
                 pystray.MenuItem(f"同步目录: {DATA_ROOT}", None, enabled=False),
                 pystray.Menu.SEPARATOR,
-                pystray.MenuItem("生产周次转换", self.open_week_converter),
                 pystray.MenuItem("打开同步文件夹", lambda: self.open_folder(DATA_ROOT)),
                 pystray.MenuItem("查看运行日志", self.open_logs),
                 pystray.Menu.SEPARATOR,
@@ -1782,12 +1036,6 @@ def start_server():
     
     # 挂载路由，启用CORS
     cherrypy.tree.mount(Health(), '/health', {
-        '/': {
-            'request.dispatch': cherrypy.dispatch.MethodDispatcher(),
-            'tools.cors.on': True,
-        }
-    })
-    cherrypy.tree.mount(Scans(), '/scans', {
         '/': {
             'request.dispatch': cherrypy.dispatch.MethodDispatcher(),
             'tools.cors.on': True,
