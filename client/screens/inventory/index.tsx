@@ -58,6 +58,8 @@ import {
   InventoryExportRecord,
 } from '@/utils/inventoryExport';
 import {
+  cancelScanSubmit,
+  scheduleScanSubmit,
   hasMatchingTraceNo,
   sanitizeStructuredScannerInput,
   shouldIgnoreRecentDuplicateScan,
@@ -514,10 +516,7 @@ export default function InventoryScreen() {
       return () => {
         isActive = false;
         screenActiveRef.current = false;
-        if (autoSubmitTimerRef.current) {
-          clearTimeout(autoSubmitTimerRef.current);
-          autoSubmitTimerRef.current = null;
-        }
+        cancelScanSubmit(autoSubmitTimerRef);
         if (focusTimerRef.current) {
           clearTimeout(focusTimerRef.current);
           focusTimerRef.current = null;
@@ -725,18 +724,14 @@ export default function InventoryScreen() {
   const handleInputChange = useCallback(
     (text: string) => {
       // 清除之前的定时器（每次输入都重置）
-      if (autoSubmitTimerRef.current) {
-        clearTimeout(autoSubmitTimerRef.current);
-        autoSubmitTimerRef.current = null;
-      }
+      cancelScanSubmit(autoSubmitTimerRef);
 
       // TextInput 是受控组件，逐字符扫码时也必须保留当前输入。
       setInputValue(text);
 
       // 如果当前有输入内容，启动定时器检测扫码完成
       if (text.length > 0) {
-        autoSubmitTimerRef.current = setTimeout(() => {
-          autoSubmitTimerRef.current = null;
+        scheduleScanSubmit(autoSubmitTimerRef, () => {
           const code = sanitizeStructuredScannerInput(text);
           // 检测到输入完成（输入停止超过阈值，认为扫码完成）
           if (code.length >= 1) {
@@ -761,10 +756,7 @@ export default function InventoryScreen() {
 
   // 扫码完成确认（焦点录入模式：用户手动按回车）
   const handleSubmitEditing = useCallback(() => {
-    if (autoSubmitTimerRef.current) {
-      clearTimeout(autoSubmitTimerRef.current);
-      autoSubmitTimerRef.current = null;
-    }
+    cancelScanSubmit(autoSubmitTimerRef);
 
     const code = sanitizeStructuredScannerInput(inputValue);
 

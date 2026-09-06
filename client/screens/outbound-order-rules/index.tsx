@@ -29,6 +29,7 @@ export default function OutboundOrderRulesScreen() {
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
   const alert = useCustomAlert();
+  const showLoadError = alert.showError;
 
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [warehouseRules, setWarehouseRules] = useState<OutboundWarehouseSampleRuleMap>({});
@@ -78,11 +79,11 @@ export default function OutboundOrderRulesScreen() {
       setWarehouseRules(savedWarehouseRules);
     } catch (error) {
       logger.error('加载出库单号规则失败:', error);
-      alert.showError('出库单号规则加载失败，请重试');
+      showLoadError('出库单号规则加载失败，请重试');
     } finally {
       setLoading(false);
     }
-  }, [alert.showError]);
+  }, [showLoadError]);
 
   useFocusEffect(
     useCallback(() => {

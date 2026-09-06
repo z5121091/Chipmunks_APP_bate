@@ -68,7 +68,7 @@ export const createStyles = (theme: Theme) =>
       borderWidth: BorderWidth.normal,
       borderColor: withAlpha(theme.error, theme.isDark ? 0.35 : 0.22),
     },
-    errorText: { flex: 1, ...Typography.captionMedium, color: theme.error },
+    errorText: { flex: 1, minWidth: 0, flexShrink: 1, ...Typography.captionMedium, color: theme.error },
     listSection: {
       flex: 1,
       marginHorizontal: Spacing.sm,

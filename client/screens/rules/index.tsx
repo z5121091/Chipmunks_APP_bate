@@ -556,8 +556,13 @@ export default function RulesScreen() {
           if (!saving) setModalVisible(false);
         }}
       >
-        <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
-          <View style={[styles.ruleEditorScreen, { paddingTop: insets.top }]}>
+        <Screen
+          backgroundColor={theme.backgroundRoot}
+          statusBarStyle={isDark ? 'light' : 'dark'}
+          safeAreaEdges={['top', 'left', 'right']}
+          disableAutoScroll
+        >
+          <View style={styles.ruleEditorScreen}>
             <View style={styles.ruleEditorHeader}>
               <AppModalHeader
                 title={editingRule ? '编辑规则' : '添加规则'}

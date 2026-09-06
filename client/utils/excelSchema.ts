@@ -186,6 +186,7 @@ export const getCompactExportDate = (date = new Date()): string => {
 
 export const sanitizeExportFileSegment = (value: string): string => {
   const cleaned = value
+    // eslint-disable-next-line no-control-regex -- Export file names must reject C0 control characters.
     .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
     .replace(/\s+/g, '')
     .replace(/_+/g, '_')

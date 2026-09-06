@@ -3,6 +3,7 @@ import { backendJsonRequest, buildErpProxyPath } from '@/utils/backendApi';
 import {
   type ErpAccountConfig,
   type ErpAccountKey,
+  getErpAccountByKey,
   requireErpAccountBackend,
 } from '@/utils/erpAccounts';
 import { safeJsonParseNullable } from '@/utils/json';
@@ -100,6 +101,13 @@ export interface PurchaseReceiveVoucher {
   warehouseCode: string;
   warehouseName: string;
 }
+
+export const isPurchaseReceiveWarehouseAllowed = (
+  account: ErpAccountConfig,
+  warehouseName: string
+): boolean =>
+  account.key !== 'shanghai-chipmunk' ||
+  warehouseName.trim() === account.expectedWarehouseName.trim();
 
 const isRecord = (value: unknown): value is MaybeRecord =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -224,8 +232,23 @@ const writeCache = async <T>(key: string, data: T): Promise<PurchaseReceiveCache
   return entry;
 };
 
-export const loadCachedPendingPurchaseReceives = (accountKey: ErpAccountKey) =>
-  readCache<PurchaseReceiveListResult>(getListCacheKey(accountKey));
+export const loadCachedPendingPurchaseReceives = async (accountKey: ErpAccountKey) => {
+  const cached = await readCache<PurchaseReceiveListResult>(getListCacheKey(accountKey));
+  const account = getErpAccountByKey(accountKey);
+  if (!cached || !account) {
+    return cached;
+  }
+
+  return {
+    ...cached,
+    data: {
+      ...cached.data,
+      items: cached.data.items.filter((item) =>
+        isPurchaseReceiveWarehouseAllowed(account, item.warehouseName)
+      ),
+    },
+  };
+};
 
 export const savePendingPurchaseReceivesCache = (
   accountKey: ErpAccountKey,
@@ -246,6 +269,15 @@ export const loadCachedPurchaseReceiveVoucher = async (
   if (
     !Number.isFinite(cachedAt) ||
     Date.now() - cachedAt > PURCHASE_RECEIVE_DETAIL_CACHE_TTL_MS
+  ) {
+    await AsyncStorage.removeItem(cacheKey);
+    return null;
+  }
+
+  const account = getErpAccountByKey(accountKey);
+  if (
+    account &&
+    !isPurchaseReceiveWarehouseAllowed(account, cached.data.warehouseName)
   ) {
     await AsyncStorage.removeItem(cacheKey);
     return null;
@@ -393,7 +425,10 @@ export const fetchPendingPurchaseReceives = async (
         warehouseName: readListCell(row, columnIndex, 'warehousename'),
       }))
       .filter((item) => item.code)
-      .filter((item) => item.stateCode === '00' || item.stateName === '未审');
+      .filter((item) => item.stateCode === '00' || item.stateName === '未审')
+      .filter((item) =>
+        isPurchaseReceiveWarehouseAllowed(account, item.warehouseName)
+      );
 
     return {
       items,

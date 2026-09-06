@@ -8,7 +8,7 @@
     "check-deps": "npx depcheck",
     "postinstall": "pnpm run install-missing",
     "install-missing": "node ./scripts/install-missing-deps.js",
-    "lint": "expo lint",
+    "lint": "eslint app components screens hooks utils contexts constants",
     "typecheck": "tsc --noEmit",
     "start": "expo start --web --offline --clear",
     "test": "jest --watchAll",

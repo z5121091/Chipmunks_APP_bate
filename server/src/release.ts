@@ -1,1 +1,1 @@
-export const SERVER_RELEASE = '2026.08.20.1';
+export const SERVER_RELEASE = '2026.09.03.1';

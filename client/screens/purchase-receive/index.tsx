@@ -1,3 +1,4 @@
+import { cancelScanSubmit, scheduleScanSubmit } from '@/utils/scannerInput';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -234,10 +235,7 @@ export default function PurchaseReceiveScreen() {
 
       return () => {
         clearInterval(statusTimer);
-        if (manualLookupTimerRef.current) {
-          clearTimeout(manualLookupTimerRef.current);
-          manualLookupTimerRef.current = null;
-        }
+        cancelScanSubmit(manualLookupTimerRef);
       };
     }, [
       loadCompletedVoucherCodes,
@@ -309,10 +307,7 @@ export default function PurchaseReceiveScreen() {
   );
 
   const handleAccountPress = useCallback((account: ErpAccountConfig) => {
-    if (manualLookupTimerRef.current) {
-      clearTimeout(manualLookupTimerRef.current);
-      manualLookupTimerRef.current = null;
-    }
+    cancelScanSubmit(manualLookupTimerRef);
     requestIdRef.current += 1;
     completionRequestIdRef.current += 1;
     statusRequestIdRef.current += 1;
@@ -449,10 +444,7 @@ export default function PurchaseReceiveScreen() {
   );
 
   const handleManualLookup = useCallback(async (nextVoucherCode?: string) => {
-    if (manualLookupTimerRef.current) {
-      clearTimeout(manualLookupTimerRef.current);
-      manualLookupTimerRef.current = null;
-    }
+    cancelScanSubmit(manualLookupTimerRef);
 
     const voucherCode = normalizeVoucherCode(nextVoucherCode ?? manualVoucherCode);
     const requestKey = `${selectedAccount.key}:${voucherCode}`;
@@ -531,10 +523,7 @@ export default function PurchaseReceiveScreen() {
 
   const handleManualVoucherCodeChange = useCallback(
     (text: string) => {
-      if (manualLookupTimerRef.current) {
-        clearTimeout(manualLookupTimerRef.current);
-        manualLookupTimerRef.current = null;
-      }
+      cancelScanSubmit(manualLookupTimerRef);
 
       setManualVoucherCode(text);
       const voucherCode = normalizeVoucherCode(text);
@@ -549,8 +538,7 @@ export default function PurchaseReceiveScreen() {
         return;
       }
 
-      manualLookupTimerRef.current = setTimeout(() => {
-        manualLookupTimerRef.current = null;
+      scheduleScanSubmit(manualLookupTimerRef, () => {
         void handleManualLookup(voucherCode);
       }, PURCHASE_RECEIVE_LOOKUP_AUTO_SUBMIT_MS);
     },

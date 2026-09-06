@@ -165,6 +165,8 @@ export const createStyles = (theme: Theme) => {
     },
     errorText: {
       flex: 1,
+      minWidth: 0,
+      flexShrink: 1,
       ...Typography.captionMedium,
       color: theme.error,
     },

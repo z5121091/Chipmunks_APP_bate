@@ -39,21 +39,14 @@ const WUXI_DUNENG_BASE_URL =
     : getEnv('EXPO_PUBLIC_ERP_WUXI_DUNENG_BASE_URL')) || COMMON_BACKEND_BASE_URL;
 const SHANGHAI_CHIPMUNK_BASE_URL =
   (USE_ERP_PUBLIC_GATEWAY
-    ? getEnv('EXPO_PUBLIC_ERP_SHANGHAI_CHIPMUNK_PUBLIC_GATEWAY_BASE_URL')
+    ? ERP_PUBLIC_GATEWAY_BASE_URL
     : getEnv('EXPO_PUBLIC_ERP_SHANGHAI_CHIPMUNK_BASE_URL')) || COMMON_BACKEND_BASE_URL;
 
 const WUXI_DUNENG_ENABLED = getEnvBool('EXPO_PUBLIC_ERP_WUXI_DUNENG_ENABLED') ?? true;
-const SHANGHAI_CHIPMUNK_ENABLED = getEnvBool('EXPO_PUBLIC_ERP_SHANGHAI_CHIPMUNK_ENABLED') ?? false;
+const SHANGHAI_CHIPMUNK_ENABLED =
+  getEnvBool('EXPO_PUBLIC_ERP_SHANGHAI_CHIPMUNK_ENABLED') ?? true;
 
 export const ERP_ACCOUNTS: ErpAccountConfig[] = [
-  {
-    backendBaseUrl: normalizeBaseUrl(WUXI_DUNENG_BASE_URL),
-    erpEnabled: WUXI_DUNENG_ENABLED,
-    expectedWarehouseName: '无锡仓库',
-    key: 'wuxi-duneng',
-    name: '无锡笃能',
-    sequenceLength: 3,
-  },
   {
     backendBaseUrl: normalizeBaseUrl(SHANGHAI_CHIPMUNK_BASE_URL),
     erpEnabled: SHANGHAI_CHIPMUNK_ENABLED,
@@ -61,6 +54,14 @@ export const ERP_ACCOUNTS: ErpAccountConfig[] = [
     key: 'shanghai-chipmunk',
     name: '上海花栗鼠',
     sequenceLength: 2,
+  },
+  {
+    backendBaseUrl: normalizeBaseUrl(WUXI_DUNENG_BASE_URL),
+    erpEnabled: WUXI_DUNENG_ENABLED,
+    expectedWarehouseName: '无锡仓库',
+    key: 'wuxi-duneng',
+    name: '无锡笃能',
+    sequenceLength: 3,
   },
 ];
 

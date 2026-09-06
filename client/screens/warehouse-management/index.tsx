@@ -41,6 +41,7 @@ export default function WarehouseManagementScreen() {
   const styles = createStyles(theme);
   const router = useSafeRouter();
   const alert = useCustomAlert();
+  const showLoadError = alert.showError;
 
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [modalVisible, setModalVisible] = useState(false);
@@ -61,9 +62,9 @@ export default function WarehouseManagementScreen() {
       setWarehouses(data);
     } catch (error) {
       logger.error('加载仓库失败:', error);
-      alert.showError('仓库加载失败，请重试');
+      showLoadError('仓库加载失败，请重试');
     }
-  }, [alert.showError]);
+  }, [showLoadError]);
 
   useFocusEffect(
     useCallback(() => {

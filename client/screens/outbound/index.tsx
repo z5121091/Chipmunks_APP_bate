@@ -56,6 +56,8 @@ import {
 import { useToast } from '@/utils/toast';
 import { getISODateTime } from '@/utils/time';
 import {
+  cancelScanSubmit,
+  scheduleScanSubmit,
   sanitizeStructuredScannerInput,
   shouldIgnoreRecentDuplicateScan,
 } from '@/utils/scannerInput';
@@ -1013,10 +1015,7 @@ export default function PDAScanScreen() {
         isActive = false;
         screenActiveRef.current = false;
         processingRef.current = false;
-        if (autoSubmitTimerRef.current) {
-          clearTimeout(autoSubmitTimerRef.current);
-          autoSubmitTimerRef.current = null;
-        }
+        cancelScanSubmit(autoSubmitTimerRef);
         if (focusTimerRef.current) {
           clearTimeout(focusTimerRef.current);
           focusTimerRef.current = null;
@@ -2576,10 +2575,7 @@ export default function PDAScanScreen() {
   const handleInputChange = useCallback(
     (text: string) => {
       // 清除之前的定时器（每次输入都重置）
-      if (autoSubmitTimerRef.current) {
-        clearTimeout(autoSubmitTimerRef.current);
-        autoSubmitTimerRef.current = null;
-      }
+      cancelScanSubmit(autoSubmitTimerRef);
 
       liveInputValueRef.current = text;
       setInputValue(text);
@@ -2597,9 +2593,9 @@ export default function PDAScanScreen() {
             (Object.keys(outboundWarehouseOrderRules).length === 0 &&
               isOutboundOrderNo(normalizedOrderText, outboundOrderRule)));
 
-        autoSubmitTimerRef.current = setTimeout(
+        scheduleScanSubmit(
+          autoSubmitTimerRef,
           () => {
-            autoSubmitTimerRef.current = null;
             flushScannerInput(text);
           },
           shouldFastSubmitOrder
@@ -2614,10 +2610,7 @@ export default function PDAScanScreen() {
 
   // 扫码完成确认（焦点录入模式：用户手动按回车）
   const handleSubmitEditing = useCallback(() => {
-    if (autoSubmitTimerRef.current) {
-      clearTimeout(autoSubmitTimerRef.current);
-      autoSubmitTimerRef.current = null;
-    }
+    cancelScanSubmit(autoSubmitTimerRef);
 
     flushScannerInput();
   }, [flushScannerInput]);

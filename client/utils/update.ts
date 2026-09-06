@@ -90,8 +90,8 @@ export const base64Encode = (str: string): string => {
  * @returns 1: v1 > v2, -1: v1 < v2, 0: v1 = v2
  */
 export const compareVersions = (v1: string, v2: string): number => {
-  const parts1 = v1.replace(/[Vv]/, '').split('.').map(Number);
-  const parts2 = v2.replace(/[Vv]/, '').split('.').map(Number);
+  const parts1 = v1.replace(/v/i, '').split('.').map(Number);
+  const parts2 = v2.replace(/v/i, '').split('.').map(Number);
 
   for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
     const p1 = parts1[i] || 0;

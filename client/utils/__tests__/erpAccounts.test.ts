@@ -10,6 +10,27 @@ describe('ERP account backend defaults', () => {
     expect(ERP_ACCOUNTS[0]?.backendBaseUrl).toBe('https://erp.chipmunks.fun');
   });
 
+  it('enables both production ERP accounts through the HTTPS gateway by default', () => {
+    expect(
+      ERP_ACCOUNTS.map(({ backendBaseUrl, erpEnabled, key }) => ({
+        backendBaseUrl,
+        erpEnabled,
+        key,
+      }))
+    ).toEqual([
+      {
+        backendBaseUrl: 'https://erp.chipmunks.fun',
+        erpEnabled: true,
+        key: 'shanghai-chipmunk',
+      },
+      {
+        backendBaseUrl: 'https://erp.chipmunks.fun',
+        erpEnabled: true,
+        key: 'wuxi-duneng',
+      },
+    ]);
+  });
+
   it('bypasses the Coze backend sandbox for ERP requests', () => {
     expect(
       resolveErpPublicGatewayMode({
@@ -17,6 +38,31 @@ describe('ERP account backend defaults', () => {
         cozeProjectId: 'coze-project',
       })
     ).toBe(true);
+  });
+
+  it('routes both accounts through the public gateway in a Coze build', () => {
+    const previousEnv = process.env;
+
+    try {
+      process.env = {
+        ...previousEnv,
+        EXPO_PUBLIC_BACKEND_BASE_URL: 'https://project.dev.coze.site',
+        EXPO_PUBLIC_COZE_PROJECT_ID: 'coze-project',
+      };
+      jest.resetModules();
+
+      const { ERP_ACCOUNTS: cozeAccounts } = jest.requireActual<
+        typeof import('../erpAccounts')
+      >('../erpAccounts');
+
+      expect(cozeAccounts.map(({ backendBaseUrl }) => backendBaseUrl)).toEqual([
+        'https://erp.chipmunks.fun',
+        'https://erp.chipmunks.fun',
+      ]);
+    } finally {
+      process.env = previousEnv;
+      jest.resetModules();
+    }
   });
 
   it('keeps the local web backend proxy outside Coze', () => {

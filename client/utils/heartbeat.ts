@@ -25,7 +25,7 @@ export const getSyncConfigError = (config: SyncConfig): string => {
   if (!normalized.ip) {
     return '请输入电脑IP或主机名';
   }
-  if (/\s|[/?#]/.test(normalized.ip) || normalized.ip.includes(':')) {
+  if (/[\s/?#]/.test(normalized.ip) || normalized.ip.includes(':')) {
     return '电脑地址只填写IP或主机名，不要包含 http、端口或路径';
   }
   if (!/^\d{1,5}$/.test(normalized.port)) {

@@ -1444,7 +1444,7 @@ if (typeof globalThis !== 'undefined') {
 const normalizeSqlText = (value: string): string => value.replace(/\s+/g, ' ').trim();
 
 const extractWhereClause = (sql: string): string | null => {
-  const match = sql.match(/\bWHERE\b\s+(.+?)(?:\s+GROUP\s+BY\b|\s+ORDER\s+BY\b|\s+LIMIT\b|$)/is);
+  const match = normalizeSqlText(sql).match(/\bWHERE (.+?)(?: GROUP BY\b| ORDER BY\b| LIMIT\b|$)/i);
   return match ? match[1].trim() : null;
 };
 
@@ -1516,12 +1516,12 @@ const getSqlExpressionFallback = (expression: string): unknown => {
 
 const getMockColumnName = (expression: string): string | null => {
   let expr = stripWrappingParentheses(expression);
-  const coalesceMatch = expr.match(/^COALESCE\((.+?),.+\)$/i);
+  const coalesceMatch = expr.match(/^COALESCE\(([^,]+),.+\)$/i);
   if (coalesceMatch) {
     expr = coalesceMatch[1].trim();
   }
 
-  const nullIfMatch = expr.match(/^NULLIF\((.+?),.+\)$/i);
+  const nullIfMatch = expr.match(/^NULLIF\(([^,]+),.+\)$/i);
   if (nullIfMatch) {
     expr = nullIfMatch[1].trim();
   }
@@ -1531,12 +1531,12 @@ const getMockColumnName = (expression: string): string | null => {
     expr = trimMatch[1].trim();
   }
 
-  const castMatch = expr.match(/^CAST\((.+?)\s+AS\s+.+\)$/i);
+  const castMatch = normalizeSqlText(expr).match(/^CAST\((.+?) AS .+\)$/i);
   if (castMatch) {
     expr = castMatch[1].trim();
   }
 
-  const columnMatch = expr.match(/(?:\w+\.)?([A-Za-z_]\w*)$/);
+  const columnMatch = expr.match(/(?:\w+\.)?([a-z_]\w*)$/i);
   return columnMatch ? columnMatch[1] : null;
 };
 
@@ -1547,7 +1547,7 @@ const getMockExpressionValue = (row: any, expression: string): unknown => {
     return quotedMatch[1] ?? quotedMatch[2] ?? '';
   }
 
-  if (/^-?\d+(\.\d+)?$/.test(expr)) {
+  if (/^-?\d+(?:\.\d+)?$/.test(expr)) {
     return Number(expr);
   }
 
@@ -1626,14 +1626,24 @@ const evaluateMockCondition = (
     return matched;
   }
 
-  const isNullMatch = normalized.match(/^(.+?)\s+IS\s+(NOT\s+)?NULL$/i);
+  const andParts = splitSqlLogical(normalized, 'AND');
+  if (andParts.length > 1) {
+    let matched = true;
+    for (const part of andParts) {
+      // Consume every placeholder even if an earlier condition did not match.
+      matched = evaluateMockCondition(row, part, params, cursor) && matched;
+    }
+    return matched;
+  }
+
+  const isNullMatch = normalized.match(/^(.+?) IS (NOT )?NULL$/i);
   if (isNullMatch) {
     const value = getMockExpressionValue(row, isNullMatch[1]);
     const isNull = value === null || value === undefined || value === '';
     return isNullMatch[2] ? !isNull : isNull;
   }
 
-  const likeMatch = normalized.match(/^(.+?)\s+LIKE\s+(.+?)(?:\s+ESCAPE\s+.+)?$/i);
+  const likeMatch = normalized.match(/^(.+?) LIKE (.+?)(?: ESCAPE .+)?$/i);
   if (likeMatch) {
     const left = String(getMockExpressionValue(row, likeMatch[1]) ?? '');
     const pattern = String(getMockRightValue(row, likeMatch[2], params, cursor) ?? '');
@@ -1644,7 +1654,7 @@ const evaluateMockCondition = (
     return new RegExp(`^${regexPattern}$`, 'i').test(left);
   }
 
-  const inMatch = normalized.match(/^(.+?)\s+IN\s*\((.+)\)$/i);
+  const inMatch = normalized.match(/^(.+?) IN ?\((.+)\)$/i);
   if (inMatch) {
     const left = String(getMockExpressionValue(row, inMatch[1]) ?? '');
     const values = inMatch[2]
@@ -1655,14 +1665,16 @@ const evaluateMockCondition = (
     return values.includes(left);
   }
 
-  const binaryMatch = normalized.match(/^(.+?)\s*(=|!=|<>|<=|>=|<|>)\s*(.+)$/);
+  const binaryMatch = normalized.match(/!=|<>|<=|>=|[=<>]/);
   if (binaryMatch) {
-    const left = getMockExpressionValue(row, binaryMatch[1]);
-    const right = getMockRightValue(row, binaryMatch[3], params, cursor);
+    const leftExpression = normalized.slice(0, binaryMatch.index).trim();
+    const rightExpression = normalized.slice((binaryMatch.index ?? 0) + binaryMatch[0].length).trim();
+    const left = getMockExpressionValue(row, leftExpression);
+    const right = getMockRightValue(row, rightExpression, params, cursor);
     return compareMockValues(
       left,
       right,
-      binaryMatch[2],
+      binaryMatch[0],
       /\bCOLLATE\s+NOCASE\b/i.test(normalized)
     );
   }
@@ -1678,10 +1690,9 @@ const filterByWhere = (rows: any[], whereClause: string, params: any[] = []): an
 
   if (!whereClause) return rows;
 
-  const conditions = splitSqlLogical(whereClause, 'AND');
   const result = rows.filter((row) => {
     const cursor = { index: 0 };
-    return conditions.every((condition) => evaluateMockCondition(row, condition, params, cursor));
+    return evaluateMockCondition(row, whereClause, params, cursor);
   });
 
   logger.log(`[MockDB] filter result: ${result.length} rows`);
@@ -1723,13 +1734,13 @@ const splitSqlComma = (value: string): string[] => {
 };
 
 const extractGroupByClause = (sql: string): string | null => {
-  const match = sql.match(/\bGROUP\s+BY\b\s+(.+?)(?:\s+ORDER\s+BY\b|\s+LIMIT\b|$)/is);
+  const match = normalizeSqlText(sql).match(/\bGROUP BY (.+?)(?: ORDER BY\b| LIMIT\b|$)/i);
   return match ? match[1].trim() : null;
 };
 
 const getMockSelectExpressionParts = (expression: string) => {
   const trimmed = expression.trim();
-  const aliasMatch = trimmed.match(/^(.+?)\s+AS\s+([A-Za-z_]\w*)$/is);
+  const aliasMatch = normalizeSqlText(trimmed).match(/^(.+?) AS ([a-z_]\w*)$/i);
   const valueExpression = aliasMatch ? aliasMatch[1].trim() : trimmed;
   const alias = aliasMatch?.[2] || getMockColumnName(valueExpression) || valueExpression;
   return { valueExpression, alias };
@@ -1740,7 +1751,7 @@ const getMockAggregateValue = (
   expression: string
 ): { handled: boolean; value: unknown } => {
   const normalized = stripWrappingParentheses(expression.trim());
-  const countMatch = normalized.match(/^COUNT\s*\((DISTINCT\s+)?(.+)\)$/is);
+  const countMatch = normalizeSqlText(normalized).match(/^COUNT *\((DISTINCT )?(.+)\)$/i);
   if (countMatch) {
     const valueExpression = countMatch[2].trim();
     if (countMatch[1]) {
@@ -2133,7 +2144,7 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
           const results = mockTables[tableName] || [];
 
           // 提取 SELECT 指定的字段
-          const selectMatch = sql.match(/SELECT\s+(.+?)\s+FROM/is);
+          const selectMatch = normalizeSqlText(sql).match(/SELECT (.+?) FROM/i);
           const selectClause = selectMatch ? selectMatch[1].trim() : '*';
 
           // 处理 WHERE 条件
@@ -2198,7 +2209,7 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
           }
 
           // 如果是 COUNT 等聚合函数，特殊处理
-          if (/\b(COUNT|SUM)\s*\(/i.test(selectClause)) {
+          if (/\b(?:COUNT|SUM)\s*\(/i.test(selectClause)) {
             const result = mapMockSelectRow(filteredResults[0] || {}, selectClause, filteredResults);
             logger.log(`[MockDB] Selected aggregate (${selectClause}) from ${tableName}:`, result);
             return [result] as T[];
@@ -2243,7 +2254,7 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
           const results = mockTables[tableName] || [];
 
           // 提取 SELECT 指定的字段
-          const selectMatch = sql.match(/SELECT\s+(.+?)\s+FROM/is);
+          const selectMatch = normalizeSqlText(sql).match(/SELECT (.+?) FROM/i);
           if (selectMatch) {
             const selectClause = selectMatch[1].trim();
 
@@ -2270,7 +2281,7 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
             }
 
             // 如果是 COUNT(*) 等聚合函数，始终返回计数
-            if (/\b(COUNT|SUM)\s*\(/i.test(selectClause)) {
+            if (/\b(?:COUNT|SUM)\s*\(/i.test(selectClause)) {
               const result = mapMockSelectRow(filteredResults[0] || {}, selectClause, filteredResults);
               logger.log(`[MockDB] aggregate result (${selectClause}):`, result);
               return result as T;

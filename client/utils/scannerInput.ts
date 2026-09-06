@@ -2,12 +2,27 @@ import type { MutableRefObject } from 'react';
 
 export const RECENT_SCAN_DUPLICATE_WINDOW_MS = 600;
 
+type ScanSubmitTimerRef = MutableRefObject<ReturnType<typeof setTimeout> | null>;
+
+export const cancelScanSubmit = (timerRef: ScanSubmitTimerRef) => {
+  if (timerRef.current !== null) clearTimeout(timerRef.current);
+  timerRef.current = null;
+};
+
+export const scheduleScanSubmit = (timerRef: ScanSubmitTimerRef, submit: () => void, delay: number) => {
+  cancelScanSubmit(timerRef);
+  timerRef.current = setTimeout(() => {
+    timerRef.current = null;
+    submit();
+  }, delay);
+};
+
 export const sanitizeCompactScannerInput = (rawText: string) =>
   rawText
     .trim()
-    .replace(/[\r\n\t\s]+/g, '')
-    .replace(/^[^A-Za-z0-9]+/, '')
-    .replace(/[^A-Za-z0-9]+$/, '');
+    .replace(/\s+/g, '')
+    .replace(/^[^a-z0-9]+/i, '')
+    .replace(/[^a-z0-9]+$/i, '');
 
 export const sanitizeLooseScannerInput = (rawText: string) =>
   rawText.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -17,7 +32,7 @@ export const sanitizeLooseScannerInput = (rawText: string) =>
  * 扫码完成仍由页面防抖触发，不依赖扫描枪发送回车。
  */
 export const sanitizeStructuredScannerInput = (rawText: string) =>
-  rawText.replace(/^\uFEFF/, '').replace(/\u0000/g, '').trim();
+  rawText.replace(/^\uFEFF/, '').split('\0').join('').trim();
 
 export const hasMatchingTraceNo = <T extends { traceNo?: string | null }>(
   records: readonly T[],

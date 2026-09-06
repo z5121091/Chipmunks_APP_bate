@@ -42,6 +42,8 @@ const defaultUpdateServer = restoreMatchingUpdateServerCredentials(
   updateServerConfig.defaultServer
 ).replace(/\/+$/, '');
 const selfUpdateEnabled = process.env.EXPO_PUBLIC_ENABLE_SELF_UPDATE !== 'false';
+const splashImage = './assets/images/splash-universal.png';
+const splashBackgroundColor = '#FFFFFF';
 
 export default function appConfig({ config }: ConfigContext): ExpoConfig {
   return {
@@ -55,20 +57,25 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/images/splash-universal.png",
-      "backgroundColor": "#FFFFFF",
+      "image": splashImage,
+      "backgroundColor": splashBackgroundColor,
       "resizeMode": "contain"
     },
     "ios": {
       "supportsTablet": true,
       "splash": {
-        "image": "./assets/images/splash-universal.png",
-        "backgroundColor": "#FFFFFF",
-        "resizeMode": "contain"
+        "image": splashImage,
+        "backgroundColor": splashBackgroundColor,
+        "resizeMode": "contain",
+        "dark": {
+          "image": splashImage,
+          "backgroundColor": splashBackgroundColor,
+          "resizeMode": "contain"
+        }
       }
     },
     "android": {
-      "package": "com.chipmunks.traceabilityBeta",
+      "package": "com.chipmunks.traceability",
       "versionCode": versionConfig.versionCode,
       "permissions": [
         "android.permission.INTERNET",
@@ -92,9 +99,14 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
         ...(!selfUpdateEnabled ? ["android.permission.REQUEST_INSTALL_PACKAGES"] : [])
       ],
       "splash": {
-        "image": "./assets/images/splash-universal.png",
-        "backgroundColor": "#FFFFFF",
-        "resizeMode": "contain"
+        "image": splashImage,
+        "backgroundColor": splashBackgroundColor,
+        "resizeMode": "contain",
+        "dark": {
+          "image": splashImage,
+          "backgroundColor": splashBackgroundColor,
+          "resizeMode": "contain"
+        }
       }
     },
     "web": {
@@ -108,6 +120,19 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
           "origin": process.env.EXPO_PUBLIC_BACKEND_BASE_URL
         }
       ] : 'expo-router',
+      [
+        "expo-splash-screen",
+        {
+          "image": splashImage,
+          "imageWidth": 288,
+          "resizeMode": "contain",
+          "backgroundColor": splashBackgroundColor,
+          "dark": {
+            "image": splashImage,
+            "backgroundColor": splashBackgroundColor
+          }
+        }
+      ],
       [
         "expo-build-properties",
         {

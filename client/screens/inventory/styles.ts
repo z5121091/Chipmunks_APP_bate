@@ -116,29 +116,6 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
     color: theme.buttonPrimaryText,
   },
 
-  // 仓库按钮
-  warehouseBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: Spacing.xs,
-    paddingVertical: Spacing.xs + 2,
-    paddingHorizontal: Spacing.sm,
-    backgroundColor: theme.backgroundDefault,
-    borderRadius: BorderRadius.lg,
-    borderWidth: BorderWidth.thin,
-    borderColor: theme.borderLight,
-    minWidth: 80,
-    minHeight: 46,
-  },
-
-  warehouseText: {
-    ...Typography.smallMedium,
-    color: theme.textPrimary,
-    maxWidth: 96,
-    flexShrink: 1,
-  },
-
   // 列表
   listSection: {
     flex: 1,

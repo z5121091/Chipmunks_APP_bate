@@ -9,6 +9,7 @@ import {
   resolveErpAccountKey,
 } from './erpAccounts.ts';
 import { SERVER_RELEASE } from './release.ts';
+import { canReuseErpConnection, requestErpRead, type ErpHttpResponse } from './erpHttp.ts';
 
 const DEFAULT_OPENAPI_BASE_URL = 'https://openapi.chanjet.com';
 const DEFAULT_MARKET_BASE_URL = 'https://market.chanjet.com';
@@ -120,6 +121,7 @@ type ChanjetRequestOptions = {
   method: HttpMethod;
   path: string;
   query?: Record<string, string | number | undefined>;
+  reuseConnection?: boolean;
 };
 
 type AsyncRoute = (req: Request, res: Response) => Promise<void> | void;
@@ -130,6 +132,7 @@ type TplusCacheEntry = {
 
 const tplusResponseCache = new Map<string, TplusCacheEntry>();
 const pendingTplusRequests = new Map<string, Promise<unknown>>();
+const latestTplusRequests = new Map<string, Promise<unknown>>();
 
 const trimEnv = (name: string): string | undefined => {
   const value = process.env[name]?.trim();
@@ -883,7 +886,10 @@ const buildUrl = (path: string, query?: Record<string, string | number | undefin
   return url;
 };
 
-const chanjetRequest = async (options: ChanjetRequestOptions): Promise<unknown> => {
+const chanjetCurlRequest = async (
+  options: ChanjetRequestOptions,
+  timeoutSeconds = getChanjetRequestTimeoutSeconds()
+): Promise<ErpHttpResponse> => {
   const bodyText = options.body === undefined ? undefined : JSON.stringify(options.body);
   const args = [
     '--silent',
@@ -891,7 +897,7 @@ const chanjetRequest = async (options: ChanjetRequestOptions): Promise<unknown> 
     '--connect-timeout',
     String(getChanjetConnectTimeoutSeconds()),
     '--max-time',
-    String(getChanjetRequestTimeoutSeconds()),
+    String(timeoutSeconds),
     '--request',
     options.method,
     '--header',
@@ -949,6 +955,39 @@ const chanjetRequest = async (options: ChanjetRequestOptions): Promise<unknown> 
 
   const text = output.slice(0, statusMarkerIndex);
   const statusCode = Number(output.slice(statusMarkerIndex + statusMarker.length).trim());
+  return { text, statusCode };
+};
+
+const chanjetRequest = async (options: ChanjetRequestOptions): Promise<unknown> => {
+  const startedAt = performance.now();
+  const timeoutMs = getChanjetRequestTimeoutSeconds() * 1000;
+  let response: ErpHttpResponse | undefined;
+  let pooledRequestFailed = false;
+  if (options.reuseConnection && canReuseErpConnection()) {
+    try {
+      response = await requestErpRead(buildUrl(options.path, options.query), {
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        headers: { Accept: 'application/json', ...options.headers },
+        method: options.method,
+        connectTimeoutMs: getChanjetConnectTimeoutSeconds() * 1000,
+        timeoutMs,
+      });
+    } catch {
+      // Only read-only T+ queries opt in. OAuth/token rotation must never be retried here.
+      pooledRequestFailed = true;
+    }
+  }
+  if (!response) {
+    const remainingMs = timeoutMs - (performance.now() - startedAt);
+    if (remainingMs <= 0) {
+      throw new ChanjetHttpError('畅捷通网络请求超时', 504, null);
+    }
+    if (pooledRequestFailed) {
+      console.warn(`[ERP transport] pooled connection failed; using curl path=${options.path}`);
+    }
+    response = await chanjetCurlRequest(options, Math.max(0.001, remainingMs / 1000));
+  }
+  const { text, statusCode } = response;
   let payload: unknown = null;
 
   if (text) {
@@ -1278,8 +1317,18 @@ const route =
   };
 
 const callTplus = async (req: Request, res: Response, path: string): Promise<void> => {
+  const startedAt = performance.now();
   const body = readObjectBody(req);
   const tokenState = await getUsableOpenTokenState();
+  const tokenMs = performance.now() - startedAt;
+  const setTiming = (upstreamMs: number) => {
+    const totalMs = performance.now() - startedAt;
+    res.setHeader('Server-Timing',
+      `erp-token;dur=${tokenMs.toFixed(1)}, erp-query;dur=${upstreamMs.toFixed(1)}, erp-total;dur=${totalMs.toFixed(1)}`);
+    if (totalMs >= 1000) {
+      console.log(`[ERP timing] account=${getLocalErpAccountKey()} path=${path} tokenMs=${tokenMs.toFixed(1)} queryMs=${upstreamMs.toFixed(1)} totalMs=${totalMs.toFixed(1)}`);
+    }
+  };
   const { state } = tokenState;
   const openToken = tokenState.openToken;
   const cacheTtl = TPLUS_CACHE_TTL_BY_PATH.get(path) || 0;
@@ -1295,12 +1344,14 @@ const callTplus = async (req: Request, res: Response, path: string): Promise<voi
       : '';
   const now = Date.now();
 
-  if (cacheKey && !bypassCache) {
+  const refreshKey = cacheKey ? `${cacheKey}:bypass` : '';
+  if (cacheKey && !bypassCache && !pendingTplusRequests.has(refreshKey)) {
     const cached = tplusResponseCache.get(cacheKey);
     if (cached && cached.expiresAt > now) {
       tplusResponseCache.delete(cacheKey);
       tplusResponseCache.set(cacheKey, cached);
       res.setHeader('X-Cache', 'HIT');
+      setTiming(0);
       res.status(200).json({
         success: true,
         data: cached.data,
@@ -1312,7 +1363,10 @@ const callTplus = async (req: Request, res: Response, path: string): Promise<voi
     }
   }
 
-  const requestKey = cacheKey ? `${cacheKey}:${bypassCache ? 'bypass' : 'default'}` : '';
+  const requestKey = cacheKey
+    ? (bypassCache || pendingTplusRequests.has(refreshKey) ? refreshKey : `${cacheKey}:default`)
+    : '';
+  const upstreamStartedAt = performance.now();
   let pendingRequest = requestKey ? pendingTplusRequests.get(requestKey) : undefined;
   if (!pendingRequest) {
     pendingRequest = (async () => {
@@ -1321,6 +1375,7 @@ const callTplus = async (req: Request, res: Response, path: string): Promise<voi
         headers: getTplusHeaders(openToken),
         method: 'POST',
         path,
+        reuseConnection: true,
       });
 
       if (isRejectedTokenPayload(data) && state.refreshToken?.trim()) {
@@ -1331,6 +1386,7 @@ const callTplus = async (req: Request, res: Response, path: string): Promise<voi
           headers: getTplusHeaders(refreshedOpenToken),
           method: 'POST',
           path,
+          reuseConnection: true,
         });
       }
 
@@ -1338,30 +1394,30 @@ const callTplus = async (req: Request, res: Response, path: string): Promise<voi
     })();
     if (requestKey) {
       pendingTplusRequests.set(requestKey, pendingRequest);
+      latestTplusRequests.set(cacheKey, pendingRequest);
     }
   }
 
   let data: unknown;
   try {
     data = await pendingRequest;
+    // A slower, older read must not overwrite a refresh that started after it.
+    if (cacheKey && latestTplusRequests.get(cacheKey) === pendingRequest && isSuccessfulTplusPayload(data)) {
+      if (tplusResponseCache.size >= TPLUS_RESPONSE_CACHE_MAX) {
+        const oldestKey = tplusResponseCache.keys().next().value as string | undefined;
+        if (oldestKey) tplusResponseCache.delete(oldestKey);
+      }
+      tplusResponseCache.set(cacheKey, { data, expiresAt: Date.now() + cacheTtl });
+    }
+    if (cacheKey) res.setHeader('X-Cache', isSuccessfulTplusPayload(data) ? (bypassCache ? 'REFRESH' : 'MISS') : 'SKIP');
   } finally {
+    setTiming(performance.now() - upstreamStartedAt);
     if (requestKey && pendingTplusRequests.get(requestKey) === pendingRequest) {
       pendingTplusRequests.delete(requestKey);
     }
-  }
-
-  if (cacheKey && isSuccessfulTplusPayload(data)) {
-    if (tplusResponseCache.size >= TPLUS_RESPONSE_CACHE_MAX) {
-      const oldestKey = tplusResponseCache.keys().next().value as string | undefined;
-      if (oldestKey) {
-        tplusResponseCache.delete(oldestKey);
-      }
+    if (cacheKey && latestTplusRequests.get(cacheKey) === pendingRequest) {
+      latestTplusRequests.delete(cacheKey);
     }
-    tplusResponseCache.set(cacheKey, {
-      data,
-      expiresAt: Date.now() + cacheTtl,
-    });
-    res.setHeader('X-Cache', bypassCache ? 'REFRESH' : 'MISS');
   }
 
   res.status(200).json({

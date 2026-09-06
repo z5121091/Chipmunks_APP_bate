@@ -1,6 +1,7 @@
 import { APP_NAME } from '@/constants/version';
 
 export const sanitizeBackupFileName = (value: string): string => {
+  // eslint-disable-next-line no-control-regex -- Windows file names must reject C0 control characters.
   const sanitized = value.replace(/[\\/:*?"<>|\x00-\x1F]/g, '_').trim();
   return sanitized.replace(/^_+|_+$/g, '') || 'warehouse';
 };

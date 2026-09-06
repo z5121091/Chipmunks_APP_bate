@@ -3,7 +3,10 @@ jest.mock('@react-native-async-storage/async-storage', () =>
 );
 
 import type { ErpAccountConfig } from '../erpAccounts';
-import { mapPurchaseReceiveVoucher } from '../erpPurchaseReceive';
+import {
+  isPurchaseReceiveWarehouseAllowed,
+  mapPurchaseReceiveVoucher,
+} from '../erpPurchaseReceive';
 import { mapSaleDispatchVoucher } from '../erpSaleDispatch';
 
 const account: ErpAccountConfig = {
@@ -48,6 +51,20 @@ describe('ERP voucher payload mapping', () => {
       specification: '32F030C8T6',
       unitName: 'PCS',
     });
+  });
+
+  it('only allows the Shanghai account to show purchase receipts from 无锡总仓', () => {
+    const shanghaiAccount: ErpAccountConfig = {
+      ...account,
+      expectedWarehouseName: '无锡总仓',
+      key: 'shanghai-chipmunk',
+      name: '上海花栗鼠',
+      sequenceLength: 2,
+    };
+
+    expect(isPurchaseReceiveWarehouseAllowed(shanghaiAccount, ' 无锡总仓 ')).toBe(true);
+    expect(isPurchaseReceiveWarehouseAllowed(shanghaiAccount, '苏州材料库')).toBe(false);
+    expect(isPurchaseReceiveWarehouseAllowed(account, '苏州材料库')).toBe(true);
   });
 
   it('maps a purchase receipt voucher and numeric quantities with separators', () => {

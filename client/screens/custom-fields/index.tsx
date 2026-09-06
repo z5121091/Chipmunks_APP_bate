@@ -39,6 +39,7 @@ export default function CustomFieldsScreen() {
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
   const alert = useCustomAlert();
+  const showLoadError = alert.showError;
   const { showToast, ToastContainer } = useToast();
 
   const [fields, setFields] = useState<CustomField[]>([]);
@@ -56,9 +57,9 @@ export default function CustomFieldsScreen() {
       setFields(data);
     } catch (error) {
       logger.error('加载占位字段失败:', error);
-      alert.showError('占位字段加载失败，请重试');
+      showLoadError('占位字段加载失败，请重试');
     }
-  }, [alert.showError]);
+  }, [showLoadError]);
 
   useFocusEffect(
     useCallback(() => {

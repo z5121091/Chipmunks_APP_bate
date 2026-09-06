@@ -40,7 +40,7 @@ import {
 } from '@/utils/database';
 import { safeJsonParseNullable } from '@/utils/json';
 import { STORAGE_KEYS } from '@/constants/config';
-import { formatDate, formatTime } from '@/utils/time';
+import { formatDate } from '@/utils/time';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { Spacing, BorderRadius, Typography } from '@/constants/theme';
 import { parseQuantity } from '@/utils/quantity';
@@ -82,7 +82,6 @@ export default function OrdersScreen() {
   const router = useSafeRouter();
   const params = useSafeSearchParams<{ orderNo?: string; materialId?: number }>();
 
-  const [orders, setOrders] = useState<Order[]>([]);
   const [filteredOrders, setFilteredOrders] = useState<Order[]>([]);
   const [searchText, setSearchText] = useState('');
   const [searchType, setSearchType] = useState<SearchType>('order');
@@ -477,7 +476,6 @@ export default function OrdersScreen() {
         loadCurrentOrder(warehouseId),
       ]);
 
-      setOrders(allOrdersForWarehouse);
       setFilteredOrders(filtered);
 
       // 如果有展开的订单，刷新其物料列表
@@ -1016,8 +1014,7 @@ export default function OrdersScreen() {
     }
   };
 
-  const renderMaterialRow = useCallback(
-    (material: MaterialRecord) => (
+  const renderMaterialRow = (material: MaterialRecord) => (
       <View key={material.id} style={styles.materialItem}>
         <TouchableOpacity
           style={styles.materialMainInfo}
@@ -1042,19 +1039,9 @@ export default function OrdersScreen() {
           <Text style={[styles.unpackBtnText, { color: theme.textPrimary }]}>编辑</Text>
         </TouchableOpacity>
       </View>
-    ),
-    [
-      handleDeleteMaterial,
-      handleOpenEditMaterial,
-      handleViewMaterial,
-      styles,
-      theme.backgroundTertiary,
-      theme.textPrimary,
-    ]
   );
 
-  const renderOrderItem = useCallback(
-    ({ item: order }: { item: Order }) => (
+  const renderOrderItem = ({ item: order }: { item: Order }) => (
       <View>
         <AnimatedCard
           onPress={() => handleToggleOrder(order)}
@@ -1125,21 +1112,9 @@ export default function OrdersScreen() {
           </View>
         )}
       </View>
-    ),
-    [
-      expandedMaterials,
-      expandedMaterialsLoadingId,
-      expandedOrderId,
-      handleDeleteOrder,
-      handleEditCustomer,
-      handleToggleOrder,
-      renderMaterialRow,
-      styles,
-      theme.textSecondary,
-    ]
   );
 
-  const renderCurrentOrderCard = useCallback(() => {
+  const renderCurrentOrderCard = () => {
     if (!currentOrder) {
       return null;
     }
@@ -1190,12 +1165,9 @@ export default function OrdersScreen() {
         </AnimatedCard>
       </View>
     );
-  }, [currentOrder, handleDeleteOrder, handleEditCustomer, styles, theme.primary, theme.textSecondary]);
+  };
 
-  const renderCurrentMaterialItem = useCallback(
-    ({ item }: { item: MaterialRecord }) => renderMaterialRow(item),
-    [renderMaterialRow]
-  );
+  const renderCurrentMaterialItem = ({ item }: { item: MaterialRecord }) => renderMaterialRow(item);
 
   const renderCurrentEmpty = useCallback(() => {
     if (currentOrderLoading) {

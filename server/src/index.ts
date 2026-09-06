@@ -10,8 +10,6 @@ import { inflateSync, strFromU8 } from 'fflate';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { request as httpRequest, type IncomingMessage } from 'node:http';
-import { request as httpsRequest } from 'node:https';
 import { isIP } from 'node:net';
 import path from 'node:path';
 import {
@@ -23,6 +21,7 @@ import {
   SERVER_ERP_ACCOUNTS,
 } from './erpAccounts.ts';
 import { registerErpRoutes } from './erp.ts';
+import { ErpProxyConnectionError, fetchProxyUpstream } from './erpProxy.ts';
 import { HOME_PAGE_HTML, PRIVACY_POLICY_HTML } from './publicPages.ts';
 import { SERVER_RELEASE } from './release.ts';
 
@@ -529,153 +528,6 @@ class ProxyRequestError extends Error {
   }
 }
 
-type ProxyFetchResult = {
-  response: globalThis.Response;
-  usedAddressFallback: boolean;
-};
-
-const readNetworkErrorCode = (error: unknown): string => {
-  let current: unknown = error;
-  for (let depth = 0; depth < 4 && current; depth += 1) {
-    if (typeof current === 'object') {
-      const record = current as Record<string, unknown>;
-      if (typeof record.code === 'string' && record.code.trim()) {
-        return record.code.trim().toUpperCase();
-      }
-      if (typeof record.name === 'string' && record.name === 'TimeoutError') {
-        return 'TIMEOUT';
-      }
-      current = record.cause;
-      continue;
-    }
-    break;
-  }
-
-  return error instanceof Error && error.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK_ERROR';
-};
-
-class ErpProxyConnectionError extends Error {
-  constructor(targetHost: string, primaryError: unknown, fallbackError?: unknown) {
-    const primaryCode = readNetworkErrorCode(primaryError);
-    const fallbackSuffix = fallbackError
-      ? `，备用地址连接：${readNetworkErrorCode(fallbackError)}`
-      : '';
-    super(`无法连接ERP后端（${targetHost}；域名连接：${primaryCode}${fallbackSuffix}）`);
-    this.name = 'ErpProxyConnectionError';
-  }
-}
-
-const buildResponseFromIncomingMessage = async (
-  incoming: IncomingMessage
-): Promise<globalThis.Response> => {
-  const chunks: Buffer[] = [];
-  for await (const chunk of incoming) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-
-  const responseHeaders = new Headers();
-  for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
-    const name = incoming.rawHeaders[index];
-    const value = incoming.rawHeaders[index + 1];
-    if (name && value !== undefined) {
-      responseHeaders.append(name, value);
-    }
-  }
-
-  return new Response(Buffer.concat(chunks), {
-    headers: responseHeaders,
-    status: incoming.statusCode || 502,
-    statusText: incoming.statusMessage,
-  });
-};
-
-const fetchUsingConfiguredAddress = (
-  urlValue: string,
-  address: string,
-  method: string,
-  headers: Headers,
-  body: Buffer | undefined,
-  signal: AbortSignal
-): Promise<globalThis.Response> => {
-  return new Promise((resolve, reject) => {
-    const targetUrl = new URL(urlValue);
-    const outgoingHeaders = Object.fromEntries(headers.entries());
-    outgoingHeaders.host = targetUrl.host;
-    const commonOptions = {
-      headers: outgoingHeaders,
-      hostname: address,
-      method,
-      path: `${targetUrl.pathname}${targetUrl.search}`,
-      port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
-      signal,
-    };
-    const handleResponse = (incoming: IncomingMessage) => {
-      void buildResponseFromIncomingMessage(incoming).then(resolve, reject);
-    };
-    const request =
-      targetUrl.protocol === 'https:'
-        ? httpsRequest(
-            {
-              ...commonOptions,
-              servername: targetUrl.hostname,
-            },
-            handleResponse
-          )
-        : httpRequest(commonOptions, handleResponse);
-
-    request.once('error', reject);
-    if (body) {
-      request.write(body);
-    }
-    request.end();
-  });
-};
-
-const fetchProxyUpstream = async (
-  urlValue: string,
-  method: string,
-  headers: Headers,
-  body: Buffer | undefined,
-  fallbackAddress: string
-): Promise<ProxyFetchResult> => {
-  try {
-    return {
-      response: await fetch(urlValue, {
-        body,
-        headers,
-        method,
-        redirect: 'manual',
-        signal: AbortSignal.timeout(erpProxyTimeoutMs),
-      }),
-      usedAddressFallback: false,
-    };
-  } catch (primaryError) {
-    const targetHost = new URL(urlValue).hostname;
-    if (!fallbackAddress) {
-      throw new ErpProxyConnectionError(targetHost, primaryError);
-    }
-
-    console.warn(
-      `[Coze ERP proxy] domain connection failed for ${targetHost} (${readNetworkErrorCode(primaryError)}); retrying configured address`
-    );
-    try {
-      return {
-        response: await fetchUsingConfiguredAddress(
-          urlValue,
-          fallbackAddress,
-          method,
-          headers,
-          body,
-          AbortSignal.timeout(erpProxyTimeoutMs)
-        ),
-        usedAddressFallback: true,
-      };
-    } catch (fallbackError) {
-      throw new ErpProxyConnectionError(targetHost, primaryError, fallbackError);
-    }
-  }
-};
-
 const MAX_ERP_PROXY_BODY_BYTES = 5 * 1024 * 1024;
 
 const readProxyRequestBody = async (req: Request): Promise<Buffer | undefined> => {
@@ -702,112 +554,6 @@ const readProxyRequestBody = async (req: Request): Promise<Buffer | undefined> =
   return chunks.length > 0 ? Buffer.concat(chunks) : undefined;
 };
 
-// ERP 查询按接口设置短期缓存，缓存键包含账套、方法、路径和请求体。
-type ProxyCacheEntry = {
-  body: Buffer;
-  contentType: string;
-  expiresAt: number;
-  status: number;
-};
-const proxyCache = new Map<string, ProxyCacheEntry>();
-const PROXY_CACHE_MAX = 200;
-const PROXY_CACHE_TTL_BY_PATH = new Map<string, number>([
-  ['/tplus/api/v2/SaleDispatchOpenApi/GetVoucherDTO', 5 * 60 * 1000],
-  ['/api/erp/tplus/current-stock/query', 15 * 1000],
-  ['/tplus/api/v2/PurchaseReceiveOpenApi/FindVoucherList', 30 * 1000],
-  ['/tplus/api/v2/PurchaseReceiveOpenApi/GetVoucherDTO', 5 * 60 * 1000],
-]);
-
-const getCacheablePathKey = (downstreamPath: string): string => {
-  // 去掉查询参数，只看路径
-  const pathOnly = downstreamPath.split('?')[0];
-  return pathOnly;
-};
-
-const getProxyCacheTtl = (downstreamPath: string): number => {
-  const pathOnly = getCacheablePathKey(downstreamPath);
-  return PROXY_CACHE_TTL_BY_PATH.get(pathOnly) || 0;
-};
-
-const computeBodyHash = (body: Buffer | undefined): string => {
-  if (!body || body.length === 0) {
-    return 'empty';
-  }
-  // body 不大时直接用内容，性能更好
-  if (body.length < 256) {
-    return body.toString('base64');
-  }
-  return createHash('md5').update(body).digest('hex');
-};
-
-const getProxyCacheKey = (
-  accountKey: ErpAccountKey,
-  req: Request,
-  downstreamPath: string,
-  body: Buffer | undefined
-): string => {
-  const pathKey = getCacheablePathKey(downstreamPath);
-  if (req.method === 'GET') {
-    return `${accountKey}:GET:${pathKey}:${downstreamPath.split('?')[1] || ''}`;
-  }
-  return `${accountKey}:${req.method}:${pathKey}:${computeBodyHash(body)}`;
-};
-
-const isSuccessfulErpPayload = (value: unknown): boolean => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-
-  const record = value as Record<string, unknown>;
-  if (record.success === false) {
-    return false;
-  }
-
-  const code = record.code ?? record.Code;
-  if (code !== undefined && code !== null && code !== '') {
-    const normalizedCode = String(code).trim().toLowerCase();
-    if (normalizedCode !== '0' && normalizedCode !== '200' && normalizedCode !== 'success') {
-      return false;
-    }
-  }
-
-  if (record.data && typeof record.data === 'object' && !Array.isArray(record.data)) {
-    const nested = record.data as Record<string, unknown>;
-    if ('success' in nested || 'code' in nested || 'Code' in nested) {
-      return isSuccessfulErpPayload(nested);
-    }
-  }
-
-  return true;
-};
-
-const isCacheableErpResponse = (body: Buffer, contentType: string): boolean => {
-  if (!contentType.toLowerCase().includes('application/json')) {
-    return false;
-  }
-
-  try {
-    return isSuccessfulErpPayload(JSON.parse(body.toString('utf8')));
-  } catch {
-    return false;
-  }
-};
-
-// 清理过期缓存（每 60 秒扫一次）
-setInterval(() => {
-  const now = Date.now();
-  let expiredCount = 0;
-  for (const [key, value] of proxyCache) {
-    if (now >= value.expiresAt) {
-      proxyCache.delete(key);
-      expiredCount++;
-    }
-  }
-  if (expiredCount > 0) {
-    console.log(`[ERP proxy cache] cleaned ${expiredCount} expired entries`);
-  }
-}, 60_000).unref?.();
-
 const proxyCozeErpRequest = async (
   req: Request,
   res: Response,
@@ -816,33 +562,17 @@ const proxyCozeErpRequest = async (
   proxyTarget: string
 ): Promise<void> => {
   const requestStartedAt = Date.now();
+  const controller = new AbortController();
+  const abortUpstream = () => {
+    if (!res.writableFinished) controller.abort();
+  };
+  req.once('aborted', abortUpstream);
+  res.once('close', abortUpstream);
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(erpProxyTimeoutMs)]);
   try {
-    // 先读 body，用于缓存 key 和转发
     const body = await readProxyRequestBody(req);
-    const cacheTtl = getProxyCacheTtl(downstreamPath);
-    const cacheable = cacheTtl > 0;
-    const bypassCache = readHeader(req, 'x-erp-cache-mode').toLowerCase() === 'bypass';
-    const cacheKey = cacheable
-      ? getProxyCacheKey(accountKey, req, downstreamPath, body)
-      : '';
+    signal.throwIfAborted();
     res.setHeader('X-Erp-Account-Key', accountKey);
-
-    // 命中缓存直接返回
-    if (cacheable && cacheKey && !bypassCache) {
-      const cached = proxyCache.get(cacheKey);
-      if (cached && Date.now() < cached.expiresAt) {
-        proxyCache.delete(cacheKey);
-        proxyCache.set(cacheKey, cached);
-        res.setHeader('X-Cache', 'HIT');
-        res.setHeader('Server-Timing', 'erp-proxy-cache;dur=0');
-        if (cached.contentType) {
-          res.setHeader('content-type', cached.contentType);
-        }
-        res.status(cached.status).send(cached.body);
-        return;
-      }
-    }
-
     const headers = new Headers();
     Object.entries(req.headers).forEach(([name, value]) => {
       const normalizedName = name.toLowerCase();
@@ -879,7 +609,8 @@ const proxyCozeErpRequest = async (
       req.method,
       headers,
       body,
-      cozeErpProxyAddresses[accountKey]
+      cozeErpProxyAddresses[accountKey],
+      signal
     );
     const upstreamResponse = upstreamResult.response;
     res.setHeader(
@@ -888,7 +619,7 @@ const proxyCozeErpRequest = async (
     );
 
     // 复制响应头
-    ['cache-control', 'content-disposition', 'content-type', 'ratelimit-limit',
+    ['cache-control', 'content-disposition', 'content-type', 'x-cache', 'ratelimit-limit',
       'ratelimit-remaining', 'ratelimit-reset'].forEach((name) => {
       const value = upstreamResponse.headers.get(name);
       if (value) {
@@ -896,66 +627,46 @@ const proxyCozeErpRequest = async (
       }
     });
 
-    const contentType = upstreamResponse.headers.get('content-type') || '';
-    res.setHeader('Server-Timing', `erp-upstream;dur=${Date.now() - requestStartedAt}`);
+    const upstreamTiming = upstreamResponse.headers.get('server-timing');
+    res.setHeader('Server-Timing', [
+      upstreamTiming,
+      `erp-proxy;dur=${Date.now() - requestStartedAt}`,
+    ].filter(Boolean).join(', '));
 
-    // 可缓存且成功的请求，读取完整 body 并存入缓存
-    if (cacheable && cacheKey && upstreamResponse.ok) {
-      const responseBody = Buffer.from(await upstreamResponse.arrayBuffer());
-      const shouldCacheResponse = isCacheableErpResponse(responseBody, contentType);
-      if (shouldCacheResponse) {
-        // 达到上限时清理最久未使用的 20%。
-        if (proxyCache.size >= PROXY_CACHE_MAX) {
-          const deleteCount = Math.ceil(PROXY_CACHE_MAX * 0.2);
-          let count = 0;
-          for (const key of proxyCache.keys()) {
-            if (count >= deleteCount) break;
-            proxyCache.delete(key);
-            count++;
+    // Cache ownership stays with the ERP service; proxies never restart its TTL.
+    res.status(upstreamResponse.status);
+    if (upstreamResponse.body) {
+      const reader = upstreamResponse.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          signal.throwIfAborted();
+          if (!res.write(Buffer.from(value))) {
+            await new Promise<void>((resolve, reject) => {
+              const cleanup = () => {
+                res.off('drain', onDrain);
+                signal.removeEventListener('abort', onAbort);
+              };
+              const onDrain = () => { cleanup(); resolve(); };
+              const onAbort = () => { cleanup(); reject(signal.reason); };
+              res.once('drain', onDrain);
+              signal.addEventListener('abort', onAbort, { once: true });
+              if (signal.aborted) onAbort();
+            });
           }
         }
-        proxyCache.set(cacheKey, {
-          body: responseBody,
-          contentType,
-          expiresAt: Date.now() + cacheTtl,
-          status: upstreamResponse.status,
-        });
-      }
-      res.setHeader('X-Cache', shouldCacheResponse ? (bypassCache ? 'REFRESH' : 'MISS') : 'SKIP');
-      res.status(upstreamResponse.status).send(responseBody);
-    } else {
-      // 不可缓存或失败请求，流式转发（减少首字节时间和内存占用）
-      res.status(upstreamResponse.status);
-      if (upstreamResponse.body) {
-        const reader = upstreamResponse.body.getReader();
-        const pump = async (): Promise<void> => {
-          try {
-            const { done, value } = await reader.read();
-            if (done) {
-              res.end();
-              return;
-            }
-            res.write(Buffer.from(value));
-            await pump();
-          } catch (error) {
-            console.error('[Coze ERP proxy] stream error:', error);
-            if (!res.headersSent) {
-              res.status(502).json({ success: false, message: 'ERP代理响应中断，请稍后重试' });
-            } else {
-              res.end();
-            }
-          }
-        };
-        void pump();
-      } else {
-        res.end();
+      } finally {
+        await reader.cancel().catch(() => undefined);
       }
     }
+    res.end();
   } catch (error) {
     console.error(
       '[Coze ERP proxy] request failed:',
       error instanceof Error ? error.message : error
     );
+    if (res.destroyed) return;
     if (!res.headersSent) {
       const statusCode = error instanceof ProxyRequestError ? error.statusCode : 502;
       res.status(statusCode).json({
@@ -968,6 +679,9 @@ const proxyCozeErpRequest = async (
     } else {
       res.end();
     }
+  } finally {
+    req.off('aborted', abortUpstream);
+    res.off('close', abortUpstream);
   }
 };
 

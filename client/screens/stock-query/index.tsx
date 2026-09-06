@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -27,7 +27,7 @@ import {
 } from '@/utils/erpCurrentStock';
 import { detectRule, getInventoryCodeByModel, initDatabase, parseWithRule } from '@/utils/database';
 import { isQRCode } from '@/utils/qrcodeParser';
-import { sanitizeStructuredScannerInput } from '@/utils/scannerInput';
+import { cancelScanSubmit, scheduleScanSubmit, sanitizeStructuredScannerInput } from '@/utils/scannerInput';
 import { logger } from '@/utils/logger';
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 import { createStyles } from './styles';
@@ -114,17 +114,8 @@ export default function StockQueryScreen() {
   useFocusEffect(
     useCallback(() => {
       focusScannerInput(120);
+      return () => cancelScanSubmit(autoSubmitTimerRef);
     }, [focusScannerInput])
-  );
-
-  useEffect(
-    () => () => {
-      if (autoSubmitTimerRef.current) {
-        clearTimeout(autoSubmitTimerRef.current);
-        autoSubmitTimerRef.current = null;
-      }
-    },
-    []
   );
 
   const workflowSummaryItems = useMemo(
@@ -158,10 +149,7 @@ export default function StockQueryScreen() {
 
   const handleQuery = useCallback(
     async (nextInput?: string) => {
-      if (autoSubmitTimerRef.current) {
-        clearTimeout(autoSubmitTimerRef.current);
-        autoSubmitTimerRef.current = null;
-      }
+      cancelScanSubmit(autoSubmitTimerRef);
 
       const rawContent = sanitizeStructuredScannerInput(nextInput ?? inputValue);
       if (!rawContent || queryingRef.current) {
@@ -226,10 +214,7 @@ export default function StockQueryScreen() {
 
   const handleInputChange = useCallback(
     (text: string) => {
-      if (autoSubmitTimerRef.current) {
-        clearTimeout(autoSubmitTimerRef.current);
-        autoSubmitTimerRef.current = null;
-      }
+      cancelScanSubmit(autoSubmitTimerRef);
 
       setInputValue(text);
 
@@ -242,8 +227,7 @@ export default function StockQueryScreen() {
         return;
       }
 
-      autoSubmitTimerRef.current = setTimeout(() => {
-        autoSubmitTimerRef.current = null;
+      scheduleScanSubmit(autoSubmitTimerRef, () => {
         void handleQuery(nextContent);
       }, STOCK_QUERY_AUTO_SUBMIT_DEBOUNCE_MS);
     },
@@ -261,10 +245,7 @@ export default function StockQueryScreen() {
           activeOpacity={0.78}
           disabled={querying}
           onPress={() => {
-            if (autoSubmitTimerRef.current) {
-              clearTimeout(autoSubmitTimerRef.current);
-              autoSubmitTimerRef.current = null;
-            }
+            cancelScanSubmit(autoSubmitTimerRef);
 
             setSelectedAccount(account);
             setInputValue('');

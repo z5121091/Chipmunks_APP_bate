@@ -15,7 +15,7 @@ export const parseQuantity = (
     normalized = Number.isFinite(value) ? value : null;
   } else if (typeof value === 'string') {
     const trimmed = value.trim();
-    const match = trimmed.match(/^(\d+)(?:\s*(?:pcs?|个|件|片|只|箱))?$/iu);
+    const match = trimmed.match(/^(\d+)(?:\s*(?:pcs?|[个件片只箱]))?$/iu);
     if (!match) {
       return null;
     }

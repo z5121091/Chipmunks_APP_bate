@@ -10,7 +10,6 @@ import {
   TextInputProps,
   TouchableOpacity,
   View,
-  ViewProps,
   ViewStyle,
 } from 'react-native';
 import { Feather } from '@expo/vector-icons';
@@ -86,14 +85,6 @@ interface UiInputProps extends TextInputProps {
   rightElement?: React.ReactNode;
   active?: boolean;
   containerStyle?: StyleProp<ViewStyle>;
-}
-
-interface UiScanBoxProps extends TextInputProps {
-  inputRef?: React.Ref<TextInput>;
-  active?: boolean;
-  processing?: boolean;
-  statusLabel?: string;
-  containerProps?: ViewProps;
 }
 
 interface UiWorkflowSummaryItem {
@@ -412,43 +403,6 @@ export function UiInput({
   );
 }
 
-export function UiScanBox({
-  inputRef,
-  active,
-  processing,
-  statusLabel,
-  containerProps,
-  style,
-  placeholderTextColor,
-  editable,
-  ...props
-}: UiScanBoxProps) {
-  const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
-  const accessibilityLabel =
-    statusLabel || (typeof props.placeholder === 'string' ? props.placeholder : undefined);
-
-  return (
-    <View
-      {...containerProps}
-      style={[styles.scanBox, containerProps?.style]}
-      accessibilityLabel={accessibilityLabel}
-    >
-      <TextInput
-        ref={inputRef}
-        style={[styles.scanInput, active && styles.scanInputActive, style]}
-        placeholderTextColor={placeholderTextColor || theme.textMuted}
-        editable={editable ?? !processing}
-        autoCapitalize="none"
-        autoCorrect={false}
-        returnKeyType="done"
-        blurOnSubmit={false}
-        {...props}
-      />
-    </View>
-  );
-}
-
 export function UiWorkflowSummary({ items, style }: UiWorkflowSummaryProps) {
   const { theme } = useTheme();
   const styles = useMemo(() => createStyles(theme), [theme]);
@@ -629,29 +583,6 @@ const createStyles = (theme: Theme) =>
       paddingVertical: 0,
       ...UI_REDESIGN_TOKENS.typography.input,
       color: theme.textPrimary,
-    },
-    scanBox: {
-      marginHorizontal: UI_REDESIGN_TOKENS.spacing.pageX,
-      marginBottom: 0,
-      backgroundColor: 'transparent',
-    },
-    scanInput: {
-      minHeight: UI_REDESIGN_TOKENS.size.scanBoxHeight,
-      width: '100%',
-      paddingHorizontal: Spacing.lg,
-      paddingVertical: 0,
-      borderRadius: UI_REDESIGN_TOKENS.radius.card,
-      backgroundColor: theme.backgroundDefault,
-      borderWidth: UI_REDESIGN_TOKENS.border.width,
-      borderColor: theme.primary,
-      ...UI_REDESIGN_TOKENS.typography.input,
-      fontWeight: '600',
-      color: theme.textPrimary,
-      textAlign: 'center',
-      includeFontPadding: false,
-    },
-    scanInputActive: {
-      backgroundColor: getUiRedesignIconBackground(theme, theme.primary),
     },
     workflowSummary: {
       marginHorizontal: UI_REDESIGN_TOKENS.spacing.pageX,
