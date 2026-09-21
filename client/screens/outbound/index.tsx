@@ -5,6 +5,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { safeJsonParseNullable } from '@/utils/json';
 import { logger } from '@/utils/logger';
 import { parseQuantity } from '@/utils/quantity';
+import { isQRCode } from '@/utils/qrcodeParser';
 import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
 import { AppEmptyState } from '@/components/AppEmptyState';
@@ -14,7 +15,7 @@ import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
 import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { UiPageHeader, UiWorkflowSummary } from '@/components/UiRedesign';
-import { WarehouseScanInput } from '@/components/WarehouseScanInput';
+import { WarehouseScanInput, type WarehouseScanInputHandle } from '@/components/WarehouseScanInput';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { createStyles } from './styles';
 import {
@@ -23,7 +24,9 @@ import {
   addMaterialWithOrder,
   getOrder,
   detectRule,
+  getActiveRules,
   parseWithRule,
+  QRCodeRuleConflictError,
   checkMaterialExists,
   getMaterialsByOrder,
   getInventoryCodeByModel,
@@ -50,6 +53,9 @@ import {
   feedbackNotBound,
   feedbackNotInOrder,
   feedbackOverQuantity,
+  feedbackOutboundOrderComplete,
+  feedbackUnpackRequired,
+  feedbackUnpackComplete,
   initSoundSetting,
   useFeedbackCleanup,
 } from '@/utils/feedback';
@@ -59,7 +65,6 @@ import {
   cancelScanSubmit,
   scheduleScanSubmit,
   sanitizeStructuredScannerInput,
-  shouldIgnoreRecentDuplicateScan,
 } from '@/utils/scannerInput';
 import {
   DEFAULT_OUTBOUND_ORDER_RULE,
@@ -83,6 +88,14 @@ import {
   syncUnpackRecordsToComputer,
 } from '@/utils/unpackWorkflow';
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
+import { buildRuleConflictDiagnostic, formatRuleConflictDiagnostic } from '@/utils/ruleConflictDiagnosis';
+import {
+  buildOutboundProgress,
+  isOutboundOrderComplete,
+  isOutboundVerificationFresh,
+  normalizeOutboundInventoryCode as normalizeInventoryCode,
+  type OutboundLineProgress,
+} from '@/utils/outboundProgress';
 
 const LEGACY_OUTBOUND_SCAN_RECORDS_KEY = 'outbound_scan_records';
 const OUTBOUND_ERP_VOUCHER_CACHE_KEY = '@outbound_erp_voucher_cache';
@@ -120,19 +133,7 @@ interface AggregatedGroup {
   items: MaterialItem[]; // 所有items，用于聚合总数量和显示
 }
 
-interface ErpLineProgress {
-  inventoryCode: string;
-  inventoryName: string;
-  key: string;
-  remainingQuantity: number;
-  requiredQuantity: number;
-  scannedItems: MaterialItem[];
-  scannedQuantity: number;
-  sourceLineCount: number;
-  specification: string;
-  status: 'complete' | 'partial' | 'pending' | 'over';
-  unitName: string;
-}
+type ErpLineProgress = OutboundLineProgress<MaterialItem>;
 
 interface PendingOutboundUnpack {
   lineSpecification: string;
@@ -470,11 +471,8 @@ const mapQueueItemToMaterialRecord = (
 const buildMaterialGroupKey = (item: MaterialItem) =>
   JSON.stringify([item.model || '', item.version || '']);
 
-const normalizeInventoryCode = (value?: string | null) =>
-  (value || '').trim().toUpperCase();
-
-const buildErpLineProgressKey = (inventoryCode: string) =>
-  `erp:${normalizeInventoryCode(inventoryCode) || 'unknown'}`;
+const buildOrderMaterialsKey = (no: string, warehouseId?: string) =>
+  JSON.stringify([normalizeOrderNoCandidate(no), warehouseId || '']);
 
 const isOutboundVisibleMaterial = (material: MaterialRecord) =>
   material.operation_type !== 'inventory';
@@ -508,6 +506,13 @@ export default function PDAScanScreen() {
   const styles = useMemo(() => createStyles(theme), [theme]);
   const router = useSafeRouter();
   const alert = useCustomAlert();
+  // 弹窗与路由 Hook 返回对象会随渲染更新；扫码回调通过 Ref 获取最新实例，避免高频扫码链路反复重建。
+  const alertRef = useRef(alert);
+  const routerRef = useRef(router);
+  useEffect(() => {
+    alertRef.current = alert;
+    routerRef.current = router;
+  }, [alert, router]);
 
   // 初始化声音设置
   useEffect(() => {
@@ -515,7 +520,7 @@ export default function PDAScanScreen() {
   }, []);
 
   // 输入
-  const inputRef = useRef<TextInput>(null);
+  const inputRef = useRef<WarehouseScanInputHandle>(null);
   const [inputValue, setInputValue] = useState('');
   const [isErpOrderLoading, setIsErpOrderLoading] = useState(false);
   const [pendingOutboundUnpack, setPendingOutboundUnpack] =
@@ -523,21 +528,23 @@ export default function PDAScanScreen() {
   const pendingOutboundUnpackRef = useRef<PendingOutboundUnpack | null>(null);
   const [outboundUnpackNotes, setOutboundUnpackNotes] = useState('');
   const [outboundUnpacking, setOutboundUnpacking] = useState(false);
+  const outboundUnpackingRef = useRef(false);
   const processingRef = useRef(false);
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const postProcessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const screenActiveRef = useRef(true);
   const liveInputValueRef = useRef('');
   const pendingScanCodesRef = useRef<string[]>([]);
   const processScanRef = useRef<(code: string) => void>(() => undefined);
-  const lastScanRef = useRef('');
-  const lastScanTimeRef = useRef(0);
   const scannerFocusBlockedRef = useRef(false);
   const orderNoRef = useRef(''); // 🔥 添加 orderNoRef，用于批量写入时判断是否需要刷新
   const customerNameRef = useRef('');
   const currentWarehouseRef = useRef<Warehouse | null>(null);
   const savedOutboundDraftRef = useRef<string | null>(null);
+  const orderMaterialsKeyRef = useRef<string | null>(null);
+  const [orderMaterialsReady, setOrderMaterialsReady] = useState(false);
+  const activeRulesRef = useRef<Awaited<ReturnType<typeof getActiveRules>> | null>(null);
+  const inventoryBindingsRef = useRef(new Map<string, string>());
   const loadOutboundStateRef = useRef<
     (warehouseList: Warehouse[], explicitWarehouse: Warehouse | null) => Promise<void>
   >(async () => undefined);
@@ -567,6 +574,8 @@ export default function PDAScanScreen() {
   const [customerName, setCustomerName] = useState('');
 
   const setActiveOrderNo = useCallback((nextOrderNo: string) => {
+    orderMaterialsKeyRef.current = null;
+    setOrderMaterialsReady(false);
     orderNoRef.current = nextOrderNo;
     setOrderNo(nextOrderNo);
   }, []);
@@ -577,12 +586,19 @@ export default function PDAScanScreen() {
   }, []);
 
   const setActiveWarehouse = useCallback((nextWarehouse: Warehouse | null) => {
+    if (nextWarehouse?.id !== currentWarehouseRef.current?.id) {
+      orderMaterialsKeyRef.current = null;
+      setOrderMaterialsReady(false);
+    }
     currentWarehouseRef.current = nextWarehouse;
     setCurrentWarehouse(nextWarehouse);
   }, []);
 
   const erpVoucherRef = useRef<SaleDispatchVoucher | null>(null);
   const verifiedErpVoucherRef = useRef<SaleDispatchVoucher | null>(null);
+  const [verifiedErpVoucher, setVerifiedErpVoucher] = useState<SaleDispatchVoucher | null>(null);
+  const erpVerifiedAtRef = useRef(0);
+  const erpVerificationErrorRef = useRef('');
   const erpVoucherRefreshRef = useRef<{
     key: string;
     promise: Promise<RefreshedErpVoucherState | null>;
@@ -593,6 +609,8 @@ export default function PDAScanScreen() {
   const setActiveErpVoucher = useCallback((nextVoucher: SaleDispatchVoucher | null) => {
     if (verifiedErpVoucherRef.current !== nextVoucher) {
       verifiedErpVoucherRef.current = null;
+      erpVerifiedAtRef.current = 0;
+      setVerifiedErpVoucher(null);
     }
     erpVoucherRef.current = nextVoucher;
     setErpVoucher(nextVoucher);
@@ -603,14 +621,20 @@ export default function PDAScanScreen() {
 
   const markErpVoucherVerified = useCallback((voucher: SaleDispatchVoucher) => {
     verifiedErpVoucherRef.current = voucher;
+    setVerifiedErpVoucher(voucher);
+    erpVerifiedAtRef.current = Date.now();
+    erpVerificationErrorRef.current = '';
   }, []);
 
   const markErpVoucherUnverified = useCallback(() => {
     verifiedErpVoucherRef.current = null;
+    setVerifiedErpVoucher(null);
+    erpVerifiedAtRef.current = 0;
   }, []);
 
   const isErpVoucherVerified = useCallback(
-    (voucher: SaleDispatchVoucher) => verifiedErpVoucherRef.current === voucher,
+    (voucher: SaleDispatchVoucher) => verifiedErpVoucherRef.current === voucher &&
+      isOutboundVerificationFresh(erpVerifiedAtRef.current),
     []
   );
 
@@ -642,6 +666,8 @@ export default function PDAScanScreen() {
   const currentScanStep = !orderNo ? 'order' : 'material';
   const currentScanPlaceholder = isErpOrderLoading
     ? '正在查询ERP单据...'
+    : orderNo && !orderMaterialsReady
+      ? '本单记录未加载，请重新扫描订单或点击刷新'
     : erpVoucherRecoveryRequired
       ? 'ERP单据未验证，请重新扫描订单或点击刷新'
     : currentScanStep === 'order'
@@ -649,6 +675,8 @@ export default function PDAScanScreen() {
       : '继续扫描物料二维码';
   const currentScanStatusLabel = isErpOrderLoading
     ? '正在读取ERP单据'
+    : orderNo && !orderMaterialsReady
+      ? '本单记录需要恢复'
     : erpVoucherRecoveryRequired
       ? 'ERP单据需要验证'
     : currentScanStep === 'order'
@@ -656,8 +684,8 @@ export default function PDAScanScreen() {
       : '物料扫码录入';
 
   useEffect(() => {
-    scannerFocusBlockedRef.current = showWarehousePicker || !!pendingOutboundUnpack;
-  }, [pendingOutboundUnpack, showWarehousePicker]);
+    scannerFocusBlockedRef.current = showWarehousePicker || !!pendingOutboundUnpack || alert.visible;
+  }, [alert.visible, pendingOutboundUnpack, showWarehousePicker]);
 
   const showAlertIfActive = useCallback(
     (title: string, message: string) => {
@@ -670,26 +698,8 @@ export default function PDAScanScreen() {
     [alert]
   );
 
-  const shouldAcceptScanCode = useCallback((code: string) => {
-    if (shouldIgnoreRecentDuplicateScan(code, lastScanRef, lastScanTimeRef)) {
-      logger.warn('[扫码出库] 忽略短时间重复扫码:', code);
-      return false;
-    }
-
-    return true;
-  }, []);
-
-  const focusScannerInput = useCallback((delay = 80) => {
-    if (focusTimerRef.current) {
-      clearTimeout(focusTimerRef.current);
-    }
-
-    focusTimerRef.current = setTimeout(() => {
-      focusTimerRef.current = null;
-      if (screenActiveRef.current && !scannerFocusBlockedRef.current) {
-        inputRef.current?.focus();
-      }
-    }, delay);
+  const focusScannerInput = useCallback((delay = 0) => {
+    if (screenActiveRef.current && !scannerFocusBlockedRef.current) inputRef.current?.focus(delay);
   }, []);
 
   const resumePendingScanCodes = useCallback(
@@ -711,16 +721,13 @@ export default function PDAScanScreen() {
         }
 
         focusScannerInput(0);
-      }, delay);
+      }, pendingScanCodesRef.current.length > 0 ? 0 : delay);
     },
     [focusScannerInput]
   );
 
   useEffect(
     () => () => {
-      if (focusTimerRef.current) {
-        clearTimeout(focusTimerRef.current);
-      }
       if (autoSubmitTimerRef.current) {
         clearTimeout(autoSubmitTimerRef.current);
       }
@@ -750,17 +757,18 @@ export default function PDAScanScreen() {
         warehouse,
         nextErpVoucher
       );
-      const serializedDraft = JSON.stringify(draft);
-      if (savedOutboundDraftRef.current === serializedDraft) {
+      const draftSignature = JSON.stringify({ ...draft, updatedAt: '' });
+      if (savedOutboundDraftRef.current === draftSignature) {
         return;
       }
+      const serializedDraft = JSON.stringify(draft);
 
       try {
         await Promise.all([
           AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT, serializedDraft),
           AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_ORDER_NO, draft.orderNo),
         ]);
-        savedOutboundDraftRef.current = serializedDraft;
+        savedOutboundDraftRef.current = draftSignature;
       } catch (error) {
         logger.warn('[扫码出库] 保存出库草稿到 AsyncStorage 失败，继续当前扫码流程:', error);
       }
@@ -801,6 +809,13 @@ export default function PDAScanScreen() {
   useFocusEffect(
     useCallback(() => {
       screenActiveRef.current = true;
+      processingRef.current = true;
+      setIsErpOrderLoading(true);
+      orderMaterialsKeyRef.current = null;
+      setOrderMaterialsReady(false);
+      activeRulesRef.current = null;
+      inventoryBindingsRef.current.clear();
+      markErpVoucherUnverified();
       let isActive = true;
 
       const init = async () => {
@@ -1006,6 +1021,11 @@ export default function PDAScanScreen() {
             focusScannerInput(300);
           }
           return undefined;
+        } finally {
+          if (isActive) {
+            setIsErpOrderLoading(false);
+            resumePendingScanCodes(0);
+          }
         }
       };
 
@@ -1015,11 +1035,8 @@ export default function PDAScanScreen() {
         isActive = false;
         screenActiveRef.current = false;
         processingRef.current = false;
+        pendingScanCodesRef.current = [];
         cancelScanSubmit(autoSubmitTimerRef);
-        if (focusTimerRef.current) {
-          clearTimeout(focusTimerRef.current);
-          focusTimerRef.current = null;
-        }
         if (postProcessTimerRef.current) {
           clearTimeout(postProcessTimerRef.current);
           postProcessTimerRef.current = null;
@@ -1031,7 +1048,7 @@ export default function PDAScanScreen() {
           })
           .catch(logger.error);
       };
-    }, [focusScannerInput, setActiveWarehouse, showToast])
+    }, [focusScannerInput, markErpVoucherUnverified, resumePendingScanCodes, setActiveWarehouse, showToast])
   );
 
   // 加载扫码出库持久化状态（订单号、仓库、扫码记录）
@@ -1357,13 +1374,16 @@ export default function PDAScanScreen() {
         }
         if (clearOnFailure) {
           setActiveErpVoucher(null);
-          setErpVoucherRecoveryRequired(true);
         }
+        markErpVoucherUnverified();
+        erpVerificationErrorRef.current = formatUserFacingErrorMessage(error, 'ERP核验失败，请稍后重试');
+        setErpVoucherRecoveryRequired(true);
         return null;
       }
     },
     [
       markErpVoucherVerified,
+      markErpVoucherUnverified,
       resolveWarehouseForErpVoucher,
       setActiveErpVoucher,
       setActiveWarehouse,
@@ -1387,6 +1407,7 @@ export default function PDAScanScreen() {
         return inFlightRefresh.promise;
       }
 
+      markErpVoucherUnverified();
       const refreshPromise = refreshErpVoucherForOrder(nextOrderNo, warehouseList, {
         bypassProxyCache: true,
         clearOnFailure: options.clearOnFailure,
@@ -1403,36 +1424,36 @@ export default function PDAScanScreen() {
       };
       return refreshPromise;
     },
-    [refreshErpVoucherForOrder]
+    [markErpVoucherUnverified, refreshErpVoucherForOrder]
   );
 
   const handleRefreshErpVoucher = useCallback(async () => {
     const activeVoucher = erpVoucherRef.current;
-    const activeVoucherIsVerified =
-      activeVoucher !== null && isErpVoucherVerified(activeVoucher);
     const activeOrderNo = orderNoRef.current;
     const account = activeOrderNo ? getErpAccountByOutboundOrderNo(activeOrderNo) : null;
-    if (!activeOrderNo || isErpOrderLoading || (!activeVoucher && !account)) {
+    if (!activeOrderNo || processingRef.current || pendingOutboundUnpackRef.current ||
+        isErpOrderLoading || (!activeVoucher && !account)) {
       focusScannerInput(0);
       return;
     }
 
+    processingRef.current = true;
     setIsErpOrderLoading(true);
     try {
       const refreshed = await forceRefreshErpVoucherForOrder(activeOrderNo, warehouses, {
-        clearOnFailure: !activeVoucherIsVerified,
+        clearOnFailure: false,
       });
       if (!refreshed) {
         showToast(
-          activeVoucherIsVerified
-            ? 'ERP刷新失败，继续使用当前已验证单据'
-            : 'ERP验证失败，请稍后重试',
+          `${erpVerificationErrorRef.current || 'ERP验证失败'}，已暂停扫码`,
           'warning'
         );
         return;
       }
 
       const nextCustomerName = refreshed.voucher.customerName.trim();
+      await loadOrderMaterialsRef.current(activeOrderNo, refreshed.warehouse.id);
+      await upsertOrder(activeOrderNo, nextCustomerName, refreshed.warehouse);
       setActiveCustomerName(nextCustomerName);
       await saveOutboundWorkDraft(
         activeOrderNo,
@@ -1441,15 +1462,20 @@ export default function PDAScanScreen() {
         refreshed.voucher
       );
       showToast('ERP销售出库单已刷新', 'success');
+    } catch (error) {
+      markErpVoucherUnverified();
+      setErpVoucherRecoveryRequired(true);
+      showToast(formatUserFacingErrorMessage(error, '本单记录恢复失败，请重试'), 'error');
     } finally {
       setIsErpOrderLoading(false);
-      focusScannerInput(100);
+      resumePendingScanCodes(100);
     }
   }, [
     focusScannerInput,
     forceRefreshErpVoucherForOrder,
-    isErpVoucherVerified,
     isErpOrderLoading,
+    markErpVoucherUnverified,
+    resumePendingScanCodes,
     saveOutboundWorkDraft,
     setActiveCustomerName,
     showToast,
@@ -1460,19 +1486,23 @@ export default function PDAScanScreen() {
   const loadOrderMaterials = useCallback(
     async (no: string, explicitWarehouseId?: string): Promise<MaterialItem[]> => {
       // 优先使用显式传入的 warehouseId，避免恢复流程读取旧闭包。
-      const warehouseId = explicitWarehouseId || currentWarehouse?.id;
+      let warehouseId = explicitWarehouseId || currentWarehouseRef.current?.id;
       const requestedOrderNo = normalizeOrderNoCandidate(no);
+      if (normalizeOrderNoCandidate(orderNoRef.current) === requestedOrderNo) {
+        orderMaterialsKeyRef.current = null;
+        setOrderMaterialsReady(false);
+      }
 
     // 确保仓库ID有效
     if (!warehouseId || typeof warehouseId !== 'string' || warehouseId.trim() === '') {
       logger.warn('[loadOrderMaterials] 仓库ID无效，无法加载订单物料');
-      return [];
+      throw new Error('仓库信息无效，无法恢复已扫记录');
     }
 
     // 确保订单号有效
     if (!no || typeof no !== 'string' || no.trim() === '') {
       logger.warn('[loadOrderMaterials] 订单号无效，无法加载订单物料');
-      return [];
+      throw new Error('订单号无效，无法恢复已扫记录');
     }
 
     let list = (await getMaterialsByOrder(no.trim(), warehouseId.trim())).filter(
@@ -1530,6 +1560,7 @@ export default function PDAScanScreen() {
           list = fallbackList.filter(
             (item) => item.warehouse_id?.trim() === fallbackWarehouseId
           );
+          warehouseId = fallbackWarehouseId;
         }
       }
     }
@@ -1572,10 +1603,13 @@ export default function PDAScanScreen() {
 
     scanRecordsRef.current = materials;
     setScanRecords(materials);
+    if (currentWarehouseRef.current?.id === warehouseId) {
+      orderMaterialsKeyRef.current = buildOrderMaterialsKey(no, warehouseId);
+      setOrderMaterialsReady(true);
+    }
     return materials;
     },
     [
-      currentWarehouse?.id,
       saveOutboundWorkDraft,
       setActiveWarehouse,
       showAlertIfActive,
@@ -1601,54 +1635,75 @@ export default function PDAScanScreen() {
       logger.log('[processScan] 当前客户名称:', activeCustomerName);
       logger.log('[processScan] 当前仓库:', activeWarehouse ? activeWarehouse.name : 'null');
 
-      if (!code || processingRef.current) return;
-
-      const normalizedOrderCode = normalizeOrderNoCandidate(code);
-      const matchedErpAccount = getErpAccountByOutboundOrderNo(normalizedOrderCode);
-      const activeErpAccount = activeOrderNo
-        ? getErpAccountByOutboundOrderNo(activeOrderNo)
-        : null;
-      const hasWarehouseSampleRules = Object.keys(outboundWarehouseOrderRules).length > 0;
-      const matchedWarehouseRules = getMatchingOutboundWarehouseOrderRules(
-        normalizedOrderCode,
-        outboundWarehouseOrderRules
-      );
-      const availableWarehouseIds = new Set(warehouses.map((warehouse) => String(warehouse.id)));
-      const matchedAvailableWarehouseRules = matchedWarehouseRules.filter((rule) =>
-        availableWarehouseIds.has(rule.warehouseId)
-      );
-      const legacyParsedOrderNo = hasWarehouseSampleRules
-        ? null
-        : parseOutboundOrderNo(normalizedOrderCode, outboundOrderRule);
-      const isOrderNoScan =
-        matchedErpAccount !== null ||
-        matchedAvailableWarehouseRules.length > 0 ||
-        legacyParsedOrderNo !== null;
-      if (erpVoucherRecoveryRequired && activeOrderNo && !isOrderNoScan) {
-        showToast('ERP单据未验证，请重新扫描订单或点击刷新', 'error');
-        feedbackError();
-        return;
-      }
-      if (activeErpAccount && !activeErpVoucher && !isOrderNoScan) {
-        showToast('ERP单据尚未验证，请重新扫描订单或点击刷新', 'error');
-        feedbackError();
-        return;
-      }
-      // 如果当前没有订单号，扫描内容必须是订单号格式
-      if (!activeOrderNo && !isOrderNoScan) {
-        showToast(
-          hasWarehouseSampleRules
-            ? '请先扫描已配置仓库样例结构的出库单号'
-            : `请先扫描订单号\n格式: ${getOutboundOrderRuleHint(outboundOrderRule)}`,
-          'error'
-        );
-        feedbackError();
-        return;
-      }
+      if (!code || processingRef.current || pendingOutboundUnpackRef.current) return;
 
       processingRef.current = true;
-
       try {
+        const normalizedOrderCode = normalizeOrderNoCandidate(code);
+        const matchedErpAccount = getErpAccountByOutboundOrderNo(normalizedOrderCode);
+        const activeErpAccount = activeOrderNo
+          ? getErpAccountByOutboundOrderNo(activeOrderNo)
+          : null;
+        const hasWarehouseSampleRules = Object.keys(outboundWarehouseOrderRules).length > 0;
+        const matchedWarehouseRules = getMatchingOutboundWarehouseOrderRules(
+          normalizedOrderCode,
+          outboundWarehouseOrderRules
+        );
+        const availableWarehouseIds = new Set(warehouses.map((warehouse) => String(warehouse.id)));
+        const matchedAvailableWarehouseRules = matchedWarehouseRules.filter((rule) =>
+          availableWarehouseIds.has(rule.warehouseId)
+        );
+        const legacyParsedOrderNo = hasWarehouseSampleRules
+          ? null
+          : parseOutboundOrderNo(normalizedOrderCode, outboundOrderRule);
+        const isOrderNoScan =
+          matchedErpAccount !== null ||
+          matchedAvailableWarehouseRules.length > 0 ||
+          legacyParsedOrderNo !== null;
+        // 订单号仍可用一维码录入；无分隔符的物料码静默忽略。
+        if (!isOrderNoScan && !isQRCode(code)) {
+          activeRulesRef.current ??= await getActiveRules();
+          if (!isQRCode(code, activeRulesRef.current)) {
+            return;
+          }
+        }
+        if (erpVoucherRecoveryRequired && activeOrderNo && !isOrderNoScan) {
+          showToast('ERP单据未验证，请重新扫描订单或点击刷新', 'error');
+          feedbackError();
+          return;
+        }
+        if (activeErpAccount && !activeErpVoucher && !isOrderNoScan) {
+          showToast('ERP单据尚未验证，请重新扫描订单或点击刷新', 'error');
+          feedbackError();
+          return;
+        }
+        if (activeOrderNo && !isOrderNoScan &&
+            orderMaterialsKeyRef.current !== buildOrderMaterialsKey(activeOrderNo, activeWarehouse?.id)) {
+          try {
+            await loadOrderMaterials(activeOrderNo, activeWarehouse?.id);
+          } catch (error) {
+            logger.warn('[扫码出库] 扫码前恢复本单记录失败:', error);
+          }
+          if (!screenActiveRef.current || orderNoRef.current !== activeOrderNo ||
+              currentWarehouseRef.current?.id !== activeWarehouse?.id ||
+              orderMaterialsKeyRef.current !== buildOrderMaterialsKey(activeOrderNo, activeWarehouse?.id)) {
+            showToast('本单记录未加载，已暂停扫码。请重新扫描订单或点击刷新', 'error');
+            feedbackError();
+            return;
+          }
+        }
+        // 如果当前没有订单号，扫描内容必须是订单号格式
+        if (!activeOrderNo && !isOrderNoScan) {
+          showToast(
+            hasWarehouseSampleRules
+              ? '请先扫描已配置仓库样例结构的出库单号'
+              : `请先扫描订单号\n格式: ${getOutboundOrderRuleHint(outboundOrderRule)}`,
+            'error'
+          );
+          feedbackError();
+          return;
+        }
+
         // 判断是否是订单号格式
         if (isOrderNoScan) {
           if (matchedErpAccount) {
@@ -1656,8 +1711,23 @@ export default function PDAScanScreen() {
               activeErpVoucher &&
               normalizeOrderNoCandidate(activeErpVoucher.code) === normalizedOrderCode
             ) {
-              const workWarehouse = activeWarehouse || currentWarehouseRef.current;
+              let workWarehouse = activeWarehouse || currentWarehouseRef.current;
+              if (!isErpVoucherVerified(activeErpVoucher)) {
+                setIsErpOrderLoading(true);
+                const refreshed = await forceRefreshErpVoucherForOrder(normalizedOrderCode, warehouses, {
+                  clearOnFailure: false,
+                });
+                if (!refreshed) throw new Error(erpVerificationErrorRef.current || 'ERP核验失败');
+                activeErpVoucher = refreshed.voucher;
+                workWarehouse = refreshed.warehouse;
+                activeCustomerName = refreshed.voucher.customerName.trim();
+                setActiveCustomerName(activeCustomerName);
+              }
               if (workWarehouse) {
+                if (orderMaterialsKeyRef.current !== buildOrderMaterialsKey(normalizedOrderCode, workWarehouse.id)) {
+                  await loadOrderMaterials(normalizedOrderCode, workWarehouse.id);
+                }
+                await upsertOrder(normalizedOrderCode, activeCustomerName.trim(), workWarehouse);
                 await saveOutboundWorkDraft(
                   normalizedOrderCode,
                   activeCustomerName.trim() || activeErpVoucher.customerName,
@@ -1861,7 +1931,8 @@ export default function PDAScanScreen() {
         let customFields: Record<string, string> = {};
 
         try {
-          const rule = await detectRule(code);
+          activeRulesRef.current ??= await getActiveRules();
+          const rule = await detectRule(code, activeRulesRef.current);
           if (rule) {
             separator = rule.separator || ',';
             ruleId = rule.id || '';
@@ -1947,6 +2018,9 @@ export default function PDAScanScreen() {
               activeErpVoucher
             ),
           ]);
+          if (orderMaterialsKeyRef.current !== buildOrderMaterialsKey(activeOrderNo, workWarehouse.id)) {
+            await loadOrderMaterials(activeOrderNo, workWarehouse.id);
+          }
         }
 
         // 检查重复 + 查找存货编码（并行查询，性能优化）
@@ -1967,7 +2041,14 @@ export default function PDAScanScreen() {
             normalizedQuantity.toString(),
             workWarehouse.id
           ),
-          getInventoryCodeByModel(normalizedModel, parsed.version),
+          (async () => {
+            const key = JSON.stringify([normalizedModel, parsed.version?.trim() || '']);
+            const cached = inventoryBindingsRef.current.get(key);
+            if (cached) return cached;
+            const value = await getInventoryCodeByModel(normalizedModel, parsed.version);
+            if (value) inventoryBindingsRef.current.set(key, value);
+            return value;
+          })(),
         ]);
         logger.log('[扫码出库] 重复检查结果:', check);
         logger.log('[扫码出库] 存货编码:', inventoryCode);
@@ -1978,6 +2059,10 @@ export default function PDAScanScreen() {
           return;
         }
 
+        if (!screenActiveRef.current || orderNoRef.current !== activeOrderNo ||
+            orderMaterialsKeyRef.current !== buildOrderMaterialsKey(activeOrderNo, workWarehouse.id)) {
+          throw new Error('出库作业已变化或记录未恢复，请重新扫描');
+        }
         const normalizedInventoryCode = normalizeInventoryCode(inventoryCode);
         let successToastText = `已扫码：${normalizedModel}`;
 
@@ -1991,33 +2076,41 @@ export default function PDAScanScreen() {
             return;
           }
 
-          const matchedErpLine = activeErpVoucher.lines.find(
-            (line) => normalizeInventoryCode(line.inventoryCode) === normalizedInventoryCode
-          );
-          const erpRequiredQuantity = activeErpVoucher.lines.reduce(
-            (sum, line) =>
-              normalizeInventoryCode(line.inventoryCode) === normalizedInventoryCode
-                ? sum + line.quantity
-                : sum,
-            0
-          );
+          if (!isErpVoucherVerified(activeErpVoucher) || erpVoucherRef.current !== activeErpVoucher) {
+            throw new Error('ERP单据正在更新，请重新扫描');
+          }
+          const progress = buildOutboundProgress(activeErpVoucher.lines, scanRecordsRef.current);
+          const matchedErpLine = progress.find((line) => line.inventoryCode === normalizedInventoryCode && line.sourceLineCount > 0);
+          const erpRequiredQuantity = matchedErpLine?.requiredQuantity ?? 0;
 
-          if (!matchedErpLine || erpRequiredQuantity <= 0) {
+          if (!matchedErpLine) {
+            logger.warn('[扫码出库] 绑定存货编码未出现在ERP单据中:', {
+              inventoryCode: normalizedInventoryCode,
+              model: normalizedModel,
+              version: parsed.version || '',
+            });
             showToast(
-              `不在ERP出库单：${normalizedModel}${parsed.version ? ` / ${parsed.version}` : ''}`,
+              `不在ERP出库单：${normalizedModel}${parsed.version ? ` / ${parsed.version}` : ''}\n绑定存货编码：${inventoryCode?.trim() || normalizedInventoryCode}`,
               'error'
             );
             feedbackNotInOrder();
             return;
           }
 
-          const scannedQuantity = scanRecordsRef.current.reduce((sum, item) => {
-            if (normalizeInventoryCode(item.inventoryCode) !== normalizedInventoryCode) {
-              return sum;
-            }
+          if (erpRequiredQuantity <= 0 || matchedErpLine.status === 'invalid') {
+            logger.warn('[扫码出库] ERP单据物料数量无效:', {
+              inventoryCode: normalizedInventoryCode,
+              quantity: erpRequiredQuantity,
+            });
+            showToast(`ERP出库数量无效：${matchedErpLine.specification || normalizedModel}`, 'error');
+            feedbackError();
+            return;
+          }
 
-            return sum + (parseQuantity(item.quantity) ?? 0);
-          }, 0);
+          if (progress.some((line) => line.status === 'unmatched' || line.status === 'invalid' || line.status === 'over')) {
+            throw new Error('本单存在不匹配或超量的已扫记录，请先核对并处理异常明细');
+          }
+          const scannedQuantity = matchedErpLine.scannedQuantity;
 
           if (scannedQuantity + normalizedQuantity > erpRequiredQuantity) {
             const remainingQuantity = Math.max(0, erpRequiredQuantity - scannedQuantity);
@@ -2059,7 +2152,7 @@ export default function PDAScanScreen() {
             pendingOutboundUnpackRef.current = nextPendingOutboundUnpack;
             setPendingOutboundUnpack(nextPendingOutboundUnpack);
             showToast('需要拆包确认', 'warning');
-            feedbackWarning();
+            void feedbackUnpackRequired();
             return;
           }
 
@@ -2112,6 +2205,7 @@ export default function PDAScanScreen() {
             warehouse_id: savedPayload.warehouseId,
             warehouse_name: savedPayload.warehouseName,
             inventory_code: savedPayload.inventoryCode || '',
+            erp_account_key: activeErpVoucher?.accountKey,
           },
           savedPayload.customerName || '',
           {
@@ -2122,26 +2216,66 @@ export default function PDAScanScreen() {
 
         await saveOutboundWorkDraft(activeOrderNo, activeCustomerName.trim(), workWarehouse);
 
+        let orderJustCompleted = false;
         if (activeOrderNo === orderNoRef.current) {
+          const recordsBeforeSave = scanRecordsRef.current;
           const savedItem = mapQueueItemToMaterialItem(materialId, savedPayload);
-          const preservedItems = scanRecordsRef.current.filter(
+          const preservedItems = recordsBeforeSave.filter(
             (item) => item.id !== savedItem.id
           );
           const nextRecords = [savedItem, ...preservedItems];
           scanRecordsRef.current = nextRecords;
           setScanRecords(nextRecords);
+          orderJustCompleted = activeErpVoucher !== null &&
+            !isOutboundOrderComplete(activeErpVoucher.lines, recordsBeforeSave) &&
+            isOutboundOrderComplete(activeErpVoucher.lines, nextRecords);
         }
 
-        showToast(successToastText, 'success');
-        feedbackSuccess();
+        showToast(
+          orderJustCompleted ? '本单已扫完，可扫描下一单' : successToastText,
+          'success'
+        );
+        void (orderJustCompleted ? feedbackOutboundOrderComplete() : feedbackSuccess());
       } catch (e) {
+        if (e instanceof QRCodeRuleConflictError) {
+          const activeRules = activeRulesRef.current ?? [];
+          const voucherInventoryCodes = new Set(
+            (activeErpVoucher?.lines || [])
+              .map((line) => normalizeInventoryCode(line.inventoryCode))
+              .filter(Boolean)
+          );
+          const diagnostic = await buildRuleConflictDiagnostic(code, activeRules, {
+            isInventoryCodeInCurrentDocument: (inventoryCode) =>
+              voucherInventoryCodes.has(normalizeInventoryCode(inventoryCode)),
+          });
+          if (diagnostic) {
+            // 不在查看诊断时继续处理排队扫码；本次不会写入任何出库记录。
+            scannerFocusBlockedRef.current = true;
+            pendingScanCodesRef.current = [];
+            alertRef.current.showAlert(
+              '解析规则冲突',
+              formatRuleConflictDiagnostic(diagnostic, '当前出库单'),
+              [
+                { text: '知道了', style: 'cancel' },
+                { text: '去配置规则', onPress: () => routerRef.current.push('/rules') },
+              ],
+              'warning'
+            );
+            feedbackWarning();
+            return;
+          }
+        }
+        if (getErpAccountByOutboundOrderNo(normalizeOrderNoCandidate(code))) {
+          markErpVoucherUnverified();
+          setErpVoucherRecoveryRequired(true);
+        }
         logger.error('[扫码出库] 处理失败:', e);
         const errorMessage = formatUserFacingErrorMessage(e, '扫码处理失败，请重新扫描');
         showToast(`处理失败：${errorMessage}`, 'error');
         feedbackError();
       } finally {
         setIsErpOrderLoading(false);
-        // 给扫码枪留一个很短的输入窗口，避免上一条还在处理时下一条被吞掉。
+        // 已提交的完整扫码立即串行处理；仅在空闲时延迟恢复焦点。
         resumePendingScanCodes(170);
       }
     },
@@ -2213,90 +2347,19 @@ export default function PDAScanScreen() {
     [aggregateMaterials]
   );
 
-  const erpLineProgressItems = useMemo<ErpLineProgress[]>(() => {
-    if (!erpVoucher) {
-      return [];
-    }
-
-    const progressMap = new Map<string, ErpLineProgress>();
-
-    erpVoucher.lines.forEach((line) => {
-      const inventoryCode = normalizeInventoryCode(line.inventoryCode);
-      const key = buildErpLineProgressKey(inventoryCode);
-      const existing = progressMap.get(key);
-
-      if (existing) {
-        existing.sourceLineCount += 1;
-        existing.requiredQuantity += line.quantity;
-        existing.remainingQuantity += line.quantity;
-        if (!existing.inventoryName && line.inventoryName) {
-          existing.inventoryName = line.inventoryName;
-        }
-        if (!existing.specification && line.specification) {
-          existing.specification = line.specification;
-        }
-        if (!existing.unitName && line.unitName) {
-          existing.unitName = line.unitName;
-        }
-        return;
-      }
-
-      progressMap.set(key, {
-        inventoryCode,
-        inventoryName: line.inventoryName,
-        key,
-        remainingQuantity: line.quantity,
-        requiredQuantity: line.quantity,
-        scannedItems: [],
-        scannedQuantity: 0,
-        sourceLineCount: 1,
-        specification: line.specification,
-        status: 'pending',
-        unitName: line.unitName || 'PCS',
-      });
-    });
-
-    const scannedByInventoryCode = new Map<string, MaterialItem[]>();
-    scanRecords.forEach((item) => {
-      const inventoryCode = normalizeInventoryCode(item.inventoryCode);
-      if (!inventoryCode) {
-        return;
-      }
-
-      const list = scannedByInventoryCode.get(inventoryCode) || [];
-      list.push(item);
-      scannedByInventoryCode.set(inventoryCode, list);
-    });
-
-    progressMap.forEach((progress) => {
-      const scannedItems = scannedByInventoryCode.get(progress.inventoryCode) || [];
-      const scannedQuantity = scannedItems.reduce(
-        (sum, item) => sum + (parseQuantity(item.quantity, { min: 0 }) ?? 0),
-        0
-      );
-
-      progress.scannedItems = scannedItems.slice().sort((a, b) => b.id.localeCompare(a.id));
-      progress.scannedQuantity = scannedQuantity;
-      progress.remainingQuantity = progress.requiredQuantity - scannedQuantity;
-      progress.status =
-        scannedQuantity > progress.requiredQuantity
-          ? 'over'
-          : scannedQuantity === progress.requiredQuantity
-            ? 'complete'
-            : scannedQuantity > 0
-              ? 'partial'
-              : 'pending';
-    });
-
-    return Array.from(progressMap.values());
-  }, [erpVoucher, scanRecords]);
+  const erpLineProgressItems = useMemo<ErpLineProgress[]>(
+    () => erpVoucher ? buildOutboundProgress(erpVoucher.lines, scanRecords) : [],
+    [erpVoucher, scanRecords]
+  );
 
   const erpRequiredTotal = useMemo(
     () => erpLineProgressItems.reduce((sum, line) => sum + line.requiredQuantity, 0),
     [erpLineProgressItems]
   );
   const isErpOrderComplete =
-    Boolean(erpVoucher) &&
+    erpVoucher !== null && verifiedErpVoucher === erpVoucher &&
+    orderMaterialsReady &&
+    !erpVoucherRecoveryRequired &&
     erpLineProgressItems.length > 0 &&
     erpLineProgressItems.every((line) => line.status === 'complete');
 
@@ -2349,23 +2412,38 @@ export default function PDAScanScreen() {
         '确定要删除这条物料吗？',
         () => {
           void (async () => {
+            if (processingRef.current || pendingOutboundUnpackRef.current || orderNo !== orderNoRef.current) {
+              showToast('正在处理出库作业，请稍后删除', 'warning');
+              return;
+            }
+            processingRef.current = true;
             try {
               await deleteMaterial(item.id);
-              // 从数据库重新加载列表
+              const remainingItems = scanRecordsRef.current.filter(record => record.id !== item.id);
+              scanRecordsRef.current = remainingItems;
+              setScanRecords(remainingItems);
               if (orderNo) {
-                await loadOrderMaterials(orderNo);
+                try {
+                  await loadOrderMaterials(orderNo);
+                } catch (refreshError) {
+                  logger.warn('[扫码出库] 物料已删除，但刷新列表失败:', refreshError);
+                  showToast('物料已删除，列表暂未刷新；下次扫码将重新读取本单记录', 'warning');
+                  return;
+                }
               }
               showToast('物料已删除', 'success');
             } catch (error) {
               logger.error('删除失败:', error);
-              showToast('删除失败', 'error');
+              showToast(formatUserFacingErrorMessage(error, '删除失败，请稍后重试'), 'error');
+            } finally {
+              resumePendingScanCodes(100);
             }
           })();
         },
         true
       );
     },
-    [alert, loadOrderMaterials, orderNo, showToast]
+    [alert, loadOrderMaterials, orderNo, resumePendingScanCodes, showToast]
   );
 
   const renderOutboundRight = useCallback(
@@ -2403,7 +2481,7 @@ export default function PDAScanScreen() {
         delayLongPress={500}
       >
         <Text style={styles.detailText}>
-          {item.model || '-'}{item.version ? ` / ${item.version}` : ''} · 数量{' '}
+          生产日期: {item.productionDate?.trim() || '-'}{item.version ? ` | 版本: ${item.version}` : ''} | 数量{' '}
           {parseQuantity(item.quantity, { min: 0 }) ?? 0}
         </Text>
         <Text style={styles.detailText}>
@@ -2422,7 +2500,11 @@ export default function PDAScanScreen() {
           ? Math.min(1, Math.max(0, item.scannedQuantity / item.requiredQuantity))
           : 0;
       const statusMeta =
-        item.status === 'complete'
+        item.status === 'unmatched'
+          ? { label: item.inventoryCode ? '不在本单' : '缺少存货编码', color: theme.error }
+          : item.status === 'invalid'
+            ? { label: '数据异常', color: theme.error }
+          : item.status === 'complete'
           ? { label: '完成', color: theme.success }
           : item.status === 'over'
             ? { label: '超量', color: theme.error }
@@ -2554,21 +2636,14 @@ export default function PDAScanScreen() {
         return;
       }
 
-      if (!shouldAcceptScanCode(code)) {
-        if (!processingRef.current && pendingScanCodesRef.current.length === 0) {
-          focusScannerInput(0);
-        }
-        return;
-      }
-
-      if (processingRef.current) {
+      if (processingRef.current || pendingOutboundUnpackRef.current) {
         pendingScanCodesRef.current.push(code);
         return;
       }
 
       processScan(code);
     },
-    [focusScannerInput, normalizeScannerInput, processScan, shouldAcceptScanCode]
+    [focusScannerInput, normalizeScannerInput, processScan]
   );
 
   // 输入变化时自动检测并触发（扫码器逐字符输入，需要防抖检测完成）
@@ -2616,7 +2691,7 @@ export default function PDAScanScreen() {
   }, [flushScannerInput]);
 
   const closePendingOutboundUnpack = useCallback(() => {
-    if (outboundUnpacking) {
+    if (outboundUnpackingRef.current) {
       return;
     }
     scannerFocusBlockedRef.current = false;
@@ -2625,11 +2700,11 @@ export default function PDAScanScreen() {
     setOutboundUnpackNotes('');
     setOutboundUnpacking(false);
     resumePendingScanCodes(120);
-  }, [outboundUnpacking, resumePendingScanCodes]);
+  }, [resumePendingScanCodes]);
 
   const handleConfirmOutboundUnpack = useCallback(async () => {
-    const pending = pendingOutboundUnpack;
-    if (!pending || outboundUnpacking) {
+    const pending = pendingOutboundUnpackRef.current;
+    if (!pending || outboundUnpackingRef.current) {
       return;
     }
 
@@ -2647,10 +2722,37 @@ export default function PDAScanScreen() {
 
     const materialId = generateId();
     let unpackSaved = false;
+    let orderJustCompleted = false;
     let pendingSync: { remainingRecord: UnpackRecord; shippedRecord: UnpackRecord } | null = null;
+    outboundUnpackingRef.current = true;
     setOutboundUnpacking(true);
 
     try {
+      let voucher = erpVoucherRef.current;
+      if (!screenActiveRef.current || orderNoRef.current !== savedPayload.orderNo ||
+          currentWarehouseRef.current?.id !== warehouse.id ||
+          orderMaterialsKeyRef.current !== buildOrderMaterialsKey(savedPayload.orderNo, warehouse.id)) {
+        throw new Error('订单或已扫记录发生变化，请取消拆包后重新扫描');
+      }
+      if (!voucher || !isErpVoucherVerified(voucher)) {
+        const refreshed = await forceRefreshErpVoucherForOrder(savedPayload.orderNo, warehouses, {
+          clearOnFailure: false,
+        });
+        if (!refreshed) throw new Error(erpVerificationErrorRef.current || 'ERP核验失败，尚未保存拆包');
+        voucher = refreshed.voucher;
+      }
+      if (currentWarehouseRef.current?.id !== warehouse.id || orderNoRef.current !== savedPayload.orderNo ||
+          orderMaterialsKeyRef.current !== buildOrderMaterialsKey(savedPayload.orderNo, warehouse.id)) {
+        throw new Error('ERP仓库发生变化，请取消拆包后重新扫描');
+      }
+      const progress = buildOutboundProgress(voucher.lines, scanRecordsRef.current);
+      const line = progress.find((item) => item.inventoryCode === normalizeInventoryCode(savedPayload.inventoryCode));
+      if (!line || progress.some((item) => ['unmatched', 'invalid', 'over'].includes(item.status)) ||
+          line.remainingQuantity !== pending.shippedQuantity) {
+        throw new Error('ERP需求或已扫数量已变化，请取消拆包后重新扫描');
+      }
+      savedPayload.customerName = voucher.customerName.trim();
+      setActiveCustomerName(savedPayload.customerName);
       const materialRecord = mapQueueItemToMaterialRecord(
         materialId,
         savedPayload,
@@ -2683,6 +2785,7 @@ export default function PDAScanScreen() {
             warehouse_id: warehouse.id,
             warehouse_name: warehouse.name,
             inventory_code: savedPayload.inventoryCode || '',
+            erp_account_key: voucher.accountKey,
           },
           customerName: savedPayload.customerName || '',
           warehouse,
@@ -2713,16 +2816,15 @@ export default function PDAScanScreen() {
         } catch (refreshError) {
           logger.warn('[扫码出库] 拆包完成后刷新本单物料失败:', refreshError);
         }
-        setScanRecords((currentRecords) => {
-          const mergedRecords = mergeMaterialItemsById([
-            shippedScanItem,
-            ...recordsBeforeRefresh,
-            ...refreshedItems,
-            ...currentRecords,
-          ]);
-          scanRecordsRef.current = mergedRecords;
-          return mergedRecords;
-        });
+        const mergedRecords = mergeMaterialItemsById([
+          shippedScanItem,
+          ...recordsBeforeRefresh,
+          ...refreshedItems,
+        ]);
+        scanRecordsRef.current = mergedRecords;
+        setScanRecords(mergedRecords);
+        orderJustCompleted = !isOutboundOrderComplete(voucher.lines, recordsBeforeRefresh) &&
+          isOutboundOrderComplete(voucher.lines, mergedRecords);
       }
 
       scannerFocusBlockedRef.current = false;
@@ -2731,10 +2833,12 @@ export default function PDAScanScreen() {
       setOutboundUnpackNotes('');
       setOutboundUnpacking(false);
       showToast(
-        `拆包完成：出库 ${pending.shippedQuantity}，剩余 ${pending.remainingQuantity}`,
+        orderJustCompleted
+          ? `拆包完成：出库 ${pending.shippedQuantity}，本单已扫完，可扫描下一单`
+          : `拆包完成：出库 ${pending.shippedQuantity}，剩余 ${pending.remainingQuantity}`,
         'success'
       );
-      feedbackSuccess();
+      void (orderJustCompleted ? feedbackOutboundOrderComplete(true) : feedbackUnpackComplete());
       resumePendingScanCodes(120);
     } catch (error) {
       logger.error('[扫码出库] 拆包出库失败:', error);
@@ -2754,6 +2858,7 @@ export default function PDAScanScreen() {
         feedbackError();
       }
     } finally {
+      outboundUnpackingRef.current = false;
       setOutboundUnpacking(false);
     }
 
@@ -2771,13 +2876,15 @@ export default function PDAScanScreen() {
         });
     }
   }, [
+    forceRefreshErpVoucherForOrder,
+    isErpVoucherVerified,
     loadOrderMaterials,
     outboundUnpackNotes,
-    outboundUnpacking,
-    pendingOutboundUnpack,
     resumePendingScanCodes,
     saveOutboundWorkDraft,
+    setActiveCustomerName,
     showToast,
+    warehouses,
   ]);
 
   // 选择仓库
@@ -2855,11 +2962,10 @@ export default function PDAScanScreen() {
           value={inputValue}
           onChangeText={handleInputChange}
           onSubmitEditing={handleSubmitEditing}
-          onBlur={() => focusScannerInput(120)}
           placeholder={currentScanPlaceholder}
           placeholderTextColor={theme.textMuted}
           autoCapitalize="none"
-          autoFocus={false}
+          autoFocus={!showWarehousePicker && !pendingOutboundUnpack && !alert.visible}
           showSoftInputOnFocus={false}
           actionLabel="提交出库扫码内容"
           actionLoading={isErpOrderLoading}

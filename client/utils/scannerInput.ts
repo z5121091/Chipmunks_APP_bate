@@ -28,11 +28,13 @@ export const sanitizeLooseScannerInput = (rawText: string) =>
   rawText.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
 
 /**
- * 保留二维码内部的结构字符，只清理扫码器可能附带的 BOM、NUL 和首尾空白。
+ * 保留二维码的结构与末尾字符，结束符交由解析规则处理；清理 BOM 和 NUL。
  * 扫码完成仍由页面防抖触发，不依赖扫描枪发送回车。
  */
-export const sanitizeStructuredScannerInput = (rawText: string) =>
-  rawText.replace(/^\uFEFF/, '').split('\0').join('').trim();
+export const sanitizeStructuredScannerInput = (rawText: string) => {
+  const content = rawText.replace(/^\uFEFF/, '').split('\0').join('');
+  return content.trim() ? content : '';
+};
 
 export const hasMatchingTraceNo = <T extends { traceNo?: string | null }>(
   records: readonly T[],

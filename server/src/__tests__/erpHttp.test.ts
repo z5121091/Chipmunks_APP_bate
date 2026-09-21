@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import express from 'express';
-import { canReuseErpConnection, requestErpRead } from '../erpHttp.ts';
+import { canReuseErpConnection, getErpKeepAliveTimeoutMs, requestErpRead } from '../erpHttp.ts';
 import { registerErpRoutes } from '../erp.ts';
 
 const listen = async (server: Server, t: TestContext) => {
@@ -34,6 +34,26 @@ test('retains curl for explicit rollback and existing proxy environments', () =>
   for (const name of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) {
     assert.equal(canReuseErpConnection({ [name]: 'http://127.0.0.1:1234' }), false);
   }
+});
+
+test('bounds configurable connection retention without changing request deadlines', () => {
+  assert.equal(getErpKeepAliveTimeoutMs({}), 20_000);
+  assert.equal(getErpKeepAliveTimeoutMs({ CHANJET_HTTP_KEEP_ALIVE_MS: '5000' }), 5000);
+  for (const value of ['', 'invalid', 'Infinity', '-1', '0', '60001']) {
+    assert.equal(getErpKeepAliveTimeoutMs({ CHANJET_HTTP_KEEP_ALIVE_MS: value }), 20_000);
+  }
+});
+
+test('reuses a connection after a normal scan pause longer than five seconds', async (t) => {
+  let connections = 0;
+  const server = createServer((_req, res) => res.end('[]'));
+  server.keepAliveTimeout = 30_000;
+  server.on('connection', () => connections++);
+  const url = await listen(server, t);
+  assert.equal((await requestErpRead(url, requestOptions)).text, '[]');
+  await new Promise(resolve => setTimeout(resolve, 5500));
+  assert.equal((await requestErpRead(url, requestOptions)).text, '[]');
+  assert.equal(connections, 1);
 });
 
 test('reuses a connection across 50 distinct queries and keeps payloads isolated', async (t) => {
@@ -111,27 +131,39 @@ test('ERP routes preserve fresh reads, cache/account isolation, concurrency and 
     CHANJET_HTTP_TRANSPORT: 'auto',
   });
   const counts = new Map<string, number>();
+  const warnings: string[] = [];
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args.join(' ')); });
   const heldResponses = new Map<string, () => void>();
   const upstream = await listen(createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
     req.on('end', () => {
-      const input = JSON.parse(Buffer.concat(chunks).toString()) as { param: { voucherCode: string } };
-      const code = input.param.voucherCode;
+      const input = JSON.parse(Buffer.concat(chunks).toString()) as { param?: { voucherCode: string } };
+      const code = input.param?.voucherCode || 'AUTH-WRITE';
       const count = (counts.get(code) || 0) + 1;
       counts.set(code, count);
-      if (code === 'RESET' && count === 1) {
+      if ((code === 'RESET' || code === 'RESET-THEN-ERROR') && count === 1) {
         req.socket.destroy();
         return;
       }
       const reply = () => {
-        res.writeHead(code === 'HTTP-ERROR' ? 503 : 200, { 'Content-Type': 'application/json' });
+        const status = ['HTTP-ERROR', 'AUTH-WRITE', 'RESET-THEN-ERROR'].includes(code) ? 503
+          : ['RETRY-SHARED', 'CURL-RETRY'].includes(code) && count === 1 ? 503
+          : code.startsWith('RETRY-') && count === 1 ? Number(code.slice(6))
+          : code.startsWith('NO-RETRY-') ? Number(code.slice(9)) : 200;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        if (code.startsWith('ARRAY')) {
+          res.end(JSON.stringify(code === 'ARRAY-EMPTY' ? [] : [{ Quantity: count }]));
+          return;
+        }
         res.end(JSON.stringify({
           code: code === 'ERP-ERROR' ? 123 : 0,
           data: { Code: code, count, token: req.headers.opentoken },
+          privateDetails: 'PRIVATE-order-customer-credential',
         }));
       };
       if (code.startsWith('RACE-')) heldResponses.set(`${code}:${count}`, reply);
+      else if (code === 'DEADLINE') { res.writeHead(200); res.write('{'); }
       else setTimeout(reply, 50);
     });
   }), t);
@@ -156,6 +188,32 @@ test('ERP routes preserve fresh reads, cache/account isolation, concurrency and 
   assert.equal((await query('FRESH')).body.data.data.count, 2);
   assert.equal((await query('FRESH', false)).response.headers.get('x-cache'), 'HIT');
   assert.equal(counts.get('FRESH'), 2);
+
+  for (const code of ['ARRAY-STOCK', 'ARRAY-EMPTY']) {
+    const readArray = async (bypass = false) => {
+      const response = await fetch(new URL('/api/erp/tplus/current-stock/query', backend), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(bypass ? { 'X-Erp-Cache-Mode': 'bypass' } : {}) },
+        body: JSON.stringify({ param: { voucherCode: code } }),
+      });
+      const body = await response.json() as { data: { Quantity: number }[] };
+      return { response, body };
+    };
+    const initial = await readArray();
+    assert.equal(initial.response.headers.get('x-cache'), 'MISS');
+    const cached = await readArray();
+    assert.equal(cached.response.headers.get('x-cache'), 'HIT');
+    assert.deepEqual(cached.body, initial.body);
+    assert.equal(counts.get(code), 1);
+    const fresh = await readArray(true);
+    assert.equal(fresh.response.headers.get('x-cache'), 'REFRESH');
+    assert.equal(counts.get(code), 2);
+    assert.deepEqual(fresh.body.data, code === 'ARRAY-EMPTY' ? [] : [{ Quantity: 2 }]);
+    process.env.CHANJET_LOCAL_ACCOUNT_KEY = 'shanghai-chipmunk';
+    assert.equal((await readArray()).response.headers.get('x-cache'), 'MISS');
+    assert.equal(counts.get(code), 3);
+    process.env.CHANJET_LOCAL_ACCOUNT_KEY = 'wuxi-duneng';
+  }
 
   const waitForResponse = async (key: string) => {
     for (let attempt = 0; attempt < 200 && !heldResponses.has(key); attempt++) {
@@ -202,8 +260,40 @@ test('ERP routes preserve fresh reads, cache/account isolation, concurrency and 
   process.env.CHANJET_LOCAL_ACCOUNT_KEY = 'wuxi-duneng';
   process.env.CHANJET_OPEN_TOKEN = 'test-token';
 
-  assert.equal((await query('HTTP-ERROR')).response.status, 503);
-  assert.equal(counts.get('HTTP-ERROR'), 1);
+  const failed = await query('HTTP-ERROR');
+  assert.equal(failed.response.status, 503);
+  assert.equal(counts.get('HTTP-ERROR'), 2);
+  const failureBody = failed.body as unknown as { requestId: string; details?: unknown };
+  assert.match(failureBody.requestId, /^[a-f0-9]{24}$/);
+  assert.equal(failed.response.headers.get('x-erp-request-id'), failureBody.requestId);
+  assert.equal(failureBody.details, undefined);
+  assert.ok(warnings.some(line => line.includes(failureBody.requestId) && line.includes('"source":"http"')));
+  for (const status of [500, 502, 503, 504]) {
+    assert.equal((await query(`RETRY-${status}`)).response.status, 200);
+    assert.equal(counts.get(`RETRY-${status}`), 2);
+  }
+  for (const status of [400, 401, 403, 404, 429]) {
+    assert.equal((await query(`NO-RETRY-${status}`)).response.status, status);
+    assert.equal(counts.get(`NO-RETRY-${status}`), 1);
+  }
+  assert.equal((await query('RESET-THEN-ERROR')).response.status, 503);
+  assert.equal(counts.get('RESET-THEN-ERROR'), 2);
+  const retriedTogether = await Promise.all(Array.from({ length: 12 }, () => query('RETRY-SHARED')));
+  assert.ok(retriedTogether.every(result => result.response.status === 200));
+  assert.equal(counts.get('RETRY-SHARED'), 2);
+  const authResponse = await fetch(new URL('/api/erp/auth/self-built-token', backend), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ appTicket: 'private-ticket', certificate: 'private-certificate' }),
+  });
+  assert.equal(authResponse.status, 503);
+  await authResponse.text();
+  assert.equal(counts.get('AUTH-WRITE'), 1);
+  process.env.CHANJET_HTTP_TIMEOUT_SECONDS = '5';
+  const deadlineStart = performance.now();
+  assert.equal((await query('DEADLINE')).response.status, 504);
+  assert.equal(counts.get('DEADLINE'), 1);
+  assert.ok(performance.now() - deadlineStart < 8000, 'retry must not restart the 5s deadline');
+  delete process.env.CHANJET_HTTP_TIMEOUT_SECONDS;
   await query('ERP-ERROR', false);
   await query('ERP-ERROR', false);
   assert.equal(counts.get('ERP-ERROR'), 2);
@@ -212,6 +302,9 @@ test('ERP routes preserve fresh reads, cache/account isolation, concurrency and 
   process.env.CHANJET_HTTP_TRANSPORT = 'curl';
   assert.equal((await query('CURL')).body.data.data.token, 'test-token');
   assert.equal(counts.get('CURL'), 1);
+  assert.equal((await query('CURL-RETRY')).response.status, 200);
+  assert.equal(counts.get('CURL-RETRY'), 2);
+  assert.ok(!warnings.join('\n').match(/PRIVATE-order|test-token|test-secret|second-account-token|private-ticket|private-certificate/));
   for (const transport of ['auto', 'curl']) {
     process.env.CHANJET_HTTP_TRANSPORT = transport;
     const times: number[] = [];

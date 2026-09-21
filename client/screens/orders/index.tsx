@@ -3,7 +3,6 @@ import {
   View,
   Text,
   TouchableOpacity,
-  ScrollView,
   TextInput,
   Modal,
   Platform,
@@ -20,8 +19,8 @@ import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
 import { AppFormField } from '@/components/AppFormField';
 import { AppEmptyState } from '@/components/AppEmptyState';
+import { useCustomAlert } from '@/components/CustomAlert';
 import { KeyboardAwareFormScrollView, KeyboardAwareModalContainer } from '@/components/KeyboardAwareForm';
-import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
 import { createStyles } from './styles';
 import { AnimatedCard } from '@/components/AnimatedCard';
 import {
@@ -42,9 +41,10 @@ import { safeJsonParseNullable } from '@/utils/json';
 import { STORAGE_KEYS } from '@/constants/config';
 import { formatDate } from '@/utils/time';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
-import { Spacing, BorderRadius, Typography } from '@/constants/theme';
+import { Spacing } from '@/constants/theme';
 import { parseQuantity } from '@/utils/quantity';
 import { logger } from '@/utils/logger';
+import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 
 // 搜索类型
 type SearchType = 'order' | 'customer' | 'batch';
@@ -61,15 +61,6 @@ type OutboundWorkDraft = {
   warehouseId?: unknown;
 };
 
-// 自定义弹窗配置
-interface CustomAlertConfig {
-  visible: boolean;
-  title: string;
-  message: string;
-  icon?: 'success' | 'warning' | 'error' | 'info';
-  buttons: { text: string; style?: 'default' | 'cancel' | 'destructive'; onPress?: () => void }[];
-}
-
 interface DeferredTimerEntry {
   timerId: ReturnType<typeof setTimeout>;
   resolve: (isActive: boolean) => void;
@@ -81,6 +72,7 @@ export default function OrdersScreen() {
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
   const params = useSafeSearchParams<{ orderNo?: string; materialId?: number }>();
+  const { showAlert: showCustomAlert, AlertComponent } = useCustomAlert();
 
   const [filteredOrders, setFilteredOrders] = useState<Order[]>([]);
   const [searchText, setSearchText] = useState('');
@@ -148,73 +140,6 @@ export default function OrdersScreen() {
       expandedMaterialsTimerRef.current = null;
     }
   }, []);
-
-  // 自定义弹窗
-  const [customAlert, setCustomAlert] = useState<CustomAlertConfig>({
-    visible: false,
-    title: '',
-    message: '',
-    buttons: [],
-  });
-
-  // 显示自定义弹窗
-  const showCustomAlert = (
-    title: string,
-    message: string,
-    buttons: CustomAlertConfig['buttons'],
-    icon?: 'success' | 'warning' | 'error' | 'info'
-  ) => {
-    setCustomAlert({ visible: true, title, message, buttons, icon });
-  };
-
-  // 关闭自定义弹窗
-  const closeCustomAlert = () => {
-    setCustomAlert((prev) => ({ ...prev, visible: false }));
-  };
-
-  const renderCustomAlertFooter = () => {
-    if (customAlert.buttons.length === 0) {
-      return null;
-    }
-
-    if (customAlert.buttons.length === 1) {
-      const [button] = customAlert.buttons;
-      return (
-        <AppModalActions
-          containerStyle={{ marginTop: 0 }}
-          primaryLabel={button.text}
-          primaryVariant={button.style === 'destructive' ? 'danger' : 'primary'}
-          onPrimaryPress={() => {
-            closeCustomAlert();
-            button.onPress?.();
-          }}
-        />
-      );
-    }
-
-    const secondaryButton =
-      customAlert.buttons.find((button) => button.style === 'cancel') ?? customAlert.buttons[0];
-    const primaryButton =
-      customAlert.buttons.find((button) => button !== secondaryButton) ?? customAlert.buttons[0];
-
-    return (
-      <AppModalActions
-        containerStyle={{ marginTop: 0 }}
-        secondaryLabel={secondaryButton.text}
-        secondaryVariant={secondaryButton.style === 'destructive' ? 'danger' : 'secondary'}
-        onSecondaryPress={() => {
-          closeCustomAlert();
-          secondaryButton.onPress?.();
-        }}
-        primaryLabel={primaryButton.text}
-        primaryVariant={primaryButton.style === 'destructive' ? 'danger' : 'primary'}
-        onPrimaryPress={() => {
-          closeCustomAlert();
-          primaryButton.onPress?.();
-        }}
-      />
-    );
-  };
 
   // 编辑客户名称弹窗
   const [editModalVisible, setEditModalVisible] = useState(false);
@@ -877,12 +802,14 @@ export default function OrdersScreen() {
           text: '删除',
           style: 'destructive',
           onPress: async () => {
+            let deleted = false;
             try {
               await deleteMaterial(material.id!);
-              // 短暂延迟确保 AsyncStorage 写入完成
+              deleted = true;
               if (!(await waitForUiFlush())) {
                 return;
               }
+              setExpandedMaterials(previous => previous.filter(row => row.id !== material.id));
               const materials = await getMaterialsByOrder(material.order_no, currentWarehouse?.id);
               setExpandedMaterials(materials);
               await loadData();
@@ -895,10 +822,11 @@ export default function OrdersScreen() {
             } catch (error) {
               logger.error('删除物料失败:', error);
               showCustomAlert(
-                '错误',
-                '删除失败',
+                deleted ? '物料已删除' : '删除失败',
+                deleted ? '记录已删除，但列表刷新失败。重新进入本单即可刷新。'
+                  : formatUserFacingErrorMessage(error, '删除失败，请稍后重试'),
                 [{ text: '确定', style: 'destructive' }],
-                'error'
+                deleted ? 'warning' : 'error'
               );
             }
           },
@@ -1238,11 +1166,6 @@ export default function OrdersScreen() {
     styles.noMaterials,
     styles.noMaterialsText,
   ]);
-
-  const isLongCustomAlert =
-    customAlert.message.length > 48 ||
-    customAlert.message.includes('\n') ||
-    customAlert.buttons.length > 1;
 
   return (
     <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
@@ -1628,123 +1551,6 @@ export default function OrdersScreen() {
         </View>
       </Modal>
 
-      {/* 自定义弹窗 */}
-      <Modal
-        visible={customAlert.visible}
-        transparent
-        animationType="fade"
-        onRequestClose={closeCustomAlert}
-      >
-        <View
-          style={{
-            flex: 1,
-            backgroundColor: theme.overlay,
-            justifyContent: 'center',
-            alignItems: 'center',
-            padding: Spacing.md,
-          }}
-        >
-          <AppModalCard
-            title={customAlert.title}
-            onClose={closeCustomAlert}
-            style={{
-              width: '100%',
-              maxWidth: APP_MODAL_MAX_WIDTH,
-              maxHeight: isLongCustomAlert ? '78%' : undefined,
-            }}
-            size="auto"
-            bodyStyle={{ alignItems: 'center', paddingBottom: Spacing.md }}
-            footer={renderCustomAlertFooter()}
-          >
-            {/* 图标 */}
-            {customAlert.icon && (
-              <View
-                style={{
-                  width: isLongCustomAlert ? 56 : 64,
-                  height: isLongCustomAlert ? 56 : 64,
-                  borderRadius: BorderRadius['3xl'],
-                  justifyContent: 'center',
-                  alignItems: 'center',
-                  marginBottom: Spacing.md,
-                  backgroundColor:
-                    customAlert.icon === 'success'
-                      ? 'rgba(16, 185, 129, 0.12)'
-                      : customAlert.icon === 'warning'
-                        ? 'rgba(245, 158, 11, 0.12)'
-                        : customAlert.icon === 'error'
-                          ? 'rgba(239, 68, 68, 0.12)'
-                          : 'rgba(59, 130, 246, 0.12)',
-                  shadowColor:
-                    customAlert.icon === 'success'
-                      ? theme.success
-                      : customAlert.icon === 'warning'
-                        ? theme.warning
-                        : customAlert.icon === 'error'
-                          ? theme.error
-                          : theme.info,
-                  shadowOffset: { width: 0, height: 4 },
-                  shadowOpacity: 0.15,
-                  shadowRadius: 14,
-                  elevation: 4,
-                }}
-              >
-                <View
-                  style={{
-                    width: isLongCustomAlert ? 38 : 44,
-                    height: isLongCustomAlert ? 38 : 44,
-                    borderRadius: BorderRadius.xl,
-                    justifyContent: 'center',
-                    alignItems: 'center',
-                    backgroundColor:
-                      customAlert.icon === 'success'
-                        ? theme.success
-                        : customAlert.icon === 'warning'
-                          ? theme.warning
-                          : customAlert.icon === 'error'
-                            ? theme.error
-                            : theme.info,
-                  }}
-                >
-                  <FontAwesome6
-                    name={
-                      customAlert.icon === 'success'
-                        ? 'check'
-                        : customAlert.icon === 'warning'
-                          ? 'triangle-exclamation'
-                          : customAlert.icon === 'error'
-                            ? 'xmark'
-                            : 'info'
-                    }
-                    size={isLongCustomAlert ? 20 : 22}
-                    color={theme.white}
-                  />
-                </View>
-              </View>
-            )}
-            <ScrollView
-              style={{
-                alignSelf: 'stretch',
-                maxHeight: isLongCustomAlert ? 132 : 72,
-                marginBottom: Spacing.xs,
-              }}
-              contentContainerStyle={{ alignItems: 'center', paddingBottom: Spacing.md }}
-              showsVerticalScrollIndicator={isLongCustomAlert}
-            >
-              <Text
-                style={{
-                  ...(isLongCustomAlert ? Typography.body : Typography.bodyMedium),
-                  color: theme.textSecondary,
-                  textAlign: 'center',
-                  lineHeight: isLongCustomAlert ? 21 : 22,
-                }}
-              >
-                {customAlert.message}
-              </Text>
-            </ScrollView>
-          </AppModalCard>
-        </View>
-      </Modal>
-
       {/* 仓库选择器弹窗 */}
       {showWarehousePicker && (
         <View style={styles.pickerOverlay}>
@@ -1776,6 +1582,7 @@ export default function OrdersScreen() {
           </View>
         </View>
       )}
+      {AlertComponent}
     </Screen>
   );
 }

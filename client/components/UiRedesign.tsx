@@ -109,6 +109,7 @@ interface UiPageHeaderProps {
   rightIcon?: IconName;
   rightLabel?: string;
   rightDisabled?: boolean;
+  rightLoading?: boolean;
   onRightPress?: () => void;
   style?: StyleProp<ViewStyle>;
 }
@@ -142,6 +143,7 @@ export function UiPageHeader({
   rightIcon,
   rightLabel,
   rightDisabled,
+  rightLoading = false,
   onRightPress,
   style,
 }: UiPageHeaderProps) {
@@ -166,15 +168,19 @@ export function UiPageHeader({
 
       {rightIcon && onRightPress ? (
         <TouchableOpacity
-          style={[styles.pageHeaderAction, rightDisabled && styles.itemDisabled]}
+          style={[styles.pageHeaderAction, (rightDisabled || rightLoading) && styles.itemDisabled]}
           activeOpacity={0.72}
-          disabled={rightDisabled}
+          disabled={rightDisabled || rightLoading}
           onPress={onRightPress}
           accessibilityRole="button"
           accessibilityLabel={rightLabel || title}
-          accessibilityState={{ disabled: Boolean(rightDisabled) }}
+          accessibilityState={{ disabled: Boolean(rightDisabled || rightLoading), busy: rightLoading }}
         >
-          <Feather name={rightIcon} size={19} color={theme.textPrimary} />
+          {rightLoading ? (
+            <ActivityIndicator size="small" color={theme.textPrimary} />
+          ) : (
+            <Feather name={rightIcon} size={19} color={theme.textPrimary} />
+          )}
         </TouchableOpacity>
       ) : (
         <View style={styles.pageHeaderActionSpacer} />

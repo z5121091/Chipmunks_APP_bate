@@ -107,11 +107,14 @@ class ErpInputError extends Error {
 class ChanjetHttpError extends Error {
   readonly details: unknown;
   readonly statusCode: number;
+  readonly failure?: { source: 'http' | 'network' | 'timeout' | 'protocol'; code?: string; requestId?: string; attempt?: number };
 
-  constructor(message: string, statusCode: number, details: unknown) {
+  constructor(message: string, statusCode: number, details: unknown,
+    failure?: ChanjetHttpError['failure']) {
     super(message);
     this.statusCode = statusCode;
     this.details = details;
+    this.failure = failure;
   }
 }
 
@@ -122,6 +125,7 @@ type ChanjetRequestOptions = {
   path: string;
   query?: Record<string, string | number | undefined>;
   reuseConnection?: boolean;
+  requestId?: string;
 };
 
 type AsyncRoute = (req: Request, res: Response) => Promise<void> | void;
@@ -920,20 +924,17 @@ const chanjetCurlRequest = async (
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
-    let stderr = '';
 
     curl.stdout.setEncoding('utf8');
-    curl.stderr.setEncoding('utf8');
     curl.stdout.on('data', (chunk) => {
       stdout += chunk;
     });
-    curl.stderr.on('data', (chunk) => {
-      stderr += chunk;
-    });
+    curl.stderr.resume();
     curl.on('error', reject);
     curl.on('close', (code) => {
       if (code !== 0) {
-        reject(new ChanjetHttpError('畅捷通网络请求失败', 502, stderr.trim()));
+        reject(new ChanjetHttpError(code === 28 ? '畅捷通网络请求超时' : '畅捷通网络请求失败',
+          code === 28 ? 504 : 502, null, { source: code === 28 ? 'timeout' : 'network', code: `CURL_${code}` }));
         return;
       }
 
@@ -950,7 +951,7 @@ const chanjetCurlRequest = async (
   const statusMarkerIndex = output.lastIndexOf(statusMarker);
 
   if (statusMarkerIndex < 0) {
-    throw new ChanjetHttpError('畅捷通响应中缺少HTTP状态码', 502, output);
+    throw new ChanjetHttpError('畅捷通响应中缺少HTTP状态码', 502, null, { source: 'protocol' });
   }
 
   const text = output.slice(0, statusMarkerIndex);
@@ -961,52 +962,64 @@ const chanjetCurlRequest = async (
 const chanjetRequest = async (options: ChanjetRequestOptions): Promise<unknown> => {
   const startedAt = performance.now();
   const timeoutMs = getChanjetRequestTimeoutSeconds() * 1000;
-  let response: ErpHttpResponse | undefined;
-  let pooledRequestFailed = false;
-  if (options.reuseConnection && canReuseErpConnection()) {
-    try {
-      response = await requestErpRead(buildUrl(options.path, options.query), {
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
-        headers: { Accept: 'application/json', ...options.headers },
-        method: options.method,
-        connectTimeoutMs: getChanjetConnectTimeoutSeconds() * 1000,
-        timeoutMs,
-      });
-    } catch {
-      // Only read-only T+ queries opt in. OAuth/token rotation must never be retried here.
-      pooledRequestFailed = true;
-    }
-  }
-  if (!response) {
+  const requestId = options.requestId || randomBytes(12).toString('hex');
+  const pooled = options.reuseConnection && canReuseErpConnection();
+  // One shared deadline and at most two wire attempts, including curl fallback.
+  const attempts = options.reuseConnection ? 2 : 1;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     const remainingMs = timeoutMs - (performance.now() - startedAt);
-    if (remainingMs <= 0) {
-      throw new ChanjetHttpError('畅捷通网络请求超时', 504, null);
-    }
-    if (pooledRequestFailed) {
-      console.warn(`[ERP transport] pooled connection failed; using curl path=${options.path}`);
-    }
-    response = await chanjetCurlRequest(options, Math.max(0.001, remainingMs / 1000));
-  }
-  const { text, statusCode } = response;
-  let payload: unknown = null;
-
-  if (text) {
+    let response: ErpHttpResponse;
     try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = text;
+      if (remainingMs <= 0) {
+        throw new ChanjetHttpError('畅捷通网络请求超时', 504, null, { source: 'timeout', code: 'ETIMEDOUT' });
+      }
+      response = pooled && attempt === 1
+        ? await requestErpRead(buildUrl(options.path, options.query), {
+          body: options.body === undefined ? undefined : JSON.stringify(options.body),
+          headers: { Accept: 'application/json', ...options.headers },
+          method: options.method,
+          connectTimeoutMs: getChanjetConnectTimeoutSeconds() * 1000,
+          timeoutMs: remainingMs,
+        })
+        : await chanjetCurlRequest(options, Math.max(0.001, remainingMs / 1000));
+      const { text, statusCode } = response;
+      let payload: unknown = null;
+      if (text) {
+        try { payload = JSON.parse(text); }
+        catch { payload = text; }
+      }
+      if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) {
+        throw new ChanjetHttpError(`畅捷通接口请求失败（状态码 ${statusCode}）`,
+          Number.isFinite(statusCode) ? statusCode : 502, payload, { source: 'http' });
+      }
+      return payload;
+    } catch (error) {
+      const code = error instanceof ChanjetHttpError ? error.failure?.code
+        : (error as NodeJS.ErrnoException)?.code;
+      const safeCode = typeof code === 'string' && /^(?:E[A-Z_]{1,30}|CURL_\d{1,3})$/.test(code) ? code : 'OTHER';
+      const failure = error instanceof ChanjetHttpError ? error
+        : new ChanjetHttpError(safeCode === 'ETIMEDOUT' ? '畅捷通网络请求超时' : '畅捷通网络请求失败',
+          safeCode === 'ETIMEDOUT' ? 504 : 502, null,
+          { source: safeCode === 'ETIMEDOUT' ? 'timeout' : 'network', code: safeCode });
+      const transient = failure.failure?.source === 'http'
+        ? [500, 502, 503, 504].includes(failure.statusCode)
+        : ['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN', 'ECONNREFUSED',
+          'CURL_5', 'CURL_6', 'CURL_7', 'CURL_28', 'CURL_52', 'CURL_55', 'CURL_56'].includes(safeCode);
+      const retry = attempt < attempts && transient && timeoutMs - (performance.now() - startedAt) > 300;
+      console.warn('[ERP upstream]', JSON.stringify({
+        requestId, account: parseErpAccountKey(process.env.CHANJET_LOCAL_ACCOUNT_KEY) || 'unconfigured', path: options.path, attempt,
+        transport: pooled && attempt === 1 ? 'pooled' : 'curl',
+        source: failure.failure?.source || 'upstream', status: failure.statusCode,
+        code: safeCode, elapsedMs: Math.round(performance.now() - startedAt), retry,
+      }));
+      if (!retry) {
+        throw new ChanjetHttpError(failure.message, failure.statusCode, failure.details,
+          { source: failure.failure?.source || 'network', code: safeCode, requestId, attempt });
+      }
+      await new Promise(resolve => setTimeout(resolve, 150));
     }
   }
-
-  if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) {
-    throw new ChanjetHttpError(
-      `畅捷通接口请求失败（状态码 ${statusCode}）`,
-      Number.isFinite(statusCode) ? statusCode : 502,
-      payload
-    );
-  }
-
-  return payload;
+  throw new Error('ERP request attempts exhausted');
 };
 
 const getCredentialHeaders = (): Record<string, string> => {
@@ -1248,6 +1261,8 @@ const getTplusHeaders = (openToken: string): Record<string, string> => {
 };
 
 const isSuccessfulTplusPayload = (value: unknown): boolean => {
+  // Current-stock queries may return a bare array, including [] for no stock.
+  if (Array.isArray(value)) return true;
   if (!isObject(value)) {
     return false;
   }
@@ -1280,6 +1295,16 @@ const isRejectedTokenPayload = (value: unknown): boolean => {
 };
 
 const sendError = (res: Response, error: unknown): void => {
+  const requestId = res.locals.erpRequestId as string;
+  console.warn('[ERP request failed]', JSON.stringify({
+    requestId, account: parseErpAccountKey(process.env.CHANJET_LOCAL_ACCOUNT_KEY) || 'unconfigured', path: res.locals.erpPath,
+    source: error instanceof ChanjetHttpError ? error.failure?.source || 'upstream-business'
+      : error instanceof ErpConfigurationError ? 'configuration' : error instanceof ErpInputError ? 'input' : 'local',
+    ...(error instanceof ChanjetHttpError ? {
+      status: error.statusCode, code: error.failure?.code, upstreamRequestId: error.failure?.requestId,
+      attempts: error.failure?.attempt,
+    } : {}),
+  }));
   if (error instanceof ChanjetHttpError) {
     const responseStatus =
       error.statusCode >= 400 && error.statusCode <= 599 ? error.statusCode : 502;
@@ -1287,6 +1312,7 @@ const sendError = (res: Response, error: unknown): void => {
       success: false,
       message: error.message,
       upstreamStatus: error.statusCode,
+      requestId,
     });
     return;
   }
@@ -1295,20 +1321,24 @@ const sendError = (res: Response, error: unknown): void => {
     res.status(error.statusCode).json({
       success: false,
       message: error.message,
+      requestId,
     });
     return;
   }
 
-  const message = error instanceof Error ? error.message : 'ERP服务发生未知错误';
   res.status(500).json({
     success: false,
-    message,
+    message: 'ERP服务暂时不可用，请稍后重试',
+    requestId,
   });
 };
 
 const route =
   (handler: AsyncRoute) =>
   async (req: Request, res: Response): Promise<void> => {
+    res.locals.erpRequestId = randomBytes(12).toString('hex');
+    res.locals.erpPath = typeof req.route?.path === 'string' ? req.route.path : 'erp-route';
+    res.setHeader('X-Erp-Request-Id', res.locals.erpRequestId);
     try {
       await handler(req, res);
     } catch (error) {
@@ -1317,6 +1347,7 @@ const route =
   };
 
 const callTplus = async (req: Request, res: Response, path: string): Promise<void> => {
+  res.locals.erpPath = path;
   const startedAt = performance.now();
   const body = readObjectBody(req);
   const tokenState = await getUsableOpenTokenState();
@@ -1326,7 +1357,7 @@ const callTplus = async (req: Request, res: Response, path: string): Promise<voi
     res.setHeader('Server-Timing',
       `erp-token;dur=${tokenMs.toFixed(1)}, erp-query;dur=${upstreamMs.toFixed(1)}, erp-total;dur=${totalMs.toFixed(1)}`);
     if (totalMs >= 1000) {
-      console.log(`[ERP timing] account=${getLocalErpAccountKey()} path=${path} tokenMs=${tokenMs.toFixed(1)} queryMs=${upstreamMs.toFixed(1)} totalMs=${totalMs.toFixed(1)}`);
+      console.log(`[ERP timing] requestId=${res.locals.erpRequestId} account=${getLocalErpAccountKey()} path=${path} tokenMs=${tokenMs.toFixed(1)} queryMs=${upstreamMs.toFixed(1)} totalMs=${totalMs.toFixed(1)}`);
     }
   };
   const { state } = tokenState;
@@ -1376,6 +1407,7 @@ const callTplus = async (req: Request, res: Response, path: string): Promise<voi
         method: 'POST',
         path,
         reuseConnection: true,
+        requestId: res.locals.erpRequestId,
       });
 
       if (isRejectedTokenPayload(data) && state.refreshToken?.trim()) {
@@ -1387,6 +1419,7 @@ const callTplus = async (req: Request, res: Response, path: string): Promise<voi
           method: 'POST',
           path,
           reuseConnection: true,
+          requestId: res.locals.erpRequestId,
         });
       }
 

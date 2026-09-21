@@ -1294,7 +1294,7 @@ export default function SettingsScreen() {
           UTI: 'public.json',
         });
         alert.showSuccess(
-          `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n物料绑定请使用独立的 Excel 导入/导出。\n请妥善保管备份文件！`
+          `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n物料绑定请使用独立的 Excel 导入/导出。\n请妥善保管备份文件！`
         );
       } else {
         alert.showError('当前设备不支持文件分享，未能导出配置备份');
@@ -1352,7 +1352,7 @@ export default function SettingsScreen() {
 
       alert.showConfirm(
         '确认恢复配置',
-        `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n即将恢复以下配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 占位字段: ${backupData.customFields?.length || 0} 个\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === undefined ? '沿用当前设置' : backupData.soundEnabled ? '开启' : '关闭'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n[说明] 物料绑定不会恢复或覆盖，请在物料绑定页面使用 Excel 导入。\n[注意] 恢复前会替换上述配置数据，业务数据（订单、物料、拆包记录等）不受影响；被历史业务引用的仓库会保留。此操作不可撤销！`,
+        `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n即将恢复以下配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === undefined ? '沿用当前设置' : backupData.soundEnabled ? '开启' : '关闭'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n[说明] 旧规则中的占位段将自动转换为忽略段。物料绑定不会恢复或覆盖，请在物料绑定页面使用 Excel 导入。\n[注意] 恢复前会替换上述配置数据，业务数据（订单、物料、拆包记录等）不受影响；被历史业务引用的仓库会保留。此操作不可撤销！`,
         async () => {
           setRestoreLoading(true);
           try {
@@ -1363,7 +1363,7 @@ export default function SettingsScreen() {
                 : result.stats?.syncConfigRestored
                   ? '已恢复'
                   : '恢复失败';
-              const summary = `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n恢复成功:\n• 解析规则: ${result.stats?.rules || 0} 条\n• 占位字段: ${result.stats?.customFields || 0} 个\n• 仓库: ${result.stats?.warehouses || 0} 个\n• 出库单号规则: ${result.stats?.outboundWarehouseOrderRules || 0} 条\n• 同步服务器: ${syncConfigStatus}\n\n物料绑定保持当前数据不变。`;
+              const summary = `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n恢复成功:\n• 解析规则: ${result.stats?.rules || 0} 条\n• 仓库: ${result.stats?.warehouses || 0} 个\n• 出库单号规则: ${result.stats?.outboundWarehouseOrderRules || 0} 条\n• 同步服务器: ${syncConfigStatus}\n\n物料绑定保持当前数据不变。`;
 
               if (result.warnings?.length) {
                 alert.showWarning(`${summary}\n\n注意:\n• ${result.warnings.join('\n• ')}`);
@@ -2114,16 +2114,6 @@ export default function SettingsScreen() {
                 false,
                 false,
                 `${configStats.rules} 条`
-              )}
-              {renderMenuCard(
-                '占位字段',
-                '跳过二维码中不需要使用的数据段',
-                'edit-3',
-                theme.warning,
-                () => router.push('/custom-fields'),
-                false,
-                false,
-                `${configStats.customFields} 个`
               )}
               {renderMenuCard(
                 '前缀配置',

@@ -74,12 +74,18 @@ describe('business Excel schemas', () => {
         traceNo: 'TRACE',
         warehouse_name: '无锡仓库',
         supplier: '珠海领芯科技有限公司',
+        model: 'DEMO',
+        inventory_code: 'IC.TEST.00',
+        unpacked_at: '2026/09/15 14:30',
       },
     ]);
 
     expect(getCell(sheet.headers, sheet.rows[0], EXCEL_HEADERS.traceNo)).toBe('TRACE-2');
     expect(getCell(sheet.headers, sheet.rows[0], EXCEL_HEADERS.originalQuantity)).toBe(2500);
     expect(getCell(sheet.headers, sheet.rows[0], EXCEL_HEADERS.labelQuantity)).toBe(2000);
+    expect(getCell(sheet.headers, sheet.rows[0], EXCEL_HEADERS.model)).toBe('DEMO');
+    expect(getCell(sheet.headers, sheet.rows[0], EXCEL_HEADERS.inventoryCode)).toBe('IC.TEST.00');
+    expect(getCell(sheet.headers, sheet.rows[0], EXCEL_HEADERS.unpackTime)).toBe('2026-09-15 14:30');
     expect(getCell(sheet.headers, sheet.rows[0], EXCEL_HEADERS.supplier)).toBe(
       '珠海领芯科技有限公司'
     );

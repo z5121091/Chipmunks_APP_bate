@@ -46,6 +46,8 @@ export function AppPillToast({ text, type = 'success', bottom, style }: AppPillT
         : type === 'info'
           ? 'info'
           : 'check-circle';
+  // 浅色主题的状态色使用深字，深色主题使用深蓝字，保证所有状态提示都有足够对比度。
+  const foregroundColor = theme.isDark ? theme.buttonPrimaryText : theme.black;
 
   return (
     <Animated.View
@@ -78,13 +80,13 @@ export function AppPillToast({ text, type = 'success', bottom, style }: AppPillT
           styles.pill,
           {
             backgroundColor: color,
-            borderColor: withAlpha(theme.white, 0.24),
+            borderColor: withAlpha(foregroundColor, 0.18),
             shadowColor: theme.shadowColor,
           },
         ]}
       >
-        <Feather name={icon} size={rf(16)} color={theme.buttonPrimaryText} />
-        <Text numberOfLines={2} style={[styles.text, { color: theme.buttonPrimaryText }]}>
+        <Feather name={icon} size={rf(16)} color={foregroundColor} />
+        <Text numberOfLines={2} style={[styles.text, { color: foregroundColor }]}>
           {text}
         </Text>
       </Animated.View>
@@ -118,10 +120,7 @@ const styles = StyleSheet.create({
     elevation: 8,
   },
   text: {
-    ...Typography.bodyMedium,
-    fontSize: rf(14),
-    lineHeight: rf(20),
-    fontWeight: '800',
+    ...Typography.feedback,
     textAlign: 'center',
     includeFontPadding: false,
   },

@@ -42,8 +42,10 @@ const defaultUpdateServer = restoreMatchingUpdateServerCredentials(
   updateServerConfig.defaultServer
 ).replace(/\/+$/, '');
 const selfUpdateEnabled = process.env.EXPO_PUBLIC_ENABLE_SELF_UPDATE !== 'false';
-const splashImage = './assets/images/splash-universal.png';
 const splashBackgroundColor = '#FFFFFF';
+const splashDarkBackgroundColor = '#121212';
+const splashImage = './assets/images/splash-logo.png';
+const splashDarkImage = './assets/images/splash-logo-dark.png';
 
 export default function appConfig({ config }: ConfigContext): ExpoConfig {
   return {
@@ -58,19 +60,18 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
     "newArchEnabled": true,
     "splash": {
       "image": splashImage,
-      "backgroundColor": splashBackgroundColor,
-      "resizeMode": "contain"
+      "resizeMode": "contain",
+      "backgroundColor": splashBackgroundColor
     },
     "ios": {
       "supportsTablet": true,
       "splash": {
         "image": splashImage,
-        "backgroundColor": splashBackgroundColor,
         "resizeMode": "contain",
+        "backgroundColor": splashBackgroundColor,
         "dark": {
-          "image": splashImage,
-          "backgroundColor": splashBackgroundColor,
-          "resizeMode": "contain"
+          "image": splashDarkImage,
+          "backgroundColor": splashDarkBackgroundColor
         }
       }
     },
@@ -100,12 +101,11 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
       ],
       "splash": {
         "image": splashImage,
-        "backgroundColor": splashBackgroundColor,
         "resizeMode": "contain",
+        "backgroundColor": splashBackgroundColor,
         "dark": {
-          "image": splashImage,
-          "backgroundColor": splashBackgroundColor,
-          "resizeMode": "contain"
+          "image": splashDarkImage,
+          "backgroundColor": splashDarkBackgroundColor
         }
       }
     },
@@ -124,12 +124,12 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
         "expo-splash-screen",
         {
           "image": splashImage,
-          "imageWidth": 288,
+          "imageWidth": 176,
           "resizeMode": "contain",
           "backgroundColor": splashBackgroundColor,
           "dark": {
-            "image": splashImage,
-            "backgroundColor": splashBackgroundColor
+            "image": splashDarkImage,
+            "backgroundColor": splashDarkBackgroundColor
           }
         }
       ],

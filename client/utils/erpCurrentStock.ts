@@ -1,9 +1,16 @@
-import { backendJsonRequest, buildErpProxyPath } from '@/utils/backendApi';
+import {
+  BackendApiError,
+  BackendNetworkError,
+  backendJsonRequest,
+  buildErpProxyPath,
+} from '@/utils/backendApi';
 import { type ErpAccountConfig, requireErpAccountBackend } from '@/utils/erpAccounts';
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 
 const CURRENT_STOCK_QUERY_PATH = buildErpProxyPath('/api/erp/tplus/current-stock/query');
 const CURRENT_STOCK_CACHE_TTL_MS = 15_000;
+export const CURRENT_STOCK_BATCH_SIZE = 100;
+const CURRENT_STOCK_PAGE_SIZE = 1000;
 
 type MaybeRecord = Record<string, unknown>;
 
@@ -38,6 +45,12 @@ export interface CurrentStockQueryResult {
   accountName: string;
   inventoryCode: string;
   rows: CurrentStockRow[];
+}
+
+export interface CurrentStockBatchResult {
+  accountKey: ErpAccountConfig['key'];
+  rows: CurrentStockRow[];
+  requestCount: number;
 }
 
 type CurrentStockCacheEntry = {
@@ -115,25 +128,38 @@ const ROW_COLLECTION_KEYS = [
   'Result',
 ] as const;
 
-const findRows = (value: unknown): unknown[] => {
+type StockPage = { rows: unknown[]; totalCount: number | null };
+
+const readTotalCount = (value: unknown): number | null => {
+  const record = asRecord(value);
+  const raw = record.TotalCount ?? record.totalCount;
+  if (raw === undefined || raw === null) return null;
+  const total = asNumberOrNull(raw);
+  if (total === null || !Number.isSafeInteger(total) || total < 0) {
+    throw new Error('ERP库存分页总数无效，已停止核对');
+  }
+  return total;
+};
+
+const findStockPage = (value: unknown): StockPage | null => {
   if (Array.isArray(value)) {
-    return value;
+    return { rows: value, totalCount: readTotalCount(value[0]) };
   }
 
   if (!isRecord(value)) {
-    return [];
+    return null;
   }
 
   for (const key of ROW_COLLECTION_KEYS) {
-    const rows = findRows(value[key]);
-    if (rows.length > 0) {
-      return rows;
+    const page = findStockPage(value[key]);
+    if (page) {
+      return { ...page, totalCount: readTotalCount(value) ?? page.totalCount };
     }
   }
 
   // Do not inspect arbitrary object values here. ERP responses may contain
   // unrelated arrays (for example paging metadata or grouping options).
-  return [];
+  return null;
 };
 
 const extractPayload = (response: unknown): ChanjetCurrentStockResponse => {
@@ -192,7 +218,6 @@ const mapStockRow = (value: unknown, fallbackInventoryCode: string): CurrentStoc
       'ExistingQuantity',
       'CurrentQuantity',
       'StockQuantity',
-      'AvailableQuantity',
     ]),
     raw,
     specification:
@@ -233,10 +258,99 @@ export const parseCurrentStockRows = (
   payload: ChanjetCurrentStockResponse,
   inventoryCode: string
 ): CurrentStockRow[] => {
-  const rows = findRows(payload.data ?? payload.value ?? payload);
+  const rows = findStockPage(payload)?.rows ?? [];
   return filterRowsByInventoryCode(rows, inventoryCode).map((row) =>
     mapStockRow(row, inventoryCode)
   );
+};
+
+// Inventory count deliberately bypasses both caches. An absent code means zero
+// only after every page of a successful, validated batch has been received.
+export const fetchCurrentStockByInventoryCodes = async (
+  account: ErpAccountConfig,
+  inventoryCodes: string[]
+): Promise<CurrentStockBatchResult> => {
+  const codes = new Map<string, string>();
+  for (const code of inventoryCodes) {
+    if (!code.trim()) throw new Error('存货编码为空，无法批量查询库存');
+    codes.set(code.trim().toLocaleLowerCase(), code.trim());
+  }
+  if (codes.size === 0 || codes.size > CURRENT_STOCK_BATCH_SIZE) {
+    throw new Error(`每批库存查询需要 1 至 ${CURRENT_STOCK_BATCH_SIZE} 个存货编码`);
+  }
+  const baseUrl = requireErpAccountBackend(account);
+  const rows: CurrentStockRow[] = [];
+  const seenPages = new Set<string>();
+  let totalCount: number | null = null;
+  let requestCount = 0;
+  // Bound unexpected upstream paging; exceeding this cap rejects the whole count.
+  for (let pageIndex = 1; pageIndex <= 100; pageIndex += 1) {
+    const requestPage = async () => {
+      requestCount += 1;
+      return backendJsonRequest<unknown>(CURRENT_STOCK_QUERY_PATH, {
+        baseUrl,
+        body: {
+          param: {
+            Inventory: Array.from(codes.values(), (Code) => ({ Code })),
+            PageSize: String(CURRENT_STOCK_PAGE_SIZE),
+            PageIndex: String(pageIndex),
+            GroupInfo: { Warehouse: true, Inventory: true },
+          },
+        },
+        erpAccountKey: account.key,
+        erpCacheMode: 'bypass',
+      });
+    };
+    let response: unknown;
+    try {
+      response = await requestPage();
+    } catch (error) {
+      const transient = error instanceof BackendNetworkError ||
+        (error instanceof BackendApiError && [429, 502, 503, 504].includes(error.status));
+      if (!transient) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      response = await requestPage();
+    }
+    const payload = extractPayload(response);
+    const page = findStockPage(payload);
+    if (!page || (asRecord(response).success !== true && String(payload.code) !== '0')) {
+      throw new Error('ERP未返回有效的库存明细，不能按零库存完成盘点');
+    }
+    if (page.totalCount !== null) {
+      if (totalCount !== null && totalCount !== page.totalCount) {
+        throw new Error('ERP库存分页总数发生变化，请重新完成盘点');
+      }
+      totalCount = page.totalCount;
+    }
+    const fingerprint = JSON.stringify(page.rows);
+    if (page.rows.length > 0 && seenPages.has(fingerprint)) {
+      throw new Error('ERP重复返回同一页库存，已停止核对');
+    }
+    seenPages.add(fingerprint);
+    for (const raw of page.rows) {
+      const row = mapStockRow(raw, codes.size === 1 ? Array.from(codes.values())[0] : '');
+      if (!codes.has(row.inventoryCode.toLocaleLowerCase())) {
+        throw new Error('ERP批量库存明细缺少存货编码或返回了未请求的编码');
+      }
+      if (row.quantity === null) {
+        throw new Error(`ERP未返回 ${row.inventoryCode} 的现存量，不能用可用量代替`);
+      }
+      // T+ may include unassigned reservation rows with zero existing stock.
+      if (account.expectedWarehouseName && !row.warehouseName && row.quantity !== 0) {
+        throw new Error(`ERP未返回 ${row.inventoryCode} 的仓库，无法核对盘点范围`);
+      }
+      rows.push(row);
+    }
+    if (totalCount !== null) {
+      if (rows.length > totalCount || (rows.length < totalCount && page.rows.length === 0)) {
+        throw new Error('ERP库存分页明细不完整，请重新完成盘点');
+      }
+      if (rows.length === totalCount) return { accountKey: account.key, rows, requestCount };
+    } else if (page.rows.length < CURRENT_STOCK_PAGE_SIZE) {
+      return { accountKey: account.key, rows, requestCount };
+    }
+  }
+  throw new Error('ERP库存分页超过安全上限，请检查返回数据后重试');
 };
 
 export const fetchCurrentStockByInventoryCode = async (
@@ -281,6 +395,9 @@ export const fetchCurrentStockByInventoryCode = async (
       erpCacheMode: options.forceRefresh ? 'bypass' : 'default',
     });
     const payload = extractPayload(response);
+    if (!findStockPage(payload) || (asRecord(response).success !== true && String(payload.code) !== '0')) {
+      throw new Error('ERP未返回有效的库存明细，请重新查询');
+    }
     const rows = parseCurrentStockRows(payload, requestedInventoryCode);
     const result = {
       accountKey: account.key,

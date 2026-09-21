@@ -48,6 +48,7 @@ describe('ERP voucher payload mapping', () => {
     expect(voucher.lines[0]).toMatchObject({
       inventoryCode: 'ic.00000537.01',
       inventoryName: '微控制器',
+      quantity: 2500,
       specification: '32F030C8T6',
       unitName: 'PCS',
     });

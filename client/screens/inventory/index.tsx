@@ -3,12 +3,13 @@ import { View, Text, TouchableOpacity, TextInput, Modal, Platform, FlatList } fr
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
-import { BorderRadius, Typography } from '@/constants/theme';
+import { BorderRadius, Spacing, Typography } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
 import { Screen } from '@/components/Screen';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
 import { AppFormField } from '@/components/AppFormField';
+import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { AggregatedRecordItem } from '@/components/AggregatedRecordItem';
 import {
@@ -17,13 +18,14 @@ import {
   UiToolbarButton,
   UiWorkflowSummary,
 } from '@/components/UiRedesign';
-import { WarehouseScanInput } from '@/components/WarehouseScanInput';
+import { WarehouseScanInput, type WarehouseScanInputHandle } from '@/components/WarehouseScanInput';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { createStyles } from './styles';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { logger } from '@/utils/logger';
 import {
   Warehouse,
+  getActiveRules,
   detectRule,
   parseWithRule,
   getInventoryCodeByModel,
@@ -34,11 +36,12 @@ import {
 } from '@/utils/database';
 import { isQRCode } from '@/utils/qrcodeParser';
 import { parseQuantity } from '@/utils/quantity';
-import { Spacing } from '@/constants/theme';
 import {
   feedbackSuccess,
   feedbackError,
   feedbackWarning,
+  feedbackClear,
+  feedbackClearFailed,
   feedbackDuplicate,
   feedbackConfirm,
   feedbackInventoryComplete,
@@ -62,7 +65,6 @@ import {
   scheduleScanSubmit,
   hasMatchingTraceNo,
   sanitizeStructuredScannerInput,
-  shouldIgnoreRecentDuplicateScan,
 } from '@/utils/scannerInput';
 import {
   ERP_ACCOUNTS,
@@ -176,28 +178,17 @@ export default function InventoryScreen() {
   const selectedAccountAvailable = isErpAccountAvailable(selectedAccount);
 
   // 输入
-  const inputRef = useRef<TextInput>(null);
+  const inputRef = useRef<WarehouseScanInputHandle>(null);
   const [inputValue, setInputValue] = useState('');
+  const liveInputValueRef = useRef('');
   const processingRef = useRef(false);
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const postProcessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const screenActiveRef = useRef(true);
   const scannerFocusBlockedRef = useRef(false);
   // 扫码队列 - 暂存处理中的新扫码
   const scanQueueRef = useRef<string[]>([]);
   const processScanRef = useRef<(code: string) => void>(() => undefined);
-  const lastScanRef = useRef('');
-  const lastScanTimeRef = useRef(0);
-
-  const shouldAcceptScanCode = useCallback((code: string) => {
-    if (shouldIgnoreRecentDuplicateScan(code, lastScanRef, lastScanTimeRef)) {
-      logger.warn('[盘点] 忽略短时间重复扫码:', code);
-      return false;
-    }
-
-    return true;
-  }, []);
 
   // 盘点仓库由账套固定映射，不允许再手动组合账套与仓库。
   const [currentWarehouse, setCurrentWarehouse] = useState<Warehouse>(() =>
@@ -378,27 +369,22 @@ export default function InventoryScreen() {
 
   // 保存状态
   const [saving, setSaving] = useState(false);
+  const [saveConfirmVisible, setSaveConfirmVisible] = useState(false);
+  const saveConfirmRef = useRef(false);
+  const [reconciliationProgress, setReconciliationProgress] = useState('');
   const saveInProgressRef = useRef(false);
 
   useEffect(() => {
-    scannerFocusBlockedRef.current = quantityModalVisible || saving || switchingAccount;
-  }, [quantityModalVisible, saving, switchingAccount]);
+    scannerFocusBlockedRef.current = quantityModalVisible || saveConfirmVisible || saving || switchingAccount || alert.visible;
+  }, [alert.visible, quantityModalVisible, saveConfirmVisible, saving, switchingAccount]);
 
-  const focusScannerInput = useCallback((delay = 80) => {
-    if (focusTimerRef.current) {
-      clearTimeout(focusTimerRef.current);
-    }
-
-    focusTimerRef.current = setTimeout(() => {
-      focusTimerRef.current = null;
-      if (screenActiveRef.current && !scannerFocusBlockedRef.current) {
-        inputRef.current?.focus();
-      }
-    }, delay);
+  const focusScannerInput = useCallback((delay = 0) => {
+    if (screenActiveRef.current && !scannerFocusBlockedRef.current) inputRef.current?.focus(delay);
   }, []);
 
   const resumeQueuedScans = useCallback(() => {
-    if (!screenActiveRef.current || processingRef.current || quantityModalVisibleRef.current) {
+    if (!screenActiveRef.current || processingRef.current || quantityModalVisibleRef.current || saveConfirmRef.current ||
+      saveInProgressRef.current || accountSwitchInProgressRef.current) {
       return;
     }
 
@@ -413,9 +399,6 @@ export default function InventoryScreen() {
 
   useEffect(
     () => () => {
-      if (focusTimerRef.current) {
-        clearTimeout(focusTimerRef.current);
-      }
       if (autoSubmitTimerRef.current) {
         clearTimeout(autoSubmitTimerRef.current);
       }
@@ -458,10 +441,13 @@ export default function InventoryScreen() {
   // 删除单条记录
   const handleDeleteRecord = useCallback(
     (record: ScanRecord) => {
+      if (saveInProgressRef.current || accountSwitchInProgressRef.current) return;
       alert.showConfirm(
         '确认删除',
         '确定要删除这条记录吗？',
         () => {
+          if (saveInProgressRef.current || accountSwitchInProgressRef.current ||
+            selectedAccountRef.current.key !== selectedAccount.key) return;
           void (async () => {
             const updated = scanRecordsRef.current.filter((r) => r.id !== record.id);
             const saved = await saveCheckRecords(
@@ -516,11 +502,11 @@ export default function InventoryScreen() {
       return () => {
         isActive = false;
         screenActiveRef.current = false;
+        liveInputValueRef.current = '';
+        setInputValue('');
+        saveConfirmRef.current = false;
+        setSaveConfirmVisible(false);
         cancelScanSubmit(autoSubmitTimerRef);
-        if (focusTimerRef.current) {
-          clearTimeout(focusTimerRef.current);
-          focusTimerRef.current = null;
-        }
         if (postProcessTimerRef.current) {
           clearTimeout(postProcessTimerRef.current);
           postProcessTimerRef.current = null;
@@ -533,8 +519,14 @@ export default function InventoryScreen() {
     async (nextAccount: ErpAccountConfig) => {
       if (
         nextAccount.key === selectedAccount.key ||
+        saveInProgressRef.current ||
         accountSwitchInProgressRef.current
       ) {
+        return;
+      }
+
+      if (processingRef.current || scanQueueRef.current.length > 0 || autoSubmitTimerRef.current) {
+        showToast('请等待当前扫码处理完成后再切换账套', 'warning');
         return;
       }
 
@@ -568,6 +560,8 @@ export default function InventoryScreen() {
         quantityModalVisibleRef.current = false;
         setQuantityModalVisible(false);
         scanQueueRef.current = [];
+        liveInputValueRef.current = '';
+        setInputValue('');
 
         if (!isErpAccountAvailable(nextAccount)) {
           showToast(`${nextAccount.name}账套暂未开放`, 'warning');
@@ -598,29 +592,25 @@ export default function InventoryScreen() {
   // 处理扫描（带参数版本）
   const processScan = useCallback(
     async (code: string) => {
-      if (!code || processingRef.current) return;
-
-      if (switchingAccount) {
-        showToast('正在切换账套，请稍候', 'warning');
-        return;
-      }
-
-      if (!selectedAccountAvailable) {
-        showToast(`${selectedAccount.name}账套暂未开放，不能开始盘点`, 'warning');
-        feedbackWarning();
-        return;
-      }
+      if (!code || processingRef.current || saveInProgressRef.current || saveConfirmRef.current) return;
 
       processingRef.current = true;
 
       try {
+        const rules = await getActiveRules();
+        if (!screenActiveRef.current || !isQRCode(code, rules)) return;
+        if (accountSwitchInProgressRef.current || switchingAccount) {
+          showToast('正在切换账套，请稍候', 'warning');
+          return;
+        }
+        if (!selectedAccountAvailable) {
+          showToast(`${selectedAccount.name}账套暂未开放，不能开始盘点`, 'warning');
+          feedbackWarning();
+          return;
+        }
         // 解析二维码
-        const rule = await detectRule(code);
+        const rule = await detectRule(code, rules);
         if (!rule) {
-          if (!isQRCode(code)) {
-            logger.log('[盘点] 静默忽略未匹配规则的一维码');
-            return;
-          }
           showToast('没有匹配的二维码解析规则，请先在设置中配置', 'error');
           logger.error('[盘点] 无法识别二维码格式:', code);
           feedbackError();
@@ -720,65 +710,51 @@ export default function InventoryScreen() {
     processScanRef.current = processScan;
   }, [processScan]);
 
-  // 输入变化时自动检测并触发（扫码器逐字符输入，需要防抖检测完成）
+  const flushScannerInput = useCallback(() => {
+    if (quantityModalVisibleRef.current || saveConfirmRef.current || saveInProgressRef.current ||
+      accountSwitchInProgressRef.current) return;
+    const code = sanitizeStructuredScannerInput(liveInputValueRef.current);
+    liveInputValueRef.current = '';
+    setInputValue('');
+    if (!code) return;
+    if (processingRef.current) {
+      scanQueueRef.current.push(code);
+      return;
+    }
+    processScan(code);
+  }, [processScan]);
+
+  // Both Enter and debounce consume the same live buffer once.
   const handleInputChange = useCallback(
     (text: string) => {
+      if (quantityModalVisibleRef.current || saveConfirmRef.current || saveInProgressRef.current ||
+        accountSwitchInProgressRef.current) return;
       // 清除之前的定时器（每次输入都重置）
       cancelScanSubmit(autoSubmitTimerRef);
 
       // TextInput 是受控组件，逐字符扫码时也必须保留当前输入。
+      liveInputValueRef.current = text;
       setInputValue(text);
 
       // 如果当前有输入内容，启动定时器检测扫码完成
       if (text.length > 0) {
-        scheduleScanSubmit(autoSubmitTimerRef, () => {
-          const code = sanitizeStructuredScannerInput(text);
-          // 检测到输入完成（输入停止超过阈值，认为扫码完成）
-          if (code.length >= 1) {
-            if (!shouldAcceptScanCode(code)) {
-              setInputValue('');
-              focusScannerInput(0);
-              return;
-            }
-            setInputValue(''); // 清空输入框
-            if (processingRef.current) {
-              scanQueueRef.current.push(code);
-              return;
-            }
-            processScan(code);
-          }
-        }, 150); // 150ms 防抖，等待扫码器输入完成
+        scheduleScanSubmit(autoSubmitTimerRef, flushScannerInput, 150);
         return;
       }
     },
-    [focusScannerInput, processScan, shouldAcceptScanCode]
+    [flushScannerInput]
   );
 
   // 扫码完成确认（焦点录入模式：用户手动按回车）
   const handleSubmitEditing = useCallback(() => {
     cancelScanSubmit(autoSubmitTimerRef);
 
-    const code = sanitizeStructuredScannerInput(inputValue);
-
-    if (!code) return;
-
-    if (!shouldAcceptScanCode(code)) {
-      setInputValue('');
-      focusScannerInput(0);
-      return;
-    }
-
-    setInputValue('');
-    if (processingRef.current) {
-      scanQueueRef.current.push(code);
-      return;
-    }
-
-    processScan(code);
-  }, [focusScannerInput, inputValue, processScan, shouldAcceptScanCode]);
+    flushScannerInput();
+  }, [flushScannerInput]);
 
   // 打开数量修改弹窗
   const openQuantityModal = useCallback((record: ScanRecord) => {
+    if (saveInProgressRef.current || accountSwitchInProgressRef.current) return;
     scannerFocusBlockedRef.current = true;
     quantityModalVisibleRef.current = true;
     setEditingRecord(record);
@@ -788,7 +764,7 @@ export default function InventoryScreen() {
 
   // 确认修改数量（支持回车和按钮）
   const handleConfirmQuantity = () => {
-    if (!editingRecord) return;
+    if (!editingRecord || saveInProgressRef.current || accountSwitchInProgressRef.current) return;
 
     const qty = parseQuantity(quantityInput, { min: 0 });
     if (qty === null) {
@@ -851,7 +827,16 @@ export default function InventoryScreen() {
   };
 
   const performSaveInventory = async () => {
-    if (saveInProgressRef.current || switchingAccount) {
+    if (saveInProgressRef.current || accountSwitchInProgressRef.current) {
+      return;
+    }
+    if (selectedAccountRef.current.key !== selectedAccount.key) {
+      showToast('账套已切换，请重新确认完成盘点', 'warning');
+      return;
+    }
+    if (processingRef.current || scanQueueRef.current.length > 0 ||
+      autoSubmitTimerRef.current || quantityModalVisibleRef.current) {
+      showToast('请等待扫码和数量调整完成后再完成盘点', 'warning');
       return;
     }
     if (!selectedAccountAvailable) {
@@ -870,10 +855,16 @@ export default function InventoryScreen() {
       }
 
       showToast(`正在核对 ${selectedAccount.name} ERP库存…`, 'success');
-      const reconciliation = await reconcileInventoryRecords(selectedAccount, allDraftRecords);
+      const reconciliation = await reconcileInventoryRecords(selectedAccount, allDraftRecords, {
+        onProgress: (completed, total) => {
+          setReconciliationProgress(`核对库存 ${completed}/${total}`);
+        },
+      });
+      setReconciliationProgress('正在保存盘点…');
       logger.log('[库存盘点] ERP库存核对完成', {
         account: selectedAccount.key,
         queryCount: reconciliation.queryCount,
+        batchCount: reconciliation.batchCount,
       });
 
       logger.log('[库存盘点] 开始保存盘点记录，共', allDraftRecords.length, '条');
@@ -1004,10 +995,11 @@ export default function InventoryScreen() {
     } finally {
       saveInProgressRef.current = false;
       setSaving(false);
+      setReconciliationProgress('');
     }
   };
 
-  // 完成盘点前明确告知本次将消耗多少次ERP查询，避免误触。
+  // 完成后才查询ERP；重复扫描的存货编码会合并后分批核对。
   const handleSaveInventory = () => {
     if (saveInProgressRef.current || saving || switchingAccount) {
       return;
@@ -1023,37 +1015,52 @@ export default function InventoryScreen() {
       return;
     }
 
-    const queryCount = new Set(
-      scanRecords
-        .map((record) => getInventoryCodeLookupKey(record.inventoryCode || ''))
-        .filter(Boolean)
-    ).size;
-    alert.showConfirm(
-      '完成盘点',
-      `将查询 ${selectedAccount.name} ERP 的 ${queryCount} 个存货编码，并生成盘点差异。完成后本次暂存会清空，确定继续吗？`,
-      () => {
-        void performSaveInventory();
-      }
-    );
+    if (processingRef.current || scanQueueRef.current.length || autoSubmitTimerRef.current || quantityModalVisibleRef.current) {
+      showToast('请等待扫码处理完成后再完成盘点', 'warning');
+      return;
+    }
+    saveConfirmRef.current = true;
+    scannerFocusBlockedRef.current = true;
+    setSaveConfirmVisible(true);
+  };
+  const closeSaveConfirmation = () => {
+    saveConfirmRef.current = false;
+    setSaveConfirmVisible(false);
+    focusScannerInput();
   };
 
   // 清空记录
   const handleClearRecords = () => {
-    if (scanRecords.length === 0 || switchingAccount) return;
+    if (scanRecords.length === 0 || switchingAccount || saveInProgressRef.current) return;
     alert.showConfirm(
       '清空盘点记录',
       `将清空 ${selectedAccount.name} 的 ${scanRecords.length} 条盘点暂存，确定继续吗？`,
       () => {
+        if (saveInProgressRef.current || accountSwitchInProgressRef.current ||
+          selectedAccountRef.current.key !== selectedAccount.key) return;
+        if (processingRef.current || scanQueueRef.current.length > 0 || autoSubmitTimerRef.current) {
+          showToast('正在处理扫码，请稍后清空', 'warning');
+          return;
+        }
+        saveInProgressRef.current = true;
+        setReconciliationProgress('正在清空盘点记录');
+        setSaving(true);
         void (async () => {
-          const cleared = await clearCheckRecords(currentWarehouse, selectedAccount.key);
-          if (!cleared) {
-            showToast('清空失败，请重试', 'error');
-            feedbackError();
-            return;
+          try {
+            const cleared = await clearCheckRecords(currentWarehouse, selectedAccount.key);
+            if (!cleared) {
+              showToast('清空失败，请重试', 'error');
+              void feedbackClearFailed();
+              return;
+            }
+            replaceScanRecords([]);
+            showToast('盘点记录已清空', 'warning');
+            void feedbackClear();
+          } finally {
+            saveInProgressRef.current = false;
+            setSaving(false);
+            setReconciliationProgress('');
           }
-          replaceScanRecords([]);
-          showToast('盘点记录已清空', 'warning');
-          feedbackWarning();
         })();
       },
       true
@@ -1089,7 +1096,9 @@ export default function InventoryScreen() {
         ? 'adjust'
         : 'review';
   const currentInventoryPlaceholder =
-    switchingAccount
+    saving
+      ? reconciliationProgress || '正在准备库存核对…'
+      : switchingAccount
       ? '正在切换账套…'
       : !selectedAccountAvailable
       ? `${selectedAccount.name}账套暂未开放`
@@ -1297,7 +1306,13 @@ export default function InventoryScreen() {
         <View style={styles.topPanel}>
           <UiPageHeader
             title="库存盘点"
-            onBack={() => router.back()}
+            onBack={() => {
+              if (saveInProgressRef.current) {
+                showToast('正在完成盘点，请稍候', 'warning');
+                return;
+              }
+              router.back();
+            }}
             rightIcon="crosshair"
             rightLabel="聚焦扫码输入框"
             onRightPress={() => focusScannerInput(0)}
@@ -1344,7 +1359,9 @@ export default function InventoryScreen() {
           inputRef={inputRef}
           active={inputValue.length > 0}
           statusLabel={
-            switchingAccount
+            saving
+              ? reconciliationProgress || '正在核对ERP库存'
+              : switchingAccount
               ? '正在切换账套'
               : !selectedAccountAvailable
               ? '当前账套暂未开放'
@@ -1355,14 +1372,13 @@ export default function InventoryScreen() {
                 : '继续扫码或确认盘点'
           }
           value={inputValue}
-          editable={selectedAccountAvailable && !saving && !switchingAccount}
+          editable={selectedAccountAvailable && !saving && !switchingAccount && !saveConfirmVisible}
           onChangeText={handleInputChange}
           onSubmitEditing={handleSubmitEditing}
-          onBlur={() => focusScannerInput(120)}
           placeholder={currentInventoryPlaceholder}
           placeholderTextColor={theme.textMuted}
           autoCapitalize="none"
-          autoFocus={false}
+          autoFocus={!quantityModalVisible && !saveConfirmVisible && !alert.visible}
           showSoftInputOnFocus={false}
           actionLabel="提交盘点扫码内容"
           actionDisabled={!selectedAccountAvailable || saving || switchingAccount}
@@ -1446,7 +1462,7 @@ export default function InventoryScreen() {
         >
           <View style={quantityModalStyles.modalOverlay}>
             <AppModalCard
-              title="修改实际数量"
+              title="修改实盘数量"
               subtitle={editingRecord ? `用于修正 ${editingRecord.model} 的实际数量` : undefined}
               onClose={handleCancelQuantity}
               style={quantityModalStyles.modalContent}
@@ -1482,6 +1498,27 @@ export default function InventoryScreen() {
           </View>
         </Modal>
 
+        {saveConfirmVisible && <Modal visible transparent animationType="fade" onRequestClose={closeSaveConfirmation}>
+          <View style={quantityModalStyles.modalOverlay}>
+            <AppModalCard title="完成盘点" subtitle={`${selectedAccount.name} · ${currentWarehouse.name}`} size="compact"
+              onClose={closeSaveConfirmation}
+              footer={<AppModalActions secondaryLabel="取消" onSecondaryPress={closeSaveConfirmation}
+                primaryLabel="确认完成" onPrimaryPress={() => {
+                  if (!saveConfirmRef.current) return;
+                  closeSaveConfirmation();
+                  void performSaveInventory();
+                }} />}>
+              <KeyboardAwareFormScrollView>
+                <Text style={[Typography.dialogNote, { color: theme.textPrimary }]}>
+                  核对 ERP 库存后保存本次盘点明细和差异。
+                </Text>
+                <Text style={[Typography.dialogNote, { color: theme.textMuted, marginTop: Spacing.sm }]}>
+                  仅保存本次扫描的盘点记录；未扫描物料不受影响。
+                </Text>
+              </KeyboardAwareFormScrollView>
+            </AppModalCard>
+          </View>
+        </Modal>}
         {alert.AlertComponent}
         <ToastContainer />
       </View>

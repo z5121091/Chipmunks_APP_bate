@@ -1,6 +1,9 @@
-import type { ComponentProps, Ref } from 'react';
+import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, type ComponentProps, type Ref } from 'react';
+import { useIsFocused } from '@react-navigation/native';
 import {
   ActivityIndicator,
+  AppState,
+  Platform,
   StyleSheet,
   TextInput,
   TouchableOpacity,
@@ -14,8 +17,12 @@ import { useTheme } from '@/hooks/useTheme';
 
 type FeatherIconName = ComponentProps<typeof Feather>['name'];
 
+export interface WarehouseScanInputHandle {
+  focus: (delay?: number) => void;
+}
+
 export interface WarehouseScanInputProps extends TextInputProps {
-  inputRef?: Ref<TextInput>;
+  inputRef?: Ref<WarehouseScanInputHandle>;
   active?: boolean;
   processing?: boolean;
   statusLabel?: string;
@@ -41,11 +48,74 @@ export function WarehouseScanInput({
   onActionPress,
   style,
   editable,
+  autoFocus = true,
+  showSoftInputOnFocus = false,
+  onFocus,
+  onBlur,
+  onLayout,
+  onSubmitEditing,
   placeholderTextColor,
   ...props
 }: WarehouseScanInputProps) {
   const { theme } = useTheme();
   const disabled = actionDisabled || processing;
+  const scannerRef = useRef<TextInput>(null);
+  const focusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isFocused = useIsFocused();
+  const canFocus = isFocused && autoFocus && (editable ?? true) && !processing;
+  const canFocusRef = useRef(false);
+  const windowFocusedRef = useRef(true);
+
+  const cancelFocus = useCallback(() => {
+    if (focusTimer.current !== null) clearTimeout(focusTimer.current);
+    focusTimer.current = null;
+  }, []);
+  const focusScanner = useCallback((delay = 0) => {
+    if (!canFocusRef.current || !windowFocusedRef.current || focusTimer.current !== null) return;
+    focusTimer.current = setTimeout(() => {
+      focusTimer.current = null;
+      // Recheck at execution time: a dialog or navigation may have opened meanwhile.
+      if (!canFocusRef.current || !windowFocusedRef.current) return;
+      if (AppState.currentState && AppState.currentState !== 'active') return;
+      if (!scannerRef.current?.isFocused()) scannerRef.current?.focus();
+    }, delay);
+  }, []);
+
+  useImperativeHandle(inputRef, () => ({ focus: focusScanner }), [focusScanner]);
+
+  useLayoutEffect(() => {
+    canFocusRef.current = canFocus;
+    if (canFocus) focusScanner();
+    else {
+      cancelFocus();
+      if (scannerRef.current?.isFocused()) scannerRef.current.blur();
+    }
+    return () => {
+      canFocusRef.current = false;
+      cancelFocus();
+    };
+  }, [canFocus, cancelFocus, focusScanner]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => {
+      if (state === 'active') focusScanner();
+      else cancelFocus();
+    });
+    const windowBlur = Platform.OS === 'android' ? AppState.addEventListener('blur', () => {
+      windowFocusedRef.current = false;
+      cancelFocus();
+    }) : undefined;
+    const windowFocus = Platform.OS === 'android' ? AppState.addEventListener('focus', () => {
+      windowFocusedRef.current = true;
+      focusScanner();
+    }) : undefined;
+    return () => {
+      cancelFocus();
+      subscription.remove();
+      windowBlur?.remove();
+      windowFocus?.remove();
+    };
+  }, [cancelFocus, focusScanner]);
 
   return (
     <View
@@ -60,7 +130,7 @@ export function WarehouseScanInput({
       ]}
     >
       <TextInput
-        ref={inputRef}
+        ref={scannerRef}
         style={[styles.input, { color: theme.textPrimary }, style]}
         editable={(editable ?? true) && !processing}
         placeholderTextColor={placeholderTextColor || theme.textMuted}
@@ -69,7 +139,26 @@ export function WarehouseScanInput({
         }
         autoCorrect={false}
         returnKeyType="done"
+        submitBehavior="submit"
         {...props}
+        showSoftInputOnFocus={showSoftInputOnFocus}
+        autoFocus={false}
+        onFocus={event => {
+          cancelFocus();
+          onFocus?.(event);
+        }}
+        onLayout={event => {
+          onLayout?.(event);
+          focusScanner();
+        }}
+        onBlur={event => {
+          onBlur?.(event);
+          focusScanner();
+        }}
+        onSubmitEditing={event => {
+          onSubmitEditing?.(event);
+          focusScanner();
+        }}
       />
       <TouchableOpacity
         style={[
@@ -82,7 +171,10 @@ export function WarehouseScanInput({
         accessibilityLabel={actionLabel}
         accessibilityState={{ disabled, busy: actionLoading || processing }}
         disabled={disabled}
-        onPress={onActionPress}
+        onPress={() => {
+          onActionPress();
+          focusScanner();
+        }}
       >
         {actionLoading || processing ? (
           <ActivityIndicator size="small" color={theme.buttonPrimaryText} />

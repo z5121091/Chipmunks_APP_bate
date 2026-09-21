@@ -419,12 +419,13 @@ class AutoDatabaseBackupWorker(
   }
 
   private fun hasBusinessData(databaseFile: File): Boolean {
+    // Native SQLite bypasses the logical-to-physical name mapping in database.ts.
     val businessTables = listOf(
-      "orders",
-      "materials",
-      "inbound_records",
-      "inventory_check_records",
-      "unpack_records"
+      "出库单",
+      "出库明细",
+      "入库记录",
+      "盘点记录",
+      "拆包记录"
     )
 
     SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
@@ -445,7 +446,7 @@ class AutoDatabaseBackupWorker(
   }
 
   private fun tableHasRows(database: SQLiteDatabase, tableName: String): Boolean {
-    database.rawQuery("SELECT 1 FROM $tableName LIMIT 1", null).use { cursor ->
+    database.rawQuery("SELECT 1 FROM [$tableName] LIMIT 1", null).use { cursor ->
       return cursor.moveToFirst()
     }
   }

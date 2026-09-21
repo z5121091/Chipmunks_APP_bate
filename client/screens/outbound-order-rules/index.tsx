@@ -11,6 +11,7 @@ import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
 import { logger } from '@/utils/logger';
+import { feedbackClear, feedbackClearFailed } from '@/utils/feedback';
 import { getAllWarehouses, type Warehouse } from '@/utils/database';
 import {
   clearOutboundWarehouseOrderRule,
@@ -159,9 +160,11 @@ export default function OutboundOrderRulesScreen() {
       setActiveWarehouse(null);
       setActiveSampleText('');
       alert.showSuccess(`已清空 ${activeWarehouse.name} 的出库单号样例`);
+      void feedbackClear();
     } catch (error) {
       logger.error('清空出库单号规则失败:', error);
       alert.showWarning(error instanceof Error ? error.message : '清空样例失败');
+      void feedbackClearFailed();
     } finally {
       setSaving(false);
     }

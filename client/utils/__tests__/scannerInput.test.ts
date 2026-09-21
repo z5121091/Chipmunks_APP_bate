@@ -46,7 +46,8 @@ describe('scannerInput', () => {
   it('preserves separators and hidden characters inside structured QR content', () => {
     expect(
       sanitizeStructuredScannerInput('\uFEFF\r\n{MODEL}\r\n{LOT}\x1D{100}\u0000\r\n')
-    ).toBe('{MODEL}\r\n{LOT}\x1D{100}');
+    ).toBe('\r\n{MODEL}\r\n{LOT}\x1D{100}\r\n');
+    expect(sanitizeStructuredScannerInput(' \r\n\t ')).toBe('');
   });
 
   it('finds a trace number across draft record groups without case sensitivity', () => {

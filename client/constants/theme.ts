@@ -4,6 +4,7 @@ import { rs, rf, getDeviceInfo } from '@/utils/responsive';
 import {
   LightColors,
   DarkColors,
+  ModuleColors,
   withAlpha,
   StatusBgColors,
   StatusBorderColors,
@@ -12,6 +13,7 @@ import {
 export {
   LightColors,
   DarkColors,
+  ModuleColors,
   withAlpha,
   StatusBgColors,
   StatusBorderColors,
@@ -106,26 +108,6 @@ export const Colors = {
     tagGray: DarkColors.tag.gray.dark,
     // 是否深色模式
     isDark: true,
-  },
-};
-
-// 首页模块主题色
-export const ModuleColors = {
-  light: {
-    inbound: "#198F6B",
-    outbound: "#2F6FDD",
-    orders: "#C7862E",
-    inventory: "#C55B52",
-    materials: "#198CA8",
-    settings: "#5F7187",
-  },
-  dark: {
-    inbound: "#3FC89A",
-    outbound: "#63A1FF",
-    orders: "#E0A14C",
-    inventory: "#F07A7A",
-    materials: "#46B9D6",
-    settings: "#A8B8CB",
   },
 };
 
@@ -249,6 +231,18 @@ export const getTypography = () => ({
     lineHeight: rf(21),
     fontWeight: "600" as const,
   },
+  formLabel: {
+    fontSize: rf(13),
+    lineHeight: rf(18),
+    fontWeight: "600" as const,
+    letterSpacing: 0,
+  },
+  formHint: {
+    fontSize: rf(11),
+    lineHeight: rf(16),
+    fontWeight: "400" as const,
+    letterSpacing: 0,
+  },
   caption: {
     fontSize: rf(12),
     lineHeight: rf(18),
@@ -279,6 +273,36 @@ export const getTypography = () => ({
     fontWeight: "700" as const,
     letterSpacing: 0,
     textTransform: "uppercase" as const,
+  },
+  dialogTitle: {
+    fontSize: rf(19),
+    lineHeight: rf(27),
+    fontWeight: "800" as const,
+    letterSpacing: 0,
+  },
+  dialogBody: {
+    fontSize: rf(15),
+    lineHeight: rf(24),
+    fontWeight: "400" as const,
+    letterSpacing: 0,
+  },
+  dialogAction: {
+    fontSize: rf(15),
+    lineHeight: rf(22),
+    fontWeight: "700" as const,
+    letterSpacing: 0,
+  },
+  dialogNote: {
+    fontSize: rf(14),
+    lineHeight: rf(22),
+    fontWeight: "400" as const,
+    letterSpacing: 0,
+  },
+  feedback: {
+    fontSize: rf(14),
+    lineHeight: rf(20),
+    fontWeight: "800" as const,
+    letterSpacing: 0,
   },
   link: {
     fontSize: rf(15),
@@ -355,6 +379,10 @@ export const AppComponentTokens = {
   },
   typography: {
     button: Typography.smallMedium,
+    dialogAction: Typography.dialogAction,
+    dialogNote: Typography.dialogNote,
+    formHint: Typography.formHint,
+    formLabel: Typography.formLabel,
     input: Typography.small,
     tag: Typography.labelSmall,
     title: Typography.smallMedium,

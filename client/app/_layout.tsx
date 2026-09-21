@@ -31,6 +31,8 @@ import {
   maybeRunAutoNasBackup,
 } from '@/utils/autoNasBackup';
 
+SplashScreen.setOptions({ duration: 200, fade: true });
+
 void SplashScreen.preventAutoHideAsync().catch((error) => {
   logger.warn('[App] prevent splash auto hide failed:', error);
 });
@@ -165,14 +167,17 @@ export default function RootLayout() {
       logger.error('[App] database initialization failed:', error);
     } finally {
       setDatabaseInitializing(false);
-      try {
-        await SplashScreen.hideAsync();
-        logger.log('[App] splash hidden');
-      } catch (splashError) {
-        logger.warn('[App] hide splash failed:', splashError);
-      }
     }
   }, []);
+
+  useEffect(() => {
+    // Hide only after the ready page (or database error screen) has committed.
+    if (!databaseInitializing) {
+      void SplashScreen.hideAsync().catch((error) => {
+        logger.warn('[App] hide splash failed:', error);
+      });
+    }
+  }, [databaseInitializing]);
 
   const retryInitializeDatabase = useCallback(() => {
     setDatabaseInitializing(true);

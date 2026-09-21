@@ -107,7 +107,10 @@ const detectCustomSeparator = (content: string): string | null => {
  * @param content 扫码内容
  * @returns true=二维码（需要震动处理），false=一维码（静默忽略）
  */
-export const isQRCode = (content: string): boolean => {
+export const isQRCode = (
+  content: string,
+  rules: readonly { separator: string }[] = []
+): boolean => {
   if (!content || content.trim().length === 0) {
     return false;
   }
@@ -135,8 +138,8 @@ export const isQRCode = (content: string): boolean => {
     return true;
   }
 
-  // 不包含任何分隔符，判定为一维码
-  return false;
+  // Include configured separators, such as a space or a custom single character.
+  return rules.some(rule => Boolean(rule.separator) && trimmed.includes(rule.separator));
 };
 
 /**
@@ -164,16 +167,12 @@ export interface ParsedQRCode {
  * 2. parseWithRule() - 按规则解析字段
  * 
  * @param content 扫码原始内容
- * @param customSeparator 可选，自定义分隔符（优先使用）
  * @returns 解析结果，或 null（解析失败）
  * 
  * @see database.ts detectRule()
  * @see database.ts parseWithRule()
  */
-export const parseQRCode = async (
-  content: string,
-  customSeparator?: string
-): Promise<ParsedQRCode | null> => {
+export const parseQRCode = async (content: string): Promise<ParsedQRCode | null> => {
   if (!content || content.trim().length === 0) {
     return null;
   }
@@ -182,14 +181,14 @@ export const parseQRCode = async (
 
   // 调用 database.ts 的 detectRule 自动检测规则
   // 只匹配用户已经启用的规则，未知结构不做猜测。
-  const rule = await detectRule(trimmedContent);
+  const rule = await detectRule(content);
 
   if (!rule) {
     return null;
   }
 
   // 使用规则解析字段
-  const { standardFields } = parseWithRule(trimmedContent, rule);
+  const { standardFields } = parseWithRule(content, rule);
 
   return {
     model: standardFields.model || '',

@@ -15,11 +15,11 @@ import {
   getAllRules,
 } from '@/utils/database';
 import { formatDateTime } from '@/utils/time';
-import { Feather } from '@expo/vector-icons';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { rf } from '@/utils/responsive';
 import { Spacing } from '@/constants/theme';
 import { logger } from '@/utils/logger';
+import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 
 export default function DetailScreen() {
   const { theme, isDark } = useTheme();
@@ -176,7 +176,7 @@ export default function DetailScreen() {
           router.back();
         } catch (error) {
       logger.error('删除失败:', error);
-          alert.showError('删除失败');
+          alert.showError(formatUserFacingErrorMessage(error, '删除失败，请稍后重试'));
         }
       },
       true

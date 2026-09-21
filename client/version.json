@@ -1,7 +1,7 @@
 {
-  "version": "V3.0",
-  "versionCode": 100,
-  "buildNumber": 100,
+  "version": "V3.06",
+  "versionCode": 106,
+  "buildNumber": 106,
   "downloadUrl": "app-release.apk",
   "forceUpdate": false,
   "appName": "掌上仓库",
@@ -12,6 +12,47 @@
   "icpFilingNumber": "苏ICP备2026059103号",
   "icpFilingUrl": "https://beian.miit.gov.cn/",
   "changelog": [
+    {
+      "version": "V3.06",
+      "date": "2026-09-17",
+      "changes": [
+        { "type": "feat", "text": "解析规则支持扫码样本、分隔符推荐、逐段字段分配和匹配诊断，分隔符仍需人工确认。" },
+        { "type": "feat", "text": "支持自定义结束符和多种识别条件，优化规则编辑流程。" },
+        { "type": "fix", "text": "统一占位字段为忽略此段，兼容旧规则和旧备份，保留字段位置、前缀及识别条件。" }
+      ]
+    },
+    {
+      "version": "V3.05",
+      "date": "2026-09-16",
+      "changes": [
+        { "type": "fix", "text": "修复出库删除拆包记录后重新扫码的处理，并保护已被后续业务使用的剩余标签。" },
+        { "type": "feat", "text": "拆包弹窗增加需要拆包语音，保存成功后提示拆包完成。" },
+        { "type": "fix", "text": "解析规则增加独立回车分隔符选项；出库展开明细显示生产日期，不再重复显示型号。" }
+      ]
+    },
+    {
+      "version": "V3.04",
+      "date": "2026-09-14",
+      "changes": [
+        { "type": "fix", "text": "修复定时 NAS 备份误用旧数据库表名而跳过备份的问题，并将批次库存流水纳入业务数据检查。" }
+      ]
+    },
+    {
+      "version": "V3.03",
+      "date": "2026-09-13",
+      "changes": [
+        { "type": "fix", "text": "恢复品牌启动页，适配系统深浅色模式及不同屏幕密度，初始化完成后淡出进入首页。" }
+      ]
+    },
+    {
+      "version": "V3.02",
+      "date": "2026-09-13",
+      "changes": [
+        { "type": "feat", "text": "增加批次与生产日期查询，支持入库登记、逐包盘点及出库扣减。" },
+        { "type": "fix", "text": "修复上海极海、领芯采购入库编码与现有物料绑定的对应。" },
+        { "type": "fix", "text": "移除启动图片，初始化完成后直接进入首页；仅发布ARM64版本。" }
+      ]
+    },
     {
       "version": "V3.0",
       "date": "2026-07-11",

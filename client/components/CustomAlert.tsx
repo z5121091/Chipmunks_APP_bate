@@ -1,11 +1,10 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, Modal, useWindowDimensions } from 'react-native';
+import { View, Text, TouchableOpacity, Modal, ScrollView, useWindowDimensions } from 'react-native';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { Spacing, BorderRadius, BorderWidth, Typography } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH, getAppModalWidth } from '@/constants/modal';
 import { withAlpha } from '@/utils/colors';
-import { rf } from '@/utils/responsive';
 import { AppPillToast, AppPillToastType } from './AppPillToast';
 
 export type AlertButtonType = {
@@ -34,8 +33,10 @@ export function CustomAlert({
   onClose,
 }: CustomAlertProps) {
   const { theme } = useTheme();
-  const { width } = useWindowDimensions();
+  const { width, height } = useWindowDimensions();
   const modalWidth = getAppModalWidth(width);
+  const shouldScrollMessage = Boolean(message && (message.includes('\n') || message.length > 96));
+  const messageMaxHeight = Math.min(Math.max(height * 0.28, 96), 180);
 
   const getIconConfig = () => {
     switch (icon) {
@@ -135,32 +136,32 @@ export function CustomAlert({
 
           {/* 标题 */}
           <Text style={{
-            ...Typography.h4,
-            fontSize: rf(19),
-            lineHeight: rf(27),
-            fontWeight: '800',
+            ...Typography.dialogTitle,
             textAlign: 'center',
             marginBottom: message ? Spacing.sm : Spacing.lg,
             color: theme.textPrimary,
-            letterSpacing: 0,
           }}>
             {title}
           </Text>
 
           {/* 消息内容 */}
-          {message && (
-            <Text style={{
-              ...Typography.body,
-              fontSize: rf(15),
-              lineHeight: rf(24),
-              textAlign: 'center',
-              marginBottom: Spacing.xl,
-              color: theme.textSecondary,
-              paddingHorizontal: Spacing.xs,
-            }}>
-              {message}
-            </Text>
-          )}
+          {message ? (
+            <ScrollView
+              style={shouldScrollMessage ? { alignSelf: 'stretch', maxHeight: messageMaxHeight } : undefined}
+              contentContainerStyle={{ paddingHorizontal: Spacing.xs }}
+              showsVerticalScrollIndicator={shouldScrollMessage}
+              bounces={shouldScrollMessage}
+            >
+              <Text style={{
+                ...Typography.dialogBody,
+                textAlign: 'center',
+                marginBottom: Spacing.xl,
+                color: theme.textSecondary,
+              }}>
+                {message}
+              </Text>
+            </ScrollView>
+          ) : null}
 
           {/* 按钮组 */}
           <View style={{
@@ -194,10 +195,7 @@ export function CustomAlert({
                   activeOpacity={0.7}
                 >
                   <Text style={{
-                    ...Typography.bodyMedium,
-                    fontSize: rf(15),
-                    lineHeight: rf(22),
-                    fontWeight: '700',
+                    ...Typography.dialogAction,
                     color: isCancel ? theme.textPrimary : theme.buttonPrimaryText,
                   }}>
                     {button.text}

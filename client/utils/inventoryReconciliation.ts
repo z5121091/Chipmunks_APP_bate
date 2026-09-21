@@ -1,6 +1,7 @@
 import {
-  fetchCurrentStockByInventoryCode,
-  type CurrentStockQueryResult,
+  CURRENT_STOCK_BATCH_SIZE,
+  fetchCurrentStockByInventoryCodes,
+  type CurrentStockBatchResult,
   type CurrentStockRow,
 } from './erpCurrentStock';
 import type { ErpAccountConfig } from './erpAccounts';
@@ -24,13 +25,13 @@ export type InventoryReconciliationResult = {
   differenceRows: InventoryDifferenceRow[];
   erpQuantityByInventoryCode: Map<string, number>;
   queryCount: number;
+  batchCount: number;
 };
 
 type FetchCurrentStock = (
   account: ErpAccountConfig,
-  inventoryCode: string,
-  options?: { forceRefresh?: boolean }
-) => Promise<CurrentStockQueryResult>;
+  inventoryCodes: string[]
+) => Promise<CurrentStockBatchResult>;
 
 const normalizeText = (value?: string | null): string => value?.trim().toLocaleLowerCase() || '';
 
@@ -44,7 +45,7 @@ const getPhysicalQuantity = (record: InventoryCountRecord): number => {
 
 const sumStockRows = (inventoryCode: string, rows: CurrentStockRow[]): number => {
   const quantities = rows.map((row) => row.quantity).filter((value): value is number => value !== null);
-  if (rows.length > 0 && quantities.length === 0) {
+  if (quantities.length !== rows.length || quantities.some((quantity) => !Number.isFinite(quantity))) {
     throw new Error(`ERP未返回 ${inventoryCode} 的库存数量字段`);
   }
 
@@ -65,19 +66,14 @@ export const getErpStockQuantityForAccount = (
     return sumStockRows(inventoryCode, rows);
   }
 
+  if (rows.some((row) => !row.warehouseName.trim() && row.quantity !== 0)) {
+    throw new Error(`ERP未返回 ${inventoryCode} 的仓库，无法核对盘点范围`);
+  }
+
   const matchedRows = rows.filter(
     (row) => normalizeText(row.warehouseName) === expectedWarehouse
   );
-  if (matchedRows.length === 0) {
-    const returnedWarehouses = Array.from(
-      new Set(rows.map((row) => row.warehouseName.trim()).filter(Boolean))
-    );
-    throw new Error(
-      `ERP返回了 ${inventoryCode}，但未找到仓库“${account.expectedWarehouseName}”` +
-        `${returnedWarehouses.length > 0 ? `（实际返回：${returnedWarehouses.join('、')}）` : ''}`
-    );
-  }
-
+  // Stock in another warehouse is not stock in the warehouse being counted.
   return sumStockRows(inventoryCode, matchedRows);
 };
 
@@ -119,17 +115,26 @@ const mapWithConcurrency = async <T, R>(
 ): Promise<R[]> => {
   const results = new Array<R>(values.length);
   let nextIndex = 0;
+  let failed = false;
+  let firstError: unknown;
 
   const worker = async () => {
-    while (nextIndex < values.length) {
+    while (!failed && nextIndex < values.length) {
       const currentIndex = nextIndex;
       nextIndex += 1;
-      results[currentIndex] = await mapper(values[currentIndex]);
+      try {
+        results[currentIndex] = await mapper(values[currentIndex]);
+      } catch (error) {
+        if (!failed) firstError = error;
+        failed = true;
+      }
     }
   };
 
-  const workerCount = Math.min(Math.max(1, concurrency), values.length);
+  const limit = Number.isFinite(concurrency) ? Math.floor(concurrency) : 2;
+  const workerCount = Math.min(Math.max(1, limit), 2, values.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  if (failed) throw firstError;
   return results;
 };
 
@@ -139,35 +144,55 @@ export const reconcileInventoryRecords = async (
   options: {
     concurrency?: number;
     fetchCurrentStock?: FetchCurrentStock;
+    onProgress?: (completed: number, total: number) => void;
   } = {}
 ): Promise<InventoryReconciliationResult> => {
   const physicalRows = buildPhysicalCountRows(records);
-  const fetchCurrentStock = options.fetchCurrentStock || fetchCurrentStockByInventoryCode;
-  const erpRows = await mapWithConcurrency(
-    physicalRows,
-    options.concurrency ?? 3,
-    async (physicalRow) => {
+  const fetchCurrentStock = options.fetchCurrentStock || fetchCurrentStockByInventoryCodes;
+  const batches: typeof physicalRows[] = [];
+  for (let index = 0; index < physicalRows.length; index += CURRENT_STOCK_BATCH_SIZE) {
+    batches.push(physicalRows.slice(index, index + CURRENT_STOCK_BATCH_SIZE));
+  }
+  let completed = 0;
+  let queryCount = 0;
+  options.onProgress?.(0, physicalRows.length);
+  const batchResults = await mapWithConcurrency(
+    batches,
+    options.concurrency ?? 2,
+    async (batch) => {
       try {
-        const result = await fetchCurrentStock(account, physicalRow.inventoryCode, {
-          forceRefresh: true,
+        const result = await fetchCurrentStock(account, batch.map((row) => row.inventoryCode));
+        if (result.accountKey !== account.key) {
+          throw new Error('ERP返回账套与当前选择不一致，已停止核对');
+        }
+        const rowsByCode = new Map<string, CurrentStockRow[]>();
+        result.rows.forEach((row) => {
+          const key = getInventoryCodeLookupKey(row.inventoryCode);
+          const rows = rowsByCode.get(key) ?? [];
+          rows.push(row);
+          rowsByCode.set(key, rows);
         });
-        return {
+        const reconciled = batch.map((physicalRow) => ({
           ...physicalRow,
           erpQuantity: getErpStockQuantityForAccount(
             account,
             physicalRow.inventoryCode,
-            result.rows
+            rowsByCode.get(getInventoryCodeLookupKey(physicalRow.inventoryCode)) ?? []
           ),
-        };
+        }));
+        queryCount += result.requestCount;
+        completed += batch.length;
+        options.onProgress?.(completed, physicalRows.length);
+        return reconciled;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`${physicalRow.inventoryCode} 库存核对失败：${message}`);
+        throw new Error(`${account.name} 库存批次（${batch[0].inventoryCode} 起）核对失败：${message}`);
       }
     }
   );
 
   const erpQuantityByInventoryCode = new Map<string, number>();
-  const differenceRows = erpRows.map((row) => {
+  const differenceRows = batchResults.flat().map((row) => {
     erpQuantityByInventoryCode.set(getInventoryCodeLookupKey(row.inventoryCode), row.erpQuantity);
     return {
       differenceQuantity: row.physicalQuantity - row.erpQuantity,
@@ -181,6 +206,7 @@ export const reconcileInventoryRecords = async (
   return {
     differenceRows,
     erpQuantityByInventoryCode,
-    queryCount: physicalRows.length,
+    queryCount,
+    batchCount: batches.length,
   };
 };

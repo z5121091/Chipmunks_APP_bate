@@ -106,7 +106,7 @@ export function AppModalActions({
         disabled={primaryDisabled}
         onPress={onPrimaryPress}
       >
-        <Text style={{ ...Typography.bodyMedium, color: primaryColors.textColor, fontWeight: '700' }}>
+        <Text style={{ ...Typography.dialogAction, color: primaryColors.textColor }}>
           {primaryLabel}
         </Text>
       </TouchableOpacity>

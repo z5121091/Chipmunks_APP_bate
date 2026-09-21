@@ -3,9 +3,9 @@ import {
   View,
   Text,
   TouchableOpacity,
-  TextInput,
   FlatList,
   Platform,
+  BackHandler,
 } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useTheme } from '@/hooks/useTheme';
@@ -18,7 +18,7 @@ import {
   UiToolbarButton,
   UiWorkflowSummary,
 } from '@/components/UiRedesign';
-import { WarehouseScanInput } from '@/components/WarehouseScanInput';
+import { WarehouseScanInput, type WarehouseScanInputHandle } from '@/components/WarehouseScanInput';
 import { createStyles } from './styles';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
@@ -30,11 +30,12 @@ import {
   getAllWarehouses,
   addInboundRecordsBatch,
   detectRule,
+  getActiveRules,
   parseWithRule,
+  QRCodeRuleConflictError,
   getInventoryCodeByModel,
   generateId,
   updateInboundDocumentSyncStatus,
-  checkInboundTraceNoExists,
   getInboundRecordsByNo,
 } from '@/utils/database';
 import { isQRCode } from '@/utils/qrcodeParser';
@@ -48,6 +49,7 @@ import {
   feedbackDuplicate,
   feedbackInboundComplete,
   feedbackClear,
+  feedbackClearFailed,
   feedbackNotBound,
   feedbackNotInOrder,
   feedbackOverQuantity,
@@ -65,7 +67,8 @@ import {
   type InboundExportRecord,
 } from '@/utils/inboundExport';
 import type { SyncConfig } from '@/constants/config';
-import { cancelScanSubmit, scheduleScanSubmit, sanitizeStructuredScannerInput, shouldIgnoreRecentDuplicateScan } from '@/utils/scannerInput';
+import { cancelScanSubmit, scheduleScanSubmit, sanitizeStructuredScannerInput } from '@/utils/scannerInput';
+import { buildOutboundProgress as buildInboundProgress } from '@/utils/outboundProgress';
 import {
   getErpAccountByKey,
   type ErpAccountConfig,
@@ -74,6 +77,7 @@ import {
 import {
   fetchPurchaseReceiveVoucherStatuses,
   fetchPurchaseReceiveVoucher,
+  getPurchaseReceiveBindingLines,
   loadCachedPurchaseReceiveVoucher,
   loadCachedPurchaseReceiveVoucherStatuses,
   savePurchaseReceiveVoucherCache,
@@ -81,6 +85,7 @@ import {
   type PurchaseReceiveVoucher,
 } from '@/utils/erpPurchaseReceive';
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
+import { buildRuleConflictDiagnostic, formatRuleConflictDiagnostic } from '@/utils/ruleConflictDiagnosis';
 import {
   buildInboundModelKey,
   buildInboundModelVersionKey,
@@ -128,7 +133,7 @@ type InboundErpLineProgress = {
   scannedRecords: ScanRecord[];
   scannedQuantity: number;
   specification: string;
-  status: 'complete' | 'partial' | 'pending';
+  status: 'complete' | 'partial' | 'pending' | 'over' | 'unmatched' | 'invalid';
   unitName: string;
 };
 
@@ -179,38 +184,36 @@ export default function InboundScreen() {
   const styles = useMemo(() => createStyles(theme), [theme]);
   const alert = useCustomAlert();
   const router = useSafeRouter();
+  // 弹窗与路由 Hook 返回对象会随渲染更新；扫码回调通过 Ref 获取最新实例，避免高频扫码链路反复重建。
+  const alertRef = useRef(alert);
+  const routerRef = useRef(router);
+  useEffect(() => {
+    alertRef.current = alert;
+    routerRef.current = router;
+  }, [alert, router]);
   const routeParams = useSafeSearchParams<{ accountKey?: ErpAccountKey; voucherCode?: string }>();
   const selectedVoucherCode = (routeParams.voucherCode || '').trim().toUpperCase();
   const selectedAccountKey = routeParams.accountKey;
 
   // 输入
-  const inputRef = useRef<TextInput>(null);
+  const inputRef = useRef<WarehouseScanInputHandle>(null);
   const [inputValue, setInputValue] = useState('');
+  const liveInputValueRef = useRef('');
   const processingRef = useRef(false);
+  const sessionIdRef = useRef(0);
+  const draftReadyRef = useRef(false);
+  const [draftReady, setDraftReady] = useState(false);
+  const activeRulesRef = useRef<Awaited<ReturnType<typeof getActiveRules>> | null>(null);
+  const inventoryBindingsRef = useRef(new Map<string, string>());
   const inboundDraftWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const postProcessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const screenActiveRef = useRef(true);
+  const isSessionActive = useCallback((id: number) =>
+    screenActiveRef.current && sessionIdRef.current === id, []);
   const scannerFocusBlockedRef = useRef(false);
   // 扫码队列 - 暂存处理中的新扫码（字符串队列，用于 processing 中排队）
   const scanQueueRef = useRef<string[]>([]);
-  // 扫码记录缓冲队列 - 批量 flush 到 scanRecords，避免每次扫码都重渲染
-  const pendingRecordsRef = useRef<ScanRecord[]>([]);
-  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // 防抖相关
-  const lastScanRef = useRef<string>('');
-  const lastScanTimeRef = useRef<number>(0);
-
-  const shouldAcceptScanCode = useCallback((code: string) => {
-    if (shouldIgnoreRecentDuplicateScan(code, lastScanRef, lastScanTimeRef)) {
-      logger.warn('[扫码入库] 忽略短时间重复扫码:', code);
-      return false;
-    }
-
-    return true;
-  }, []);
-
   // 仓库
   const [currentWarehouse, setCurrentWarehouse] = useState<Warehouse | null>(null);
 
@@ -297,27 +300,15 @@ export default function InboundScreen() {
   }, [scanRecords]);
 
   useEffect(() => {
-    scannerFocusBlockedRef.current = saving || erpVoucherLoading;
-  }, [erpVoucherLoading, saving]);
+    scannerFocusBlockedRef.current = saving || erpVoucherLoading || alert.visible;
+  }, [alert.visible, erpVoucherLoading, saving]);
 
-  const focusScannerInput = useCallback((delay = 80) => {
-    if (focusTimerRef.current) {
-      clearTimeout(focusTimerRef.current);
-    }
-
-    focusTimerRef.current = setTimeout(() => {
-      focusTimerRef.current = null;
-      if (screenActiveRef.current && !scannerFocusBlockedRef.current) {
-        inputRef.current?.focus();
-      }
-    }, delay);
+  const focusScannerInput = useCallback((delay = 0) => {
+    if (screenActiveRef.current && !scannerFocusBlockedRef.current) inputRef.current?.focus(delay);
   }, []);
 
   useEffect(
     () => () => {
-      if (focusTimerRef.current) {
-        clearTimeout(focusTimerRef.current);
-      }
       if (autoSubmitTimerRef.current) {
         clearTimeout(autoSubmitTimerRef.current);
       }
@@ -349,7 +340,9 @@ export default function InboundScreen() {
       expectedVoucherCode: string,
       fallbackSupplier?: string | null
     ): Promise<string | null> => {
+      const sessionId = sessionIdRef.current;
       try {
+        await inboundDraftWriteQueueRef.current;
         const currentWarehouseId = warehouse?.id;
         if (!currentWarehouseId) {
           logger.log('[loadScanRecords] 当前仓库未加载，跳过恢复');
@@ -394,9 +387,13 @@ export default function InboundScreen() {
             'inbound.scanRecords'
           );
           if (!parsedRecords) {
-            return null;
+            throw new Error('本单入库草稿损坏，请先备份并检查，未覆盖原草稿');
           }
+          if (!Array.isArray(parsedRecords) || parsedRecords.some(record =>
+            !record || !record.id || !record.model || !Number.isSafeInteger(record.quantity) || record.quantity <= 0
+          )) throw new Error('入库草稿格式异常，未覆盖原草稿');
           const records = await normalizeInboundDraftRecords(parsedRecords);
+          if (!isSessionActive(sessionId)) return null;
           const normalizedSavedRecords = JSON.stringify(records);
           let restoredInboundNo: string | null = null;
 
@@ -410,7 +407,7 @@ export default function InboundScreen() {
                accountKey?: ErpAccountKey;
              }>(pendingData, 'inbound.pendingData');
             if (!data) {
-              return null;
+              throw new Error('本单草稿信息损坏，未覆盖原草稿');
             }
 
             const savedInboundNo = (data.inboundNo || '').trim().toUpperCase();
@@ -423,6 +420,7 @@ export default function InboundScreen() {
               savedInboundNo &&
               savedInboundNo !== normalizedExpectedVoucherCode
             ) {
+              if (!shouldMigrateLegacyDraft) throw new Error('本单草稿单号不匹配，未覆盖原草稿');
               logger.warn('[loadScanRecords] 草稿单号与当前ERP单据不一致，跳过恢复:', {
                 currentVoucherCode: normalizedExpectedVoucherCode,
                 savedInboundNo,
@@ -434,6 +432,7 @@ export default function InboundScreen() {
               selectedAccountKey &&
               data.accountKey !== selectedAccountKey
             ) {
+              if (!shouldMigrateLegacyDraft) throw new Error('本单草稿账套不匹配，未覆盖原草稿');
               logger.warn('[loadScanRecords] 草稿账套与当前ERP账套不一致，跳过恢复:', {
                 savedAccountKey: data.accountKey,
                 currentAccountKey: selectedAccountKey,
@@ -443,6 +442,7 @@ export default function InboundScreen() {
 
             // 验证保存时的仓库是否与当前仓库匹配
             if (data.warehouseId && data.warehouseId !== currentWarehouseId) {
+              if (!shouldMigrateLegacyDraft) throw new Error('本单草稿仓库不匹配，未覆盖原草稿');
               logger.log('[loadScanRecords] 仓库不匹配，跳过恢复:', {
                 savedWarehouseId: data.warehouseId,
                 currentWarehouseId,
@@ -484,13 +484,18 @@ export default function InboundScreen() {
 
           return restoredInboundNo;
         }
+        if (isSessionActive(sessionId)) {
+          scanRecordsRef.current = [];
+          setScanRecords([]);
+        }
       } catch (error) {
         logger.error('加载扫描记录失败:', error);
+        throw error;
       }
 
       return null;
     },
-    [getInboundDraftKeys, getLegacyInboundDraftKeys, selectedAccountKey, showToast]
+    [getInboundDraftKeys, getLegacyInboundDraftKeys, isSessionActive, selectedAccountKey, showToast]
   );
 
   // 保存扫描记录
@@ -530,15 +535,10 @@ export default function InboundScreen() {
   // 清空扫描记录
   const clearScanRecords = async () => {
     const draftKeys = getInboundDraftKeys(currentWarehouse?.id);
-    const legacyScopedDraftKeys = getLegacyInboundDraftKeys(currentWarehouse?.id);
     await enqueueInboundDraftWrite(() =>
       AsyncStorage.multiRemove([
         draftKeys.recordsKey,
         draftKeys.pendingKey,
-        legacyScopedDraftKeys.recordsKey,
-        legacyScopedDraftKeys.pendingKey,
-        INBOUND_SCAN_RECORDS_KEY,
-        INBOUND_PENDING_DATA_KEY,
       ])
     );
   };
@@ -546,6 +546,15 @@ export default function InboundScreen() {
   // 初始化
   // 自动清理震动和提示音
   useFeedbackCleanup();
+
+  useFocusEffect(useCallback(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (!saveInProgressRef.current && !processingRef.current && scanQueueRef.current.length === 0) return false;
+      showToast('正在处理入库数据，请完成后返回', 'warning');
+      return true;
+    });
+    return () => subscription.remove();
+  }, [showToast]));
 
   const assertPurchaseReceiveUnaudited = useCallback(
     async (account: ErpAccountConfig, voucherCode: string, forceRefresh = false) => {
@@ -576,6 +585,7 @@ export default function InboundScreen() {
   const loadSelectedErpVoucher = useCallback(async (
     options: { forceRefresh?: boolean } = {}
   ): Promise<PurchaseReceiveVoucher> => {
+    const sessionId = sessionIdRef.current;
     if (!selectedVoucherCode || !selectedAccountKey) {
       setActiveErpVoucher(null);
       setErpVoucherLoading(false);
@@ -592,21 +602,11 @@ export default function InboundScreen() {
     setErpVoucherLoading(true);
     setErpVoucherError('');
     try {
-      try {
-        await assertPurchaseReceiveUnaudited(
-          account,
-          selectedVoucherCode,
-          options.forceRefresh
-        );
-      } catch (statusError) {
-        if (statusError instanceof Error && statusError.message.includes('已在ERP审核')) {
-          throw statusError;
-        }
-        logger.warn('[扫码入库] 审核消息状态读取失败:', statusError);
-        throw new Error('无法确认ERP审核状态，请检查网络后重试');
-      }
-
-      const existingRecords = await getInboundRecordsByNo(selectedVoucherCode);
+      const [existingRecords, cached] = await Promise.all([
+        getInboundRecordsByNo(selectedVoucherCode),
+        options.forceRefresh ? null : loadCachedPurchaseReceiveVoucher(account.key, selectedVoucherCode),
+        assertPurchaseReceiveUnaudited(account, selectedVoucherCode, options.forceRefresh),
+      ]);
       const alreadyCompleted = existingRecords.some(
         (record) => (record.warehouse_name || '').trim() === account.expectedWarehouseName
       );
@@ -616,43 +616,51 @@ export default function InboundScreen() {
         );
       }
 
-      const cached = options.forceRefresh
-        ? null
-        : await loadCachedPurchaseReceiveVoucher(account.key, selectedVoucherCode);
+      const cachedAt = cached ? Date.parse(cached.cachedAt) : NaN;
+      const cacheIsFresh = Number.isFinite(cachedAt) && Date.now() >= cachedAt && Date.now() - cachedAt < 5 * 60_000;
       const voucher =
-        cached?.data ||
+        (cacheIsFresh ? cached?.data : null) ||
         (await fetchPurchaseReceiveVoucher(account, selectedVoucherCode, {
-          bypassCache: options.forceRefresh,
+          bypassCache: true,
         }));
-      if (!cached) {
+      if (!cacheIsFresh) {
         await savePurchaseReceiveVoucherCache(voucher);
       }
+      if (!isSessionActive(sessionId)) throw new Error('已离开当前入库作业');
       setActiveErpVoucher(voucher);
       return voucher;
     } catch (error) {
-      setActiveErpVoucher(null);
-      setErpVoucherError(
-        formatUserFacingErrorMessage(error, '采购入库单加载失败，请稍后重试')
-      );
+      if (isSessionActive(sessionId)) {
+        setActiveErpVoucher(null);
+        setErpVoucherError(formatUserFacingErrorMessage(error, '采购入库单加载失败，请稍后重试'));
+      }
       throw error;
     } finally {
-      setErpVoucherLoading(false);
+      if (isSessionActive(sessionId)) setErpVoucherLoading(false);
     }
   }, [
     assertPurchaseReceiveUnaudited,
+    isSessionActive,
     selectedAccountKey,
     selectedVoucherCode,
     setActiveErpVoucher,
   ]);
 
   const handleRefreshErpVoucher = useCallback(async () => {
-    if (!selectedVoucherCode || !selectedAccountKey || erpVoucherLoading || saving) {
+    if (!selectedVoucherCode || !selectedAccountKey || erpVoucherLoading || saveInProgressRef.current ||
+        processingRef.current || scanQueueRef.current.length > 0 || liveInputValueRef.current.trim()) {
       focusScannerInput(0);
       return;
     }
 
+    const sessionId = sessionIdRef.current;
+    saveInProgressRef.current = true;
+    setSaving(true);
+    draftReadyRef.current = false;
+    setDraftReady(false);
     try {
       const voucher = await loadSelectedErpVoucher({ forceRefresh: true });
+      if (!isSessionActive(sessionId)) return;
       if (
         currentWarehouse &&
         voucher.warehouseName.trim() !== currentWarehouse.name.trim()
@@ -662,20 +670,37 @@ export default function InboundScreen() {
         setErpVoucherError(message);
         throw new Error(message);
       }
+      const warehouse = currentWarehouse || (await getAllWarehouses()).find(item => item.name === voucher.warehouseName);
+      if (!warehouse) throw new Error('本地未找到ERP仓库，请检查仓库设置');
+      if (!isSessionActive(sessionId)) return;
+      setCurrentWarehouse(warehouse);
+      await loadScanRecords(warehouse, voucher.code, voucher.partnerName);
+      if (!isSessionActive(sessionId)) return;
       setCurrentSupplier(voucher.partnerName || null);
       setInboundNo(voucher.code);
+      draftReadyRef.current = true;
+      setDraftReady(true);
       showToast('ERP采购入库单已刷新', 'success');
     } catch (error) {
-      showToast(formatUserFacingErrorMessage(error, 'ERP刷新失败，请稍后重试'), 'warning');
+      if (isSessionActive(sessionId)) {
+        const message = formatUserFacingErrorMessage(error, 'ERP或草稿恢复失败，请稍后重试');
+        setErpVoucherError(message);
+        showToast(message, 'warning');
+      }
     } finally {
-      focusScannerInput(100);
+      if (isSessionActive(sessionId)) {
+        saveInProgressRef.current = false;
+        setSaving(false);
+        focusScannerInput(100);
+      }
     }
   }, [
     currentWarehouse,
     erpVoucherLoading,
     focusScannerInput,
+    isSessionActive,
+    loadScanRecords,
     loadSelectedErpVoucher,
-    saving,
     selectedAccountKey,
     selectedVoucherCode,
     setActiveErpVoucher,
@@ -686,13 +711,26 @@ export default function InboundScreen() {
   useFocusEffect(
     useCallback(() => {
       screenActiveRef.current = true;
+      const sessionId = ++sessionIdRef.current;
+      draftReadyRef.current = false;
+      setDraftReady(false);
+      setActiveErpVoucher(null);
+      scanRecordsRef.current = [];
+      setScanRecords([]);
+      activeRulesRef.current = null;
+      inventoryBindingsRef.current.clear();
+      liveInputValueRef.current = '';
+      setInputValue('');
+      setSaving(false);
       let isActive = true;
       const init = async () => {
         try {
           // 1. 加载仓库列表（数据库已在 APP 启动时初始化）
           const list = await getAllWarehouses();
+          if (!isSessionActive(sessionId)) return;
 
           const selectedVoucher = await loadSelectedErpVoucher();
+          if (!isSessionActive(sessionId)) return;
 
           // 2. 恢复之前选择的仓库，并等待状态更新
           const warehouse =
@@ -712,6 +750,9 @@ export default function InboundScreen() {
             selectedVoucher.code,
             selectedVoucher.partnerName
           );
+          if (!isSessionActive(sessionId)) return;
+          draftReadyRef.current = true;
+          setDraftReady(true);
 
           // 5. 如果没有入库单号，生成新单号
           setInboundNo(restoredInboundNo || selectedVoucher.code);
@@ -724,6 +765,7 @@ export default function InboundScreen() {
         } catch (error) {
           logger.error('[扫码入库] 初始化失败:', error);
           if (isActive) {
+            setErpVoucherError(formatUserFacingErrorMessage(error, 'ERP或草稿恢复失败，请点击刷新'));
             showToast(
               formatUserFacingErrorMessage(error, '入库页面初始化失败，请稍后重试'),
               'error'
@@ -737,55 +779,27 @@ export default function InboundScreen() {
       return () => {
         isActive = false;
         screenActiveRef.current = false;
+        sessionIdRef.current += 1;
+        draftReadyRef.current = false;
+        scanQueueRef.current = [];
+        processingRef.current = false;
+        saveInProgressRef.current = false;
         cancelScanSubmit(autoSubmitTimerRef);
-        if (focusTimerRef.current) {
-          clearTimeout(focusTimerRef.current);
-          focusTimerRef.current = null;
-        }
         if (postProcessTimerRef.current) {
           clearTimeout(postProcessTimerRef.current);
           postProcessTimerRef.current = null;
         }
       };
-    }, [focusScannerInput, loadScanRecords, loadSelectedErpVoucher, showToast])
+    }, [focusScannerInput, isSessionActive, loadScanRecords, loadSelectedErpVoucher, setActiveErpVoucher, showToast])
   );
-
-  // 批量 flush 缓冲的扫码记录到 state
-  const flushPendingRecords = useCallback((): ScanRecord[] => {
-    if (flushTimerRef.current) {
-      clearTimeout(flushTimerRef.current);
-      flushTimerRef.current = null;
-    }
-    if (pendingRecordsRef.current.length === 0) {
-      return scanRecordsRef.current;
-    }
-
-    const merged = [...pendingRecordsRef.current, ...scanRecordsRef.current];
-    pendingRecordsRef.current = [];
-    scanRecordsRef.current = merged;
-    setScanRecords(merged);
-    void saveScanRecords(merged, currentSupplier);
-    return merged;
-  }, [currentSupplier, saveScanRecords]);
 
   // 处理扫描（带参数版本，供自动触发调用）
   const processScan = useCallback(
     async (code: string) => {
       if (!code || processingRef.current) return;
+      const sessionId = sessionIdRef.current;
 
       const activeErpVoucher = erpVoucherRef.current;
-
-      if (!activeErpVoucher) {
-        showToast('请先从采购入库列表选择ERP单据', 'warning');
-        feedbackWarning();
-        return;
-      }
-
-      if (!currentWarehouse) {
-        showToast('请先选择仓库', 'error');
-        feedbackError();
-        return;
-      }
 
       processingRef.current = true;
       let parsed: {
@@ -805,7 +819,27 @@ export default function InboundScreen() {
       try {
         // 解析二维码
         try {
-          const rule = await detectRule(code);
+          const rules = activeRulesRef.current ?? await getActiveRules();
+          if (!isSessionActive(sessionId)) return;
+          activeRulesRef.current = rules;
+          if (!isQRCode(code, rules)) return;
+          if (!draftReadyRef.current || saveInProgressRef.current) {
+            showToast('入库作业尚未就绪或正在保存，请稍后重新扫描', 'warning');
+            feedbackWarning();
+            return;
+          }
+          if (!activeErpVoucher) {
+            showToast('请先从采购入库列表选择ERP单据', 'warning');
+            feedbackWarning();
+            return;
+          }
+          if (!currentWarehouse) {
+            showToast('请先选择仓库', 'error');
+            feedbackError();
+            return;
+          }
+          const rule = await detectRule(code, activeRulesRef.current);
+          if (!isSessionActive(sessionId)) return;
           logger.log('[扫码入库] 检测到规则:', {
             ruleName: rule?.name,
             ruleSeparator: rule?.separator,
@@ -832,15 +866,42 @@ export default function InboundScreen() {
             };
           } else {
             logger.warn('[扫码入库] 未检测到匹配的解析规则');
-            if (!isQRCode(code)) {
-              return;
-            }
             showToast('没有匹配的二维码解析规则，请先在设置中配置', 'error');
             feedbackError();
             return;
           }
         } catch (e) {
           logger.error('[扫码入库] 规则解析失败:', e);
+          if (e instanceof QRCodeRuleConflictError) {
+            const activeRules = activeRulesRef.current ?? [];
+            const voucherInventoryCodes = new Set(
+              (activeErpVoucher ? getPurchaseReceiveBindingLines(activeErpVoucher) : [])
+                .map((line) => getInventoryCodeMatchKey(line.inventoryCode))
+                .filter(Boolean)
+            );
+            const diagnostic = await buildRuleConflictDiagnostic(code, activeRules, {
+              normalizeModel: normalizeInboundModel,
+              normalizeVersion: normalizeInboundVersion,
+              isInventoryCodeInCurrentDocument: (inventoryCode) =>
+                voucherInventoryCodes.has(getInventoryCodeMatchKey(inventoryCode)),
+            });
+            if (diagnostic) {
+              // 冲突诊断期间停止队列，避免操作者查看结果时继续写入后续扫码。
+              scannerFocusBlockedRef.current = true;
+              scanQueueRef.current = [];
+              alertRef.current.showAlert(
+                '解析规则冲突',
+                formatRuleConflictDiagnostic(diagnostic, '当前入库单'),
+                [
+                  { text: '知道了', style: 'cancel' },
+                  { text: '去配置规则', onPress: () => routerRef.current.push('/rules') },
+                ],
+                'warning'
+              );
+              feedbackWarning();
+              return;
+            }
+          }
           throw e;
         }
 
@@ -880,10 +941,11 @@ export default function InboundScreen() {
         }
 
         // ERP 单据是入库供应商的唯一来源；物料绑定只负责型号到存货编码的映射。
-        const inventoryCode = await getInventoryCodeByModel(
-          normalizedModel,
-          normalizedVersion
-        );
+        const bindingKey = buildInboundModelVersionKey(normalizedModel, normalizedVersion);
+        const inventoryCode = inventoryBindingsRef.current.get(bindingKey) ||
+          await getInventoryCodeByModel(normalizedModel, normalizedVersion);
+        if (!isSessionActive(sessionId)) return;
+        if (inventoryCode) inventoryBindingsRef.current.set(bindingKey, inventoryCode);
         const normalizedInventoryCode = normalizeInventoryCode(inventoryCode);
         const inventoryCodeMatchKey = getInventoryCodeMatchKey(inventoryCode);
 
@@ -903,16 +965,9 @@ export default function InboundScreen() {
             return;
           }
 
-          const matchedLine = activeErpVoucher.lines.find(
-            (line) => getInventoryCodeMatchKey(line.inventoryCode) === inventoryCodeMatchKey
-          );
-          const requiredQuantity = activeErpVoucher.lines.reduce(
-            (sum, line) =>
-              getInventoryCodeMatchKey(line.inventoryCode) === inventoryCodeMatchKey
-                ? sum + line.quantity
-                : sum,
-            0
-          );
+          const progress = buildInboundProgress(getPurchaseReceiveBindingLines(activeErpVoucher), scanRecordsRef.current);
+          const matchedLine = progress.find(line => line.inventoryCode === inventoryCodeMatchKey && line.sourceLineCount > 0);
+          const requiredQuantity = matchedLine?.requiredQuantity || 0;
 
           if (!matchedLine || requiredQuantity <= 0) {
             showToast(
@@ -923,13 +978,10 @@ export default function InboundScreen() {
             return;
           }
 
-          const scannedQuantity = [...pendingRecordsRef.current, ...scanRecordsRef.current].reduce(
-            (sum, record) =>
-              getInventoryCodeMatchKey(record.inventoryCode) === inventoryCodeMatchKey
-                ? sum + record.quantity
-                : sum,
-            0
-          );
+          if (progress.some(line => ['unmatched', 'invalid', 'over'].includes(line.status))) {
+            throw new Error('本单存在不匹配或超量的记录，请先核对异常明细');
+          }
+          const scannedQuantity = matchedLine.scannedQuantity;
           if (scannedQuantity + quantity > requiredQuantity) {
             const remainingQuantity = Math.max(0, requiredQuantity - scannedQuantity);
             showToast(
@@ -946,10 +998,10 @@ export default function InboundScreen() {
         // 检查是否重复扫描（只检测追溯码，因为箱号可能重复）
         let isDuplicate = false;
 
-        // 根据追溯码判断（已保存的记录 + 缓冲中未 flush 的记录）
-        if (parsedRecord.traceNo) {
-          const allCurrentRecords = [...pendingRecordsRef.current, ...scanRecordsRef.current];
-          const existing = allCurrentRecords.find((r) => r.traceNo === parsedRecord.traceNo);
+        // 无追溯码的相同标签继续允许逐次扫描，不按二维码内容去重。
+        const traceNo = parsedRecord.traceNo?.trim() || '';
+        if (traceNo) {
+          const existing = scanRecordsRef.current.find((r) => r.traceNo?.trim() === traceNo);
           if (existing) {
             isDuplicate = true;
           }
@@ -961,7 +1013,7 @@ export default function InboundScreen() {
           return;
         }
 
-        // 新增记录（保存原始记录，不合并数量）——先放入缓冲队列，批量 flush 到 UI
+        // 每包只保存一次草稿，成功后再更新数量和播放确认语音。
         const newRecord: ScanRecord = {
           id: generateId(),
           model: normalizedModel,
@@ -977,19 +1029,31 @@ export default function InboundScreen() {
           package: parsedRecord.package || undefined,
           version: normalizedVersion || undefined,
           productionDate: parsedRecord.productionDate || undefined,
-          traceNo: parsedRecord.traceNo || undefined,
+          traceNo: traceNo || undefined,
           sourceNo: parsedRecord.sourceNo || undefined,
           // 占位字段解析值
           customFields: parsedRecord.customFields,
         };
-        pendingRecordsRef.current.push(newRecord);
-        void saveScanRecords(
-          [...pendingRecordsRef.current, ...scanRecordsRef.current],
-          activeErpVoucher.partnerName || currentSupplier
-        );
+        if (!isSessionActive(sessionId) || erpVoucherRef.current !== activeErpVoucher) return;
+        const nextRecords = [newRecord, ...scanRecordsRef.current];
+        if (!(await saveScanRecords(nextRecords, activeErpVoucher.partnerName || currentSupplier))) {
+          if (isSessionActive(sessionId)) {
+            draftReadyRef.current = false;
+            setDraftReady(false);
+            scanQueueRef.current = [];
+            liveInputValueRef.current = '';
+            setInputValue('');
+            cancelScanSubmit(autoSubmitTimerRef);
+          }
+          throw new Error('扫码草稿保存失败，本次和排队扫码均未确认成功，请点击刷新恢复后核对重扫');
+        }
+        if (!isSessionActive(sessionId)) return;
+        scanRecordsRef.current = nextRecords;
+        setScanRecords(nextRecords);
         showToast(`已扫码：${normalizedModel}`, 'success');
         feedbackSuccess();
       } catch (e) {
+        if (!isSessionActive(sessionId)) return;
         logger.error('[扫码入库] 处理失败:', e);
         const errorMessage = formatUserFacingErrorMessage(e, '二维码解析失败，请检查标签内容');
         logger.error('[扫码入库] 错误详情:', {
@@ -999,44 +1063,33 @@ export default function InboundScreen() {
           processingRef: processingRef.current,
           scanQueueLength: scanQueueRef.current.length,
         });
-        showToast(`解析失败：${errorMessage}\n长度: ${code.length}`, 'error');
+        showToast(`录入失败：${errorMessage}`, 'error');
         feedbackError();
       } finally {
-        processingRef.current = false;
         // 处理完成后，检查队列是否有待处理的扫码
         // 注意：使用 setTimeout 让 React 有机会更新状态，避免重复检测失败
-        if (postProcessTimerRef.current) {
-          clearTimeout(postProcessTimerRef.current);
+        if (isSessionActive(sessionId)) {
+          if (postProcessTimerRef.current) {
+            clearTimeout(postProcessTimerRef.current);
+          }
+          postProcessTimerRef.current = setTimeout(() => {
+            postProcessTimerRef.current = null;
+            if (!isSessionActive(sessionId)) return;
+            processingRef.current = false;
+            if (scanQueueRef.current.length > 0) {
+              const nextCode = scanQueueRef.current.shift();
+              if (nextCode) processScanRef.current(nextCode);
+            } else {
+              focusScannerInput(50);
+            }
+          }, 0);
         }
-        postProcessTimerRef.current = setTimeout(() => {
-          postProcessTimerRef.current = null;
-          if (!screenActiveRef.current) {
-            return;
-          }
-          if (scanQueueRef.current.length > 0) {
-            logger.log('[扫码入库] 队列中有待处理扫码:', scanQueueRef.current.length);
-            const nextCode = scanQueueRef.current.shift();
-            if (nextCode) {
-              processScanRef.current(nextCode);
-            }
-          } else {
-            // 队列空了，启动 flush timer 批量刷新 UI
-            if (!flushTimerRef.current) {
-              flushTimerRef.current = setTimeout(() => {
-                flushTimerRef.current = null;
-                flushPendingRecords();
-              }, 200);
-            }
-            // 短暂延迟后聚焦，等待 flush 完成
-            focusScannerInput(50);
-          }
-        }, 0);
       }
     },
     [
       currentSupplier,
       currentWarehouse,
-      flushPendingRecords,
+      isSessionActive,
       focusScannerInput,
       saveScanRecords,
       showToast,
@@ -1055,6 +1108,8 @@ export default function InboundScreen() {
       cancelScanSubmit(autoSubmitTimerRef);
 
       // TextInput 是受控组件，非空内容也必须立即入状态，避免逐字符扫码被重渲染清空。
+      if (!draftReadyRef.current || saveInProgressRef.current) return;
+      liveInputValueRef.current = text;
       setInputValue(text);
 
       // 如果当前有输入内容，启动定时器检测扫码完成
@@ -1063,11 +1118,7 @@ export default function InboundScreen() {
           const code = sanitizeStructuredScannerInput(text);
           // 检测到输入完成（输入停止超过阈值，认为扫码完成）
           if (code.length >= 1) {
-            if (!shouldAcceptScanCode(code)) {
-              setInputValue('');
-              focusScannerInput(0);
-              return;
-            }
+            liveInputValueRef.current = '';
             setInputValue(''); // 清空输入框
             if (processingRef.current) {
               scanQueueRef.current.push(code);
@@ -1079,23 +1130,19 @@ export default function InboundScreen() {
         return;
       }
     },
-    [focusScannerInput, processScan, shouldAcceptScanCode]
+    [processScan]
   );
 
   // 扫码完成确认（焦点录入模式：用户手动按回车）
   const handleSubmitEditing = useCallback(() => {
     cancelScanSubmit(autoSubmitTimerRef);
 
-    const code = sanitizeStructuredScannerInput(inputValue);
+    if (!draftReadyRef.current || saveInProgressRef.current) return;
+    const code = sanitizeStructuredScannerInput(liveInputValueRef.current);
 
     if (!code) return;
 
-    if (!shouldAcceptScanCode(code)) {
-      setInputValue('');
-      focusScannerInput(0);
-      return;
-    }
-
+    liveInputValueRef.current = '';
     setInputValue('');
     if (processingRef.current) {
       scanQueueRef.current.push(code);
@@ -1103,7 +1150,7 @@ export default function InboundScreen() {
     }
 
     processScan(code);
-  }, [focusScannerInput, inputValue, processScan, shouldAcceptScanCode]);
+  }, [processScan]);
 
   const syncInboundSnapshot = async (
     records: InboundExportRecord[],
@@ -1138,21 +1185,33 @@ export default function InboundScreen() {
     };
   };
 
+  const beginDraftMutation = useCallback(() => {
+    if (saveInProgressRef.current) return false;
+    if (!draftReadyRef.current || !erpVoucherRef.current) {
+      showToast('本单草稿或ERP未验证，请点击刷新后重试', 'warning');
+      return false;
+    }
+    if (processingRef.current || scanQueueRef.current.length > 0 || liveInputValueRef.current.trim()) {
+      showToast('还有扫码内容正在处理，请处理完成后重试', 'warning');
+      return false;
+    }
+    saveInProgressRef.current = true;
+    setSaving(true);
+    return true;
+  }, [showToast]);
+
   // 确认入库
   const handleSaveInbound = async () => {
-    if (saveInProgressRef.current) {
-      return;
-    }
     if (!currentWarehouse) {
       showToast('请先选择仓库', 'warning');
       feedbackWarning();
       return;
     }
 
-    saveInProgressRef.current = true;
-    setSaving(true);
+    if (!beginDraftMutation()) return;
+    const sessionId = sessionIdRef.current;
     try {
-      const recordsSnapshot = flushPendingRecords();
+      const recordsSnapshot = scanRecordsRef.current;
       if (recordsSnapshot.length === 0) {
         showToast('暂无扫描记录', 'warning');
         feedbackWarning();
@@ -1160,6 +1219,11 @@ export default function InboundScreen() {
       }
 
       const activeErpVoucher = erpVoucherRef.current;
+      if (!activeErpVoucher || activeErpVoucher.accountKey !== selectedAccountKey ||
+          activeErpVoucher.code.trim().toUpperCase() !== selectedVoucherCode ||
+          inboundNo.trim().toUpperCase() !== selectedVoucherCode) {
+        throw new Error('当前ERP单据未验证或与入库作业不一致，已阻止保存');
+      }
       if (activeErpVoucher) {
         const account = selectedAccountKey ? getErpAccountByKey(selectedAccountKey) : null;
         if (!account) {
@@ -1170,10 +1234,11 @@ export default function InboundScreen() {
 
         let verifiedErpVoucher = activeErpVoucher;
         try {
-          await assertPurchaseReceiveUnaudited(account, activeErpVoucher.code, true);
-          verifiedErpVoucher = await fetchPurchaseReceiveVoucher(account, activeErpVoucher.code, {
-            bypassCache: true,
-          });
+          [verifiedErpVoucher] = await Promise.all([
+            fetchPurchaseReceiveVoucher(account, activeErpVoucher.code, { bypassCache: true }),
+            assertPurchaseReceiveUnaudited(account, activeErpVoucher.code, true),
+          ]);
+          if (!isSessionActive(sessionId)) return;
           if (verifiedErpVoucher.warehouseName.trim() !== currentWarehouse.name.trim()) {
             const message = `ERP仓库已变更为 ${verifiedErpVoucher.warehouseName || '-'}，请返回列表后重新进入单据`;
             setActiveErpVoucher(null);
@@ -1181,8 +1246,14 @@ export default function InboundScreen() {
             throw new Error(message);
           }
           await savePurchaseReceiveVoucherCache(verifiedErpVoucher);
+          if (!isSessionActive(sessionId)) return;
           setActiveErpVoucher(verifiedErpVoucher);
         } catch (error) {
+          if (!isSessionActive(sessionId)) return;
+          setActiveErpVoucher(null);
+          draftReadyRef.current = false;
+          setDraftReady(false);
+          setErpVoucherError(formatUserFacingErrorMessage(error, 'ERP核验失败，请点击刷新'));
           showToast(
             formatUserFacingErrorMessage(
               error,
@@ -1194,31 +1265,8 @@ export default function InboundScreen() {
           return;
         }
 
-        const requiredByInventoryCode = new Map<string, number>();
-        verifiedErpVoucher.lines.forEach((line) => {
-          const inventoryCode = getInventoryCodeMatchKey(line.inventoryCode);
-          requiredByInventoryCode.set(
-            inventoryCode,
-            (requiredByInventoryCode.get(inventoryCode) || 0) + line.quantity
-          );
-        });
-        const scannedByInventoryCode = new Map<string, number>();
-        recordsSnapshot.forEach((record) => {
-          const inventoryCode = getInventoryCodeMatchKey(record.inventoryCode);
-          scannedByInventoryCode.set(
-            inventoryCode,
-            (scannedByInventoryCode.get(inventoryCode) || 0) + record.quantity
-          );
-        });
-        const comparedInventoryCodes = new Set([
-          ...requiredByInventoryCode.keys(),
-          ...scannedByInventoryCode.keys(),
-        ]);
-        const incompleteCount = Array.from(comparedInventoryCodes).filter(
-          (inventoryCode) =>
-            (scannedByInventoryCode.get(inventoryCode) || 0) !==
-            (requiredByInventoryCode.get(inventoryCode) || 0)
-        ).length;
+        const incompleteCount = buildInboundProgress(getPurchaseReceiveBindingLines(verifiedErpVoucher), recordsSnapshot)
+          .filter(line => line.status !== 'complete').length;
 
         if (incompleteCount > 0) {
           showToast(`有 ${incompleteCount} 项数量与ERP最新明细不一致`, 'warning');
@@ -1227,29 +1275,8 @@ export default function InboundScreen() {
         }
       }
 
-      // 数据库级 traceNo 重复检测
-      const traceNoRecords = recordsSnapshot.filter((r) => r.traceNo && r.traceNo.trim());
-      if (traceNoRecords.length > 0) {
-        const uniqueTraceNos = [...new Set(traceNoRecords.map((r) => r.traceNo!.trim()))];
-        const currentDraftRecordIds = recordsSnapshot.map((record) => record.id).filter(Boolean);
-        const checkResults = await Promise.all(
-          uniqueTraceNos.map(async (traceNo) => ({
-            traceNo,
-            exists: await checkInboundTraceNoExists(traceNo, undefined, currentDraftRecordIds),
-          }))
-        );
-        const duplicates = checkResults.filter((r) => r.exists).map((r) => r.traceNo);
-        if (duplicates.length > 0) {
-          alert.showAlert(
-            '重复追踪码',
-            `以下追踪码已存在于数据库中，无法重复入库：\n${duplicates.join('\n')}`,
-            [{ text: '确定' }],
-            'warning'
-          );
-          feedbackWarning();
-          return;
-        }
-      }
+      // 批次内和历史追溯码判重由 addInboundRecordsBatch 在同一事务中执行。
+      if (!isSessionActive(sessionId)) return;
 
       const today = formatDate(new Date().toISOString());
       const createdAt = getISODateTime();
@@ -1262,6 +1289,7 @@ export default function InboundScreen() {
           inbound_no: inboundNo,
           warehouse_id: currentWarehouse.id,
           warehouse_name: currentWarehouse.name,
+          erp_account_key: selectedAccountKey,
           inventory_code: record.inventoryCode || '',
           scan_model: record.model,
           batch: record.batch || '',
@@ -1290,6 +1318,12 @@ export default function InboundScreen() {
       });
 
       await addInboundRecordsBatch(recordsToSave);
+      if (isSessionActive(sessionId)) {
+        draftReadyRef.current = false;
+        setDraftReady(false);
+        scanRecordsRef.current = [];
+        setScanRecords([]);
+      }
       let draftCleared = true;
       try {
         await clearScanRecords();
@@ -1325,10 +1359,7 @@ export default function InboundScreen() {
         logger.warn('[handleSaveInbound] 入库单同步状态更新失败:', statusError);
       }
 
-      // 主写入成功后立即清草稿，避免后续刷新失败导致重复入库
-      pendingRecordsRef.current = [];
-      scanRecordsRef.current = [];
-      setScanRecords([]);
+      if (!isSessionActive(sessionId)) return;
       setCurrentSupplier(null);
       expandedGroupsRef.current = new Set();
       confirmedGroupsRef.current = new Set();
@@ -1362,28 +1393,28 @@ export default function InboundScreen() {
         showToast('入库已保存，但界面刷新失败，请重新进入页面确认', 'warning');
       }
     } catch (error) {
+      if (!isSessionActive(sessionId)) return;
       logger.error('[handleSaveInbound] 保存失败:', error);
       const errorMessage = formatUserFacingErrorMessage(error, '入库保存失败，请稍后重试');
       showToast(`保存失败: ${errorMessage}`, 'error');
       feedbackError();
     } finally {
-      scannerFocusBlockedRef.current = false;
-      saveInProgressRef.current = false;
-      setSaving(false);
-      focusScannerInput(120);
+      if (isSessionActive(sessionId)) {
+        scannerFocusBlockedRef.current = false;
+        saveInProgressRef.current = false;
+        setSaving(false);
+        focusScannerInput(120);
+      }
     }
   };
 
   // 清空记录
   const clearCurrentScanRecords = async () => {
-    if (saving || (scanRecords.length === 0 && pendingRecordsRef.current.length === 0)) return;
-    if (flushTimerRef.current) {
-      clearTimeout(flushTimerRef.current);
-      flushTimerRef.current = null;
-    }
+    if (scanRecordsRef.current.length === 0 || !beginDraftMutation()) return;
+    const sessionId = sessionIdRef.current;
     try {
       await clearScanRecords();
-      pendingRecordsRef.current = [];
+      if (!isSessionActive(sessionId)) return;
       scanRecordsRef.current = [];
       setScanRecords([]);
       confirmedGroupsRef.current = new Set();
@@ -1394,16 +1425,23 @@ export default function InboundScreen() {
       showToast('本单扫码记录已清空', 'warning');
       feedbackClear();
     } catch (error) {
+      if (!isSessionActive(sessionId)) return;
       logger.error('清空扫描记录失败:', error);
-      showToast('清空失败，请重试', 'error');
-      feedbackError();
+      draftReadyRef.current = false;
+      setDraftReady(false);
+      showToast('清空失败，请点击刷新恢复并核对草稿', 'error');
+      void feedbackClearFailed();
     } finally {
-      focusScannerInput(100);
+      if (isSessionActive(sessionId)) {
+        saveInProgressRef.current = false;
+        setSaving(false);
+        focusScannerInput(100);
+      }
     }
   };
 
   const handleClearRecords = () => {
-    if (saving || (scanRecords.length === 0 && pendingRecordsRef.current.length === 0)) return;
+    if (saving || scanRecords.length === 0) return;
 
     alert.showConfirm(
       '清空本单扫码记录',
@@ -1447,22 +1485,34 @@ export default function InboundScreen() {
         '确定要删除这条记录吗？',
         () => {
           void (async () => {
-            const recordsSnapshot = flushPendingRecords();
-            const updated = recordsSnapshot.filter((r) => r.id !== record.id);
-            if (!(await saveScanRecords(updated))) {
-              showToast('删除失败，草稿未能保存，请重试', 'error');
-              feedbackError();
-              return;
+            if (!beginDraftMutation()) return;
+            const sessionId = sessionIdRef.current;
+            try {
+              const updated = scanRecordsRef.current.filter((r) => r.id !== record.id);
+              if (!(await saveScanRecords(updated))) {
+                if (!isSessionActive(sessionId)) return;
+                draftReadyRef.current = false;
+                setDraftReady(false);
+                showToast('删除失败，请点击刷新恢复并核对草稿', 'error');
+                feedbackError();
+                return;
+              }
+              if (!isSessionActive(sessionId)) return;
+              scanRecordsRef.current = updated;
+              setScanRecords(updated);
+              showToast('记录已删除', 'success');
+            } finally {
+              if (isSessionActive(sessionId)) {
+                saveInProgressRef.current = false;
+                setSaving(false);
+              }
             }
-            scanRecordsRef.current = updated;
-            setScanRecords(updated);
-            showToast('记录已删除', 'success');
           })();
         },
         true
       );
     },
-    [alert, flushPendingRecords, saveScanRecords, showToast]
+    [alert, beginDraftMutation, isSessionActive, saveScanRecords, showToast]
   );
 
   // 计算总数量
@@ -1516,47 +1566,10 @@ export default function InboundScreen() {
       return [];
     }
 
-    const progressMap = new Map<string, InboundErpLineProgress>();
-    erpVoucher.lines.forEach((line) => {
-      const inventoryCode = getInventoryCodeMatchKey(line.inventoryCode);
-      const key = `erp-inbound:${inventoryCode || line.id}`;
-      const existing = progressMap.get(key);
-      if (existing) {
-        existing.requiredQuantity += line.quantity;
-        existing.remainingQuantity += line.quantity;
-        return;
-      }
-
-      progressMap.set(key, {
-        inventoryCode,
-        key,
-        remainingQuantity: line.quantity,
-        requiredQuantity: line.quantity,
-        scannedRecords: [],
-        scannedQuantity: 0,
-        specification: line.specification || line.inventoryName,
-        status: 'pending',
-        unitName: line.unitName || 'PCS',
-      });
-    });
-
-    progressMap.forEach((progress) => {
-      const scannedRecords = scanRecords.filter(
-        (record) => getInventoryCodeMatchKey(record.inventoryCode) === progress.inventoryCode
-      );
-      const scannedQuantity = scannedRecords.reduce((sum, record) => sum + record.quantity, 0);
-      progress.scannedRecords = scannedRecords;
-      progress.scannedQuantity = scannedQuantity;
-      progress.remainingQuantity = progress.requiredQuantity - scannedQuantity;
-      progress.status =
-        scannedQuantity === progress.requiredQuantity
-          ? 'complete'
-          : scannedQuantity > 0
-            ? 'partial'
-            : 'pending';
-    });
-
-    return Array.from(progressMap.values());
+    return buildInboundProgress(getPurchaseReceiveBindingLines(erpVoucher), scanRecords).map(({ scannedItems, ...line }) => ({
+      ...line,
+      scannedRecords: scannedItems,
+    }));
   }, [erpVoucher, scanRecords]);
 
   const erpCompletedLineCount = useMemo(
@@ -1566,21 +1579,11 @@ export default function InboundScreen() {
   const incompleteErpLineCount = erpVoucher
     ? Math.max(0, erpLineProgressItems.length - erpCompletedLineCount)
     : 0;
-  const inboundReadyToSave = erpVoucher
-    ? erpLineProgressItems.length > 0 && incompleteErpLineCount === 0
-    : scanRecords.length > 0;
+  const inboundReadyToSave = draftReady && Boolean(erpVoucher) &&
+    erpLineProgressItems.length > 0 && incompleteErpLineCount === 0;
   const inboundSaveLabel = inboundReadyToSave
     ? '完成入库'
-    : `还差 ${incompleteErpLineCount} 项`;
-
-  // 数据变化时自动保存到 AsyncStorage（实现持久化）
-  useEffect(() => {
-    // 当有扫描记录时自动保存
-    if (scanRecords.length > 0) {
-      void saveScanRecords(scanRecords, currentSupplier);
-      logger.log('[入库] 数据变化，自动保存记录:', scanRecords.length);
-    }
-  }, [currentSupplier, saveScanRecords, scanRecords]);
+    : !draftReady || !erpVoucher ? '请刷新核验' : `待核对 ${incompleteErpLineCount} 项`;
 
   const inboundListState = useMemo(
     () => `${[...expandedGroups].join('|')}::${[...confirmedGroups].join('|')}`,
@@ -1739,7 +1742,9 @@ export default function InboundScreen() {
           ? { label: '完成', color: theme.success }
           : item.status === 'partial'
             ? { label: '进行中', color: theme.primary }
-            : { label: '待扫', color: theme.textMuted };
+            : item.status === 'pending'
+              ? { label: '待扫', color: theme.textMuted }
+              : { label: item.status === 'over' ? '超出应入数量' : item.status === 'unmatched' ? '已不在本单' : '数量异常', color: theme.error };
 
       return (
         <View style={styles.erpLineCard}>
@@ -1805,7 +1810,7 @@ export default function InboundScreen() {
         </View>
       );
     },
-    [handleDeleteRecord, styles, theme.primary, theme.success, theme.textMuted, toggleExpand]
+    [handleDeleteRecord, styles, theme.error, theme.primary, theme.success, theme.textMuted, toggleExpand]
   );
 
   const aggregatedRecordKeyExtractor = useCallback(
@@ -1825,17 +1830,19 @@ export default function InboundScreen() {
         <View style={styles.topPanel}>
           <UiPageHeader
             title="入库扫描"
-            onBack={() => router.back()}
-            backLabel="返回采购入库单列表"
-            rightIcon={erpVoucher ? 'refresh-cw' : 'crosshair'}
-            rightLabel={erpVoucher ? '刷新ERP采购入库单' : '聚焦扫码输入框'}
-            rightDisabled={erpVoucherLoading || saving}
-            onRightPress={() => {
-              if (erpVoucher) {
-                void handleRefreshErpVoucher();
+            onBack={() => {
+              if (saveInProgressRef.current || processingRef.current || scanQueueRef.current.length > 0) {
+                showToast('正在处理入库数据，请完成后返回', 'warning');
                 return;
               }
-              focusScannerInput(0);
+              router.back();
+            }}
+            backLabel="返回采购入库单列表"
+            rightIcon="refresh-cw"
+            rightLabel="刷新ERP采购入库单与草稿"
+            rightDisabled={erpVoucherLoading || saving}
+            onRightPress={() => {
+              void handleRefreshErpVoucher();
             }}
           />
 
@@ -1846,7 +1853,7 @@ export default function InboundScreen() {
         <WarehouseScanInput
           inputRef={inputRef}
           active={inputValue.length > 0}
-          processing={erpVoucherLoading}
+          processing={erpVoucherLoading || saving}
           statusLabel={
             erpVoucherLoading
               ? '正在读取ERP采购入库单'
@@ -1859,15 +1866,14 @@ export default function InboundScreen() {
           value={inputValue}
           onChangeText={handleInputChange}
           onSubmitEditing={handleSubmitEditing}
-          onBlur={() => focusScannerInput(120)}
           placeholder={currentInboundPlaceholder}
           placeholderTextColor={theme.textMuted}
           autoCapitalize="none"
-          autoFocus={false}
-          editable={!erpVoucherLoading && Boolean(erpVoucher)}
+          autoFocus={!alert.visible}
+          editable={draftReady && !saving && !erpVoucherLoading && Boolean(erpVoucher)}
           showSoftInputOnFocus={false}
           actionLabel="提交入库扫码内容"
-          actionDisabled={!erpVoucher || saving}
+          actionDisabled={!draftReady || !erpVoucher || saving}
           actionLoading={erpVoucherLoading}
           onActionPress={() => {
             if (inputValue.trim()) {
@@ -1947,7 +1953,7 @@ export default function InboundScreen() {
                   label={Str.btnClear}
                   icon="trash-2"
                   variant="secondary"
-                  disabled={saving}
+                  disabled={saving || !draftReady}
                   onPress={handleClearRecords}
                   style={styles.actionButton}
                 />

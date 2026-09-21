@@ -23,6 +23,7 @@ NATIVE_LABEL_FIELD_HEADERS = {
     'version': '版本号',
     'label_type': '标签类型',
     'supplier': '供应商',
+    'unpacked_at': '拆包时间',
 }
 NATIVE_LABEL_REQUIRED_HEADERS = ('型号', '标签数量', '追溯码')
 NATIVE_LABEL_REQUIRED_VALUES = (('型号', 'model'), ('标签数量', 'quantity'))
@@ -192,6 +193,7 @@ def build_native_text_bitmap(
     image_items=(),
     ellipse_items=(),
     line_items=(),
+    font_loader=get_native_arial_font,
 ):
     """把模板中的文字、图片和简单线条合并为一个 TSPL 位图层。"""
     try:
@@ -211,7 +213,7 @@ def build_native_text_bitmap(
         draw.text(
             (x, y),
             text,
-            font=get_native_arial_font(
+            font=font_loader(
                 bold=bold,
                 size_pixels=font_sizes[0] if font_sizes else NATIVE_LABEL_FONT_SIZE_PIXELS,
             ),

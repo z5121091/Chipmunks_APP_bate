@@ -63,7 +63,7 @@ const asText = (value: unknown): string => {
 };
 
 const asNumber = (value: unknown): number => {
-  const parsed = Number(asText(value));
+  const parsed = Number(asText(value).replace(/,/g, ''));
   return Number.isFinite(parsed) ? parsed : 0;
 };
 

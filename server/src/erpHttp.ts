@@ -1,12 +1,18 @@
 import { Agent as HttpAgent, request as httpRequest } from 'node:http';
 import { Agent as HttpsAgent, request as httpsRequest } from 'node:https';
 
+export const getErpKeepAliveTimeoutMs = (env: NodeJS.ProcessEnv = process.env): number => {
+  const value = Number(env.CHANJET_HTTP_KEEP_ALIVE_MS?.trim() || 20_000);
+  return Number.isFinite(value) && value >= 1000 && value <= 60_000 ? value : 20_000;
+};
+
 const agentOptions = {
   keepAlive: true,
   maxSockets: 16,
   maxTotalSockets: 32,
   maxFreeSockets: 4,
-  timeout: 5000,
+  // Keep connections across normal scan intervals; request deadlines remain independent.
+  timeout: getErpKeepAliveTimeoutMs(),
 };
 const httpAgent = new HttpAgent(agentOptions);
 const httpsAgent = new HttpsAgent(agentOptions);

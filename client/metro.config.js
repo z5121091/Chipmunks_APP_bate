@@ -1,8 +1,14 @@
 const { getDefaultConfig } = require('expo/metro-config');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const connect = require('connect');
+const path = require('node:path');
 
 const config = getDefaultConfig(__dirname);
+
+// Windows native bundling uses paths relative to client; keep hoisted dependencies visible.
+if (process.env.EXPO_NO_METRO_WORKSPACE_ROOT === '1') {
+  config.watchFolders = [...new Set([...config.watchFolders, path.resolve(__dirname, '../node_modules')])];
+}
 
 // 安全地获取 Expo 的默认排除列表
 const existingBlockList = [].concat(config.resolver.blockList || []);

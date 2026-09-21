@@ -4,7 +4,6 @@ import {
   FlatList,
   Platform,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -12,8 +11,8 @@ import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { Screen } from '@/components/Screen';
-import { UiWorkflowSummary } from '@/components/UiRedesign';
-import { WarehouseScanInput } from '@/components/WarehouseScanInput';
+import { UiPageHeader, UiWorkflowSummary } from '@/components/UiRedesign';
+import { WarehouseScanInput, type WarehouseScanInputHandle } from '@/components/WarehouseScanInput';
 import { useTheme } from '@/hooks/useTheme';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import {
@@ -25,7 +24,8 @@ import {
   fetchCurrentStockByInventoryCode,
   type CurrentStockRow,
 } from '@/utils/erpCurrentStock';
-import { detectRule, getInventoryCodeByModel, initDatabase, parseWithRule } from '@/utils/database';
+import { detectRule, getActiveRules, getInventoryCodeByModel, initDatabase, parseWithRule, type QRCodeRule } from '@/utils/database';
+import { feedbackNotBound, feedbackQueryFailed, feedbackQuerySuccess } from '@/utils/feedback';
 import { isQRCode } from '@/utils/qrcodeParser';
 import { cancelScanSubmit, scheduleScanSubmit, sanitizeStructuredScannerInput } from '@/utils/scannerInput';
 import { logger } from '@/utils/logger';
@@ -34,10 +34,6 @@ import { createStyles } from './styles';
 
 type ParsedStockScan = {
   model: string;
-  quantity: string;
-  rawContent: string;
-  ruleName: string;
-  traceNo: string;
   version: string;
 };
 
@@ -56,46 +52,32 @@ const getAccountLabel = (account: ErpAccountConfig) => ACCOUNT_LABELS[account.ke
 const formatQuantity = (value: number | null) =>
   value === null ? '-' : value.toLocaleString(undefined, { maximumFractionDigits: 4 });
 
-const looksLikeInventoryCode = (value: string) => /^IC[-.\w]+$/i.test(value.trim());
-const STOCK_QUERY_AUTO_SUBMIT_DEBOUNCE_MS = 450;
-const STOCK_QUERY_MIN_AUTO_SUBMIT_LENGTH = 4;
+const STOCK_QUERY_AUTO_SUBMIT_DEBOUNCE_MS = 150;
 
-const parseStockScan = async (content: string): Promise<ParsedStockScan> => {
-  const normalizedContent = sanitizeStructuredScannerInput(content);
-  const rule = await detectRule(normalizedContent);
+const parseStockScan = async (content: string, rules: readonly QRCodeRule[]): Promise<ParsedStockScan> => {
+  const rule = await detectRule(content, rules);
 
   if (rule) {
-    const { standardFields } = parseWithRule(normalizedContent, rule);
+    const { standardFields } = parseWithRule(content, rule);
     return {
       model: standardFields.model || '',
-      quantity: standardFields.quantity || '',
-      rawContent: normalizedContent,
-      ruleName: rule.name,
-      traceNo: standardFields.traceNo || '',
       version: standardFields.version || '',
     };
   }
 
-  if (isQRCode(normalizedContent)) {
-    throw new Error('未找到匹配的二维码解析规则，请先到设置中配置规则');
-  }
-
-  return {
-    model: normalizedContent,
-    quantity: '',
-    rawContent: normalizedContent,
-    ruleName: '原始内容',
-    traceNo: '',
-    version: '',
-  };
+  throw new Error('未找到匹配的二维码解析规则，请先到设置中配置规则');
 };
 
 export default function StockQueryScreen() {
   const { theme, isDark } = useTheme();
   const styles = useMemo(() => createStyles(theme), [theme]);
   const router = useSafeRouter();
-  const inputRef = useRef<TextInput>(null);
+  const inputRef = useRef<WarehouseScanInputHandle>(null);
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const screenActiveRef = useRef(false);
+  const requestIdRef = useRef(0);
+  const liveInputRef = useRef('');
+  const activeRulesRef = useRef<QRCodeRule[] | null>(null);
   const queryingRef = useRef(false);
   const [selectedAccount, setSelectedAccount] = useState<ErpAccountConfig>(ERP_ACCOUNTS[0]);
   const [inputValue, setInputValue] = useState('');
@@ -105,16 +87,24 @@ export default function StockQueryScreen() {
   const [errorMessage, setErrorMessage] = useState('');
   const selectedAccountAvailable = isErpAccountAvailable(selectedAccount);
 
-  const focusScannerInput = useCallback((delay = 80) => {
-    setTimeout(() => {
-      inputRef.current?.focus();
-    }, delay);
+  const focusScannerInput = useCallback((delay = 0) => {
+    if (screenActiveRef.current) inputRef.current?.focus(delay);
   }, []);
 
   useFocusEffect(
     useCallback(() => {
+      screenActiveRef.current = true;
+      activeRulesRef.current = null;
+      queryingRef.current = false;
+      setQuerying(false);
       focusScannerInput(120);
-      return () => cancelScanSubmit(autoSubmitTimerRef);
+      return () => {
+        screenActiveRef.current = false;
+        requestIdRef.current += 1;
+        liveInputRef.current = '';
+        setInputValue('');
+        cancelScanSubmit(autoSubmitTimerRef);
+      };
     }, [focusScannerInput])
   );
 
@@ -151,81 +141,86 @@ export default function StockQueryScreen() {
     async (nextInput?: string) => {
       cancelScanSubmit(autoSubmitTimerRef);
 
-      const rawContent = sanitizeStructuredScannerInput(nextInput ?? inputValue);
+      const rawContent = sanitizeStructuredScannerInput(nextInput ?? liveInputRef.current);
       if (!rawContent || queryingRef.current) {
         return;
       }
 
-      if (!selectedAccountAvailable) {
-        setLastQuery(null);
-        setStockRows([]);
-        setInputValue('');
-        setErrorMessage(`${getAccountLabel(selectedAccount)}账套暂未开放，暂不能查询库存`);
-        focusScannerInput(120);
-        return;
-      }
-
+      liveInputRef.current = '';
       setInputValue('');
       queryingRef.current = true;
-      setQuerying(true);
-      setErrorMessage('');
-      setLastQuery(null);
-      setStockRows([]);
+      const requestId = ++requestIdRef.current;
+      const isCurrent = () => screenActiveRef.current && requestIdRef.current === requestId;
 
       try {
         await initDatabase();
-        const parsed = await parseStockScan(rawContent);
+        const rules = activeRulesRef.current ?? await getActiveRules();
+        if (!isCurrent()) return;
+        activeRulesRef.current = rules;
+        if (!isQRCode(rawContent, rules)) return;
+        setQuerying(true);
+        setErrorMessage('');
+        setLastQuery(null);
+        setStockRows([]);
+        if (!selectedAccountAvailable) {
+          throw new Error(`${getAccountLabel(selectedAccount)}账套暂未开放，暂不能查询库存`);
+        }
+        const parsed = await parseStockScan(rawContent, rules);
+        if (!isCurrent()) return;
         const model = parsed.model.trim();
 
         if (!model) {
           throw new Error('未识别到型号');
         }
 
-        const inventoryCode =
-          (await getInventoryCodeByModel(model, parsed.version)) ||
-          (looksLikeInventoryCode(model) ? model : '');
+        const inventoryCode = await getInventoryCodeByModel(model, parsed.version);
+        if (!isCurrent()) return;
 
         if (!inventoryCode) {
-          throw new Error(
+          setErrorMessage(
             `未找到物料绑定：${model}${parsed.version ? ` / ${parsed.version}` : ''}`
           );
+          void feedbackNotBound();
+          return;
         }
 
         const result = await fetchCurrentStockByInventoryCode(selectedAccount, inventoryCode);
+        if (!isCurrent()) return;
         setLastQuery({
           inventoryCode:
             result.rows.find((row) => row.inventoryCode)?.inventoryCode || result.inventoryCode,
           specification: result.rows.find((row) => row.specification)?.specification || '-',
         });
         setStockRows(result.rows);
+        void feedbackQuerySuccess();
       } catch (error) {
+        if (!isCurrent()) return;
         logger.error('[库存查询] 查询失败:', error);
         setErrorMessage(formatUserFacingErrorMessage(error, '库存查询失败，请稍后重试'));
         setLastQuery(null);
         setStockRows([]);
+        void feedbackQueryFailed();
       } finally {
-        queryingRef.current = false;
-        setQuerying(false);
-        focusScannerInput(120);
+        if (isCurrent()) {
+          queryingRef.current = false;
+          setQuerying(false);
+          focusScannerInput(120);
+        }
       }
     },
-    [focusScannerInput, inputValue, selectedAccount, selectedAccountAvailable]
+    [focusScannerInput, selectedAccount, selectedAccountAvailable]
   );
 
   const handleInputChange = useCallback(
     (text: string) => {
       cancelScanSubmit(autoSubmitTimerRef);
+      if (queryingRef.current) return;
 
+      liveInputRef.current = text;
       setInputValue(text);
 
       const nextContent = sanitizeStructuredScannerInput(text);
-      if (
-        !nextContent ||
-        queryingRef.current ||
-        nextContent.length < STOCK_QUERY_MIN_AUTO_SUBMIT_LENGTH
-      ) {
-        return;
-      }
+      if (!nextContent) return;
 
       scheduleScanSubmit(autoSubmitTimerRef, () => {
         void handleQuery(nextContent);
@@ -245,7 +240,10 @@ export default function StockQueryScreen() {
           activeOpacity={0.78}
           disabled={querying}
           onPress={() => {
+            if (queryingRef.current) return;
             cancelScanSubmit(autoSubmitTimerRef);
+            requestIdRef.current += 1;
+            liveInputRef.current = '';
 
             setSelectedAccount(account);
             setInputValue('');
@@ -300,27 +298,13 @@ export default function StockQueryScreen() {
     <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
       <View style={styles.container}>
         <View style={styles.topPanel}>
-          <View style={styles.header}>
-            <TouchableOpacity
-              style={styles.backButton}
-              activeOpacity={0.7}
-              onPress={() => router.back()}
-              accessibilityRole="button"
-              accessibilityLabel="返回"
-            >
-              <Feather name="arrow-left" size={22} color={theme.textPrimary} />
-            </TouchableOpacity>
-            <Text style={styles.headerTitle}>库存查询</Text>
-            <TouchableOpacity
-              style={styles.headerMenuButton}
-              activeOpacity={0.7}
-              onPress={() => focusScannerInput(0)}
-              accessibilityRole="button"
-              accessibilityLabel="聚焦库存查询输入框"
-            >
-              <Feather name="crosshair" size={20} color={theme.textPrimary} />
-            </TouchableOpacity>
-          </View>
+          <UiPageHeader
+            title="库存查询"
+            onBack={() => router.back()}
+            rightIcon="crosshair"
+            rightLabel="聚焦库存查询输入框"
+            onRightPress={() => focusScannerInput(0)}
+          />
 
           <UiWorkflowSummary items={workflowSummaryItems} />
         </View>
@@ -343,17 +327,15 @@ export default function StockQueryScreen() {
           onSubmitEditing={() => {
             void handleQuery();
           }}
-          onBlur={() => focusScannerInput(120)}
           placeholder={
             querying
               ? '正在查询ERP库存...'
               : selectedAccountAvailable
-                ? '扫描物料标签 / 输入存货编码'
+                ? '扫描物料二维码'
                 : `${getAccountLabel(selectedAccount)}账套暂未开放`
           }
           placeholderTextColor={theme.textMuted}
           autoCapitalize="none"
-          autoFocus={false}
           editable={selectedAccountAvailable}
           showSoftInputOnFocus={false}
           actionLabel="查询ERP库存"
@@ -384,6 +366,12 @@ export default function StockQueryScreen() {
                     {lastQuery.inventoryCode}
                   </Text>
                 </View>
+                <View style={styles.queryFieldRow}>
+                  <Text style={styles.queryLabel}>ERP 总库存</Text>
+                  <Text style={styles.queryValue}>
+                    {formatQuantity(stockRows.some(row => row.quantity === null) ? null : stockRows.reduce((sum, row) => sum + (row.quantity ?? 0), 0))}
+                  </Text>
+                </View>
               </View>
               <View style={styles.queryBadge}>
                 <Text style={styles.queryBadgeText}>{stockRows.length} 仓库</Text>
@@ -410,7 +398,7 @@ export default function StockQueryScreen() {
               renderItem={renderStockRow}
               style={styles.list}
               contentContainerStyle={
-                stockRows.length === 0 ? styles.listEmptyContent : styles.listContent
+                !lastQuery && stockRows.length === 0 ? styles.listEmptyContent : styles.listContent
               }
               keyboardShouldPersistTaps="handled"
               removeClippedSubviews={Platform.OS === 'android'}
@@ -418,7 +406,7 @@ export default function StockQueryScreen() {
                 <AppEmptyState
                   icon="search"
                   title={lastQuery ? 'ERP未返回库存' : '等待查询'}
-                  description={lastQuery ? '请确认账套和物料绑定是否正确' : '扫描物料标签后显示现存量'}
+                  description={lastQuery ? '该账套未返回此物料的库存明细' : '扫描物料二维码后显示现存量'}
                   compact
                   style={styles.empty}
                 />

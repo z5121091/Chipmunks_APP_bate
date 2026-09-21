@@ -515,6 +515,7 @@ const corsOptions: CorsOptions = {
     'X-Cache',
     'X-Erp-Account-Key',
     'X-Proxy-Auth-Mode',
+    'X-Erp-Request-Id',
     'X-Proxy-Network-Mode',
   ],
 };
@@ -619,7 +620,7 @@ const proxyCozeErpRequest = async (
     );
 
     // 复制响应头
-    ['cache-control', 'content-disposition', 'content-type', 'x-cache', 'ratelimit-limit',
+    ['cache-control', 'content-disposition', 'content-type', 'x-cache', 'x-erp-request-id', 'ratelimit-limit',
       'ratelimit-remaining', 'ratelimit-reset'].forEach((name) => {
       const value = upstreamResponse.headers.get(name);
       if (value) {

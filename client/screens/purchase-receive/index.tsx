@@ -2,6 +2,7 @@ import { cancelScanSubmit, scheduleScanSubmit } from '@/utils/scannerInput';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  AppState,
   FlatList,
   Platform,
   RefreshControl,
@@ -13,7 +14,7 @@ import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { Screen } from '@/components/Screen';
-import { UiWorkflowSummary } from '@/components/UiRedesign';
+import { UiPageHeader, UiWorkflowSummary } from '@/components/UiRedesign';
 import { WarehouseScanInput } from '@/components/WarehouseScanInput';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
@@ -25,7 +26,7 @@ import {
   type ErpAccountConfig,
 } from '@/utils/erpAccounts';
 import {
-  fetchPendingPurchaseReceives,
+  fetchAllPendingPurchaseReceives,
   fetchPurchaseReceiveVoucher,
   fetchPurchaseReceiveVoucherStatuses,
   loadCachedPendingPurchaseReceives,
@@ -52,7 +53,7 @@ const PURCHASE_RECEIVE_STATUS_POLL_INTERVAL_MS = 30_000;
 const PURCHASE_RECEIVE_REQUIRED_FRESHNESS_MS = 5 * 60_000;
 const PURCHASE_RECEIVE_LIST_AUTO_REFRESH_MS = 5 * 60_000;
 const PURCHASE_RECEIVE_LOOKUP_AUTO_SUBMIT_MS = 180;
-const STANDARD_PURCHASE_RECEIVE_CODE_PATTERN = /^II-\d{4}-\d{2}-\d{2}-\d{3}$/i;
+const STANDARD_PURCHASE_RECEIVE_CODE_PATTERN = /^II-\d{4}-\d{2}-\d{2}-\d{2,3}$/i;
 
 type PendingListLoadOptions = {
   forceRefresh?: boolean;
@@ -69,6 +70,7 @@ export default function PurchaseReceiveScreen() {
   const detailRequestIdRef = useRef(0);
   const manualLookupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const manualLookupInProgressRef = useRef('');
+  const manualVoucherCodeRef = useRef('');
   const [selectedAccount, setSelectedAccount] = useState<ErpAccountConfig>(ERP_ACCOUNTS[0]);
   const [items, setItems] = useState<PurchaseReceiveListItem[]>([]);
   const [updatedAt, setUpdatedAt] = useState('');
@@ -113,6 +115,7 @@ export default function PurchaseReceiveScreen() {
           const cachedAt = Date.parse(cached.cachedAt);
           const cacheIsFresh =
             Number.isFinite(cachedAt) &&
+            cachedAt <= Date.now() &&
             Date.now() - cachedAt <= PURCHASE_RECEIVE_LIST_AUTO_REFRESH_MS;
           if (!revalidateStaleCache || cacheIsFresh) {
             return;
@@ -123,8 +126,8 @@ export default function PurchaseReceiveScreen() {
         }
       }
 
-      const result = await fetchPendingPurchaseReceives(account, 0, 100, {
-        bypassCache: forceRefresh,
+      const result = await fetchAllPendingPurchaseReceives(account, {
+        bypassCache: forceRefresh || revalidateStaleCache,
       });
       const cache = await savePendingPurchaseReceivesCache(account.key, result);
       if (requestId === requestIdRef.current) {
@@ -230,12 +233,24 @@ export default function PurchaseReceiveScreen() {
       void loadPurchaseReceiveStatuses(selectedAccount);
 
       const statusTimer = setInterval(() => {
-        void loadPurchaseReceiveStatuses(selectedAccount, false);
+        if (AppState.currentState === 'active') void loadPurchaseReceiveStatuses(selectedAccount, false);
       }, PURCHASE_RECEIVE_STATUS_POLL_INTERVAL_MS);
+      const subscription = AppState.addEventListener('change', state => {
+        if (state !== 'active') return;
+        void loadPendingList(selectedAccount, { revalidateStaleCache: true });
+        void loadPurchaseReceiveStatuses(selectedAccount, false);
+      });
 
       return () => {
         clearInterval(statusTimer);
+        subscription.remove();
+        requestIdRef.current += 1;
+        completionRequestIdRef.current += 1;
+        statusRequestIdRef.current += 1;
+        detailRequestIdRef.current += 1;
         cancelScanSubmit(manualLookupTimerRef);
+        manualVoucherCodeRef.current = '';
+        setManualVoucherCode('');
       };
     }, [
       loadCompletedVoucherCodes,
@@ -313,6 +328,7 @@ export default function PurchaseReceiveScreen() {
     statusRequestIdRef.current += 1;
     detailRequestIdRef.current += 1;
     manualLookupInProgressRef.current = '';
+    manualVoucherCodeRef.current = '';
     setSelectedAccount(account);
     setItems([]);
     setCompletedVoucherCodes(new Set());
@@ -370,7 +386,7 @@ export default function PurchaseReceiveScreen() {
         const canUseCache = Boolean(cached && (!options.requireFresh || cacheIsFresh));
         const voucher = canUseCache
           ? cached!.data
-          : await fetchPurchaseReceiveVoucher(account, item.code);
+          : await fetchPurchaseReceiveVoucher(account, item.code, { bypassCache: options.requireFresh });
 
         if (!canUseCache) {
           await savePurchaseReceiveVoucherCache(voucher);
@@ -446,7 +462,7 @@ export default function PurchaseReceiveScreen() {
   const handleManualLookup = useCallback(async (nextVoucherCode?: string) => {
     cancelScanSubmit(manualLookupTimerRef);
 
-    const voucherCode = normalizeVoucherCode(nextVoucherCode ?? manualVoucherCode);
+    const voucherCode = normalizeVoucherCode(nextVoucherCode ?? manualVoucherCodeRef.current);
     const requestKey = `${selectedAccount.key}:${voucherCode}`;
     if (
       !voucherCode ||
@@ -456,6 +472,8 @@ export default function PurchaseReceiveScreen() {
     ) {
       return;
     }
+    manualVoucherCodeRef.current = '';
+    setManualVoucherCode('');
     if (auditedVoucherCodes.has(voucherCode)) {
       setErrorMessage(`${voucherCode} 已在ERP审核，不再属于待入库单`);
       setExpandedCode('');
@@ -499,7 +517,6 @@ export default function PurchaseReceiveScreen() {
         warehouseName: voucher.warehouseName,
       };
       setItems((current) => [listItem, ...current.filter((item) => item.code !== voucher.code)]);
-      setManualVoucherCode('');
       setErrorMessage('');
       router.push('/inbound', {
         accountKey: voucher.accountKey,
@@ -515,7 +532,6 @@ export default function PurchaseReceiveScreen() {
     completedVoucherCodes,
     loadVoucherDetail,
     loadingDetailCode,
-    manualVoucherCode,
     router,
     selectedAccount,
     selectedAccountAvailable,
@@ -524,7 +540,8 @@ export default function PurchaseReceiveScreen() {
   const handleManualVoucherCodeChange = useCallback(
     (text: string) => {
       cancelScanSubmit(manualLookupTimerRef);
-
+      if (manualLookupInProgressRef.current || loadingDetailCode) return;
+      manualVoucherCodeRef.current = text;
       setManualVoucherCode(text);
       const voucherCode = normalizeVoucherCode(text);
       if (!voucherCode || !selectedAccountAvailable || loadingDetailCode) {
@@ -655,25 +672,17 @@ export default function PurchaseReceiveScreen() {
     <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
       <View style={styles.container}>
         <View style={styles.topPanel}>
-          <View style={styles.header}>
-            <TouchableOpacity style={styles.headerButton} activeOpacity={0.7} onPress={() => router.back()}>
-              <Feather name="arrow-left" size={22} color={theme.textPrimary} />
-            </TouchableOpacity>
-            <Text style={styles.headerTitle}>采购入库</Text>
-            <TouchableOpacity
-              style={styles.headerButton}
-              activeOpacity={0.7}
-              disabled={!selectedAccountAvailable || refreshing}
-              accessibilityLabel="同步ERP未审采购入库单"
-              onPress={handleRefresh}
-            >
-              {refreshing ? (
-                <ActivityIndicator size="small" color={theme.primary} />
-              ) : (
-                <Feather name="refresh-cw" size={19} color={theme.textPrimary} />
-              )}
-            </TouchableOpacity>
-          </View>
+          <UiPageHeader
+            title="采购入库"
+            onBack={() => router.back()}
+            rightIcon="refresh-cw"
+            rightLabel="同步ERP未审采购入库单"
+            rightDisabled={!selectedAccountAvailable || refreshing}
+            rightLoading={refreshing}
+            onRightPress={() => {
+              void handleRefresh();
+            }}
+          />
           <UiWorkflowSummary items={workflowSummaryItems} />
         </View>
 
@@ -713,6 +722,7 @@ export default function PurchaseReceiveScreen() {
           placeholder="扫描或输入采购入库单号"
           placeholderTextColor={theme.textMuted}
           autoCapitalize="characters"
+          showSoftInputOnFocus={false}
           returnKeyType="search"
           actionLabel="打开采购入库单并开始扫码"
           actionDisabled={!manualVoucherCode.trim() || !selectedAccountAvailable}

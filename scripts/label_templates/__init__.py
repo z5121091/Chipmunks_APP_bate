@@ -1,4 +1,5 @@
 from .apm import NATIVE_LABEL_RIGHT_VALUE_X, build_native_apm_label
+from .unpack_time import build_native_unpack_time_label
 from .boya import (
     NATIVE_LABEL_BOYA_HEADER_FONT_SIZE_PIXELS,
     build_native_boya_label,
@@ -33,6 +34,7 @@ __all__ = [
     'build_native_apm_label',
     'build_native_boya_label',
     'build_native_label',
+    'build_native_unpack_time_label',
     'build_native_text_bitmap',
     'get_excel_cell_text',
     'get_native_centered_text_x',

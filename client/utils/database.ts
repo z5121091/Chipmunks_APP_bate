@@ -7,6 +7,9 @@ import { Base64 } from 'js-base64';
 import { STORAGE_KEYS, ExportType, SyncConfig } from '@/constants/config';
 import { getISODateTime, getTodayLocal } from './time';
 import { parseQuantity } from './quantity';
+import { assertValidRuleTerminator, stripRuleTerminator } from './ruleTerminator';
+import { CONDITION_OPERATORS, type ConditionOperator, isConditionOperator, isIgnoredRuleField, matchesRuleCondition } from './ruleConditions';
+import { migrateLegacyRuleFields } from './legacyRuleFields';
 import { safeJsonParseNullable } from './json';
 import { logger } from './logger';
 import { getDatabaseBackupDateString, sanitizeBackupFileName } from './backupNaming';
@@ -19,6 +22,7 @@ import {
 } from './outboundOrderRule';
 import { getSyncConfigError, normalizeSyncConfig } from './heartbeat';
 import { APP_NAME } from '@/constants/version';
+import { ERP_ACCOUNTS, getErpAccountByOutboundOrderNo } from './erpAccounts';
 import {
   buildInboundModelKey,
   buildInboundModelVersionKey,
@@ -120,10 +124,11 @@ const isWebPlatform = Platform.OS === 'web';
 // 数据版本
 const CURRENT_DATA_VERSION = 12;
 
-// 匹配条件接口（简化版：指定位置字段包含指定关键字）
+// 未指定操作符的历史条件继续使用“包含”。
 export interface MatchCondition {
   fieldIndex: number; // 字段位置（从0开始）
   keyword: string; // 匹配关键字（字段值包含此关键字即匹配）
+  operator?: ConditionOperator;
 }
 
 export class QRCodeRuleConflictError extends Error {
@@ -144,8 +149,11 @@ export interface QRCodeRule {
   id: string;
   name: string; // 厂家/规则名称，如"极海半导体"
   description: string; // 规则描述
+  // 仅控制“解析规则”列表的展示顺序，绝不参与扫码规则匹配优先级。
+  displayOrder?: number;
   separator: string; // 分隔符，如 "/"、","、"*"等
-  fieldOrder: string[]; // 字段顺序，标准字段用原名称（如"model"），自定义字段用"custom:字段ID"格式
+  terminator?: string; // 整条扫码内容的可选结束符，只移除末尾完整匹配的一次
+  fieldOrder: string[]; // 标准字段或 ignore:N；旧 custom:字段ID 在读取/恢复时自动转换
   customFieldIds?: string[]; // 关联的自定义字段ID列表（已弃用，保留兼容性）
   fieldPrefixes?: FieldPrefixes; // 字段前缀配置，key 与 fieldOrder 保持一致
   isActive: boolean; // 是否启用
@@ -154,6 +162,15 @@ export interface QRCodeRule {
   created_at: string;
   updated_at: string;
 }
+
+export const getQRCodeRuleSegmentCount = (
+  rule: Pick<QRCodeRule, 'fieldOrder' | 'customFieldIds'>
+): number => {
+  const fields = rule.fieldOrder || [];
+  // 旧备份可能仍把占位段保留在 customFieldIds 中；结构比较时也必须计入。
+  const legacyOnlyCount = (rule.customFieldIds || []).filter((id) => !fields.includes(`custom:${id}`)).length;
+  return fields.length + legacyOnlyCount;
+};
 
 // 字段定义（用于显示）
 export const FIELD_LABELS: Record<string, string> = {
@@ -292,6 +309,7 @@ export interface MaterialRecord {
   warehouse_id?: string; // 仓库ID
   warehouse_name?: string; // 仓库名称（冗余存储）
   inventory_code?: string; // 存货编码
+  erp_account_key?: string;
 }
 
 export interface OutboundExportRow {
@@ -396,6 +414,7 @@ export interface InboundRecord {
   sync_file_name?: string;
   synced_at?: string;
   sync_message?: string;
+  erp_account_key?: string;
 }
 
 export type DocumentSyncStatus = 'pending' | 'success' | 'failed';
@@ -617,7 +636,8 @@ const isMatchConditionShape = (value: unknown): value is MatchCondition => {
     isPlainObject(value) &&
     typeof value.fieldIndex === 'number' &&
     Number.isInteger(value.fieldIndex) &&
-    typeof value.keyword === 'string'
+    typeof value.keyword === 'string' &&
+    (value.operator === undefined || isConditionOperator(value.operator))
   );
 };
 
@@ -628,6 +648,12 @@ const isQRCodeRuleShape = (value: unknown): value is QRCodeRule => {
     typeof value.name === 'string' &&
     typeof value.description === 'string' &&
     typeof value.separator === 'string' &&
+    (value.displayOrder === undefined ||
+      (typeof value.displayOrder === 'number' &&
+        Number.isSafeInteger(value.displayOrder) &&
+        value.displayOrder > 0)) &&
+    (value.terminator === undefined || (typeof value.terminator === 'string' &&
+      value.terminator.length <= 64 && !value.terminator.includes('\0'))) &&
     isStringArray(value.fieldOrder) &&
     typeof value.isActive === 'boolean' &&
     typeof value.created_at === 'string' &&
@@ -776,6 +802,8 @@ type RuleRecordRow = {
   field_order?: string | null;
   custom_field_ids?: string | null;
   field_prefixes?: string | null;
+  terminator?: string | null;
+  display_order?: number | string | null;
   is_active: number | boolean;
   supplier_name?: string | null;
   created_at?: string | null;
@@ -783,12 +811,21 @@ type RuleRecordRow = {
   match_conditions?: string | null;
 };
 
+const getRuleDisplayOrder = (value: unknown): number | undefined => {
+  const numericValue = typeof value === 'number' ? value : Number(value);
+  return Number.isSafeInteger(numericValue) && numericValue > 0
+    ? numericValue
+    : undefined;
+};
+
 const normalizeRuleRecord = (record: RuleRecordRow): QRCodeRule => {
-  const fieldOrder = safeJsonParseNullable<string[]>(record.field_order ?? null, 'database.safeJsonParseNullable') || [];
-  const customFieldIds = safeJsonParseNullable<string[]>(record.custom_field_ids ?? null, 'database.safeJsonParseNullable') || [];
+  const legacyOrder = safeJsonParseNullable<string[]>(record.field_order ?? null, 'database.safeJsonParseNullable') || [];
+  const legacyIds = safeJsonParseNullable<string[]>(record.custom_field_ids ?? null, 'database.safeJsonParseNullable') || [];
   const rawFieldPrefixes = safeJsonParseNullable<FieldPrefixes>(record.field_prefixes ?? null, 'database.safeJsonParseNullable') || {};
+  const migrated = migrateLegacyRuleFields({ fieldOrder: legacyOrder, customFieldIds: legacyIds, fieldPrefixes: rawFieldPrefixes });
+  const { fieldOrder, customFieldIds } = migrated;
   const fieldPrefixes = fieldOrder.reduce<FieldPrefixes>((acc, fieldName) => {
-    const prefix = rawFieldPrefixes[fieldName];
+    const prefix = migrated.fieldPrefixes[fieldName];
     if (typeof prefix === 'string') {
       acc[fieldName] = prefix;
     }
@@ -806,13 +843,16 @@ const normalizeRuleRecord = (record: RuleRecordRow): QRCodeRule => {
     .map((condition) => ({
       fieldIndex: condition.fieldIndex,
       keyword: condition.keyword.trim(),
+      ...(condition.operator === undefined ? {} : { operator: condition.operator }),
     }));
 
   return {
     id: record.id,
     name: record.name,
     description: record.description || '',
+    displayOrder: getRuleDisplayOrder(record.display_order),
     separator: record.separator,
+    terminator: record.terminator || '',
     fieldOrder,
     customFieldIds,
     fieldPrefixes,
@@ -824,17 +864,28 @@ const normalizeRuleRecord = (record: RuleRecordRow): QRCodeRule => {
   };
 };
 
-const sortRulesByPriority = (rules: QRCodeRule[]): QRCodeRule[] => {
+const compareRulesByLegacyPresentation = (a: QRCodeRule, b: QRCodeRule): number => {
+  const updatedDiff =
+    parseStoredDateTimeToMillis(b.updated_at) - parseStoredDateTimeToMillis(a.updated_at);
+  if (updatedDiff !== 0) return updatedDiff;
+
+  const createdDiff =
+    parseStoredDateTimeToMillis(b.created_at) - parseStoredDateTimeToMillis(a.created_at);
+  if (createdDiff !== 0) return createdDiff;
+
+  return a.name.localeCompare(b.name, 'zh-CN');
+};
+
+const sortRulesForDisplay = (rules: QRCodeRule[]): QRCodeRule[] => {
   return rules.slice().sort((a, b) => {
-    const updatedDiff =
-      parseStoredDateTimeToMillis(b.updated_at) - parseStoredDateTimeToMillis(a.updated_at);
-    if (updatedDiff !== 0) return updatedDiff;
-
-    const createdDiff =
-      parseStoredDateTimeToMillis(b.created_at) - parseStoredDateTimeToMillis(a.created_at);
-    if (createdDiff !== 0) return createdDiff;
-
-    return a.name.localeCompare(b.name, 'zh-CN');
+    const aOrder = getRuleDisplayOrder(a.displayOrder);
+    const bOrder = getRuleDisplayOrder(b.displayOrder);
+    if (aOrder !== undefined && bOrder !== undefined && aOrder !== bOrder) {
+      return aOrder - bOrder;
+    }
+    if (aOrder !== undefined && bOrder === undefined) return -1;
+    if (aOrder === undefined && bOrder !== undefined) return 1;
+    return compareRulesByLegacyPresentation(a, b);
   });
 };
 
@@ -1203,6 +1254,9 @@ type ExistingInboundRecordIdentity = {
   version?: string | null;
   quantity: number;
   traceNo?: string | null;
+  batch?: string | null;
+  productionDate?: string | null;
+  erp_account_key?: string | null;
 };
 
 const normalizeComparableText = (value: unknown): string => String(value ?? '').trim();
@@ -1220,6 +1274,9 @@ const isEquivalentInboundRecord = (
   normalizeComparableText(existing.version).toLocaleLowerCase() ===
     normalizeComparableText(record.version).toLocaleLowerCase() &&
   Number(existing.quantity) === Number(record.quantity) &&
+  normalizeComparableText(existing.batch) === normalizeComparableText(record.batch) &&
+  normalizeComparableText(existing.productionDate) === normalizeComparableText(record.productionDate) &&
+  normalizeComparableText(existing.erp_account_key) === normalizeComparableText(record.erp_account_key) &&
   normalizeComparableText(existing.traceNo) === normalizeComparableText(record.traceNo);
 
 const assertUnpackTraceNoAvailable = async (
@@ -2814,6 +2871,8 @@ const performDatabaseInitialization = async (): Promise<void> => {
         supplier_name TEXT,
         match_conditions TEXT,
         field_prefixes TEXT,
+        terminator TEXT NOT NULL DEFAULT '',
+        display_order INTEGER,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -2914,6 +2973,34 @@ const performDatabaseInitialization = async (): Promise<void> => {
     `);
 
   await ensureInventoryCheckErpSnapshotColumns(db);
+  const ruleColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(qr_code_rules)');
+  if (!ruleColumns.some(column => column.name === 'terminator')) {
+    await db.execAsync("ALTER TABLE qr_code_rules ADD COLUMN terminator TEXT NOT NULL DEFAULT ''");
+  }
+  if (!ruleColumns.some(column => column.name === 'display_order')) {
+    await db.execAsync('ALTER TABLE qr_code_rules ADD COLUMN display_order INTEGER');
+  }
+  await runExclusiveWriteTransaction(db, 'migrateLegacyRuleFields', async transaction => {
+    const rows = await transaction.getAllAsync<RuleRecordRow>('SELECT * FROM qr_code_rules');
+    for (const row of rows) {
+      const order = safeJsonParseNullable<string[]>(row.field_order ?? null, 'ruleMigration.fieldOrder') || [];
+      const ids = safeJsonParseNullable<string[]>(row.custom_field_ids ?? null, 'ruleMigration.customFieldIds') || [];
+      if (!ids.length && !order.some(field => field.startsWith('custom:'))) continue;
+      const rule = normalizeRuleRecord(row);
+      await transaction.runAsync(
+        'UPDATE qr_code_rules SET field_order = ?, field_prefixes = ?, custom_field_ids = ? WHERE id = ?',
+        [JSON.stringify(rule.fieldOrder), JSON.stringify(rule.fieldPrefixes), '[]', rule.id],
+      );
+    }
+  });
+  // Retire the derived ledger only; parsed batch/date fields on business records remain intact.
+  await db.execAsync('DROP TABLE IF EXISTS "批次库存流水"; DROP TABLE IF EXISTS batch_stock_events;');
+  for (const table of ['materials', 'inbound_records']) {
+    const columns = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+    if (!columns.some(column => column.name === 'erp_account_key')) {
+      await db.execAsync(`ALTER TABLE ${table} ADD COLUMN erp_account_key TEXT`);
+    }
+  }
   await ensureTraceNoUniqueIndexes(db);
   await ensureRollingInventoryTraceNoIndex(db);
   await ensureRecycleBinTableAndTriggers(db);
@@ -3074,15 +3161,19 @@ const upsertOrderWithDatabase = async (
   }
 
   if (existingOrder) {
+    const customerChanged = customerName !== undefined && customerName !== existingOrder.customer_name;
+    const warehouseChanged = warehouse && (
+      warehouse.id !== existingOrder.warehouse_id || warehouse.name !== existingOrder.warehouse_name
+    );
     // 更新现有订单
     const updates: string[] = [];
     const params: any[] = [];
 
-    if (customerName !== undefined) {
+    if (customerChanged) {
       updates.push('customer_name = ?');
       params.push(customerName);
     }
-    if (warehouse) {
+    if (warehouseChanged) {
       updates.push('warehouse_id = ?');
       updates.push('warehouse_name = ?');
       params.push(warehouse.id);
@@ -3098,11 +3189,11 @@ const upsertOrderWithDatabase = async (
       const materialUpdates: string[] = [];
       const materialParams: any[] = [];
 
-      if (customerName !== undefined) {
+      if (customerChanged) {
         materialUpdates.push('customer_name = ?');
         materialParams.push(customerName);
       }
-      if (warehouse) {
+      if (warehouseChanged) {
         materialUpdates.push('warehouse_id = ?');
         materialUpdates.push('warehouse_name = ?');
         materialParams.push(warehouse.id);
@@ -3584,6 +3675,8 @@ export const deleteOrder = async (orderNo: string, warehouseId?: string | null):
     const params = normalizedWarehouseId ? [trimmedOrderNo, normalizedWarehouseId] : [trimmedOrderNo];
 
     await runExclusiveWriteTransaction(database, 'deleteOrder', async (transactionDatabase) => {
+      const rows = await transactionDatabase.getAllAsync<{ id: string }>(`SELECT id FROM materials WHERE order_no = ?${warehouseClause}`, params);
+      await deleteMaterialsWithDatabase(transactionDatabase, rows.map(row => row.id));
       // 删除关联的拆包记录，避免留下孤儿数据
       await transactionDatabase.runAsync(`DELETE FROM unpack_records WHERE order_no = ?${warehouseClause}`, params);
 
@@ -3756,6 +3849,7 @@ export type MaterialWritePayload = {
   warehouse_id?: string;
   warehouse_name?: string;
   inventory_code?: string;
+  erp_account_key?: string;
 };
 
 const prepareMaterialWritePayload = (material: MaterialWritePayload): MaterialWritePayload => ({
@@ -3865,6 +3959,11 @@ const insertMaterialWithDatabase = async (
     [materialId]
   );
   verifyMaterialWriteResult(inserted, material, materialId);
+
+  const accountKey = material.erp_account_key || getErpAccountByOutboundOrderNo(material.order_no)?.key;
+  if (accountKey) {
+    await database.runAsync('UPDATE materials SET erp_account_key = ? WHERE id = ?', [accountKey, materialId]);
+  }
 
   return materialId;
 };
@@ -4184,7 +4283,7 @@ export const hasAnyBusinessData = async (): Promise<boolean> => {
             OR EXISTS (SELECT 1 FROM unpack_records LIMIT 1)
           THEN 1
           ELSE 0
-        END AS exists
+        END AS [exists]
       `)
     );
 
@@ -4372,43 +4471,66 @@ export const searchMaterials = async (params: {
   }
 };
 
+// Deleting either split label cancels the parent operation, never just half of a label pair.
+const deleteMaterialsWithDatabase = async (
+  transactionDatabase: SQLite.SQLiteDatabase,
+  ids: string[]
+): Promise<void> => {
+  const deleting = new Set(ids);
+  for (const id of deleting) {
+    const dependents = await transactionDatabase.getAllAsync<{ id: string }>(
+      `SELECT m.id FROM materials m
+       WHERE m.id != ? AND EXISTS (
+         SELECT 1 FROM unpack_records u
+         WHERE u.original_material_id = ? AND TRIM(COALESCE(u.new_traceNo, '')) != ''
+           AND COALESCE(m.warehouse_id, '') = COALESCE(u.warehouse_id, '')
+           AND (TRIM(m.traceNo) = TRIM(u.new_traceNo) OR EXISTS (
+             SELECT 1 FROM unpack_records next
+             WHERE next.original_material_id = m.id AND TRIM(next.traceNo) = TRIM(u.new_traceNo)
+           ))
+       )`, [id, id]
+    );
+    if (dependents.some(row => !deleting.has(row.id))) {
+      throw new Error('拆包后的标签已有后续出库记录，请先撤销后续出库，再删除原拆包');
+    }
+  }
+  for (const trimmedId of deleting) {
+    const materialRow = await transactionDatabase.getFirstAsync<{
+      order_no: string | null;
+      warehouse_id: string | null;
+    }>('SELECT order_no, warehouse_id FROM materials WHERE id = ?', [trimmedId]);
+    await transactionDatabase.runAsync('DELETE FROM unpack_records WHERE original_material_id = ?', [trimmedId]);
+    await transactionDatabase.runAsync('DELETE FROM materials WHERE id = ?', [trimmedId]);
+
+    if (materialRow?.order_no) {
+      const remainingMaterial = await transactionDatabase.getFirstAsync<{ count: number }>(
+        materialRow.warehouse_id
+          ? 'SELECT COUNT(*) as count FROM materials WHERE order_no = ? AND warehouse_id = ?'
+          : "SELECT COUNT(*) as count FROM materials WHERE order_no = ? AND (warehouse_id IS NULL OR warehouse_id = '')",
+        materialRow.warehouse_id ? [materialRow.order_no, materialRow.warehouse_id] : [materialRow.order_no]
+      );
+
+      if ((remainingMaterial?.count || 0) === 0) {
+        await transactionDatabase.runAsync(
+          materialRow.warehouse_id
+            ? 'DELETE FROM orders WHERE order_no = ? AND warehouse_id = ?'
+            : "DELETE FROM orders WHERE order_no = ? AND (warehouse_id IS NULL OR warehouse_id = '')",
+          materialRow.warehouse_id ? [materialRow.order_no, materialRow.warehouse_id] : [materialRow.order_no]
+        );
+      }
+    }
+  }
+};
+
 // 删除物料记录
 export const deleteMaterial = async (id: string): Promise<void> => {
   try {
-    // 参数验证
     if (!id || typeof id !== 'string' || id.trim() === '') {
       logger.warn('[deleteMaterial] 无效的 id:', id);
       return;
     }
-
-    const database = getDb();
-    const trimmedId = id.trim();
-    await runExclusiveWriteTransaction(database, 'deleteMaterial', async (transactionDatabase) => {
-      const materialRow = await transactionDatabase.getFirstAsync<{
-        order_no: string | null;
-        warehouse_id: string | null;
-      }>('SELECT order_no, warehouse_id FROM materials WHERE id = ?', [trimmedId]);
-      await transactionDatabase.runAsync('DELETE FROM unpack_records WHERE original_material_id = ?', [trimmedId]);
-      await transactionDatabase.runAsync('DELETE FROM materials WHERE id = ?', [trimmedId]);
-
-      if (materialRow?.order_no) {
-        const remainingMaterial = await transactionDatabase.getFirstAsync<{ count: number }>(
-          materialRow.warehouse_id
-            ? 'SELECT COUNT(*) as count FROM materials WHERE order_no = ? AND warehouse_id = ?'
-            : "SELECT COUNT(*) as count FROM materials WHERE order_no = ? AND (warehouse_id IS NULL OR warehouse_id = '')",
-          materialRow.warehouse_id ? [materialRow.order_no, materialRow.warehouse_id] : [materialRow.order_no]
-        );
-
-        if ((remainingMaterial?.count || 0) === 0) {
-          await transactionDatabase.runAsync(
-            materialRow.warehouse_id
-              ? 'DELETE FROM orders WHERE order_no = ? AND warehouse_id = ?'
-              : "DELETE FROM orders WHERE order_no = ? AND (warehouse_id IS NULL OR warehouse_id = '')",
-            materialRow.warehouse_id ? [materialRow.order_no, materialRow.warehouse_id] : [materialRow.order_no]
-          );
-        }
-      }
-    });
+    await runExclusiveWriteTransaction(getDb(), 'deleteMaterial', transactionDatabase =>
+      deleteMaterialsWithDatabase(transactionDatabase, [id.trim()]));
   } catch (error) {
     logger.error('[deleteMaterial] 删除物料记录失败:', error);
     throw error;
@@ -4460,10 +4582,7 @@ export const updateMaterialQuantity = async (id: string, newQuantity: number): P
 
     const database = getDb();
     await runExclusiveWriteTransaction(database, 'updateMaterialQuantity', async (transactionDatabase) => {
-      await transactionDatabase.runAsync('UPDATE materials SET quantity = ? WHERE id = ?', [
-        parsedQuantity,
-        id.trim(),
-      ]);
+      await updateMaterialWithDatabase(transactionDatabase, id.trim(), { quantity: parsedQuantity });
     });
   } catch (error) {
     logger.error('[updateMaterialQuantity] 更新物料数量失败:', error);
@@ -4536,6 +4655,13 @@ const updateMaterialWithDatabase = async (
   id: string,
   updates: MaterialUpdatePayload
 ): Promise<void> => {
+  if (updates.batch !== undefined || updates.productionDate !== undefined) {
+    const current = await database.getFirstAsync<MaterialRecord>('SELECT * FROM materials WHERE id = ?', [id]);
+    if (current && updates.batch !== undefined && (current.batch || '') !== updates.batch) throw new Error('批次只能由扫码解析，不允许手动修改');
+    if (current && updates.productionDate !== undefined && (current.productionDate || '') !== updates.productionDate) {
+      throw new Error('生产日期只能由扫码解析，不允许手动修改');
+    }
+  }
   const updateFields: string[] = [];
   const values: SQLite.SQLiteBindValue[] = [];
 
@@ -5065,24 +5191,10 @@ export const markUnpackRecordsAsPrinted = async (ids: string[]): Promise<void> =
   }
 };
 
-// 删除拆包记录
+// 删除拆包记录会撤销对应的整条出库物料及其全部成对标签。
 export const deleteUnpackRecord = async (id: string): Promise<void> => {
-  try {
-    // 参数验证
-    if (!id || typeof id !== 'string' || id.trim() === '') {
-      logger.warn('[deleteUnpackRecord] 无效的 id:', id);
-      return;
-    }
-
-    const database = getDb();
-    const trimmedId = id.trim();
-    await runExclusiveWriteTransaction(database, 'deleteUnpackRecord', async (transactionDatabase) => {
-      await transactionDatabase.runAsync('DELETE FROM unpack_records WHERE id = ?', [trimmedId]);
-    });
-  } catch (error) {
-    logger.error('[deleteUnpackRecord] 删除拆包记录失败:', error);
-    throw error;
-  }
+  if (typeof id !== 'string' || !id.trim()) return;
+  await deleteUnpackRecords([id]);
 };
 
 // 删除多个拆包记录
@@ -5096,6 +5208,10 @@ export const deleteUnpackRecords = async (ids: string[]): Promise<void> => {
 
     const placeholders = normalizedIds.map(() => '?').join(',');
     await runExclusiveWriteTransaction(database, 'deleteUnpackRecords', async (transactionDatabase) => {
+      const parents = await transactionDatabase.getAllAsync<{ original_material_id: string }>(
+        `SELECT DISTINCT original_material_id FROM unpack_records WHERE id IN (${placeholders})`, normalizedIds
+      );
+      await deleteMaterialsWithDatabase(transactionDatabase, parents.map(row => row.original_material_id).filter(Boolean));
       await transactionDatabase.runAsync(
         `DELETE FROM unpack_records WHERE id IN (${placeholders})`,
         normalizedIds
@@ -5580,7 +5696,7 @@ export const getInventoryCodeByModel = async (
 
     if (normalizedVersion) {
       const exactVersionResult = await database.getFirstAsync<{ inventory_code: string }>(
-        "SELECT inventory_code FROM inventory_bindings WHERE scan_model = ? COLLATE NOCASE AND COALESCE(version, '') = ? COLLATE NOCASE",
+        "SELECT inventory_code FROM inventory_bindings WHERE TRIM(scan_model) = ? COLLATE NOCASE AND COALESCE(TRIM(version), '') = ? COLLATE NOCASE",
         [normalizedModel, normalizedVersion]
       );
 
@@ -5590,12 +5706,38 @@ export const getInventoryCodeByModel = async (
     }
 
     const result = await database.getFirstAsync<{ inventory_code: string }>(
-      "SELECT inventory_code FROM inventory_bindings WHERE scan_model = ? COLLATE NOCASE AND COALESCE(version, '') = ''",
+      "SELECT inventory_code FROM inventory_bindings WHERE TRIM(scan_model) = ? COLLATE NOCASE AND COALESCE(TRIM(version), '') = ''",
       [normalizedModel]
     );
     return result?.inventory_code?.trim() || null;
   } catch (error) {
     logger.error('[getInventoryCodeByModel] 获取存货编码失败:', error);
+    return null;
+  }
+};
+
+/**
+ * 仅按“扫描型号 + 版本号”精确查询物料绑定。
+ *
+ * 业务扫码仍使用 getInventoryCodeByModel 的既有回退逻辑；本方法只供
+ * 规则冲突诊断使用，避免把“有版本但未精确匹配”的候选误判为已绑定。
+ */
+export const getExactInventoryCodeByModelVersion = async (
+  scanModel: string,
+  version?: string
+): Promise<string | null> => {
+  try {
+    const normalizedModel = typeof scanModel === 'string' ? scanModel.trim() : '';
+    if (!normalizedModel) return null;
+
+    const normalizedVersion = typeof version === 'string' ? version.trim() : '';
+    const result = await getDb().getFirstAsync<{ inventory_code: string }>(
+      "SELECT inventory_code FROM inventory_bindings WHERE TRIM(scan_model) = ? COLLATE NOCASE AND COALESCE(TRIM(version), '') = ? COLLATE NOCASE",
+      [normalizedModel, normalizedVersion]
+    );
+    return result?.inventory_code?.trim() || null;
+  } catch (error) {
+    logger.error('[getExactInventoryCodeByModelVersion] 获取精确存货编码失败:', error);
     return null;
   }
 };
@@ -6354,6 +6496,9 @@ const insertInboundRecord = async (
     ]
   );
 
+  if (record.erp_account_key) {
+    await database.runAsync('UPDATE inbound_records SET erp_account_key = ? WHERE id = ?', [record.erp_account_key, id]);
+  }
   return id;
 };
 
@@ -6400,7 +6545,7 @@ export const addInboundRecordsBatch = async (records: InboundRecordInsert[]): Pr
         const stableId = record.id?.trim();
         const existing = stableId
           ? await transactionDatabase.getFirstAsync<ExistingInboundRecordIdentity>(
-              `SELECT id, inbound_no, warehouse_id, inventory_code, scan_model, version, quantity, traceNo
+              `SELECT id, inbound_no, warehouse_id, inventory_code, scan_model, version, quantity, traceNo, batch, productionDate, erp_account_key
                FROM inbound_records
                WHERE id = ?
                LIMIT 1`,
@@ -6860,6 +7005,8 @@ type ExistingInventoryCheckRecordIdentity = {
   traceNo?: string | null;
   erp_account_key?: string | null;
   erp_quantity?: number | null;
+  batch?: string | null;
+  productionDate?: string | null;
 };
 
 const isEquivalentInventoryCheckRecord = (
@@ -6867,6 +7014,8 @@ const isEquivalentInventoryCheckRecord = (
   record: InventoryCheckRecordInsert
 ): boolean =>
   normalizeComparableText(existing.warehouse_id) === normalizeComparableText(record.warehouse_id) &&
+  normalizeComparableText(existing.batch) === normalizeComparableText(record.batch) &&
+  normalizeComparableText(existing.productionDate) === normalizeComparableText(record.productionDate) &&
   normalizeComparableText(existing.inventory_code).toLocaleLowerCase() ===
     normalizeComparableText(record.inventory_code).toLocaleLowerCase() &&
   normalizeComparableText(existing.scan_model).toLocaleLowerCase() ===
@@ -7007,7 +7156,7 @@ export const addInventoryCheckRecordsBatch = async (
         const existing = stableId
           ? await transactionDatabase.getFirstAsync<ExistingInventoryCheckRecordIdentity>(
               `SELECT id, check_no, warehouse_id, inventory_code, scan_model, version, quantity,
-                      check_type, actual_quantity, traceNo, erp_account_key, erp_quantity
+                      check_type, actual_quantity, traceNo, erp_account_key, erp_quantity, batch, productionDate
                FROM inventory_check_records
                WHERE id = ?
                LIMIT 1`,
@@ -7140,12 +7289,52 @@ export const deleteInventoryCheckDocument = async (
 
 type QRCodeRuleConfiguration = Pick<
   QRCodeRule,
-  'name' | 'separator' | 'fieldOrder' | 'matchConditions' | 'fieldPrefixes'
+  'name' | 'separator' | 'terminator' | 'fieldOrder' | 'matchConditions' | 'fieldPrefixes'
 >;
+
+export const normalizeQRCodeRuleName = (name: string): string =>
+  name.normalize('NFKC').trim().toLowerCase();
+
+const assertUniqueQRCodeRuleName = async (
+  database: SQLite.SQLiteDatabase,
+  name: string,
+  excludedRuleId?: string,
+): Promise<void> => {
+  const normalizedName = normalizeQRCodeRuleName(name);
+  const rules = await database.getAllAsync<Pick<QRCodeRule, 'id' | 'name'>>(
+    'SELECT id, name FROM qr_code_rules',
+  );
+  const duplicate = rules.find(rule =>
+    rule.id !== excludedRuleId && normalizeQRCodeRuleName(rule.name) === normalizedName,
+  );
+  if (duplicate) {
+    throw new Error(`解析规则名称“${name.trim()}”已存在，请使用不同名称`);
+  }
+};
+
+const makeQRCodeRuleNamesUnique = (rules: QRCodeRule[]): {
+  rules: QRCodeRule[];
+  renamed: Array<{ from: string; to: string }>;
+} => {
+  const usedNames = new Set<string>();
+  const renamed: Array<{ from: string; to: string }> = [];
+  const normalizedRules = rules.map((rule) => {
+    const baseName = rule.name.trim();
+    let name = baseName;
+    let suffix = 2;
+    while (usedNames.has(normalizeQRCodeRuleName(name))) {
+      name = `${baseName} (${suffix})`;
+      suffix += 1;
+    }
+    usedNames.add(normalizeQRCodeRuleName(name));
+    if (name !== rule.name) renamed.push({ from: rule.name, to: name });
+    return { ...rule, name };
+  });
+  return { rules: normalizedRules, renamed };
+};
 
 const assertValidQRCodeRuleConfiguration = (
   rule: QRCodeRuleConfiguration,
-  availableCustomFieldIds?: ReadonlySet<string>
 ): void => {
   if (!rule.name.trim()) {
     throw new Error('解析规则名称不能为空');
@@ -7153,6 +7342,7 @@ const assertValidQRCodeRuleConfiguration = (
   if (!rule.separator) {
     throw new Error(`解析规则“${rule.name}”的分隔符不能为空`);
   }
+  assertValidRuleTerminator(rule.terminator);
   if (!Array.isArray(rule.fieldOrder) || rule.fieldOrder.length < 2) {
     throw new Error(`解析规则“${rule.name}”至少需要配置 2 个字段`);
   }
@@ -7161,18 +7351,11 @@ const assertValidQRCodeRuleConfiguration = (
   rule.fieldOrder.forEach((fieldName, index) => {
     const normalizedFieldName = String(fieldName || '').trim();
     const isStandardField = AVAILABLE_FIELDS.includes(normalizedFieldName);
-    const customFieldId = isCustomField(normalizedFieldName)
-      ? getCustomFieldId(normalizedFieldName).trim()
-      : '';
-
-    if (!isStandardField && !customFieldId) {
+    if (!isStandardField && !isIgnoredRuleField(normalizedFieldName)) {
       throw new Error(`解析规则“${rule.name}”第 ${index + 1} 段字段无效`);
     }
     if (seenFields.has(normalizedFieldName)) {
       throw new Error(`解析规则“${rule.name}”重复使用了字段：${normalizedFieldName}`);
-    }
-    if (customFieldId && availableCustomFieldIds && !availableCustomFieldIds.has(customFieldId)) {
-      throw new Error(`解析规则“${rule.name}”引用了不存在的占位字段`);
     }
     seenFields.add(normalizedFieldName);
   });
@@ -7187,6 +7370,9 @@ const assertValidQRCodeRuleConfiguration = (
     }
     if (!condition.keyword.trim()) {
       throw new Error(`解析规则“${rule.name}”第 ${index + 1} 个识别条件不能为空`);
+    }
+    if (condition.operator !== undefined && !isConditionOperator(condition.operator)) {
+      throw new Error(`解析规则“${rule.name}”第 ${index + 1} 个识别条件类型无效`);
     }
   });
 
@@ -7204,7 +7390,7 @@ export const getAllRules = async (): Promise<QRCodeRule[]> => {
       getDb().getAllAsync<any>('SELECT * FROM qr_code_rules')
     );
 
-    return sortRulesByPriority(results.map(normalizeRuleRecord));
+    return sortRulesForDisplay(results.map(normalizeRuleRecord));
   } catch (error) {
     logger.error('获取规则列表失败:', error);
     throw error;
@@ -7222,28 +7408,42 @@ export const getActiveRules = async (): Promise<QRCodeRule[]> => {
   }
 };
 
+// 保存规则列表的手工展示顺序（只影响列表展示，不参与扫码匹配与冲突判断）。
+export const setRulesDisplayOrder = async (orderedIds: string[]): Promise<void> => {
+  try {
+    const database = getDb();
+    await runExclusiveWriteTransaction(database, 'setRulesDisplayOrder', async (transactionDatabase) => {
+      for (let index = 0; index < orderedIds.length; index++) {
+        await transactionDatabase.runAsync(
+          'UPDATE qr_code_rules SET display_order = ? WHERE id = ?',
+          [index + 1, orderedIds[index]]
+        );
+      }
+    });
+  } catch (error) {
+    logger.error('保存规则排序失败:', error);
+    throw error;
+  }
+};
+
 // 添加规则
 export const addRule = async (
   rule: Omit<QRCodeRule, 'id' | 'created_at' | 'updated_at'>
 ): Promise<string> => {
   try {
+    rule = migrateLegacyRuleFields({ ...rule, name: rule.name.trim() });
     const database = getDb();
     const id = generateId();
     const isoDateTime = getISODateTime();
 
     await runExclusiveWriteTransaction(database, 'addRule', async (transactionDatabase) => {
-      const customFieldRows = await transactionDatabase.getAllAsync<{ id: string }>(
-        'SELECT id FROM custom_fields'
-      );
-      assertValidQRCodeRuleConfiguration(
-        rule,
-        new Set(customFieldRows.map((row) => row.id))
-      );
+      assertValidQRCodeRuleConfiguration(rule);
+      await assertUniqueQRCodeRuleName(transactionDatabase, rule.name);
       await transactionDatabase.runAsync(
         `INSERT INTO qr_code_rules (
           id, name, description, separator, field_order, custom_field_ids, is_active,
-          supplier_name, match_conditions, field_prefixes, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
           rule.name,
@@ -7255,6 +7455,7 @@ export const addRule = async (
           rule.supplierName || null,
           rule.matchConditions ? JSON.stringify(rule.matchConditions) : null,
           rule.fieldPrefixes ? JSON.stringify(rule.fieldPrefixes) : null,
+          rule.terminator || '',
           isoDateTime,
           isoDateTime,
         ]
@@ -7272,11 +7473,14 @@ const QR_RULE_UPDATE_COLUMN_MAP: Partial<Record<keyof QRCodeRule, string>> = {
   name: 'name',
   description: 'description',
   separator: 'separator',
+  terminator: 'terminator',
 };
 
 // 更新规则
 export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Promise<void> => {
   try {
+    if (updates.name !== undefined) updates = { ...updates, name: updates.name.trim() };
+    if (updates.fieldOrder) updates = migrateLegacyRuleFields({ ...updates, fieldOrder: updates.fieldOrder });
     const trimmedId = id.trim();
     if (!trimmedId) {
       throw new Error('解析规则 ID 不能为空');
@@ -7335,13 +7539,8 @@ export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Prom
         }
         const currentRule = normalizeRuleRecord(rawRule);
         const mergedRule: QRCodeRule = { ...currentRule, ...updates, id: currentRule.id };
-        const customFieldRows = await transactionDatabase.getAllAsync<{ id: string }>(
-          'SELECT id FROM custom_fields'
-        );
-        assertValidQRCodeRuleConfiguration(
-          mergedRule,
-          new Set(customFieldRows.map((row) => row.id))
-        );
+        assertValidQRCodeRuleConfiguration(mergedRule);
+        await assertUniqueQRCodeRuleName(transactionDatabase, mergedRule.name, currentRule.id);
         await transactionDatabase.runAsync(
           `UPDATE qr_code_rules SET ${updateFields.join(', ')} WHERE id = ?`,
           values
@@ -7610,31 +7809,6 @@ export const reorderCustomFields = async (fieldIds: string[]): Promise<void> => 
 
 // ========== 二维码解析相关函数（逻辑部分，不涉及存储） ==========
 
-// 支持的括号分隔符格式
-const BRACKET_PAIRS: Record<string, string> = {
-  '{': '}',
-  '(': ')',
-  '[': ']',
-  '<': '>',
-};
-
-// 检测预设括号格式并返回左括号
-const detectBracketFormat = (str: string): string | null => {
-  for (const left of Object.keys(BRACKET_PAIRS)) {
-    const right = BRACKET_PAIRS[left];
-    if (str.startsWith(left) && str.includes(right + left)) {
-      return left;
-    }
-  }
-  return null;
-};
-
-// 解析预设括号格式
-const splitByBracket = (str: string, leftBracket: string): string[] => {
-  const rightBracket = BRACKET_PAIRS[leftBracket];
-  return splitByBracketPair(str, leftBracket, rightBracket);
-};
-
 const splitByBracketPair = (
   str: string,
   leftBracket: string,
@@ -7745,9 +7919,11 @@ const normalizeSplitPartsForRule = (parts: string[], rule: QRCodeRule): string[]
         .join(rule.separator)
         .trim();
 
+      // Reassemble dates split by their own delimiter, not a complete date plus another field.
       if (
         consumeCount > 1 &&
-        !isLikelyDateValue(stripConfiguredFieldPrefix(mergedValue, rule.fieldPrefixes?.[fieldName]))
+        (!isLikelyDateValue(stripConfiguredFieldPrefix(mergedValue, rule.fieldPrefixes?.[fieldName])) ||
+          effectiveParts.slice(partIndex, partIndex + consumeCount).some(isLikelyDateValue))
       ) {
         continue;
       }
@@ -7768,21 +7944,22 @@ const normalizeSplitPartsForRule = (parts: string[], rule: QRCodeRule): string[]
 };
 
 const splitContentByRule = (content: string, rule: QRCodeRule): string[] => {
+  // Same-as-separator endings are handled by field count, preserving required empty fields.
+  const terminator = rule.terminator === rule.separator ? undefined : rule.terminator;
+  const normalizedContent = stripRuleTerminator(content, terminator).content.trim();
   const configuredBracketPair = getBracketPairFromSeparator(rule.separator);
   const parts =
     configuredBracketPair &&
-    matchesBracketPair(content, configuredBracketPair.left, configuredBracketPair.right)
+    matchesBracketPair(normalizedContent, configuredBracketPair.left, configuredBracketPair.right)
       ? splitByBracketPair(
-          content,
+          normalizedContent,
           configuredBracketPair.left,
           configuredBracketPair.right
         )
-      : splitBySeparator(content, rule.separator);
+      : splitBySeparator(normalizedContent, rule.separator);
 
   return normalizeSplitPartsForRule(parts, rule);
 };
-
-const normalizeMatchText = (value: string): string => value.trim().toLowerCase();
 
 const getConfiguredFieldPrefixMatchLength = (value: string, prefix?: string): number | null => {
   const normalizedPrefix = prefix?.replace(/\s+/g, '').toLowerCase();
@@ -7829,6 +8006,36 @@ const getRulePrefixStats = (rule: QRCodeRule, parts: string[]) => {
   return { configuredCount, matchedCount };
 };
 
+// Shared by the editor and live detection so diagnostic results cannot drift from scanning.
+export const inspectQRCodeRule = (content: string, rule: QRCodeRule) => {
+  rule = migrateLegacyRuleFields(rule);
+  const parts = splitContentByRule(content, rule);
+  const errors: string[] = [];
+  if (!content.trim()) errors.push('样本内容为空');
+  if (!rule.separator) errors.push('分隔符未设置');
+  if ((rule.separator === '/' || rule.separator === '//') && /^(?:https?|s?ftp):\/\//i.test(content.trimStart())) {
+    errors.push('网址不作为物料二维码解析');
+  }
+  if (rule.fieldOrder.length < 2) errors.push('至少需要配置2段字段');
+  if (parts.length !== rule.fieldOrder.length) {
+    errors.push(`需要${rule.fieldOrder.length}段，实际${parts.length}段`);
+  }
+  rule.fieldOrder.forEach((field, index) => {
+    const prefix = rule.fieldPrefixes?.[field];
+    if (prefix?.trim() && !doesConfiguredFieldPrefixMatch(parts[index] ?? '', prefix)) {
+      errors.push(`第${index + 1}段前缀不匹配：${prefix}`);
+    }
+  });
+  (rule.matchConditions || []).forEach(condition => {
+    if (parts[condition.fieldIndex] === undefined || !matchesRuleCondition(parts[condition.fieldIndex], condition)) {
+      errors.push(`第${condition.fieldIndex + 1}段不满足“${CONDITION_OPERATORS[condition.operator ?? 'contains'] ?? '未知条件'} ${condition.keyword}”`);
+    }
+  });
+  return { parts, errors, matched: errors.length === 0,
+    values: parts.map((part, index) => stripConfiguredFieldPrefix(part, rule.fieldPrefixes?.[rule.fieldOrder[index]])),
+  };
+};
+
 type RuleDetectionCandidate = {
   rule: QRCodeRule;
   parts: string[];
@@ -7837,7 +8044,19 @@ type RuleDetectionCandidate = {
   separatorLength: number;
   configuredPrefixCount: number;
   matchedPrefixCount: number;
+  matchedTerminatorLength: number;
 };
+
+export interface QRCodeRuleDetectionAnalysis {
+  /** 所有通过分隔符、段数、前缀及手动条件校验的规则。 */
+  matchedRules: QRCodeRule[];
+  /** 实际参与最终优先级选择的规则；带识别条件的候选优先于普通候选。 */
+  consideredRules: QRCodeRule[];
+  /** 唯一胜出的规则；存在同优先级冲突时为 null。 */
+  selectedRule: QRCodeRule | null;
+  /** 与最佳候选优先级完全相同、无法由扫码内容自动区分的规则。 */
+  conflictingRules: QRCodeRule[];
+}
 
 const compareRuleDetectionCandidates = (
   a: RuleDetectionCandidate,
@@ -7860,6 +8079,10 @@ const compareRuleDetectionCandidates = (
     return b.matchConditionCount - a.matchConditionCount;
   }
 
+  if (a.matchedTerminatorLength !== b.matchedTerminatorLength) {
+    return b.matchedTerminatorLength - a.matchedTerminatorLength;
+  }
+
   if (a.separatorLength !== b.separatorLength) {
     return b.separatorLength - a.separatorLength;
   }
@@ -7878,151 +8101,98 @@ const haveEquivalentRuleDetectionPriority = (
   a.matchedPrefixCount === b.matchedPrefixCount &&
   a.configuredPrefixCount === b.configuredPrefixCount &&
   a.matchConditionCount === b.matchConditionCount &&
+  a.matchedTerminatorLength === b.matchedTerminatorLength &&
   a.separatorLength === b.separatorLength &&
   a.fieldCount === b.fieldCount;
 
+const buildRuleDetectionCandidate = (
+  content: string,
+  rule: QRCodeRule,
+  parts: string[]
+): RuleDetectionCandidate => {
+  const fieldCount = rule.fieldOrder?.length || 0;
+  const prefixStats = getRulePrefixStats(rule, parts);
+  return {
+    rule,
+    parts,
+    fieldCount,
+    matchConditionCount: rule.matchConditions?.length || 0,
+    separatorLength: Array.from(rule.separator || '').length,
+    configuredPrefixCount: prefixStats.configuredCount,
+    matchedPrefixCount: prefixStats.matchedCount,
+    matchedTerminatorLength: stripRuleTerminator(content, rule.terminator).matched
+      ? rule.terminator!.length : 0,
+  };
+};
+
+const selectBestRuleDetectionCandidate = (candidates: RuleDetectionCandidate[]): {
+  best: RuleDetectionCandidate | null;
+  conflicts: RuleDetectionCandidate[];
+} => {
+  if (candidates.length === 0) {
+    return { best: null, conflicts: [] };
+  }
+
+  const sorted = candidates.slice().sort(compareRuleDetectionCandidates);
+  const best = sorted[0];
+  const conflicts = sorted.filter((candidate) =>
+    haveEquivalentRuleDetectionPriority(best, candidate)
+  );
+
+  return { best, conflicts: conflicts.length > 1 ? conflicts : [] };
+};
+
+/**
+ * 使用与业务扫码相同的优先级分析一个样本，供规则编辑页显示真实的区分结果。
+ */
+export const analyzeQRCodeRuleDetection = (
+  content: string,
+  activeRules: readonly QRCodeRule[]
+): QRCodeRuleDetectionAnalysis => {
+  const conditionedCandidates: RuleDetectionCandidate[] = [];
+  const exactCandidates: RuleDetectionCandidate[] = [];
+
+  // 每条规则只移除自身的结束符，再独立检查分隔符、前缀和识别条件。
+  for (const originalRule of activeRules) {
+    const rule = migrateLegacyRuleFields(originalRule);
+    const inspection = inspectQRCodeRule(content, rule);
+    if (!inspection.matched) continue;
+
+    const candidate = buildRuleDetectionCandidate(content, rule, inspection.parts);
+    if ((rule.matchConditions?.length || 0) > 0) {
+      conditionedCandidates.push(candidate);
+    } else {
+      exactCandidates.push(candidate);
+    }
+  }
+
+  const consideredCandidates = conditionedCandidates.length > 0
+    ? conditionedCandidates
+    : exactCandidates;
+  const selection = selectBestRuleDetectionCandidate(consideredCandidates);
+  const hasConflict = selection.conflicts.length > 1;
+
+  return {
+    matchedRules: [...conditionedCandidates, ...exactCandidates].map((candidate) => candidate.rule),
+    consideredRules: consideredCandidates.map((candidate) => candidate.rule),
+    selectedRule: hasConflict ? null : selection.best?.rule ?? null,
+    conflictingRules: hasConflict ? selection.conflicts.map((candidate) => candidate.rule) : [],
+  };
+};
+
 // 根据二维码内容自动识别规则
-export const detectRule = async (content: string): Promise<QRCodeRule | null> => {
+export const detectRule = async (
+  content: string,
+  activeRules?: readonly QRCodeRule[]
+): Promise<QRCodeRule | null> => {
   try {
-    const rules = await getActiveRules();
-
-    // 从规则中提取所有唯一的分隔符
-    const ruleSeparators = [...new Set(rules.map((r) => r.separator))];
-    const commonSeparators = ['||', '|', ',', '*', '#', ';', ':', '\t'];
-    const allSeparators = [...ruleSeparators, ...commonSeparators];
-    const uniqueSeparators = [...new Set(allSeparators)];
-
-    // 检测是否是 URL
-    const isURL = (str: string): boolean => {
-      const lower = str.toLowerCase();
-      return (
-        lower.startsWith('http://') ||
-        lower.startsWith('https://') ||
-        lower.startsWith('ftp://') ||
-        lower.startsWith('sftp://')
-      );
-    };
-
-    // 计算每种分隔符能拆分出多少字段（保留空字段，避免字段位置错位）
-    const separatorPartsCount: { separator: string; count: number; parts: string[] }[] = [];
-
-    // 优先检测预设括号格式
-    const bracketLeft = detectBracketFormat(content);
-    if (bracketLeft) {
-      const parts = splitByBracket(content, bracketLeft);
-      if (parts.length >= 2) {
-        separatorPartsCount.push({
-          separator: bracketLeft + BRACKET_PAIRS[bracketLeft],
-          count: parts.length,
-          parts,
-        });
-      }
+    const rules = (activeRules ?? await getActiveRules()).map(migrateLegacyRuleFields);
+    const analysis = analyzeQRCodeRuleDetection(content, rules);
+    if (analysis.conflictingRules.length > 1) {
+      throw new QRCodeRuleConflictError(analysis.conflictingRules.map((rule) => rule.name));
     }
 
-    // 检测其他分隔符
-    for (const sep of uniqueSeparators) {
-      if ((sep === '/' || sep === '//') && isURL(content)) continue;
-
-      if (bracketLeft && sep === bracketLeft + BRACKET_PAIRS[bracketLeft]) {
-        continue;
-      }
-
-      const bracketPair = getBracketPairFromSeparator(sep);
-      const parts =
-        bracketPair && matchesBracketPair(content, bracketPair.left, bracketPair.right)
-          ? splitByBracketPair(content, bracketPair.left, bracketPair.right)
-          : splitBySeparator(content, sep);
-      if (parts.length >= 2) {
-        separatorPartsCount.push({ separator: sep, count: parts.length, parts });
-      }
-    }
-
-    const buildCandidate = (rule: QRCodeRule, parts: string[]): RuleDetectionCandidate => {
-      const fieldCount = rule.fieldOrder?.length || 0;
-      const prefixStats = getRulePrefixStats(rule, parts);
-      return {
-        rule,
-        parts,
-        fieldCount,
-        matchConditionCount: rule.matchConditions?.length || 0,
-        separatorLength: Array.from(rule.separator || '').length,
-        configuredPrefixCount: prefixStats.configuredCount,
-        matchedPrefixCount: prefixStats.matchedCount,
-      };
-    };
-
-    const selectBestCandidate = (candidates: RuleDetectionCandidate[]): QRCodeRule | null => {
-      if (candidates.length === 0) {
-        return null;
-      }
-
-      const sorted = candidates.slice().sort(compareRuleDetectionCandidates);
-      const best = sorted[0];
-      const conflicts = sorted.filter((candidate) =>
-        haveEquivalentRuleDetectionPriority(best, candidate)
-      );
-
-      if (conflicts.length > 1) {
-        throw new QRCodeRuleConflictError(conflicts.map((candidate) => candidate.rule.name));
-      }
-
-      return best.rule;
-    };
-
-    const conditionedCandidates: RuleDetectionCandidate[] = [];
-    const exactCandidates: RuleDetectionCandidate[] = [];
-
-    for (const { separator, parts } of separatorPartsCount) {
-      const matchingRules = rules.filter((rule) => rule.separator === separator);
-      if (matchingRules.length === 0) {
-        continue;
-      }
-
-      matchingRules.forEach((rule) => {
-        const ruleParts = normalizeSplitPartsForRule(parts, rule);
-        const ruleFieldCount = rule.fieldOrder?.length || 0;
-        if (ruleFieldCount !== ruleParts.length) {
-          return;
-        }
-
-        const candidate = buildCandidate(rule, ruleParts);
-        if (
-          candidate.configuredPrefixCount > 0 &&
-          candidate.matchedPrefixCount !== candidate.configuredPrefixCount
-        ) {
-          return;
-        }
-
-        if ((rule.matchConditions?.length || 0) > 0) {
-          const allMatch = (rule.matchConditions || []).every((condition) => {
-            if (condition.fieldIndex < 0 || condition.fieldIndex >= ruleParts.length) return false;
-            return normalizeMatchText(ruleParts[condition.fieldIndex]).includes(
-              normalizeMatchText(condition.keyword)
-            );
-          });
-
-          if (allMatch) {
-            conditionedCandidates.push(candidate);
-          }
-          return;
-        }
-
-        exactCandidates.push(candidate);
-      });
-
-    }
-
-    const conditionedMatch = selectBestCandidate(conditionedCandidates);
-    if (conditionedMatch) {
-      return conditionedMatch;
-    }
-
-    const exactMatch = selectBestCandidate(exactCandidates);
-    if (exactMatch) {
-      return exactMatch;
-    }
-
-    return null;
+    return analysis.selectedRule;
   } catch (error) {
     if (error instanceof QRCodeRuleConflictError) {
       throw error;
@@ -8049,6 +8219,7 @@ export const parseWithRule = (
   standardFields: Record<string, string>;
   customFields: Record<string, string>;
 } => {
+  rule = migrateLegacyRuleFields(rule);
   const parts = splitContentByRule(content, rule);
 
   // 提取标准字段和自定义字段
@@ -8056,13 +8227,10 @@ export const parseWithRule = (
   const customFields: Record<string, string> = {};
 
   rule.fieldOrder.forEach((fieldName, index) => {
+    if (isIgnoredRuleField(fieldName)) return;
     if (index < parts.length) {
       const parsedValue = stripConfiguredFieldPrefix(parts[index], rule.fieldPrefixes?.[fieldName]);
-      if (isCustomField(fieldName)) {
-        customFields[getCustomFieldId(fieldName)] = parsedValue;
-      } else {
-        standardFields[fieldName] = parsedValue;
-      }
+      standardFields[fieldName] = parsedValue;
     }
   });
 
@@ -8076,7 +8244,6 @@ export const exportBackupData = async (): Promise<BackupData> => {
   try {
     const [
       rules,
-      customFields,
       warehouses,
       outboundOrderRule,
       outboundWarehouseOrderRules,
@@ -8084,7 +8251,6 @@ export const exportBackupData = async (): Promise<BackupData> => {
       savedSoundEnabled,
     ] = await Promise.all([
       getAllRules(),
-      getAllCustomFields(),
       getAllWarehouses(),
       loadOutboundOrderRule(),
       loadOutboundWarehouseOrderRules(),
@@ -8110,14 +8276,14 @@ export const exportBackupData = async (): Promise<BackupData> => {
       backupTime: getISODateTime(),
       // 只导出配置数据
       rules,
-      customFields,
+      customFields: [], // Retained only as an empty compatibility field in configuration backups.
       warehouses,
       outboundOrderRule,
       outboundWarehouseOrderRules,
       soundEnabled: savedSoundEnabled !== 'false',
       stats: {
         rules: rules.length,
-        customFields: customFields.length,
+        customFields: 0,
         warehouses: warehouses.length,
         hasOutboundOrderRule: true,
         outboundWarehouseOrderRules: Object.keys(outboundWarehouseOrderRules).length,
@@ -8155,22 +8321,9 @@ export const importBackupData = async (
     if (!isBackupDataShape(backup)) {
       throw new Error('备份文件结构无效');
     }
-
-    const customFieldIds = new Set<string>();
-    const customFieldNames = new Set<string>();
-    backup.customFields.forEach((field) => {
-      const id = field.id.trim();
-      const name = field.name.trim();
-      if (!id || !name) {
-        throw new Error('备份中的占位字段 ID 或名称为空');
-      }
-      const normalizedName = name.toLocaleLowerCase();
-      if (customFieldIds.has(id) || customFieldNames.has(normalizedName)) {
-        throw new Error(`备份中存在重复的占位字段：${name}`);
-      }
-      customFieldIds.add(id);
-      customFieldNames.add(normalizedName);
-    });
+    const migratedRules = backup.rules.map(migrateLegacyRuleFields);
+    const uniqueRuleNames = makeQRCodeRuleNamesUnique(migratedRules);
+    backup = { ...backup, rules: uniqueRuleNames.rules, customFields: [] };
 
     const ruleIds = new Set<string>();
     backup.rules.forEach((rule) => {
@@ -8179,7 +8332,7 @@ export const importBackupData = async (
         throw new Error(`备份中存在无效或重复的解析规则 ID：${rule.name || '-'}`);
       }
       ruleIds.add(id);
-      assertValidQRCodeRuleConfiguration(rule, customFieldIds);
+      assertValidQRCodeRuleConfiguration(rule);
     });
 
     const warehouseIds = new Set<string>();
@@ -8212,6 +8365,9 @@ export const importBackupData = async (
     }
 
     const warnings: string[] = [];
+    if (uniqueRuleNames.renamed.length > 0) {
+      warnings.push(`备份中有 ${uniqueRuleNames.renamed.length} 条解析规则名称重复，已自动追加序号以保留全部规则。`);
+    }
     const backupWarehouses = backup.warehouses || [];
     const backupWarehouseIds = new Set(backupWarehouses.map((warehouse) => warehouse.id));
     const backupDefaultWarehouseId =
@@ -8289,8 +8445,8 @@ export const importBackupData = async (
             await transactionDatabase.runAsync(
               `INSERT INTO qr_code_rules (
                 id, name, description, separator, field_order, custom_field_ids,
-                is_active, supplier_name, match_conditions, field_prefixes, created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                is_active, supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 rule.id,
                 rule.name,
@@ -8302,6 +8458,7 @@ export const importBackupData = async (
                 rule.supplierName || '',
                 JSON.stringify(rule.matchConditions || []),
                 JSON.stringify(rule.fieldPrefixes || {}),
+                rule.terminator || '',
                 rule.created_at || getISODateTime(),
                 rule.updated_at || getISODateTime(),
               ]
@@ -8309,33 +8466,6 @@ export const importBackupData = async (
           } catch (e) {
             logger.error('导入解析规则失败:', rule, e);
             throw new Error(`导入解析规则失败: ${rule.name} - ${e}`);
-          }
-        }
-      }
-
-      // 5. 导入自定义字段
-      if (backup.customFields && backup.customFields.length > 0) {
-        for (const field of backup.customFields) {
-          try {
-            const sortOrder = getBackupSortOrder(field as unknown as Record<string, unknown>) ?? 0;
-            await transactionDatabase.runAsync(
-              `INSERT INTO custom_fields (
-                id, name, type, required, options, sort_order, created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-              [
-                field.id,
-                field.name,
-                field.type === 'select' ? 'select' : 'text',
-                field.required ? 1 : 0,
-                JSON.stringify(field.options || []),
-                sortOrder,
-                field.created_at || getISODateTime(),
-                field.updated_at || getISODateTime(),
-              ]
-            );
-          } catch (e) {
-            logger.error('导入自定义字段失败:', field, e);
-            throw new Error(`导入自定义字段失败: ${field.name} - ${e}`);
           }
         }
       }

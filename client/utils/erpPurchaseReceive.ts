@@ -102,6 +102,21 @@ export interface PurchaseReceiveVoucher {
   warehouseName: string;
 }
 
+export const getPurchaseReceiveBindingLines = (
+  voucher: Pick<PurchaseReceiveVoucher, 'accountKey' | 'partnerName' | 'lines'>
+): PurchaseReceiveLine[] => {
+  if (voucher.accountKey !== 'shanghai-chipmunk' || ![
+    '珠海极海半导体有限公司',
+    '珠海领芯科技有限公司',
+  ].includes(voucher.partnerName.trim())) return voucher.lines;
+
+  // Only the matching copy uses the binding code; ERP details and cached vouchers stay unchanged.
+  return voucher.lines.map(line => ({
+    ...line,
+    inventoryCode: line.inventoryCode.trim().replace(/^IC\.M(\d{7}\.\d{2})$/i, 'IC.0$1'),
+  }));
+};
+
 export const isPurchaseReceiveWarehouseAllowed = (
   account: ErpAccountConfig,
   warehouseName: string
@@ -446,6 +461,28 @@ export const fetchPendingPurchaseReceives = async (
       pendingListRequests.delete(requestKey);
     }
   }
+};
+
+export const fetchAllPendingPurchaseReceives = async (
+  account: ErpAccountConfig,
+  options: { bypassCache?: boolean } = {}
+): Promise<PurchaseReceiveListResult> => {
+  const pageSize = 100;
+  const first = await fetchPendingPurchaseReceives(account, 0, pageSize, options);
+  const items = new Map(first.items.map(item => [item.code.trim().toUpperCase(), item]));
+  const pageCount = (result: PurchaseReceiveListResult) =>
+    Math.max(1, Math.ceil(result.totalPageNum), Math.ceil(result.totalCount / pageSize));
+  let totalPages = pageCount(first);
+  for (let page = 1; page < totalPages; page += 1) {
+    // 不用筛选后的 items.length 判断末页，其他仓库可能占满前面的页。
+    if (!Number.isFinite(totalPages) || totalPages > 100) {
+      throw new Error('ERP未审单据超过100页，请缩小ERP未审范围后重试，未更新不完整列表');
+    }
+    const result = await fetchPendingPurchaseReceives(account, page, pageSize, options);
+    result.items.forEach(item => items.set(item.code.trim().toUpperCase(), item));
+    totalPages = Math.max(totalPages, pageCount(result));
+  }
+  return { ...first, items: [...items.values()], totalPageNum: totalPages };
 };
 
 export const fetchPurchaseReceiveVoucher = async (

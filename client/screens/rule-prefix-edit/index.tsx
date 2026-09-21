@@ -18,18 +18,16 @@ import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
 import { logger } from '@/utils/logger';
+import { feedbackClear, feedbackClearFailed } from '@/utils/feedback';
 import {
-  CustomField,
   FIELD_LABELS,
   FieldPrefixes,
   QRCodeRule,
-  getAllCustomFields,
-  getCustomFieldId,
   getRuleById,
-  isCustomField,
   updateRule,
 } from '@/utils/database';
 import { createStyles } from './styles';
+import { isIgnoredRuleField } from '@/utils/ruleConditions';
 
 type FieldRow = {
   key: string;
@@ -38,17 +36,8 @@ type FieldRow = {
   subtitle: string;
 };
 
-const getFieldMeta = (fieldKey: string, index: number, customFields: CustomField[]): FieldRow => {
-  if (isCustomField(fieldKey)) {
-    const fieldId = getCustomFieldId(fieldKey);
-    const customField = customFields.find((field) => field.id === fieldId);
-    return {
-      key: fieldKey,
-      index,
-      label: `占位：${customField?.name || '未知字段'}`,
-      subtitle: '保持字段位置；前缀可辅助区分相似规则',
-    };
-  }
+const getFieldMeta = (fieldKey: string, index: number): FieldRow => {
+  if (isIgnoredRuleField(fieldKey)) return { key: fieldKey, index, label: '忽略此段', subtitle: '前缀仅用于识别，不保存该段内容' };
 
   return {
     key: fieldKey,
@@ -67,7 +56,6 @@ export default function RulePrefixEditScreen() {
   const { ruleId } = useSafeSearchParams<{ ruleId?: string }>();
 
   const [rule, setRule] = useState<QRCodeRule | null>(null);
-  const [customFields, setCustomFields] = useState<CustomField[]>([]);
   const [prefixes, setPrefixes] = useState<FieldPrefixes>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -82,7 +70,7 @@ export default function RulePrefixEditScreen() {
 
     setLoading(true);
     try {
-      const [ruleData, customFieldData] = await Promise.all([getRuleById(ruleId), getAllCustomFields()]);
+      const ruleData = await getRuleById(ruleId);
 
       if (!ruleData) {
         showError('解析规则不存在');
@@ -90,7 +78,6 @@ export default function RulePrefixEditScreen() {
       }
 
       setRule(ruleData);
-      setCustomFields(customFieldData);
       setPrefixes(ruleData.fieldPrefixes || {});
     } catch (error) {
       logger.error('加载字段前缀配置失败:', error);
@@ -107,8 +94,8 @@ export default function RulePrefixEditScreen() {
   );
 
   const fields = useMemo(
-    () => (rule?.fieldOrder || []).map((fieldKey, index) => getFieldMeta(fieldKey, index, customFields)),
-    [customFields, rule?.fieldOrder]
+    () => (rule?.fieldOrder || []).map((fieldKey, index) => getFieldMeta(fieldKey, index)),
+    [rule?.fieldOrder]
   );
 
   const configuredCount = useMemo(
@@ -188,9 +175,11 @@ export default function RulePrefixEditScreen() {
               await updateRule(rule.id, { fieldPrefixes: {} });
               setRule((prev) => (prev ? { ...prev, fieldPrefixes: {} } : prev));
               setPrefixes({});
+              void feedbackClear();
             } catch (error) {
               logger.error('清空字段前缀配置失败:', error);
               showError('清空失败');
+              void feedbackClearFailed();
             } finally {
               setSaving(false);
             }
@@ -468,8 +457,12 @@ export default function RulePrefixEditScreen() {
               <AppModalActions
                 containerStyle={styles.editorActions}
                 secondaryLabel="清空当前"
-                onSecondaryPress={() => setDraftPrefix('')}
-                secondaryDisabled={saving}
+                onSecondaryPress={() => {
+                  if (!draftPrefix || saving) return;
+                  setDraftPrefix('');
+                  void feedbackClear();
+                }}
+                secondaryDisabled={saving || !draftPrefix}
                 primaryLabel={saving ? '保存中...' : '保存'}
                 onPrimaryPress={() => void handleApplyField()}
                 primaryDisabled={saving}

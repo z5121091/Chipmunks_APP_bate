@@ -330,6 +330,25 @@ export async function feedbackError() {
   }
 }
 
+export async function feedbackQuerySuccess() {
+  try {
+    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
+  } catch (error) {
+    logger.error('[Feedback] 查询成功震动失败:', error);
+  }
+  await speakChinese('查询成功');
+}
+
+export async function feedbackQueryFailed() {
+  await feedbackError();
+  await speakChinese('查询失败', 'replace');
+}
+
+export async function feedbackClearFailed() {
+  await feedbackError();
+  await speakChinese('清空失败', 'replace');
+}
+
 /**
  * 警告反馈（单次）
  */
@@ -339,6 +358,36 @@ export async function feedbackWarning() {
   } catch (e) {
     logger.error('[Feedback] 警告震动失败:', e);
   }
+}
+
+export async function feedbackUnpackRequired() {
+  await feedbackWarning();
+  await speakChinese('需要拆包');
+}
+
+export async function feedbackUnpackComplete() {
+  try {
+    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
+  } catch (error) {
+    logger.error('[Feedback] 拆包完成震动失败:', error);
+  }
+  await speakChinese('拆包完成');
+}
+
+/**
+ * 出库单在本次扫码后刚好全部完成时的专用反馈。
+ * 使用一条完整语音，避免与普通“扫码成功”或“拆包完成”相互抢占。
+ */
+export async function feedbackOutboundOrderComplete(afterUnpack = false) {
+  try {
+    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
+  } catch (error) {
+    logger.error('[Feedback] 本单完成震动失败:', error);
+  }
+  await speakChinese(
+    afterUnpack ? '拆包完成，本单已扫完' : '本单已扫完，可扫描下一单',
+    'replace'
+  );
 }
 
 /**

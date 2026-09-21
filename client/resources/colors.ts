@@ -285,6 +285,18 @@ export const DarkColors = {
   shadow: '#020814',
 } as const;
 
+// 首页模块色只从当前主题色资源派生，避免与 theme.ts 出现两套手工维护值。
+export const ModuleColors = {
+  light: {
+    ...LightColors.module,
+    settings: LightColors.module.settings.light,
+  },
+  dark: {
+    ...DarkColors.module,
+    settings: DarkColors.module.settings.dark,
+  },
+} as const;
+
 // 默认导出浅色主题（运行时会被 useTheme 覆盖）
 export const Colors = LightColors;
 

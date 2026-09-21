@@ -1,8 +1,7 @@
 import React from 'react';
 import { StyleProp, Text, View, ViewStyle } from 'react-native';
 import { useTheme } from '@/hooks/useTheme';
-import { Spacing } from '@/constants/theme';
-import { rf } from '@/utils/responsive';
+import { Spacing, Typography } from '@/constants/theme';
 
 interface AppFormFieldProps {
   label: string;
@@ -26,8 +25,7 @@ export function AppFormField({
       <Text
         style={{
           marginBottom: Spacing.xs,
-          fontSize: rf(13),
-          fontWeight: '600',
+          ...Typography.formLabel,
           color: theme.textPrimary,
         }}
       >
@@ -39,8 +37,7 @@ export function AppFormField({
         <Text
           style={{
             marginTop: Spacing.xs,
-            fontSize: rf(11),
-            lineHeight: rf(16),
+            ...Typography.formHint,
             color: theme.textMuted,
           }}
         >

@@ -10,9 +10,12 @@
 import cherrypy
 import json
 import datetime
+import ipaddress
 import os
+import re
 import sys
 import socket
+import subprocess
 import threading
 import uuid
 import logging
@@ -25,6 +28,7 @@ try:
     from .label_templates import (
         NATIVE_LABEL_COPIES,
         build_native_label,
+        build_native_unpack_time_label,
         get_excel_cell_text,
         get_native_label_records,
         get_native_label_template,
@@ -33,6 +37,7 @@ except ImportError:
     from label_templates import (
         NATIVE_LABEL_COPIES,
         build_native_label,
+        build_native_unpack_time_label,
         get_excel_cell_text,
         get_native_label_records,
         get_native_label_template,
@@ -43,7 +48,7 @@ SYNC_SERVICE_ID = 'palm-warehouse-sync'
 SYNC_API_VERSION = 2
 SYNC_DISPLAY_NAME = '掌上仓库 ERP版同步助手'
 SYNC_EDITION = 'ERP'
-SYNC_VERSION = '3.6.1'
+SYNC_VERSION = '3.6.3'
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_FILE_NAME_LENGTH = 120
 DIRECT_PRINT_PRINTER_NAME = (
@@ -58,6 +63,28 @@ SUPPORTED_NATIVE_LABEL_PRINT_MODES = {
 }
 MAX_NATIVE_PRINT_HISTORY = 500
 RAW_PRINT_CHUNK_BYTES = 64 * 1024
+NETWORK_ADDRESS_REFRESH_SECONDS = 15
+
+# 代理 / VPN 通常会新增虚拟网卡。同步助手只需要把同一局域网内 PDA 可访问的
+# 物理网卡地址展示出来，不应跟随默认路由把 VPN 或代理地址当成服务地址。
+VIRTUAL_ADAPTER_KEYWORDS = (
+    'vpn', 'proxy', 'tun', 'tap', 'wintun', 'wireguard', 'tailscale',
+    'zerotier', 'virtual', 'vmware', 'hyper-v', 'docker', 'vethernet',
+    'loopback', 'bluetooth', 'meta', 'clash', 'mihomo', 'sing-box',
+    'v2ray', 'xray', 'hysteria',
+)
+PREFERRED_ADAPTER_KEYWORDS = (
+    'wi-fi', 'wifi', 'wlan', 'wireless', 'ethernet', '以太网', '无线',
+)
+IPV4_PATTERN = re.compile(
+    r'(?<![\d.])((?:25[0-5]|2[0-4]\d|1?\d?\d)'
+    r'(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})(?![\d.])'
+)
+RFC1918_NETWORKS = (
+    ipaddress.IPv4Network('10.0.0.0/8'),
+    ipaddress.IPv4Network('172.16.0.0/12'),
+    ipaddress.IPv4Network('192.168.0.0/16'),
+)
 
 
 def get_default_data_root():
@@ -181,20 +208,170 @@ def log(message):
     # 同时输出到控制台
     print(log_line)
 
-def get_ip():
-    """获取本机IP地址"""
+def is_usable_lan_ipv4(value):
+    """判断地址是否适合作为 PDA 访问同步助手的局域网 IPv4 地址。"""
     try:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        address = ipaddress.IPv4Address(str(value).strip())
+    except ipaddress.AddressValueError:
+        return False
+
+    return any(address in network for network in RFC1918_NETWORKS)
+
+
+def parse_windows_ipconfig(output):
+    """从 Windows ipconfig 输出读取网卡、IPv4 和默认网关信息。"""
+    adapters = []
+    current = None
+
+    for raw_line in str(output or '').splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        is_adapter_header = line.endswith(':') and (
+            'adapter' in lowered or '适配器' in line
+        )
+        if is_adapter_header:
+            current = {
+                'name': line[:-1].strip(),
+                'addresses': [],
+                'has_default_gateway': False,
+            }
+            adapters.append(current)
+            continue
+
+        if current is None:
+            continue
+
+        address_match = IPV4_PATTERN.search(line)
+        if not address_match:
+            continue
+
+        address = address_match.group(1)
+        if 'default gateway' in lowered or '默认网关' in line:
+            current['has_default_gateway'] = True
+        elif 'ipv4' in lowered or 'ip address' in lowered or 'ip 地址' in lowered:
+            current['addresses'].append(address)
+
+    return adapters
+
+
+def read_windows_ipconfig():
+    """读取 ipconfig，兼容中文 Windows 常见的 GBK 输出。"""
+    try:
+        # 打包后的同步助手是无控制台窗口程序。ipconfig 是控制台程序，若不显式
+        # 隐藏子进程窗口，会在首次读取或定时刷新局域网 IP 时短暂闪出黑色 CMD。
+        creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        result = subprocess.run(
+            ['ipconfig'],
+            capture_output=True,
+            check=False,
+            timeout=5,
+            creationflags=creation_flags,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    output = result.stdout or b''
+    for encoding in ('utf-8', 'gbk', 'mbcs'):
         try:
-            probe.connect(('8.8.8.8', 80))
-            return probe.getsockname()[0]
-        finally:
-            probe.close()
+            return parse_windows_ipconfig(output.decode(encoding))
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return parse_windows_ipconfig(output.decode('utf-8', errors='ignore'))
+
+
+def get_socket_ipv4_addresses():
+    """ipconfig 不可用时的保守回退，仅保留私有 IPv4 地址。"""
+    addresses = set()
+    try:
+        results = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
     except OSError:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except OSError:
-            return '127.0.0.1'
+        return []
+
+    for _family, _sock_type, _protocol, _canonical_name, sockaddr in results:
+        address = sockaddr[0]
+        if is_usable_lan_ipv4(address):
+            addresses.add(address)
+    return sorted(addresses)
+
+
+def is_virtual_adapter(name):
+    normalized_name = str(name or '').lower()
+    return any(keyword in normalized_name for keyword in VIRTUAL_ADAPTER_KEYWORDS)
+
+
+def get_lan_ipv4_addresses(adapters=None, fallback_addresses=None):
+    """返回按可用性排序的物理局域网 IPv4 地址。"""
+    explicit_address = os.environ.get('PALM_WAREHOUSE_SYNC_IP', '').strip()
+    if explicit_address and is_usable_lan_ipv4(explicit_address):
+        return [explicit_address]
+
+    adapter_records = read_windows_ipconfig() if adapters is None else adapters
+    ranked_addresses = []
+    for adapter in adapter_records:
+        name = str(adapter.get('name', ''))
+        if is_virtual_adapter(name):
+            continue
+
+        score = 0
+        normalized_name = name.lower()
+        if adapter.get('has_default_gateway'):
+            score += 100
+        if any(keyword in normalized_name for keyword in PREFERRED_ADAPTER_KEYWORDS):
+            score += 20
+
+        for address in adapter.get('addresses', []):
+            if is_usable_lan_ipv4(address):
+                ranked_addresses.append((-score, str(address)))
+
+    if ranked_addresses:
+        ranked_addresses.sort()
+        return list(dict.fromkeys(address for _score, address in ranked_addresses))
+
+    addresses = get_socket_ipv4_addresses() if fallback_addresses is None else fallback_addresses
+    return sorted({str(address) for address in addresses if is_usable_lan_ipv4(address)})
+
+
+def get_lan_ip():
+    """获取首选局域网 IPv4；没有可用地址时返回回环地址供本机诊断。"""
+    addresses = get_lan_ipv4_addresses()
+    return addresses[0] if addresses else '127.0.0.1'
+
+
+class NetworkAddressMonitor:
+    """定期检测局域网地址变化，供托盘菜单无重启刷新地址。"""
+
+    def __init__(self, initial_address=None, interval=NETWORK_ADDRESS_REFRESH_SECONDS, resolver=get_lan_ip):
+        self.address = initial_address or resolver()
+        self.interval = interval
+        self.resolver = resolver
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self, on_change):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(on_change,),
+            daemon=True,
+            name='sync-address-monitor',
+        )
+        self._thread.start()
+
+    def _run(self, on_change):
+        while not self._stop_event.wait(self.interval):
+            new_address = self.resolver()
+            if new_address == self.address:
+                continue
+            previous_address = self.address
+            self.address = new_address
+            on_change(previous_address, new_address)
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1)
 
 
 def get_installed_printer_names():
@@ -340,6 +517,10 @@ def submit_native_unpack_labels(records, print_job_id):
                 'spool_job_id': existing.get('spoolJobId'),
                 'duplicate': True,
                 'printed_count': int(existing.get('labelCount') or 0),
+                'time_label_count': int(existing.get('timeLabelCount') or 0),
+                'physical_label_count': int(existing.get('physicalLabelCount') or (
+                    int(existing.get('labelCount') or 0) * int(existing.get('copiesPerLabel') or NATIVE_LABEL_COPIES)
+                )),
                 'skipped_count': int(existing.get('skippedCount') or 0),
                 'skipped_suppliers': existing.get('skippedSuppliers') or [],
                 'template_names': existing.get('templateNames') or [],
@@ -362,6 +543,8 @@ def submit_native_unpack_labels(records, print_job_id):
                 'spool_job_id': None,
                 'duplicate': False,
                 'printed_count': 0,
+                'time_label_count': 0,
+                'physical_label_count': 0,
                 'skipped_count': skipped_count,
                 'skipped_suppliers': skipped_suppliers,
                 'template_names': [],
@@ -371,6 +554,13 @@ def submit_native_unpack_labels(records, print_job_id):
             build_native_label(record, template)
             for record, template in printable_records
         )
+        # A print_job_id represents one unpack pair; retries reuse the same five-label job.
+        time_record = next(
+            (record for record, _template in printable_records if record.get('label_type') == '剩余标签'),
+            printable_records[0][0],
+        )
+        commands += build_native_unpack_time_label(time_record)
+        physical_label_count = len(printable_records) * NATIVE_LABEL_COPIES + 1
         spool_job_id = send_raw_tspl_to_printer(
             DIRECT_PRINT_PRINTER_NAME,
             commands,
@@ -380,6 +570,8 @@ def submit_native_unpack_labels(records, print_job_id):
             'submittedAt': datetime.datetime.now().isoformat(timespec='seconds'),
             'spoolJobId': spool_job_id,
             'labelCount': len(printable_records),
+            'timeLabelCount': 1,
+            'physicalLabelCount': physical_label_count,
             'skippedCount': skipped_count,
             'skippedSuppliers': skipped_suppliers,
             'templateNames': template_names,
@@ -397,6 +589,7 @@ def submit_native_unpack_labels(records, print_job_id):
             f'原生拆包标签已提交: {DIRECT_PRINT_PRINTER_NAME}，'
             f'任务 {normalized_job_id}，模板 {"、".join(template_names)}，'
             f'{len(printable_records)} 条，每条 {NATIVE_LABEL_COPIES} 份，'
+            f'另加拆包时间标签 1 张，共 {physical_label_count} 张，'
             f'跳过 {skipped_count} 条，'
             f'打印队列任务号 {spool_job_id}'
         )
@@ -405,6 +598,8 @@ def submit_native_unpack_labels(records, print_job_id):
             'spool_job_id': spool_job_id,
             'duplicate': False,
             'printed_count': len(printable_records),
+            'time_label_count': 1,
+            'physical_label_count': physical_label_count,
             'skipped_count': skipped_count,
             'skipped_suppliers': skipped_suppliers,
             'template_names': template_names,
@@ -544,6 +739,7 @@ class Health:
 
     def GET(self):
         enable_cors()
+        lan_addresses = get_lan_ipv4_addresses()
         return json_response({
             'status': 'ok',
             'serviceId': SYNC_SERVICE_ID,
@@ -554,6 +750,10 @@ class Health:
             'version': SYNC_VERSION,
             'nativePrintModes': sorted(SUPPORTED_NATIVE_LABEL_PRINT_MODES),
             'maxUploadBytes': MAX_UPLOAD_BYTES,
+            # PDA 可用的地址。服务监听 0.0.0.0，因此网卡 IP 变化后无需重启。
+            'lanIp': lan_addresses[0] if lan_addresses else None,
+            'lanIps': lan_addresses,
+            'port': SERVER_PORT,
         })
 
 
@@ -801,6 +1001,8 @@ class Labels:
                     'nativePrintJobId': print_result['job_id'],
                     'nativePrintDuplicate': print_result['duplicate'],
                     'nativePrintSpoolJobId': print_result['spool_job_id'],
+                    'nativePrintTimeLabelCount': print_result['time_label_count'],
+                    'nativePrintPhysicalLabelCount': print_result['physical_label_count'],
                     'message': (
                         '标签已保存并按供应商模板提交原生打印'
                         if printed_count > 0
@@ -876,7 +1078,8 @@ class TrayIcon:
     def __init__(self):
         self.icon = None
         self.running = True
-        self.ip_address = get_ip()
+        self.ip_address = get_lan_ip()
+        self.address_monitor = NetworkAddressMonitor(self.ip_address)
         
     def create_icon_image(self):
         """创建托盘图标"""
@@ -931,6 +1134,22 @@ class TrayIcon:
         except Exception as error:
             log(f'托盘通知失败: {error}')
 
+    def get_service_address_text(self, _item=None):
+        """让 pystray 每次展开菜单时读取最新的服务地址。"""
+        return f"服务地址: {self.ip_address}:{SERVER_PORT}"
+
+    def refresh_network_address(self, previous_address, new_address):
+        """网络切换后刷新托盘内容；HTTP 服务无需重启。"""
+        self.ip_address = new_address
+        message = f'局域网地址已从 {previous_address} 更新为 {new_address}:{SERVER_PORT}'
+        log(message)
+        if self.icon:
+            try:
+                self.icon.update_menu()
+            except Exception as error:
+                log(f'刷新托盘菜单失败: {error}')
+        self.notify('同步地址已更新', message)
+
     def set_autostart(self, enable=True):
         """设置开机自启动"""
         try:
@@ -975,6 +1194,7 @@ class TrayIcon:
     def quit_app(self):
         """退出应用"""
         self.running = False
+        self.address_monitor.stop()
         if self.icon:
             self.icon.stop()
         cherrypy.engine.exit()
@@ -989,15 +1209,13 @@ class TrayIcon:
             icon_image = self.create_icon_image()
             
             # 创建菜单
-            is_autostart = self.check_autostart()
-            
             menu = pystray.Menu(
                 pystray.MenuItem(
                     lambda text: f"✓ 开机自启动" if self.check_autostart() else "○ 开机自启动",
                     lambda: self.set_autostart(not self.check_autostart()),
                 ),
                 pystray.Menu.SEPARATOR,
-                pystray.MenuItem(f"服务地址: {self.ip_address}:{SERVER_PORT}", None, enabled=False),
+                pystray.MenuItem(self.get_service_address_text, None, enabled=False),
                 pystray.MenuItem(f"版本: {SYNC_EDITION} v{SYNC_VERSION}", None, enabled=False),
                 pystray.MenuItem(f"同步目录: {DATA_ROOT}", None, enabled=False),
                 pystray.Menu.SEPARATOR,
@@ -1009,7 +1227,11 @@ class TrayIcon:
             
             # 创建托盘图标
             self.icon = pystray.Icon("label_sync_erp", icon_image, SYNC_DISPLAY_NAME, menu)
-            self.icon.run()
+            self.address_monitor.start(self.refresh_network_address)
+            try:
+                self.icon.run()
+            finally:
+                self.address_monitor.stop()
             
         except ImportError:
             log("缺少依赖: pip install pystray Pillow")
@@ -1022,7 +1244,8 @@ class TrayIcon:
 # ==================== 启动服务 ====================
 def start_server():
     """启动HTTP服务"""
-    ip_address = get_ip()
+    ip_address = get_lan_ip()
+    lan_addresses = get_lan_ipv4_addresses()
     
     conf = {
         'global': {
@@ -1076,7 +1299,11 @@ def start_server():
     log("=" * 50)
     log(f"  {SYNC_DISPLAY_NAME} v{SYNC_VERSION}")
     log("=" * 50)
-    log(f"  本机IP: {ip_address}")
+    log(f"  局域网IP: {ip_address}")
+    if len(lan_addresses) > 1:
+        log(f"  其他局域网IP: {', '.join(lan_addresses[1:])}")
+    if ip_address == '127.0.0.1':
+        log('  未发现可用局域网 IPv4；请检查 Wi-Fi/以太网连接')
     log(f"  服务端口: {SERVER_PORT}")
     log(f"  数据目录: {DATA_ROOT}")
     log("=" * 50)

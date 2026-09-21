@@ -25,6 +25,7 @@ import { UiInput, UiToolbarButton } from '@/components/UiRedesign';
 import { createStyles } from './styles';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { logger } from '@/utils/logger';
+import { feedbackClear } from '@/utils/feedback';
 import { useCustomAlert } from '@/components/CustomAlert';
 import {
   InventoryBinding,
@@ -271,13 +272,21 @@ export default function InventoryBindingScreen() {
       const workbook = XLSX.read(fileContent, { type: 'base64' });
       const firstSheetName = workbook.SheetNames[0];
       const worksheet = workbook.Sheets[firstSheetName];
-      const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as string[][];
-      const headers = (jsonData[0] || []).map((value) => String(value || '').replace(/\s+/g, ''));
-      if (
-        headers[0] !== '型号' ||
-        !headers[1]?.startsWith('版本号') ||
-        headers[2] !== '存货编码'
-      ) {
+      const jsonData = XLSX.utils.sheet_to_json<unknown[]>(worksheet, { header: 1 });
+      const headers = (jsonData[0] || []).map((value) => String(value ?? '')
+        .replace(/\s+/g, '')
+        .replace(/[（(](?:可选|选填|必填)[）)]$/, '')
+        .replace(/^扫描型号$/, '型号'));
+      // 按表头读取，兼容旧版列顺序，避免供应商和版本号错位。
+      const [modelColumn, codeColumn, supplierColumn, versionColumn, descriptionColumn] =
+        ['型号', '存货编码', '供应商', '版本号', '描述'].map((header) => {
+          const index = headers.indexOf(header);
+          if (index !== headers.lastIndexOf(header)) {
+            throw new Error(`Excel表头「${header}」重复，请检查后重新导入`);
+          }
+          return index;
+        });
+      if (modelColumn < 0 || codeColumn < 0) {
         throw new Error('Excel表头不正确，请使用物料绑定导出文件或导入模板');
       }
 
@@ -292,13 +301,17 @@ export default function InventoryBindingScreen() {
 
       for (let i = 1; i < jsonData.length; i++) {
         const row = jsonData[i];
-        if (row && row.length >= 3 && row[0] && row[2]) {
+        if (!row) continue;
+        const readCell = (column: number) => String(row[column] ?? '').trim();
+        const scanModel = readCell(modelColumn);
+        const inventoryCode = readCell(codeColumn);
+        if (scanModel && inventoryCode) {
           bindingsToImport.push({
-            scan_model: String(row[0]).trim(),
-            version: row[1] ? String(row[1]).trim() : undefined,
-            inventory_code: String(row[2]).trim(),
-            supplier: row[3] ? String(row[3]).trim() : undefined,
-            description: row[4] ? String(row[4]).trim() : undefined,
+            scan_model: scanModel,
+            inventory_code: inventoryCode,
+            supplier: readCell(supplierColumn) || undefined,
+            version: readCell(versionColumn) || undefined,
+            description: readCell(descriptionColumn) || undefined,
           });
         }
       }
@@ -348,12 +361,12 @@ export default function InventoryBindingScreen() {
     }
 
     try {
-      const headers = ['型号', '版本号', '存货编码', '供应商', '描述', '创建时间'];
+      const headers = ['扫描型号', '存货编码', '供应商', '版本号', '描述', '创建时间'];
       const rows = exportBindings.map((b) => [
         b.scan_model,
-        b.version || '',
         b.inventory_code,
         b.supplier || '',
+        b.version || '',
         b.description || '',
         b.created_at ? formatDate(b.created_at) : '',
       ]);
@@ -365,9 +378,9 @@ export default function InventoryBindingScreen() {
       // 设置列宽
       ws['!cols'] = [
         { wch: 20 },
-        { wch: 12 },
         { wch: 20 },
         { wch: 15 },
+        { wch: 12 },
         { wch: 30 },
         { wch: 12 },
       ];
@@ -397,16 +410,15 @@ export default function InventoryBindingScreen() {
   const handleExportTemplate = async () => {
     try {
       // 模板表头 + 示例数据行
-      const headers = ['型号', '版本号（可选）', '存货编码', '供应商', '描述（可选）'];
-      const exampleRow = ['示例型号ABC', 'A1', 'INV001', '供应商A', '这是示例描述'];
-      const hintRow = ['（必填）', '（选填）', '（必填）', '（选填）', '（选填）'];
+      const headers = ['扫描型号（必填）', '存货编码（必填）', '供应商（可选）', '版本号（可选）', '描述（可选）'];
+      const exampleRow = ['示例型号ABC', 'INV001', '供应商A', 'A1', '这是示例描述'];
 
-      const ws = XLSX.utils.aoa_to_sheet([headers, exampleRow, hintRow]);
+      const ws = XLSX.utils.aoa_to_sheet([headers, exampleRow]);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, '物料绑定模板');
 
       // 设置列宽
-      ws['!cols'] = [{ wch: 20 }, { wch: 14 }, { wch: 20 }, { wch: 15 }, { wch: 30 }];
+      ws['!cols'] = [{ wch: 20 }, { wch: 20 }, { wch: 15 }, { wch: 14 }, { wch: 30 }];
 
       const wbout = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
       const fileName = `物料绑定导入模板.xlsx`;
@@ -511,6 +523,7 @@ export default function InventoryBindingScreen() {
   const handleClearSearch = useCallback(async () => {
     setSearchInput('');
     setSearchKeyword('');
+    void feedbackClear();
     await loadBindings(1, '');
   }, [loadBindings]);
 
@@ -763,18 +776,6 @@ export default function InventoryBindingScreen() {
                 />
               </AppFormField>
 
-              <AppFormField label="版本号">
-                <TextInput
-                  style={styles.input}
-                  value={formData.version}
-                  onChangeText={(text) => setFormData({ ...formData, version: text })}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  placeholder="同型号多版本时填写"
-                  placeholderTextColor={theme.textMuted}
-                />
-              </AppFormField>
-
               <AppFormField label="存货编码" required>
                 <TextInput
                   style={styles.input}
@@ -793,6 +794,18 @@ export default function InventoryBindingScreen() {
                   value={formData.supplier}
                   onChangeText={(text) => setFormData({ ...formData, supplier: text })}
                   placeholder="供应商名称（选填）"
+                  placeholderTextColor={theme.textMuted}
+                />
+              </AppFormField>
+
+              <AppFormField label="版本号">
+                <TextInput
+                  style={styles.input}
+                  value={formData.version}
+                  onChangeText={(text) => setFormData({ ...formData, version: text })}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  placeholder="同型号多版本时填写"
                   placeholderTextColor={theme.textMuted}
                 />
               </AppFormField>
