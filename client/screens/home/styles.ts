@@ -223,45 +223,5 @@ export const createStyles = (theme: Theme, screenWidth: number, screenHeight: nu
       color: theme.textMuted,
       marginTop: 2,
     },
-    bottomNav: {
-      minHeight: isCompact ? 60 : 66,
-      flexDirection: 'row',
-      alignItems: 'center',
-      paddingHorizontal: horizontalPadding,
-      paddingTop: 5,
-      paddingBottom: isCompact ? 6 : 8,
-      borderTopWidth: BorderWidth.normal,
-      borderTopColor: theme.border,
-      backgroundColor: theme.backgroundDefault,
-    },
-    bottomNavItem: {
-      position: 'relative',
-      flex: 1,
-      minHeight: 48,
-      alignItems: 'center',
-      justifyContent: 'center',
-      gap: 2,
-    },
-    bottomNavIndicator: {
-      position: 'absolute',
-      top: -5,
-      width: 26,
-      height: 3,
-      borderRadius: BorderRadius.full,
-      backgroundColor: 'transparent',
-    },
-    bottomNavIndicatorActive: {
-      backgroundColor: theme.primary,
-    },
-    bottomNavLabel: {
-      ...Typography.navLabel,
-      color: theme.textMuted,
-      fontWeight: '600',
-      includeFontPadding: false,
-    },
-    bottomNavLabelActive: {
-      color: theme.primary,
-      fontWeight: '800',
-    },
   });
 };

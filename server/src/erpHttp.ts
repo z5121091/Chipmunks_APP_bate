@@ -11,7 +11,7 @@ const agentOptions = {
   maxSockets: 16,
   maxTotalSockets: 32,
   maxFreeSockets: 4,
-  // Keep connections across normal scan intervals; request deadlines remain independent.
+  // 扫码间隔内复用连接，每次请求仍按自己的超时时间结束。
   timeout: getErpKeepAliveTimeoutMs(),
 };
 const httpAgent = new HttpAgent(agentOptions);
@@ -21,7 +21,7 @@ export type ErpHttpResponse = { statusCode: number; text: string };
 
 export const canReuseErpConnection = (env: NodeJS.ProcessEnv = process.env): boolean =>
   env.CHANJET_HTTP_TRANSPORT?.trim().toLowerCase() !== 'curl' &&
-  // Keep curl's existing proxy and NO_PROXY behavior in development/sandbox environments.
+  // 开发和沙箱环境沿用 curl 的代理及 NO_PROXY 设置。
   !['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']
     .some((name) => env[name]?.trim());
 
@@ -68,7 +68,7 @@ export const requestErpRead = (
   const timeout = () => request.destroy(Object.assign(new Error('ERP request timed out'), {
     code: 'ETIMEDOUT',
   }));
-  // The total deadline includes queueing and reading the full response, not only response headers.
+  // 总超时包含排队和读取完整响应的时间，不只计算响应头。
   const totalTimer = setTimeout(timeout, options.timeoutMs);
   request.once('socket', (socket) => {
     if (socket.connecting) {

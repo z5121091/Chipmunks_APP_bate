@@ -1,11 +1,10 @@
-# Chipmunks 智能仓储管理系统
+# 掌上仓库
 
 <div align="center">
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
 ![Database](https://img.shields.io/badge/database-SQLite-green.svg)
 ![Platform](https://img.shields.io/badge/platform-Android%20%7C%20iOS-lightgrey.svg)
-![License](https://img.shields.io/badge/license-Proprietary-red.svg)
 
 **精准溯源 · 智能仓储**
 
@@ -165,24 +164,18 @@ Chipmunks_app_SQLite/
 
 ### 版本信息
 
-- **当前版本**：v1.0.0
+- **当前版本**：V1.0
 - **发布日期**：2026
 
 ### 版权信息
 
 <div align="center">
 
-**上海花栗鼠科技有限公司**
+**掌上仓库项目**
 
-© 2026 Shanghai Chipmunks Technology Co., Ltd. All Rights Reserved.
+原创内容的权利主体以书面权属文件为准。
 
 </div>
-
----
-
-## 📄 许可证
-
-本软件为 proprietary software（专有软件），版权归上海花栗鼠科技有限公司所有。未经授权，不得复制、分发、修改或用于商业用途。
 
 ---
 

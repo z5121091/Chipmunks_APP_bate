@@ -39,3 +39,20 @@ scripts/visual-label-assistant/controls-*.png
 scripts/visual-label-assistant/property-panel-check*.png
 scripts/visual-label-assistant/ui-*.png
 scripts/visual-label-assistant/ui-preview.png
+
+# Local build outputs and private runtime data
+output/
+*.exe
+*.apk
+*.aab
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3

@@ -11,7 +11,7 @@ export interface ErpAccountConfig {
   sequenceLength: number;
 }
 
-// 读取环境变量，APK 构建时如果扣子没注入 EXPO_PUBLIC_* 变量，就走下方的默认值
+// 读取环境变量；构建环境没有注入 EXPO_PUBLIC_* 时使用下方默认值。
 const getEnv = (key: string): string =>
   (process.env as Record<string, string | undefined>)[key]?.trim() || '';
 
@@ -22,7 +22,7 @@ const getEnvBool = (key: string): boolean | null => {
   return null;
 };
 
-// APK 构建没有注入 EXPO_PUBLIC_* 时使用稳定的 HTTPS 域名。
+// 构建时没有注入 EXPO_PUBLIC_*，使用稳定的 HTTPS 域名。
 // 后续迁移服务器只需要修改 DNS，不需要为了更换 IP 重新打包 APK。
 const DEFAULT_BACKEND_BASE_URL = 'https://erp.chipmunks.fun';
 

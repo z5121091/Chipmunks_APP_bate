@@ -662,8 +662,7 @@ const shouldReplacePurchaseReceiveStatus = (
     return false;
   }
 
-  // A replay without an event time must not overwrite a known state. This is
-  // common when a platform retry omits optional metadata.
+  // 重试通知可能没有事件时间，不能用它覆盖已经确认的状态。
   if (!nextMessageTime) {
     return false;
   }
@@ -964,7 +963,7 @@ const chanjetRequest = async (options: ChanjetRequestOptions): Promise<unknown> 
   const timeoutMs = getChanjetRequestTimeoutSeconds() * 1000;
   const requestId = options.requestId || randomBytes(12).toString('hex');
   const pooled = options.reuseConnection && canReuseErpConnection();
-  // One shared deadline and at most two wire attempts, including curl fallback.
+  // 两次网络尝试共用一个截止时间，其中包含 curl 兜底请求。
   const attempts = options.reuseConnection ? 2 : 1;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     const remainingMs = timeoutMs - (performance.now() - startedAt);
@@ -1128,8 +1127,7 @@ const refreshOpenToken = async (
     const releaseLock = await acquireTokenRefreshFileLock();
 
     try {
-      // Re-read after acquiring the cross-process lock. Another process may
-      // already have rotated both tokens while this process was waiting.
+      // 拿到跨进程锁后重新读取，等待期间其他进程可能已经更新了 Token。
       const state = await readChanjetState();
       const refreshToken = options.refreshToken?.trim() || state.refreshToken?.trim();
       const dueAt = getTokenRefreshDueAtMs(state);
@@ -1261,7 +1259,7 @@ const getTplusHeaders = (openToken: string): Record<string, string> => {
 };
 
 const isSuccessfulTplusPayload = (value: unknown): boolean => {
-  // Current-stock queries may return a bare array, including [] for no stock.
+  // 现存量接口可能直接返回数组；空数组表示没有库存。
   if (Array.isArray(value)) return true;
   if (!isObject(value)) {
     return false;
@@ -1434,7 +1432,7 @@ const callTplus = async (req: Request, res: Response, path: string): Promise<voi
   let data: unknown;
   try {
     data = await pendingRequest;
-    // A slower, older read must not overwrite a refresh that started after it.
+    // 较早发出的慢请求不能覆盖后发起的刷新结果。
     if (cacheKey && latestTplusRequests.get(cacheKey) === pendingRequest && isSuccessfulTplusPayload(data)) {
       if (tplusResponseCache.size >= TPLUS_RESPONSE_CACHE_MAX) {
         const oldestKey = tplusResponseCache.keys().next().value as string | undefined;

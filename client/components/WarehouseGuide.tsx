@@ -15,7 +15,7 @@ interface GuideStep {
 
 const STEPS: GuideStep[] = [
   {
-    title: '\u6b22\u8fce\u4f7f\u7528 Chipmunks \u638c\u4e0a\u4ed3\u5e93',
+    title: '\u6b22\u8fce\u4f7f\u7528\u638c\u4e0a\u4ed3\u5e93',
     description:
       '\u8bf7\u5148\u521b\u5efa\u4ed3\u5e93\uff0c\u518d\u5f00\u59cb\u5165\u5e93\u3001\u51fa\u5e93\u548c\u76d8\u70b9\u4f5c\u4e1a\u3002',
     icon: 'package',

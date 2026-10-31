@@ -298,7 +298,13 @@ export const createStyles = (theme: Theme) => {
       maxWidth: APP_MODAL_MAX_WIDTH,
     },
     modalBody: {
+      minHeight: 0,
+      overflow: 'hidden',
       paddingBottom: Spacing.sm,
+    },
+    bindingFormScroll: {
+      flex: 1,
+      minHeight: 0,
     },
     dataToolsBody: {
       gap: Spacing.sm,
@@ -317,6 +323,85 @@ export const createStyles = (theme: Theme) => {
       borderWidth: BorderWidth.normal,
       borderColor: theme.border,
       minHeight: 44,
+    },
+    supplierPicker: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.sm,
+    },
+    supplierPickerText: {
+      flex: 1,
+      color: theme.textPrimary,
+      fontSize: rf(14),
+    },
+    supplierPlaceholder: {
+      color: theme.textMuted,
+    },
+    supplierBody: {
+      paddingBottom: 0,
+    },
+    supplierList: {
+      flex: 1,
+      minHeight: 0,
+    },
+    supplierListHeader: {
+      gap: Spacing.sm,
+      paddingBottom: Spacing.sm,
+    },
+    supplierAddRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.sm,
+    },
+    supplierNameInput: {
+      flex: 1,
+      minWidth: 0,
+    },
+    supplierAddButtonWrap: {
+      width: 76,
+      flexGrow: 0,
+      flexShrink: 0,
+    },
+    supplierAddButton: {
+      width: '100%',
+      minHeight: 44,
+      paddingHorizontal: 6,
+    },
+    supplierHint: {
+      color: theme.textMuted,
+      fontSize: rf(11),
+      lineHeight: rf(17),
+    },
+    supplierEmptyState: {
+      paddingVertical: Spacing.sm,
+    },
+    supplierOption: {
+      minHeight: 48,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.sm,
+      paddingHorizontal: Spacing.sm,
+      paddingVertical: Spacing.sm,
+      borderBottomWidth: BorderWidth.thin,
+      borderBottomColor: theme.borderLight,
+    },
+    supplierOptionContent: {
+      flex: 1,
+      minWidth: 0,
+      gap: 2,
+    },
+    supplierOptionName: {
+      flexShrink: 1,
+      flexGrow: 1,
+      fontSize: rf(14),
+      lineHeight: rf(21),
+      color: theme.textPrimary,
+    },
+    supplierDelete: {
+      width: 44,
+      height: 44,
+      alignItems: 'center',
+      justifyContent: 'center',
     },
     modalActions: {
       marginTop: 0,

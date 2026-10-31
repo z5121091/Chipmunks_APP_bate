@@ -43,9 +43,49 @@ function withFixture(run) {
 }
 
 test('native template and checked-in Android worker have identical behavior', () => {
-  const normalized = native.replace(/^package [^\n]+/, 'package __PACKAGE_NAME__')
-    .replace(/private const val DEFAULT_UPDATE_SERVER = [^\n]+/, 'private const val DEFAULT_UPDATE_SERVER = __DEFAULT_UPDATE_SERVER__');
+  const normalized = native.replace(/^package [^\n]+/, 'package __PACKAGE_NAME__');
   assert.ok(normalized === template, 'Regenerate the Android worker from its Expo plugin template');
+});
+
+test('all native worker entry points share a guard before snapshot, upload and status writes', () => {
+  const work = template.slice(template.indexOf('override suspend fun doWork()'), template.indexOf('private fun hasBusinessData'));
+  assert.ok(work.indexOf('backupInProgress.compareAndSet(false, true)') < work.indexOf('AutoDatabaseBackupScheduler.writeStatus'));
+  assert.match(work, /if \(!backupInProgress\.compareAndSet\(false, true\)\) \{[\s\S]*?return Result\.retry\(\)/);
+  assert.match(work, /finally \{\s*backupInProgress\.set\(false\)\s*\}/);
+  assert.match(template.slice(template.indexOf('companion object {', template.indexOf('private fun urlEncode'))), /backupInProgress = AtomicBoolean\(false\)/);
+});
+
+test('native backup keeps remote sequence names separate from per-execution snapshot ownership and cleanup', () => {
+  const snapshot = template.slice(template.indexOf('private fun createDatabaseSnapshot'), template.indexOf('private fun remoteFileExists'));
+  assert.match(snapshot, /File\(backupDir, "snapshot-\$\{UUID\.randomUUID\(\)\}\.db"\)/);
+  assert.doesNotMatch(snapshot, /File\(backupDir, backupFileName\)/);
+  assert.match(snapshot, /remoteFileName = backupFileName/);
+  assert.match(template, /fileName = backupSnapshot\.remoteFileName/);
+  assert.match(snapshot, /catch \(error: Exception\) \{\s*backupFile\.delete\(\)\s*throw error/);
+  assert.match(snapshot, /finally \{[\s\S]*?backupFile\.exists\(\) && !backupFile\.delete\(\)/);
+  assert.match(template, /\$\{appName\}_\$\{date\}_\$\{sequence\.toString\(\)\.padStart\(2, '0'\)\}\.db/);
+});
+
+test('native backup reads the foreground app-private NAS configuration and falls back only before migration', () => {
+  const mirror = read('utils/nativeNasBackupConfig.ts');
+  const location = mirror.match(/NATIVE_NAS_BACKUP_CONFIG_FILE = '([^']+)'/)?.[1];
+  assert.equal(location, 'auto-db-backup/server-config.json');
+  assert.ok(template.includes(`File(applicationContext.filesDir, "${location}")`));
+  assert.match(template, /WebDavServer\.from\(readEffectiveUpdateServer\(\)\)/);
+  const reader = template.slice(template.indexOf('private fun readEffectiveUpdateServer'), template.indexOf('private fun remoteFileExists'));
+  assert.match(reader, /if \(!configFile\.exists\(\)\) return DEFAULT_UPDATE_SERVER/);
+  assert.match(reader, /config\.optInt\("version"\) != 1/);
+  assert.match(reader, /uri\.scheme\?\.lowercase\(Locale.US\) !in listOf\("http", "https"\)/);
+  assert.match(reader, /catch \(_: Exception\) \{[\s\S]*throw IllegalStateException\("NAS 后台配置无法读取/);
+  assert.equal((reader.match(/return DEFAULT_UPDATE_SERVER/g) || []).length, 1);
+  assert.match(mirror, /await FileSystem\.writeAsStringAsync\(temporary/);
+  assert.match(mirror, /await FileSystem\.moveAsync\(\{ from: temporary, to: destination \}\)/);
+  assert.doesNotMatch(mirror, /deleteAsync\(destination/);
+});
+
+test('native credential decoding preserves literal plus and does not log the destination URL', () => {
+  assert.match(template, /URLDecoder\.decode\(it\.replace\("\+", "%2B"\)/);
+  assert.doesNotMatch(template, /Log\.[a-z]+\([^\n]*\$(?:backupFileUrl|serverUrl|rawUrl)/);
 });
 
 test('native backup uses the current database filename and physical business table names', () => {
@@ -54,7 +94,7 @@ test('native backup uses the current database filename and physical business tab
   assert.deepEqual(nativeTables, logicalTables.map(name => tables[name]));
 });
 
-for (const logical of ['orders', 'materials', 'inbound_records', 'inventory_check_records', 'unpack_records']) {
+for (const logical of ['orders', 'materials', 'inbound_records', 'inventory_check_records', 'unpack_records', 'sales_return_records']) {
   test(`native backup detects a database containing only ${logical}`, () => withFixture(db => {
     db.prepare(`INSERT INTO [${tables[logical]}] (id) VALUES (?)`).run('backup-regression-test');
     assert.equal(hasNativeBusinessData(db), true);

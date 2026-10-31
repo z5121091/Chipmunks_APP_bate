@@ -139,12 +139,6 @@ export const createStyles = (theme: Theme) => {
       fontWeight: '600',
       color: theme.textPrimary,
     },
-    dangerButton: {
-      backgroundColor: theme.error,
-    },
-    dangerButtonText: {
-      color: theme.white,
-    },
     loadingContainer: {
       flex: 1,
       justifyContent: 'center',

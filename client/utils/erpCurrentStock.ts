@@ -157,8 +157,7 @@ const findStockPage = (value: unknown): StockPage | null => {
     }
   }
 
-  // Do not inspect arbitrary object values here. ERP responses may contain
-  // unrelated arrays (for example paging metadata or grouping options).
+  // 不遍历任意对象值，ERP 响应里可能还有分页信息等无关数组。
   return null;
 };
 
@@ -243,8 +242,7 @@ const filterRowsByInventoryCode = (rows: unknown[], inventoryCode: string): unkn
   const normalizedCode = inventoryCode.trim().toLocaleLowerCase();
   const rowsWithCode = rows.filter((row) => Boolean(getRowInventoryCode(row)));
 
-  // Some T+ responses omit the inventory code because it was fixed in the
-  // request. In that case the rows are still valid and must be retained.
+  // 请求已经指定存货编码时，T+ 有时不会在响应中重复返回，记录仍然有效。
   if (rowsWithCode.length === 0) {
     return rows;
   }
@@ -264,8 +262,7 @@ export const parseCurrentStockRows = (
   );
 };
 
-// Inventory count deliberately bypasses both caches. An absent code means zero
-// only after every page of a successful, validated batch has been received.
+// 盘点查询不使用缓存。只有全部分页都成功返回后，缺少的编码才按零库存处理。
 export const fetchCurrentStockByInventoryCodes = async (
   account: ErpAccountConfig,
   inventoryCodes: string[]
@@ -283,7 +280,7 @@ export const fetchCurrentStockByInventoryCodes = async (
   const seenPages = new Set<string>();
   let totalCount: number | null = null;
   let requestCount = 0;
-  // Bound unexpected upstream paging; exceeding this cap rejects the whole count.
+  // 限制异常分页数量，超过上限时整次盘点查询失败。
   for (let pageIndex = 1; pageIndex <= 100; pageIndex += 1) {
     const requestPage = async () => {
       requestCount += 1;
@@ -335,7 +332,7 @@ export const fetchCurrentStockByInventoryCodes = async (
       if (row.quantity === null) {
         throw new Error(`ERP未返回 ${row.inventoryCode} 的现存量，不能用可用量代替`);
       }
-      // T+ may include unassigned reservation rows with zero existing stock.
+      // T+ 可能返回现存量为零的未分配预留行。
       if (account.expectedWarehouseName && !row.warehouseName && row.quantity !== 0) {
         throw new Error(`ERP未返回 ${row.inventoryCode} 的仓库，无法核对盘点范围`);
       }

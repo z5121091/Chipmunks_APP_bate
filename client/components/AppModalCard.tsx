@@ -1,5 +1,5 @@
-import React from 'react';
-import { StyleProp, View, ViewStyle, useWindowDimensions } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import { AccessibilityInfo, Animated, Easing, StyleProp, View, ViewStyle, useWindowDimensions } from 'react-native';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, BorderWidth, Spacing } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH, getAppModalWidth } from '@/constants/modal';
@@ -34,6 +34,25 @@ export function AppModalCard({
   const { theme } = useTheme();
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const effectiveHeight = windowHeight;
+  const [reduceMotion, setReduceMotion] = useState(true);
+  const [progress] = useState(() => new Animated.Value(1));
+  useEffect(() => {
+    let active = true;
+    void AccessibilityInfo.isReduceMotionEnabled().then(value => {
+      if (active) setReduceMotion(value);
+    }).catch(() => undefined);
+    const subscription = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduceMotion);
+    return () => { active = false; subscription.remove(); };
+  }, []);
+  useEffect(() => {
+    if (reduceMotion) { progress.setValue(1); return; }
+    progress.setValue(0);
+    const animation = Animated.timing(progress, {
+      toValue: 1, duration: 160, easing: Easing.out(Easing.cubic), useNativeDriver: true,
+    });
+    animation.start();
+    return () => animation.stop();
+  }, [progress, reduceMotion, title]);
 
   const modalWidth = getAppModalWidth(windowWidth);
 
@@ -70,7 +89,7 @@ export function AppModalCard({
   const shouldStretchBody = stretchBody ?? size !== 'auto';
 
   return (
-    <View
+    <Animated.View
       style={[
         {
           width: modalWidth,
@@ -89,6 +108,8 @@ export function AppModalCard({
         style,
         computedSizeStyle,
         { width: modalWidth, maxWidth: APP_MODAL_MAX_WIDTH },
+        { opacity: progress.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] }),
+          transform: [{ translateY: progress.interpolate({ inputRange: [0, 1], outputRange: [8, 0] }) }] },
       ]}
     >
       <View
@@ -132,6 +153,6 @@ export function AppModalCard({
           {footer}
         </View>
       ) : null}
-    </View>
+    </Animated.View>
   );
 }

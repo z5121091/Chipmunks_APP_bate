@@ -1,7 +1,9 @@
 import type { SaleDispatchVoucher } from './erpSaleDispatch';
 import { parseQuantity } from './quantity';
+import { getSaleDispatchDirection, normalizeSaleReturnLines } from './salesReturn';
 
-export const OUTBOUND_VERIFICATION_TTL_MS = 60_000;
+// 从最近一次 ERP 查询成功起算，物料扫码不会延长核验窗口。
+export const OUTBOUND_VERIFICATION_TTL_MS = 15 * 60 * 1000;
 
 export const isOutboundVerificationFresh = (verifiedAt: number, now = Date.now()) =>
   verifiedAt > 0 && now >= verifiedAt && now - verifiedAt < OUTBOUND_VERIFICATION_TTL_MS;
@@ -82,5 +84,30 @@ export function isOutboundOrderComplete<T extends ScannedItem>(
   records: T[]
 ): boolean {
   const progress = buildOutboundProgress(lines, records);
+  return progress.length > 0 && progress.every((line) => line.status === 'complete');
+}
+
+/** 退货以 ERP 负数量的绝对值作为需求，复用出库的存货码分组和超量判断。 */
+export function buildSalesReturnProgress<T extends ScannedItem>(
+  lines: SaleDispatchVoucher['lines'],
+  records: T[]
+): OutboundLineProgress<T>[] {
+  const returnLines = getSaleDispatchDirection(lines) === 'sales_return'
+    ? normalizeSaleReturnLines(lines)
+    : lines.map((line) => ({ ...line, quantity: 0 }));
+  const progress = buildOutboundProgress(returnLines, records);
+  for (const group of progress) {
+    if (!Number.isSafeInteger(group.requiredQuantity) || !Number.isSafeInteger(group.scannedQuantity)) {
+      group.status = 'invalid';
+    }
+  }
+  return progress;
+}
+
+export function isSalesReturnOrderComplete<T extends ScannedItem>(
+  lines: SaleDispatchVoucher['lines'],
+  records: T[]
+): boolean {
+  const progress = buildSalesReturnProgress(lines, records);
   return progress.length > 0 && progress.every((line) => line.status === 'complete');
 }

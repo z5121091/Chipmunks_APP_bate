@@ -26,13 +26,13 @@ import {
   type ErpAccountConfig,
 } from '@/utils/erpAccounts';
 import {
-  fetchAllPendingPurchaseReceives,
   fetchPurchaseReceiveVoucher,
   fetchPurchaseReceiveVoucherStatuses,
+  getPendingPurchaseReceivesSnapshot,
   loadCachedPendingPurchaseReceives,
   loadCachedPurchaseReceiveVoucher,
   loadCachedPurchaseReceiveVoucherStatuses,
-  savePendingPurchaseReceivesCache,
+  revalidatePendingPurchaseReceives,
   savePurchaseReceiveVoucherCache,
   savePurchaseReceiveVoucherStatusesCache,
   type PurchaseReceiveListItem,
@@ -49,15 +49,15 @@ const getUpdatedLabel = (value: string) =>
   value ? formatDateTime(value) : '尚未同步';
 
 const normalizeVoucherCode = (value: string) => value.trim().toUpperCase();
+const isForegroundState = (state: typeof AppState.currentState) => !state || state === 'active';
 const PURCHASE_RECEIVE_STATUS_POLL_INTERVAL_MS = 30_000;
 const PURCHASE_RECEIVE_REQUIRED_FRESHNESS_MS = 5 * 60_000;
-const PURCHASE_RECEIVE_LIST_AUTO_REFRESH_MS = 5 * 60_000;
 const PURCHASE_RECEIVE_LOOKUP_AUTO_SUBMIT_MS = 180;
 const STANDARD_PURCHASE_RECEIVE_CODE_PATTERN = /^II-\d{4}-\d{2}-\d{2}-\d{2,3}$/i;
 
 type PendingListLoadOptions = {
   forceRefresh?: boolean;
-  revalidateStaleCache?: boolean;
+  background?: boolean;
 };
 
 export default function PurchaseReceiveScreen() {
@@ -71,9 +71,15 @@ export default function PurchaseReceiveScreen() {
   const manualLookupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const manualLookupInProgressRef = useRef('');
   const manualVoucherCodeRef = useRef('');
+  const focusedRef = useRef(false);
+  const appStateRef = useRef(AppState.currentState);
+  const loadingDetailCodeRef = useRef('');
+  const pendingListLoadRef = useRef<{ accountKey: ErpAccountConfig['key']; requestId: number } | null>(null);
+  const [initialPendingSnapshot] = useState(() => getPendingPurchaseReceivesSnapshot(ERP_ACCOUNTS[0].key));
+  const hasPendingListRef = useRef(Boolean(initialPendingSnapshot));
   const [selectedAccount, setSelectedAccount] = useState<ErpAccountConfig>(ERP_ACCOUNTS[0]);
-  const [items, setItems] = useState<PurchaseReceiveListItem[]>([]);
-  const [updatedAt, setUpdatedAt] = useState('');
+  const [items, setItems] = useState<PurchaseReceiveListItem[]>(initialPendingSnapshot?.data.items || []);
+  const [updatedAt, setUpdatedAt] = useState(initialPendingSnapshot?.cachedAt || '');
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
@@ -83,6 +89,7 @@ export default function PurchaseReceiveScreen() {
   const [detailLoadedAt, setDetailLoadedAt] = useState<Record<string, number>>({});
   const [manualVoucherCode, setManualVoucherCode] = useState('');
   const [completedVoucherCodes, setCompletedVoucherCodes] = useState<Set<string>>(new Set());
+  const [partialVoucherCodes, setPartialVoucherCodes] = useState<Set<string>>(new Set());
   const [auditedVoucherCodes, setAuditedVoucherCodes] = useState<Set<string>>(new Set());
   const selectedAccountAvailable = isErpAccountAvailable(selectedAccount);
 
@@ -90,7 +97,8 @@ export default function PurchaseReceiveScreen() {
     account: ErpAccountConfig,
     options: PendingListLoadOptions = {}
   ) => {
-    const { forceRefresh = false, revalidateStaleCache = false } = options;
+    const { forceRefresh = false, background = false } = options;
+    if (pendingListLoadRef.current?.accountKey === account.key) return;
     const requestId = requestIdRef.current + 1;
     requestIdRef.current = requestId;
 
@@ -101,42 +109,47 @@ export default function PurchaseReceiveScreen() {
       return;
     }
 
-    setErrorMessage('');
+    pendingListLoadRef.current = { accountKey: account.key, requestId };
+    if (!background) setErrorMessage('');
     if (forceRefresh) {
       setRefreshing(true);
     }
 
     try {
-      if (!forceRefresh) {
+      const snapshot = getPendingPurchaseReceivesSnapshot(account.key);
+      if (snapshot) {
+        hasPendingListRef.current = true;
+        setItems(snapshot.data.items);
+        setUpdatedAt(snapshot.cachedAt);
+      } else if (!hasPendingListRef.current) {
+        setLoading(true);
         const cached = await loadCachedPendingPurchaseReceives(account.key);
-        if (cached && requestId === requestIdRef.current) {
+        if (
+          requestId !== requestIdRef.current ||
+          !focusedRef.current ||
+          !isForegroundState(appStateRef.current)
+        ) return;
+        if (cached) {
+          hasPendingListRef.current = true;
           setItems(cached.data.items);
           setUpdatedAt(cached.cachedAt);
-          const cachedAt = Date.parse(cached.cachedAt);
-          const cacheIsFresh =
-            Number.isFinite(cachedAt) &&
-            cachedAt <= Date.now() &&
-            Date.now() - cachedAt <= PURCHASE_RECEIVE_LIST_AUTO_REFRESH_MS;
-          if (!revalidateStaleCache || cacheIsFresh) {
-            return;
-          }
-          setRefreshing(true);
-        } else {
-          setLoading(true);
+          setLoading(false);
         }
       }
 
-      const result = await fetchAllPendingPurchaseReceives(account, {
-        bypassCache: forceRefresh || revalidateStaleCache,
-      });
-      const cache = await savePendingPurchaseReceivesCache(account.key, result);
-      if (requestId === requestIdRef.current) {
-        setItems(result.items);
+      const cache = await revalidatePendingPurchaseReceives(account, { forceRefresh });
+      if (
+        requestId === requestIdRef.current &&
+        focusedRef.current &&
+        isForegroundState(appStateRef.current)
+      ) {
+        hasPendingListRef.current = true;
+        setItems(cache.data.items);
         setUpdatedAt(cache.cachedAt);
       }
     } catch (error) {
       logger.error('[采购入库] 加载未审单据失败:', error);
-      if (requestId === requestIdRef.current) {
+      if (requestId === requestIdRef.current && !background) {
         setErrorMessage(
           formatUserFacingErrorMessage(error, '采购入库单查询失败，请稍后重试')
         );
@@ -145,6 +158,9 @@ export default function PurchaseReceiveScreen() {
       if (requestId === requestIdRef.current) {
         setLoading(false);
         setRefreshing(false);
+      }
+      if (pendingListLoadRef.current?.requestId === requestId) {
+        pendingListLoadRef.current = null;
       }
     }
   }, []);
@@ -155,6 +171,7 @@ export default function PurchaseReceiveScreen() {
 
     if (!isErpAccountAvailable(account)) {
       setCompletedVoucherCodes(new Set());
+      setPartialVoucherCodes(new Set());
       return;
     }
 
@@ -164,11 +181,14 @@ export default function PurchaseReceiveScreen() {
         return;
       }
 
+      setPartialVoucherCodes(new Set(documents.filter(document =>
+        document.warehouse_name.trim() === account.expectedWarehouseName && document.completion_status === 'partial'
+      ).map(document => normalizeVoucherCode(document.inbound_no))));
       setCompletedVoucherCodes(
         new Set(
           documents
             .filter(
-              (document) => document.warehouse_name.trim() === account.expectedWarehouseName
+              (document) => document.warehouse_name.trim() === account.expectedWarehouseName && document.completion_status !== 'partial'
             )
             .map((document) => normalizeVoucherCode(document.inbound_no))
             .filter(Boolean)
@@ -178,6 +198,7 @@ export default function PurchaseReceiveScreen() {
       logger.error('[采购入库] 读取本地已入库单据失败:', error);
       if (requestId === completionRequestIdRef.current) {
         setCompletedVoucherCodes(new Set());
+        setPartialVoucherCodes(new Set());
       }
     }
   }, []);
@@ -228,26 +249,60 @@ export default function PurchaseReceiveScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      void loadPendingList(selectedAccount, { revalidateStaleCache: true });
+      focusedRef.current = true;
+      appStateRef.current = AppState.currentState;
+      let entryListRefreshRequired = true;
+      const refreshWhenIdle = (options: {
+        includeList?: boolean;
+        background?: boolean;
+        useStatusCache?: boolean;
+      } = {}) => {
+        const { includeList = false, background = true, useStatusCache = false } = options;
+        if (
+          !focusedRef.current ||
+          !isForegroundState(appStateRef.current) ||
+          manualLookupInProgressRef.current ||
+          manualVoucherCodeRef.current.trim() ||
+          loadingDetailCodeRef.current
+        ) return;
+        if (includeList) {
+          // 每次进入页面查一次最新单据；之后回到前台仍采用每日预加载策略。
+          const forceRefresh = entryListRefreshRequired;
+          entryListRefreshRequired = false;
+          void loadPendingList(selectedAccount, {
+            background: background && !forceRefresh,
+            forceRefresh,
+          });
+        }
+        void loadPurchaseReceiveStatuses(selectedAccount, useStatusCache);
+      };
+      refreshWhenIdle({ includeList: true, background: false, useStatusCache: true });
       void loadCompletedVoucherCodes(selectedAccount);
-      void loadPurchaseReceiveStatuses(selectedAccount);
 
       const statusTimer = setInterval(() => {
-        if (AppState.currentState === 'active') void loadPurchaseReceiveStatuses(selectedAccount, false);
+        // Audit messages come from our server; do not poll the metered ERP list.
+        refreshWhenIdle();
       }, PURCHASE_RECEIVE_STATUS_POLL_INTERVAL_MS);
       const subscription = AppState.addEventListener('change', state => {
+        appStateRef.current = state;
         if (state !== 'active') return;
-        void loadPendingList(selectedAccount, { revalidateStaleCache: true });
-        void loadPurchaseReceiveStatuses(selectedAccount, false);
+        refreshWhenIdle({ includeList: true });
+        void loadCompletedVoucherCodes(selectedAccount);
       });
 
       return () => {
+        focusedRef.current = false;
         clearInterval(statusTimer);
         subscription.remove();
         requestIdRef.current += 1;
         completionRequestIdRef.current += 1;
         statusRequestIdRef.current += 1;
         detailRequestIdRef.current += 1;
+        pendingListLoadRef.current = null;
+        loadingDetailCodeRef.current = '';
+        setLoading(false);
+        setRefreshing(false);
+        setLoadingDetailCode('');
         cancelScanSubmit(manualLookupTimerRef);
         manualVoucherCodeRef.current = '';
         setManualVoucherCode('');
@@ -322,18 +377,24 @@ export default function PurchaseReceiveScreen() {
   );
 
   const handleAccountPress = useCallback((account: ErpAccountConfig) => {
+    if (account.key === selectedAccount.key) return;
     cancelScanSubmit(manualLookupTimerRef);
     requestIdRef.current += 1;
     completionRequestIdRef.current += 1;
     statusRequestIdRef.current += 1;
     detailRequestIdRef.current += 1;
     manualLookupInProgressRef.current = '';
+    pendingListLoadRef.current = null;
+    loadingDetailCodeRef.current = '';
     manualVoucherCodeRef.current = '';
     setSelectedAccount(account);
-    setItems([]);
+    const snapshot = getPendingPurchaseReceivesSnapshot(account.key);
+    hasPendingListRef.current = Boolean(snapshot);
+    setItems(snapshot?.data.items || []);
     setCompletedVoucherCodes(new Set());
+      setPartialVoucherCodes(new Set());
     setAuditedVoucherCodes(new Set());
-    setUpdatedAt('');
+    setUpdatedAt(snapshot?.cachedAt || '');
     setLoading(false);
     setRefreshing(false);
     setErrorMessage('');
@@ -342,7 +403,7 @@ export default function PurchaseReceiveScreen() {
     setDetails({});
     setDetailLoadedAt({});
     setManualVoucherCode('');
-  }, []);
+  }, [selectedAccount.key]);
 
   const handleRefresh = useCallback(() => {
     void loadPendingList(selectedAccount, { forceRefresh: true });
@@ -371,6 +432,7 @@ export default function PurchaseReceiveScreen() {
 
       const requestId = detailRequestIdRef.current + 1;
       detailRequestIdRef.current = requestId;
+      loadingDetailCodeRef.current = item.code;
       setLoadingDetailCode(item.code);
       setErrorMessage('');
       try {
@@ -410,6 +472,7 @@ export default function PurchaseReceiveScreen() {
         return null;
       } finally {
         if (requestId === detailRequestIdRef.current) {
+          loadingDetailCodeRef.current = '';
           setLoadingDetailCode('');
         }
       }
@@ -568,6 +631,7 @@ export default function PurchaseReceiveScreen() {
       const detail = details[item.code];
       const detailLoading = loadingDetailCode === item.code;
       const completed = completedVoucherCodes.has(normalizeVoucherCode(item.code));
+      const partial = partialVoucherCodes.has(normalizeVoucherCode(item.code));
 
       return (
         <View style={[styles.voucherCard, completed && styles.voucherCardCompleted]}>
@@ -586,7 +650,7 @@ export default function PurchaseReceiveScreen() {
                   <Text
                     style={[styles.pendingBadgeText, completed && styles.completedBadgeText]}
                   >
-                    {completed ? '已入库' : item.stateName || '未审'}
+                    {completed ? '已入库完成' : partial ? '部分入库' : item.stateName || '未审'}
                   </Text>
                 </View>
               </View>
@@ -644,7 +708,7 @@ export default function PurchaseReceiveScreen() {
                     }}
                   >
                     <Feather name="maximize" size={18} color={theme.buttonPrimaryText} />
-                    <Text style={styles.startButtonText}>开始扫码入库</Text>
+                    <Text style={styles.startButtonText}>{partial ? '继续扫码入库' : '开始扫码入库'}</Text>
                   </TouchableOpacity>
                 </>
               ) : null}
@@ -656,6 +720,7 @@ export default function PurchaseReceiveScreen() {
     [
       details,
       completedVoucherCodes,
+      partialVoucherCodes,
       expandedCode,
       handleStartScan,
       handleToggleItem,

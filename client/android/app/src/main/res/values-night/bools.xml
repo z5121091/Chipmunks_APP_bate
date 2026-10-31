@@ -1,3 +1,1 @@
-<resources>
-  <bool name="splashscreen_light_bars">false</bool>
-</resources>
+<resources><bool name="splashscreen_light_bars">false</bool></resources>

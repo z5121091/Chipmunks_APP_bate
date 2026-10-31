@@ -1,5 +1,5 @@
 {
-  "name": "expo-express-monorepo",
+  "name": "chipmunks-warehouse-workspace",
   "private": true,
   "version": "0.0.0",
   "scripts": {
@@ -20,5 +20,10 @@
   "packageManager": "pnpm@9.0.0",
   "engines": {
     "pnpm": ">=9.0.0"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "expo-sqlite@57.0.3": "patches/expo-sqlite@57.0.3.patch"
+    }
   }
 }

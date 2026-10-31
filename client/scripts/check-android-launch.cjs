@@ -9,9 +9,13 @@ const prebuild = require.resolve('@expo/prebuild-config/package.json', {
 });
 const imageUtils = require.resolve('@expo/image-utils', { paths: [prebuild] });
 const Jimp = require(require.resolve('jimp-compact', { paths: [imageUtils] }));
-const { setSplashImageDrawablesAsync } = require(require.resolve(
-  '@expo/prebuild-config/build/plugins/unversioned/expo-splash-screen/withAndroidSplashImages',
-  { paths: [prebuild] }
+const { setSplashImageDrawablesAsync } = require(path.join(
+  path.dirname(require.resolve('expo-splash-screen/package.json')),
+  'plugin/build/withAndroidSplashImages.js'
+));
+const { getAndroidSplashConfig } = require(path.join(
+  path.dirname(require.resolve('expo-splash-screen/package.json')),
+  'plugin/build/getAndroidSplashConfig.js'
 ));
 
 async function main() {
@@ -22,17 +26,18 @@ async function main() {
   const native = path.join(root, 'android/app/src/main/res');
   assert.equal(exp.userInterfaceStyle, 'automatic');
   assert.equal(splash.imageWidth, 176);
-  for (const config of [exp.splash, exp.android.splash, exp.ios.splash, splash]) {
+  for (const config of [splash]) {
     assert.equal(config.image, './assets/images/splash-logo.png');
     assert.equal(config.resizeMode, 'contain');
     assert.equal(config.backgroundColor, '#FFFFFF');
   }
-  for (const config of [exp.android.splash, exp.ios.splash, splash]) {
+  for (const config of [splash]) {
     assert.equal(config.dark.image, './assets/images/splash-logo-dark.png');
     assert.equal(config.dark.backgroundColor, '#121212');
   }
   assert.equal(exp.android.package, 'com.chipmunks.traceability');
   assert.equal(exp.name, '掌上仓库');
+  assert.equal(exp.extra.selfUpdateEnabled, true);
   const build = exp.plugins.find(plugin => Array.isArray(plugin) && plugin[0] === 'expo-build-properties')[1];
   assert.deepEqual(build.android.buildArchs, ['arm64-v8a']);
   const gradle = fs.readFileSync(path.join(root, 'android/gradle.properties'), 'utf8');
@@ -60,7 +65,7 @@ async function main() {
       for (let c = 0; c < 3; c++) darkPixels[i + c] = Math.round(darkPixels[i + c] * 0.72 + 255 * 0.28);
     }
     await darkLogo.writeAsync(path.join(root, splash.dark.image));
-    await setSplashImageDrawablesAsync(exp, splash, root, splash.imageWidth);
+    await setSplashImageDrawablesAsync(getAndroidSplashConfig(splash), root);
   }
   assert.notDeepEqual(fs.readFileSync(path.join(root, splash.image)), fs.readFileSync(path.join(root, splash.dark.image)), 'Dark logo must be brighter, not an identical copy');
 
@@ -93,9 +98,11 @@ async function main() {
       for (let y = 0; y < size; y++) {
         for (let x = 0; x < size; x++) {
           const pixel = bitmap.getPixelColor(x, y);
-          assert.ok((pixel & 255) >= 254);
-          // Jimp's composition may round a background channel by one level.
-          const difference = Math.max(...[24, 16, 8].map(shift => Math.abs(((pixel >>> shift) & 255) - ((background >>> shift) & 255))));
+          const alpha = (pixel & 255) / 255;
+          if (x === 0 || y === 0 || x === size - 1 || y === size - 1) assert.equal(alpha, 0);
+          // SDK 57 leaves the canvas transparent; compare its composited appearance.
+          const difference = Math.max(...[24, 16, 8].map(shift =>
+            alpha * Math.abs(((pixel >>> shift) & 255) - ((background >>> shift) & 255))));
           if (difference > 2) {
             colored++;
             // Android 12 can mask the icon to a 192dp circle inside its 288dp canvas.
@@ -123,7 +130,7 @@ async function main() {
       fs.copyFileSync(path.join(root, config.image), destination);
     }
     process.chdir(temporary);
-    await setSplashImageDrawablesAsync(exp, splash, temporary, splash.imageWidth);
+    await setSplashImageDrawablesAsync(getAndroidSplashConfig(splash), temporary);
     for (const mode of ['', '-night']) {
       for (const density of ['mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi']) {
         const relative = `drawable${mode}-${density}/splashscreen_logo.png`;

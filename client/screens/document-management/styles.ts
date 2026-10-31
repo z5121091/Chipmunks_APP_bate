@@ -10,6 +10,7 @@ export const createStyles = (theme: Theme) =>
     },
     scrollContent: {
       padding: Spacing.md,
+      paddingBottom: Spacing.xl,
     },
     header: {
       flexDirection: 'row',
@@ -26,14 +27,6 @@ export const createStyles = (theme: Theme) =>
       shadowRadius: 18,
       elevation: 4,
       marginBottom: Spacing.md,
-    },
-    backButton: {
-      width: 44,
-      height: 44,
-      borderRadius: BorderRadius.lg,
-      justifyContent: 'center',
-      alignItems: 'center',
-      backgroundColor: theme.backgroundTertiary,
     },
     headerTextBlock: {
       flex: 1,

@@ -5,7 +5,10 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import InventoryBindingScreen from '../index';
 import { AppFormField } from '@/components/AppFormField';
+import { AppModalActions } from '@/components/AppModalActions';
+import { AnimatedButton } from '@/components/AnimatedButton';
 import { UiToolbarButton } from '@/components/UiRedesign';
+import { SupplierManager } from '../SupplierManager';
 import { useCustomAlert } from '@/components/CustomAlert';
 import * as database from '@/utils/database';
 
@@ -15,10 +18,14 @@ jest.mock('expo-router', () => ({
 jest.mock('@/hooks/useSafeRouter', () => ({ useSafeRouter: () => ({ back: jest.fn() }) }));
 jest.mock('@/hooks/useTheme', () => ({ useTheme: () => ({ theme: {}, isDark: false }) }));
 jest.mock('../styles', () => ({ createStyles: () => ({}) }));
+jest.mock('../SupplierManager', () => ({ SupplierManager: 'SupplierPanel' }));
 jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
 jest.mock('@/components/AnimatedButton', () => ({ AnimatedButton: 'Button' }));
 jest.mock('@/components/AppEmptyState', () => ({ AppEmptyState: 'Empty' }));
-jest.mock('@/components/AppModalCard', () => ({ AppModalCard: 'Card' }));
+jest.mock('@/components/AppModalCard', () => ({
+  AppModalCard: (props: { children?: import('react').ReactNode; footer?: import('react').ReactNode }) =>
+    require('react').createElement('Card', props, props.children, props.footer),
+}));
 jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'Actions' }));
 jest.mock('@/components/AppFormField', () => ({ AppFormField: 'Field' }));
 jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'Scroll' }));
@@ -95,9 +102,76 @@ it.each(['新增', '编辑'])('keeps %s form fields in the requested order with 
   const fields = root.root.findAllByType(AppFormField);
   expect(fields.map(field => field.props.label)).toEqual(fieldOrder);
   expect(fields.map(field => Boolean(field.props.required))).toEqual([true, true, false, false, false]);
-  expect(fields.map(field => field.findByType(TextInput).props.value)).toEqual(mode === '新增'
+  expect(fields.map(field => field.props.label === '供应商'
+    ? field.findByType(TouchableOpacity).props.accessibilityValue.text.replace(/^未设置$/, '')
+    : field.findByType(TextInput).props.value)).toEqual(mode === '新增'
     ? ['', '', '', '', '']
     : [binding.scan_model, binding.inventory_code, binding.supplier, binding.version, binding.description]);
+});
+
+async function fillBinding(model = 'NEW-MODEL', code = 'NEW-CODE') {
+  for (const [label, value] of [['扫描型号', model], ['存货编码', code]]) {
+    await act(async () => {
+      root.root.findAllByType(AppFormField).find(field => field.props.label === label)!
+        .findByType(TextInput).props.onChangeText(value);
+    });
+  }
+}
+
+async function openSupplierSelection() {
+  await act(async () => {
+    root.root.findAllByType(TouchableOpacity).find(item => item.props.accessibilityLabel === '选择物料供应商')!.props.onPress();
+  });
+}
+
+it('opens supplier maintenance from the toolbar without a material form', async () => {
+  expect(root.root.findAllByType(SupplierManager)).toHaveLength(0);
+  await pressTool('维护供应商');
+  expect(root.root.findByType(SupplierManager).props.mode).toBe('manage');
+  expect(root.root.findAllByType(AppFormField)).toHaveLength(0);
+  await act(async () => { root.root.findByType(SupplierManager).props.onClose(); });
+  expect(root.root.findAllByType(SupplierManager)).toHaveLength(0);
+});
+
+it('keeps typed model and code when selecting or cancelling a supplier and saves the selected name', async () => {
+  await pressTool('新增');
+  await fillBinding();
+  await openSupplierSelection();
+  expect(root.root.findByType(SupplierManager).props.mode).toBe('select');
+  await act(async () => { root.root.findByType(SupplierManager).props.onClose(); });
+  expect(root.root.findAllByType(AppFormField)[0].findByType(TextInput).props.value).toBe('NEW-MODEL');
+  await openSupplierSelection();
+  await act(async () => { root.root.findByType(SupplierManager).props.onSelect('新供应商'); });
+  await act(async () => { root.root.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(database.addInventoryBinding).toHaveBeenCalledWith({
+    scan_model: 'NEW-MODEL', inventory_code: 'NEW-CODE', version: '', supplier: '新供应商', description: '',
+  });
+});
+
+it('allows saving without a supplier', async () => {
+  await pressTool('新增');
+  await fillBinding();
+  await act(async () => { root.root.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(database.addInventoryBinding).toHaveBeenCalledWith(expect.objectContaining({ supplier: '' }));
+});
+
+it('shows the actual binding validation failure and keeps the form for correction', async () => {
+  jest.mocked(database.addInventoryBinding).mockRejectedValueOnce(new Error('该型号及版本已关联销售退货，不能更改存货编码'));
+  await pressTool('新增');
+  await fillBinding();
+  await act(async () => { root.root.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(useCustomAlert().showError).toHaveBeenCalledWith('该型号及版本已关联销售退货，不能更改存货编码');
+  expect(root.root.findAllByType(AppFormField)).toHaveLength(5);
+});
+
+it('loads only once when changing binding pages', async () => {
+  jest.mocked(database.getInventoryBindingsPage).mockResolvedValueOnce({ items: [binding], total: 25, page: 1, pageSize: 10 });
+  await act(async () => { root.unmount(); root = TestRenderer.create(<InventoryBindingScreen />); });
+  jest.mocked(database.getInventoryBindingsPage).mockClear();
+  jest.mocked(database.getInventoryBindingsPage).mockResolvedValueOnce({ items: [binding], total: 25, page: 2, pageSize: 10 });
+  await act(async () => { root.root.findAllByType(AnimatedButton)[1].props.onPress(); });
+  expect(database.getInventoryBindingsPage).toHaveBeenCalledTimes(1);
+  expect(database.getInventoryBindingsPage).toHaveBeenCalledWith({ page: 2, pageSize: 10, keyword: '' });
 });
 
 it('exports columns and values in the new order and can import the result unchanged', async () => {

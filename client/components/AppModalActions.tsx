@@ -3,6 +3,7 @@ import { StyleProp, Text, TouchableOpacity, View, ViewStyle } from 'react-native
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, BorderWidth, Spacing, Typography } from '@/constants/theme';
 import { MIN_TOUCH_TARGET } from '@/utils/responsive';
+import { feedbackCancel, feedbackConfirm } from '@/utils/feedback';
 
 interface AppModalActionsProps {
   primaryLabel: string;
@@ -76,7 +77,10 @@ export function AppModalActions({
           accessibilityRole="button"
           accessibilityState={{ disabled: secondaryDisabled }}
           disabled={secondaryDisabled}
-          onPress={onSecondaryPress}
+          onPress={() => {
+            if (secondaryLabel === '取消') void feedbackCancel();
+            onSecondaryPress?.();
+          }}
         >
           <Text style={{ ...Typography.bodyMedium, color: secondaryColors.textColor }}>
             {secondaryLabel}
@@ -104,7 +108,10 @@ export function AppModalActions({
         accessibilityRole="button"
         accessibilityState={{ disabled: primaryDisabled }}
         disabled={primaryDisabled}
-        onPress={onPrimaryPress}
+        onPress={() => {
+          if (primaryLabel === '确认' || primaryLabel === '确定') void feedbackConfirm();
+          onPrimaryPress();
+        }}
       >
         <Text style={{ ...Typography.dialogAction, color: primaryColors.textColor }}>
           {primaryLabel}

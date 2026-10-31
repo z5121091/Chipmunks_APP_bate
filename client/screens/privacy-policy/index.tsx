@@ -137,7 +137,7 @@ const createStyles = (theme: Theme) =>
       backgroundColor: theme.backgroundDefault,
     },
     loadingContainer: {
-      ...StyleSheet.absoluteFillObject,
+      ...StyleSheet.absoluteFill,
       alignItems: 'center',
       justifyContent: 'center',
       backgroundColor: theme.backgroundDefault,

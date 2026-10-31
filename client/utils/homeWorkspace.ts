@@ -1,4 +1,4 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { workDraftStorage as AsyncStorage } from './workDraftIsolation';
 import { STORAGE_KEYS } from '@/constants/config';
 import {
   getAllWarehouses,

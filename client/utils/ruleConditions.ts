@@ -7,6 +7,63 @@ export const CONDITION_OPERATORS = {
 
 export type ConditionOperator = keyof typeof CONDITION_OPERATORS;
 
+export type RuleConditionMode = 'all' | 'any' | 'mixed';
+export type RuleConditionGroup = 'all' | 'any';
+
+export const isRuleConditionMode = (value: unknown): value is RuleConditionMode =>
+  value === 'all' || value === 'any' || value === 'mixed';
+
+export const isRuleConditionGroup = (value: unknown): value is RuleConditionGroup =>
+  value === 'all' || value === 'any';
+
+export interface RuleConditionInput {
+  fieldIndex: number;
+  keyword: string;
+  operator?: ConditionOperator;
+  group?: RuleConditionGroup;
+}
+
+/** Missing mode/group intentionally retain the historical all-conditions behavior. */
+export const evaluateRuleConditions = (
+  parts: readonly string[],
+  conditions: readonly RuleConditionInput[],
+  mode: RuleConditionMode = 'all',
+): { matched: boolean; errors: string[]; specificity: number } => {
+  const configurationErrors: string[] = [];
+  if (!isRuleConditionMode(mode)) configurationErrors.push('识别条件逻辑无效');
+  if (!Array.isArray(conditions)) {
+    return { matched: false, errors: [...configurationErrors, '识别条件配置无效'], specificity: 0 };
+  }
+  conditions.forEach((condition, index) => {
+    if (!condition || !Number.isInteger(condition.fieldIndex) || condition.fieldIndex < 0 ||
+        typeof condition.keyword !== 'string' || !condition.keyword.trim() ||
+        (condition.operator !== undefined && !isConditionOperator(condition.operator)) ||
+        (condition.group !== undefined && !isRuleConditionGroup(condition.group))) {
+      configurationErrors.push(`第${index + 1}个识别条件配置无效`);
+    }
+  });
+  if (configurationErrors.length) return { matched: false, errors: configurationErrors, specificity: 0 };
+
+  const mandatory = mode === 'any' ? []
+    : mode === 'mixed' ? conditions.filter(condition => condition.group !== 'any') : conditions;
+  const alternatives = mode === 'any' ? conditions
+    : mode === 'mixed' ? conditions.filter(condition => condition.group === 'any') : [];
+  const matches = (condition: RuleConditionInput) => parts[condition.fieldIndex] !== undefined &&
+    matchesRuleCondition(parts[condition.fieldIndex], condition);
+  const description = (condition: RuleConditionInput) =>
+    `第${condition.fieldIndex + 1}段不满足“${CONDITION_OPERATORS[condition.operator ?? 'contains']} ${condition.keyword}”`;
+  const errors = mandatory.filter(condition => !matches(condition)).map(description);
+  if (alternatives.length && !alternatives.some(matches)) {
+    errors.push(`任选条件至少需要满足一项：${alternatives.map(description).join('；')}`);
+  }
+  return {
+    matched: errors.length === 0,
+    errors,
+    // Adding OR branches broadens a rule; it never adds specificity or ranking points.
+    specificity: mandatory.length + (alternatives.length ? 1 : 0),
+  };
+};
+
 export const isConditionOperator = (value: unknown): value is ConditionOperator =>
   typeof value === 'string' && Object.prototype.hasOwnProperty.call(CONDITION_OPERATORS, value);
 
@@ -90,7 +147,7 @@ export const suggestRuleSeparators = (content: string, configured: readonly stri
     '\x1D': 'GS', '\x1E': 'RS', ' ': '空格', '{}': '{…}', '()': '(…)', '[]': '[…]', '<>': '<…>' };
   const brackets = ['{}', '()', '[]', '<>'];
   const separators = [...brackets, '\r\n', '\n', '\r', '\t', '\x1D', '\x1E', '||', '|', ';', '&', '#', '*', '/', ',', ':', ' ', ...configured];
-  // Candidates describe syntax only; punctuation inside models/specifications can also split.
+  // 候选项只表示可能的格式，型号或规格里的标点也可能被拆开。
   return [...new Set(separators)].flatMap((value, priority) => {
     if (!value) return [];
     if ((value === '\n' || value === '\r') && text.includes('\r\n') && !text.replace(/\r\n/g, '').includes(value)) return [];

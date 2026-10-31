@@ -1,0 +1,13 @@
+diff --git a/android/src/main/java/expo/modules/sqlite/SQLiteModule.kt b/android/src/main/java/expo/modules/sqlite/SQLiteModule.kt
+index 3e668be157f276504ad5a60efb9f66e34d81e876..d52edc2cf24033f89fdb154ce0e9e68d86af3069 100644
+--- a/android/src/main/java/expo/modules/sqlite/SQLiteModule.kt
++++ b/android/src/main/java/expo/modules/sqlite/SQLiteModule.kt
+@@ -596,7 +596,7 @@ class SQLiteModule : Module() {
+ 
+   @Synchronized
+   private fun removeAllCachedDatabases(): List<NativeDatabase> {
+-    val databases = cachedDatabases
++    val databases = cachedDatabases.toList()
+     cachedDatabases.clear()
+     return databases
+   }

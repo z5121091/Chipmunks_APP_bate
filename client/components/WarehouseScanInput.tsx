@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, type ComponentProps, type Ref } from 'react';
-import { useIsFocused } from '@react-navigation/native';
+import { useIsFocused } from 'expo-router/react-navigation';
 import {
   ActivityIndicator,
   AppState,
@@ -19,12 +19,15 @@ type FeatherIconName = ComponentProps<typeof Feather>['name'];
 
 export interface WarehouseScanInputHandle {
   focus: (delay?: number) => void;
+  clear: () => void;
 }
 
 export interface WarehouseScanInputProps extends TextInputProps {
   inputRef?: Ref<WarehouseScanInputHandle>;
   active?: boolean;
   processing?: boolean;
+  /** Keep hardware keyboard scanner input available while its accepted scans wait for processing. */
+  acceptInputWhileProcessing?: boolean;
   statusLabel?: string;
   containerProps?: ViewProps;
   actionIcon?: FeatherIconName;
@@ -39,6 +42,7 @@ export function WarehouseScanInput({
   inputRef,
   active,
   processing = false,
+  acceptInputWhileProcessing = false,
   statusLabel,
   containerProps,
   actionIcon = 'maximize',
@@ -53,6 +57,8 @@ export function WarehouseScanInput({
   onFocus,
   onBlur,
   onLayout,
+  onChange,
+  onChangeText,
   onSubmitEditing,
   placeholderTextColor,
   ...props
@@ -62,9 +68,15 @@ export function WarehouseScanInput({
   const scannerRef = useRef<TextInput>(null);
   const focusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFocused = useIsFocused();
-  const canFocus = isFocused && autoFocus && (editable ?? true) && !processing;
+  const canEdit = (editable ?? true) && (!processing || acceptInputWhileProcessing);
+  const canFocus = isFocused && autoFocus && canEdit;
   const canFocusRef = useRef(false);
   const windowFocusedRef = useRef(true);
+  // 原生 clear 与 JS 回调异步执行。按事件序号过滤旧快照，避免清空后被写回。
+  // 不按文本去重：不同包装可以有完全相同的二维码。
+  const latestChangeCountRef = useRef(-1);
+  const consumedChangeCountRef = useRef(-1);
+  const ignoreChangeTextRef = useRef(false);
 
   const cancelFocus = useCallback(() => {
     if (focusTimer.current !== null) clearTimeout(focusTimer.current);
@@ -74,14 +86,20 @@ export function WarehouseScanInput({
     if (!canFocusRef.current || !windowFocusedRef.current || focusTimer.current !== null) return;
     focusTimer.current = setTimeout(() => {
       focusTimer.current = null;
-      // Recheck at execution time: a dialog or navigation may have opened meanwhile.
+      // 延迟执行前再检查一次，等待期间可能已经打开弹窗或切换页面。
       if (!canFocusRef.current || !windowFocusedRef.current) return;
       if (AppState.currentState && AppState.currentState !== 'active') return;
       if (!scannerRef.current?.isFocused()) scannerRef.current?.focus();
     }, delay);
   }, []);
 
-  useImperativeHandle(inputRef, () => ({ focus: focusScanner }), [focusScanner]);
+  useImperativeHandle(inputRef, () => ({
+    focus: focusScanner,
+    clear: () => {
+      consumedChangeCountRef.current = latestChangeCountRef.current;
+      scannerRef.current?.clear();
+    },
+  }), [focusScanner]);
 
   useLayoutEffect(() => {
     canFocusRef.current = canFocus;
@@ -132,7 +150,7 @@ export function WarehouseScanInput({
       <TextInput
         ref={scannerRef}
         style={[styles.input, { color: theme.textPrimary }, style]}
-        editable={(editable ?? true) && !processing}
+        editable={canEdit}
         placeholderTextColor={placeholderTextColor || theme.textMuted}
         accessibilityLabel={
           statusLabel || (typeof props.placeholder === 'string' ? props.placeholder : undefined)
@@ -143,6 +161,22 @@ export function WarehouseScanInput({
         {...props}
         showSoftInputOnFocus={showSoftInputOnFocus}
         autoFocus={false}
+        onChange={event => {
+          const count = event.nativeEvent.eventCount;
+          const hasCount = Number.isFinite(count);
+          ignoreChangeTextRef.current = hasCount && (
+            count <= consumedChangeCountRef.current || count < latestChangeCountRef.current
+          );
+          if (ignoreChangeTextRef.current) return;
+          if (hasCount) latestChangeCountRef.current = count;
+          onChange?.(event);
+        }}
+        onChangeText={text => {
+          // RN 先调用 onChange，再调用同一事件的 onChangeText。
+          const ignored = ignoreChangeTextRef.current;
+          ignoreChangeTextRef.current = false;
+          if (!ignored) onChangeText?.(text);
+        }}
         onFocus={event => {
           cancelFocus();
           onFocus?.(event);

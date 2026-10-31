@@ -2,6 +2,7 @@
 import { withAlpha } from '@/utils/colors';
 import { Spacing, BorderRadius, Theme, BorderWidth } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
+import { UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 import { rs, rf } from '@/utils/responsive';
 
 // 动态计算更新弹窗内容区域的最大高度
@@ -44,11 +45,21 @@ const getBaseStyles = (theme: Theme) => {
     scrollContent: {
       paddingHorizontal: Spacing.md,
       paddingTop: Spacing.sm,
-      paddingBottom: 150,
+      paddingBottom: Spacing.xl,
     },
     settingsPageHeader: {
+      minHeight: 50,
+      justifyContent: 'center',
+      paddingVertical: Spacing.xs,
       marginBottom: Spacing.sm,
       paddingHorizontal: 0,
+    },
+    settingsPageTitle: {
+      ...UI_REDESIGN_TOKENS.typography.title,
+      fontWeight: '800',
+      color: theme.textPrimary,
+      textAlign: 'center',
+      includeFontPadding: false,
     },
     settingsOverview: {
       gap: Spacing.sm,
@@ -1272,7 +1283,7 @@ const getDynamicStyles = (
     scrollContent: {
       paddingHorizontal: isCompactScreen ? Spacing.sm : Spacing.md,
       paddingTop: isCompactScreen ? Spacing.xs : Spacing.sm,
-      paddingBottom: isCompactScreen ? 120 : 150,
+      paddingBottom: Spacing.xl,
     },
     settingsPageHeader: {
       marginBottom: isCompactScreen ? Spacing.sm : Spacing.md,
@@ -1320,7 +1331,7 @@ interface StylesCache {
   theme: Theme;
   sw: number;
   sh: number;
-  // StyleSheet keys intentionally mix ViewStyle/TextStyle/ImageStyle.
+  // 这里同时包含容器、文字和图片样式。
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   result: Record<string, any>;
 }
@@ -1348,7 +1359,7 @@ export const createStyles = (
   const base = getBaseStyles(theme);
   const dynamic = getDynamicStyles(theme, screenWidth, screenHeight, insets);
 
-  // Preserve the exact runtime merge used by React Native StyleSheet.
+  // 保持和 React Native StyleSheet 运行时相同的合并结果。
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const merged = { ...base } as Record<string, any>;
   for (const key of Object.keys(dynamic)) {

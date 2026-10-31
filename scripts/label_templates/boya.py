@@ -6,6 +6,9 @@ from .common import (
     build_native_text_bitmap,
     get_native_centered_text_x,
     get_native_image_mask,
+    get_native_qr_payload,
+    build_reprint_qr_image,
+    assert_native_text_width,
     normalize_tspl_value,
 )
 
@@ -19,14 +22,15 @@ _BOYA_LOGO_POSITION = (28, 8)
 _BOYA_ROHS_ELLIPSE = (694, 92, 770, 168)
 
 
-def build_native_boya_label(record, _template=None, copies=NATIVE_LABEL_COPIES):
+def build_native_boya_label(record, _template=None, copies=NATIVE_LABEL_COPIES, source_qr=None):
     """生成珠海博雅的 100x50mm 拆包标签。"""
-    model = normalize_tspl_value(record.get('model'), 22)
-    quantity = normalize_tspl_value(record.get('quantity'), 12)
-    batch = normalize_tspl_value(record.get('batch'), 18)
-    production_date = normalize_tspl_value(record.get('production_date'), 10)
-    package = normalize_tspl_value(record.get('package'), 18)
-    source_no = normalize_tspl_value(record.get('source_no'), 18)
+    strict = source_qr is not None
+    model = normalize_tspl_value(record.get('model'), 22, strict=strict, field_name='型号')
+    quantity = normalize_tspl_value(record.get('quantity'), 12, strict=strict, field_name='数量')
+    batch = normalize_tspl_value(record.get('batch'), 18, strict=strict, field_name='批次')
+    production_date = normalize_tspl_value(record.get('production_date'), 10, strict=strict, field_name='生产日期')
+    package = normalize_tspl_value(record.get('package'), 18, strict=strict, field_name='封装')
+    source_no = normalize_tspl_value(record.get('source_no'), 18, strict=strict, field_name='箱号')
     scan_payload = '/'.join(field.replace('/', '-') for field in (
         model,
         package,
@@ -35,8 +39,20 @@ def build_native_boya_label(record, _template=None, copies=NATIVE_LABEL_COPIES):
         production_date,
         source_no,
     ))
+    scan_payload = get_native_qr_payload(scan_payload, source_qr, max_bytes=192)
+    reprint_qr = None
+    if strict:
+        reprint_qr = build_reprint_qr_image(
+            scan_payload, 198, (554, 154, 800, 400),
+            NATIVE_LABEL_BOYA_QR_X, NATIVE_LABEL_BOYA_QR_Y,
+        )
+        right_edge = reprint_qr.x - 4
+        for field_name, value in (('型号', model), ('数量', quantity), ('批次', batch), ('生产日期', production_date), ('封装', package), ('箱号', source_no)):
+            assert_native_text_width(value, right_edge - 210, field_name=field_name)
 
     header = 'BOYA MICROELECTRONICS'
+    if strict:
+        assert_native_text_width(header, 800, size_pixels=NATIVE_LABEL_BOYA_HEADER_FONT_SIZE_PIXELS, field_name='标题')
     text_items = [
         (
             get_native_centered_text_x(
@@ -61,7 +77,7 @@ def build_native_boya_label(record, _template=None, copies=NATIVE_LABEL_COPIES):
         (28, 330, 'Track ID:', False),
         (210, 330, source_no, False),
         (28, 365, 'MSL3', True),
-        (701, 122, 'RoHS', True),
+        (701, 102 if strict else 122, 'RoHS', True),
     ]
     setup_commands = '\r\n'.join([
         'SIZE 100 mm,50 mm',
@@ -71,12 +87,15 @@ def build_native_boya_label(record, _template=None, copies=NATIVE_LABEL_COPIES):
         '',
     ]).encode('ascii')
     print_commands = '\r\n'.join([
-        f'QRCODE {NATIVE_LABEL_BOYA_QR_X},{NATIVE_LABEL_BOYA_QR_Y},L,{NATIVE_LABEL_BOYA_QR_CELL_DOTS},A,0,{NATIVE_LABEL_QR_MODEL},{NATIVE_LABEL_QR_MASK},"{scan_payload}"',
+        *([] if strict else [f'QRCODE {NATIVE_LABEL_BOYA_QR_X},{NATIVE_LABEL_BOYA_QR_Y},L,{NATIVE_LABEL_BOYA_QR_CELL_DOTS},A,0,{NATIVE_LABEL_QR_MODEL},{NATIVE_LABEL_QR_MASK},"{scan_payload}"']),
         f'PRINT 1,{copies}',
         '',
     ]).encode('ascii')
-    image_items = ((get_native_image_mask('boya-logo.png', 70), _BOYA_LOGO_POSITION),)
-    ellipse_items = ((_BOYA_ROHS_ELLIPSE, 3),)
+    image_items = [(get_native_image_mask('boya-logo.png', 70), _BOYA_LOGO_POSITION)]
+    if reprint_qr is not None:
+        image_items.append((reprint_qr.image, (reprint_qr.x, reprint_qr.y)))
+    ellipse_bounds = (694, 72, 770, 148) if strict else _BOYA_ROHS_ELLIPSE
+    ellipse_items = ((ellipse_bounds, 3),)
     return (
         setup_commands
         + build_native_text_bitmap(text_items, image_items, ellipse_items)

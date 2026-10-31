@@ -35,7 +35,19 @@ export interface ErrorDetail {
  * @param router 路由实例（可选，用于设置 onPress）
  * @returns 错误详情
  */
-export function getErrorDetail(code: string, context?: any, router?: any): ErrorDetail {
+type ErrorContext = {
+  code?: string;
+  model?: string;
+  batch?: string;
+  traceNo?: string;
+  warehouseId?: string;
+  error?: unknown;
+};
+type ErrorActionRouter = {
+  push: (pathname: string, params?: Record<string, unknown>) => void;
+};
+
+export function getErrorDetail(code: string, context?: ErrorContext, router?: ErrorActionRouter): ErrorDetail {
   let detail: ErrorDetail;
 
   switch (code) {

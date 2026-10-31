@@ -15,6 +15,7 @@ import { useCustomAlert } from '@/components/CustomAlert';
 import { ModuleColors } from '@/constants/theme';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
+import { usePendingPurchaseReceivePrefetch } from '@/hooks/usePendingPurchaseReceivePrefetch';
 import {
   addWarehouse,
   getAllWarehouses,
@@ -46,14 +47,6 @@ interface OperationItem {
   title: string;
 }
 
-interface BottomNavItem {
-  active?: boolean;
-  icon: FeatherIconName;
-  id: string;
-  label: string;
-  route?: string;
-}
-
 const EMPTY_WORKSPACE: HomeWorkspaceSnapshot = {
   activeWork: [],
   pendingReceipts: [],
@@ -71,48 +64,6 @@ const getWorkByKind = (
   activeWork: readonly HomeActiveWork[],
   kind: HomeActiveWork['kind']
 ) => activeWork.find((work) => work.kind === kind);
-
-interface BottomNavigationProps {
-  activeColor: string;
-  items: BottomNavItem[];
-  mutedColor: string;
-  onNavigate: (route?: string) => void;
-  styles: ReturnType<typeof createStyles>;
-}
-
-function BottomNavigation({
-  activeColor,
-  items,
-  mutedColor,
-  onNavigate,
-  styles,
-}: BottomNavigationProps) {
-  return (
-    <View style={styles.bottomNav}>
-      {items.map((item) => (
-        <TouchableOpacity
-          key={item.id}
-          style={styles.bottomNavItem}
-          activeOpacity={0.78}
-          disabled={item.active}
-          onPress={() => onNavigate(item.route)}
-          accessibilityRole="button"
-          accessibilityLabel={item.label}
-        >
-          <View style={[styles.bottomNavIndicator, item.active && styles.bottomNavIndicatorActive]} />
-          <Feather
-            name={item.icon}
-            size={19}
-            color={item.active ? activeColor : mutedColor}
-          />
-          <Text style={[styles.bottomNavLabel, item.active && styles.bottomNavLabelActive]}>
-            {item.label}
-          </Text>
-        </TouchableOpacity>
-      ))}
-    </View>
-  );
-}
 
 export default function HomeScreen() {
   const { theme, isDark } = useTheme();
@@ -143,15 +94,19 @@ export default function HomeScreen() {
     [router]
   );
 
-  const loadHomeData = useCallback(async () => {
+  const loadHomeData = useCallback(async (isCurrent: () => boolean = () => true) => {
     await initDatabase();
     const [nextWorkspace, latestDocuments] = await Promise.all([
       loadHomeWorkspaceSnapshot(),
       getRecentDocumentSummaries(3),
     ]);
-    setWorkspace(nextWorkspace);
-    setRecentDocuments(latestDocuments);
+    if (isCurrent()) {
+      setWorkspace(nextWorkspace);
+      setRecentDocuments(latestDocuments);
+    }
   }, []);
+
+  usePendingPurchaseReceivePrefetch(loadHomeData);
 
   useFocusEffect(
     useCallback(() => {
@@ -172,7 +127,7 @@ export default function HomeScreen() {
               })
             );
           }
-          await loadHomeData();
+          await loadHomeData(() => !cancelled);
         } catch (error) {
           logger.error('[首页] 加载工作台失败:', error);
         }
@@ -262,19 +217,9 @@ export default function HomeScreen() {
     [navigateToRoute]
   );
 
-  const bottomNavItems: BottomNavItem[] = [
-    { active: true, icon: 'home', id: 'workbench', label: '工作台' },
-    {
-      icon: 'file-text',
-      id: 'documents',
-      label: '单据',
-      route: '/document-management',
-    },
-    { icon: 'settings', id: 'settings', label: '设置', route: '/settings' },
-  ];
-
   return (
-    <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
+    <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}
+      safeAreaEdges={['top', 'left', 'right']} disableAutoScroll>
       <View style={styles.container}>
         <ScrollView
           style={styles.scroll}
@@ -436,13 +381,6 @@ export default function HomeScreen() {
           </View>
         </ScrollView>
 
-        <BottomNavigation
-          activeColor={theme.primary}
-          items={bottomNavItems}
-          mutedColor={theme.textMuted}
-          styles={styles}
-          onNavigate={(route) => navigateToRoute(route)}
-        />
       </View>
 
       <WarehouseGuide

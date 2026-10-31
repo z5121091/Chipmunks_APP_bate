@@ -1,9 +1,11 @@
 const { getDefaultConfig } = require('expo/metro-config');
+const { withUniwindConfig } = require('uniwind/metro');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const connect = require('connect');
 const path = require('node:path');
 
 const config = getDefaultConfig(__dirname);
+config.resolver.assetExts = [...new Set([...config.resolver.assetExts, 'wasm'])];
 
 // Windows native bundling uses paths relative to client; keep hoisted dependencies visible.
 if (process.env.EXPO_NO_METRO_WORKSPACE_ROOT === '1') {
@@ -132,4 +134,7 @@ config.server = {
   },
 };
 
-module.exports = config;
+module.exports = withUniwindConfig(config, {
+  cssEntryFile: './global.css',
+  dtsFile: './uniwind-types.d.ts',
+});

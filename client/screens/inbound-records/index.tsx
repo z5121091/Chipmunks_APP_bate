@@ -18,6 +18,8 @@ import { Screen } from '@/components/Screen';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
+import { useHardwareBack } from '@/hooks/useHardwareBack';
+import { feedbackDeleted } from '@/utils/feedback';
 import {
   deleteInboundDocument,
   deleteInboundRecord,
@@ -90,6 +92,10 @@ export default function InboundRecordsScreen() {
 
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [selectedWarehouseId, setSelectedWarehouseId] = useState<string | null>(null);
+  const selectedWarehouseRef = useRef(selectedWarehouseId);
+  const pageActiveRef = useRef(false);
+  const pageSessionRef = useRef(0);
+  const documentRequestRef = useRef(0);
   const [documents, setDocuments] = useState<InboundDocumentSummary[]>([]);
   const [detailsByKey, setDetailsByKey] = useState<DetailMap>({});
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
@@ -101,6 +107,12 @@ export default function InboundRecordsScreen() {
   const [syncingKeys, setSyncingKeys] = useState<Set<string>>(new Set());
   const [notice, setNotice] = useState<{ text: string; type: NoticeType } | null>(null);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useHardwareBack(useCallback(() => {
+    if (!showWarehousePicker) return false;
+    setShowWarehousePicker(false);
+    return true;
+  }, [showWarehousePicker]));
 
   const showNotice = useCallback((text: string, type: NoticeType = 'success') => {
     if (noticeTimerRef.current) {
@@ -132,57 +144,63 @@ export default function InboundRecordsScreen() {
     return { documentCount };
   }, [documents]);
 
-  const loadDocuments = useCallback(async (warehouseId: string | null, asRefresh = false) => {
-    if (asRefresh) {
-      setRefreshing(true);
-    } else {
-      setLoading(true);
+  const capturePageOwner = useCallback((warehouseId: string | null) => {
+    const sessionId = pageSessionRef.current;
+    return () => pageActiveRef.current && pageSessionRef.current === sessionId &&
+      selectedWarehouseRef.current === warehouseId;
+  }, []);
+
+  const loadDocuments = useCallback(async (warehouseId: string | null, asRefresh = false, silent = false) => {
+    const ownsPage = capturePageOwner(warehouseId);
+    if (!ownsPage()) return null;
+    const requestId = ++documentRequestRef.current;
+    const isCurrent = () => ownsPage() && documentRequestRef.current === requestId;
+    if (!silent) {
+      setRefreshing(asRefresh);
+      setLoading(!asRefresh);
     }
 
     try {
       const rows = await getInboundDocumentSummaries(warehouseId || undefined);
+      if (!isCurrent()) return null;
       setDocuments(rows);
-    } catch (error) {
-      showNotice('入库记录加载失败', 'error');
+      return { rows, isCurrent };
+    } catch {
+      if (isCurrent()) showNotice('入库记录加载失败', 'error');
+      return null;
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (isCurrent()) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  }, [showNotice]);
+  }, [capturePageOwner, showNotice]);
 
   const loadWarehouses = useCallback(async () => {
-    const rows = await getAllWarehouses();
-    setWarehouses(rows);
-  }, []);
+    const ownsPage = capturePageOwner(selectedWarehouseRef.current);
+    try {
+      const rows = await getAllWarehouses();
+      if (ownsPage()) setWarehouses(rows);
+    } catch {
+      if (ownsPage()) showNotice('仓库加载失败', 'error');
+    }
+  }, [capturePageOwner, showNotice]);
 
   useFocusEffect(
     useCallback(() => {
-      let cancelled = false;
-
-      const run = async () => {
-        setLoading(true);
-        const [warehouseRows, documentRows] = await Promise.all([
-          getAllWarehouses(),
-          getInboundDocumentSummaries(selectedWarehouseId || undefined),
-        ]);
-
-        if (cancelled) return;
-        setWarehouses(warehouseRows);
-        setDocuments(documentRows);
-        setLoading(false);
-      };
-
-      run().catch(() => {
-        if (!cancelled) {
-          setLoading(false);
-          showNotice('入库记录加载失败', 'error');
-        }
-      });
+      pageActiveRef.current = true;
+      const sessionId = ++pageSessionRef.current;
+      setLoadingKeys(new Set());
+      setSyncingKeys(new Set());
+      void Promise.all([loadWarehouses(), loadDocuments(selectedWarehouseId)]);
 
       return () => {
-        cancelled = true;
+        if (pageSessionRef.current !== sessionId) return;
+        pageActiveRef.current = false;
+        pageSessionRef.current += 1;
+        documentRequestRef.current += 1;
       };
-    }, [selectedWarehouseId, showNotice])
+    }, [loadDocuments, loadWarehouses, selectedWarehouseId])
   );
 
   const handleRefresh = useCallback(async () => {
@@ -193,6 +211,11 @@ export default function InboundRecordsScreen() {
   }, [loadDocuments, loadWarehouses, selectedWarehouseId]);
 
   const handleWarehouseSelect = useCallback((warehouseId: string | null) => {
+    if (selectedWarehouseRef.current !== warehouseId) {
+      selectedWarehouseRef.current = warehouseId;
+      pageSessionRef.current += 1;
+      documentRequestRef.current += 1;
+    }
     setSelectedWarehouseId(warehouseId);
     setShowWarehousePicker(false);
     setExpandedKeys(new Set());
@@ -201,6 +224,7 @@ export default function InboundRecordsScreen() {
   }, []);
 
   const toggleDocument = useCallback(async (item: InboundDocumentSummary) => {
+    const ownsPage = capturePageOwner(selectedWarehouseRef.current);
     const key = getDocumentKey(item);
     const isExpanded = expandedKeys.has(key);
 
@@ -222,27 +246,29 @@ export default function InboundRecordsScreen() {
     setLoadingKeys((prev) => new Set(prev).add(key));
     try {
       const records = await getInboundRecordsByNo(item.inbound_no, item.warehouse_id);
+      if (!ownsPage()) return;
       setDetailsByKey((prev) => ({ ...prev, [key]: records }));
-    } catch (error) {
-      showNotice('明细加载失败', 'error');
+    } catch {
+      if (ownsPage()) showNotice('明细加载失败', 'error');
     } finally {
-      setLoadingKeys((prev) => {
+      if (ownsPage()) setLoadingKeys((prev) => {
         const next = new Set(prev);
         next.delete(key);
         return next;
       });
     }
-  }, [detailsByKey, expandedKeys, showNotice]);
+  }, [capturePageOwner, detailsByKey, expandedKeys, showNotice]);
 
   const reloadAfterDelete = useCallback(async (
     documentKey?: string,
     document?: InboundDocumentSummary
   ) => {
-    const nextDocuments = await getInboundDocumentSummaries(selectedWarehouseId || undefined);
-    setDocuments(nextDocuments);
+    const result = await loadDocuments(selectedWarehouseId, false, true);
+    if (!result) return false;
+    const { rows: nextDocuments, isCurrent } = result;
 
     if (!documentKey || !document) {
-      return;
+      return true;
     }
 
     const stillExists = nextDocuments.some((item) => getDocumentKey(item) === documentKey);
@@ -266,15 +292,18 @@ export default function InboundRecordsScreen() {
         delete next[documentKey];
         return next;
       });
-      return;
+      return true;
     }
 
     const records = await getInboundRecordsByNo(document.inbound_no, document.warehouse_id);
+    if (!isCurrent()) return false;
     setDetailsByKey((prev) => ({ ...prev, [documentKey]: records }));
-  }, [selectedWarehouseId]);
+    return true;
+  }, [loadDocuments, selectedWarehouseId]);
 
   const handleDeleteDocument = useCallback((item: InboundDocumentSummary) => {
     const key = getDocumentKey(item);
+    const ownsPage = capturePageOwner(selectedWarehouseId);
     alert.showConfirm(
       '删除入库单',
       `将删除 ${item.inbound_no} 的 ${item.record_count} 条明细，并同步刷新入库汇总。`,
@@ -282,22 +311,24 @@ export default function InboundRecordsScreen() {
         void (async () => {
           try {
             await deleteInboundDocument(item.inbound_no, item.warehouse_id);
-            await reloadAfterDelete(key, item);
+            if (!ownsPage() || !await reloadAfterDelete(key, item) || !ownsPage()) return;
             showNotice('入库单已删除', 'success');
-          } catch (error) {
-            showNotice('删除失败', 'error');
+            void feedbackDeleted();
+          } catch {
+            if (ownsPage()) showNotice('删除失败', 'error');
           }
         })();
       },
       true
     );
-  }, [alert, reloadAfterDelete, showNotice]);
+  }, [alert, capturePageOwner, reloadAfterDelete, selectedWarehouseId, showNotice]);
 
   const handleDeleteRecord = useCallback((
     record: InboundRecord,
     document: InboundDocumentSummary
   ) => {
     const key = getDocumentKey(document);
+    const ownsPage = capturePageOwner(selectedWarehouseId);
     alert.showConfirm(
       '删除入库明细',
       `将删除 ${record.scan_model}${formatVersion(record.version)}，数量 ${formatQuantity(record.quantity)}。`,
@@ -314,21 +345,21 @@ export default function InboundRecordsScreen() {
             } catch {
               // 明细已删除时，同步状态刷新失败不应反向提示删除失败。
             }
-            await reloadAfterDelete(key, document);
+            if (!ownsPage() || !await reloadAfterDelete(key, document) || !ownsPage()) return;
             showNotice('明细已删除', 'success');
-          } catch (error) {
-            showNotice('删除失败', 'error');
+            void feedbackDeleted();
+          } catch {
+            if (ownsPage()) showNotice('删除失败', 'error');
           }
         })();
       },
       true
     );
-  }, [alert, reloadAfterDelete, showNotice]);
+  }, [alert, capturePageOwner, reloadAfterDelete, selectedWarehouseId, showNotice]);
 
   const refreshDocumentSummaries = useCallback(async () => {
-    const nextDocuments = await getInboundDocumentSummaries(selectedWarehouseId || undefined);
-    setDocuments(nextDocuments);
-  }, [selectedWarehouseId]);
+    return loadDocuments(selectedWarehouseId, false, true);
+  }, [loadDocuments, selectedWarehouseId]);
 
   const getSyncStatusMeta = useCallback((status: DocumentSyncStatus) => {
     if (status === 'success') {
@@ -345,12 +376,14 @@ export default function InboundRecordsScreen() {
   const handleResyncDocument = useCallback((item: InboundDocumentSummary) => {
     const key = getDocumentKey(item);
     if (syncingKeys.has(key)) return;
+    const ownsPage = capturePageOwner(selectedWarehouseId);
 
     void (async () => {
       setSyncingKeys((prev) => new Set(prev).add(key));
 
       try {
         const syncConfig = await getStoredSyncConfig();
+        if (!ownsPage()) return;
         if (!syncConfig?.ip) {
           showNotice('请先在设置中配置电脑同步', 'warning');
           return;
@@ -386,13 +419,15 @@ export default function InboundRecordsScreen() {
           // 同步结果已经产生，状态写入失败只影响列表标识，不影响文件同步结果。
         }
 
+        if (!ownsPage()) return;
         if (result.success) {
           showNotice('入库单已重新同步', 'success');
         } else {
           showNotice(`同步失败：${formatSyncErrorMessage(result.message)}`, 'warning');
         }
 
-        await refreshDocumentSummaries();
+        const refreshed = await refreshDocumentSummaries();
+        if (!ownsPage() || !refreshed?.isCurrent()) return;
         if (!detailsByKey[key]) {
           setDetailsByKey((prev) => ({ ...prev, [key]: records }));
         }
@@ -404,17 +439,19 @@ export default function InboundRecordsScreen() {
           undefined,
           error instanceof Error ? error.message : String(error)
         );
-        showNotice('重新同步失败，请检查同步助手', 'error');
-        await refreshDocumentSummaries();
+        if (ownsPage()) {
+          showNotice('重新同步失败，请检查同步助手', 'error');
+          await refreshDocumentSummaries();
+        }
       } finally {
-        setSyncingKeys((prev) => {
+        if (ownsPage()) setSyncingKeys((prev) => {
           const next = new Set(prev);
           next.delete(key);
           return next;
         });
       }
     })();
-  }, [detailsByKey, refreshDocumentSummaries, showNotice, syncingKeys]);
+  }, [capturePageOwner, detailsByKey, refreshDocumentSummaries, selectedWarehouseId, showNotice, syncingKeys]);
 
   const getDetailGroups = useCallback((records: InboundRecord[]): InboundDetailGroup[] => {
     const groupMap = new Map<string, InboundDetailGroup>();
@@ -624,6 +661,9 @@ export default function InboundRecordsScreen() {
                   </Text>
                 </TouchableOpacity>
               </View>
+              <Text style={[styles.documentMeta, { color: item.completion_status === 'partial' ? theme.primary : theme.success }]}>
+                {item.completion_status === 'partial' ? '部分入库 · 可继续扫码' : '已入库完成'}
+              </Text>
               <Text style={styles.documentMeta} numberOfLines={1}>
                 {item.in_date} · {item.warehouse_name}
               </Text>
@@ -675,6 +715,7 @@ export default function InboundRecordsScreen() {
     renderDetailGroup,
     styles,
     theme.primary,
+    theme.success,
     theme.textSecondary,
     toggleDocument,
     syncingKeys,
@@ -698,7 +739,7 @@ export default function InboundRecordsScreen() {
           </TouchableOpacity>
           <View style={styles.headerTextBlock}>
             <Text style={styles.title}>入库记录</Text>
-            <Text style={styles.subtitle}>按入库单查看，长按可删除误保存数据</Text>
+            <Text style={styles.subtitle}>按入库单查看明细，长按可删除本机记录</Text>
           </View>
         </View>
 

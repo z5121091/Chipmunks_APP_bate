@@ -36,8 +36,8 @@
  * const { id, uri } = useSafeSearchParams<{ id: number; uri: string }>();
  * ```
  */
-import { useMemo } from 'react';
-import { useRouter as useExpoRouter, useLocalSearchParams as useExpoParams } from 'expo-router';
+import { useCallback, useMemo, useRef } from 'react';
+import { useFocusEffect, useRouter as useExpoRouter, useLocalSearchParams as useExpoParams } from 'expo-router';
 import { Base64 } from 'js-base64';
 import { logger } from '@/utils/logger';
 
@@ -117,25 +117,42 @@ const deserializeParams = <T = Record<string, unknown>>(
 export function useSafeRouter() {
   const router = useExpoRouter();
   const rawParams = useExpoParams<Record<string, string | string[]>>();
+  const transitionPendingRef = useRef(false);
+  useFocusEffect(useCallback(() => {
+    // Returning to this screen starts a new interaction; rerenders must not unlock a transition.
+    transitionPendingRef.current = false;
+  }, []));
+
+  const startTransition = (action: () => void) => {
+    if (transitionPendingRef.current) return;
+    transitionPendingRef.current = true;
+    try {
+      action();
+    } catch (error) {
+      transitionPendingRef.current = false;
+      throw error;
+    }
+  };
 
   const push = (pathname: string, params: Record<string, unknown> = {}) => {
     const encodedPayload = serializeParams(params);
-    router.push({
+    startTransition(() => router.push({
       pathname: pathname as `/${string}`,
       params: { [PAYLOAD_KEY]: encodedPayload },
-    });
+    }));
   };
 
   const replace = (pathname: string, params: Record<string, unknown> = {}) => {
     const encodedPayload = serializeParams(params);
-    router.replace({
+    startTransition(() => router.replace({
       pathname: pathname as `/${string}`,
       params: { [PAYLOAD_KEY]: encodedPayload },
-    });
+    }));
   };
 
   const navigate = (pathname: string, params: Record<string, unknown> = {}) => {
     const encodedPayload = serializeParams(params);
+    // NAVIGATE can intentionally stay on the current route; it must not lock later pushes.
     router.navigate({
       pathname: pathname as `/${string}`,
       params: { [PAYLOAD_KEY]: encodedPayload },

@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React from 'react';
 import {
   Platform,
   StyleSheet,
@@ -13,7 +13,6 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets, Edge } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
-// 引入 KeyboardAware 系列组件
 import {
   KeyboardAwareScrollView,
   KeyboardAwareFlatList,
@@ -23,89 +22,23 @@ import {
 const SCREEN_KEYBOARD_EXTRA_HEIGHT = Platform.OS === 'android' ? 64 : 54;
 const SCREEN_KEYBOARD_EXTRA_SCROLL_HEIGHT = Platform.OS === 'android' ? 8 : 6;
 
-/**
- * 判断颜色是否为深色（用于自动适配状态栏背景）
- */
-const isColorDark = (color: string): boolean => {
-  if (!color || color === 'transparent') return false;
-  
-  // 处理 rgba 格式
-  const rgbaMatch = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-  if (rgbaMatch) {
-    const r = parseInt(rgbaMatch[1], 10);
-    const g = parseInt(rgbaMatch[2], 10);
-    const b = parseInt(rgbaMatch[3], 10);
-    // 使用亮度公式：L = 0.299*R + 0.587*G + 0.114*B
-    const brightness = (r * 299 + g * 587 + b * 114) / 1000;
-    return brightness < 128;
-  }
-  
-  // 处理十六进制格式
-  const hexMatch = color.match(/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
-  if (hexMatch) {
-    const r = parseInt(hexMatch[1], 16);
-    const g = parseInt(hexMatch[2], 16);
-    const b = parseInt(hexMatch[3], 16);
-    const brightness = (r * 299 + g * 587 + b * 114) / 1000;
-    return brightness < 128;
-  }
-  
-  return false;
-};
-
-/**
- * # Screen 组件使用指南
- *
- * 核心原则：统一使用手动安全区管理 (padding)，支持沉浸式布局，解决 iOS/Android 状态栏一致性问题。
- *
- * ## 1. 普通页面 (默认)
- * - 场景：标准的白底或纯色背景页面，Header 在安全区下方。
- * - 用法：`<Screen>{children}</Screen>`
- * - 行为：自动处理上下左右安全区，状态栏文字黑色。
- *
- * ## 2. 沉浸式 Header (推荐)
- * - 场景：Header 背景色/图片需要延伸到状态栏 (如首页、个人中心)。
- * - 用法：`<Screen safeAreaEdges={['left', 'right', 'bottom']}>` (去掉 'top')
- * - 配合：页面内部 Header 组件必须手动添加 paddingTop:
- *   ```tsx
- *   const insets = useSafeAreaInsets();
- *   <View style={{ paddingTop: insets.top + 12, backgroundColor: '...' }}>
- *   ```
- *
- * ## 3. 底部有 TabBar 或 悬浮按钮
- * - 场景：页面底部有固定导航栏，或者需要精细控制底部留白。
- * - 用法：`<Screen safeAreaEdges={['top', 'left', 'right']}>` (去掉 'bottom')
- * - 配合：
- *   - 若是滚动页：`<ScrollView contentContainerStyle={{ paddingBottom: insets.bottom + 80 }}>`
- *   - 若是固定页：`<View style={{ paddingBottom: insets.bottom + 60 }}>`
- *
- * ## 4. 滚动列表/表单
- * - 场景：长内容，需要键盘避让。
- * - 用法：`<Screen>{children}</Screen>`
- * - 行为：若子树不包含 ScrollView/FlatList/SectionList，则外层自动使用 ScrollView，
- *        自动处理键盘遮挡，底部安全区会自动加在内容末尾。
- */
+/** 页面通用容器，统一处理安全区、滚动区域和键盘遮挡。 */
 interface ScreenProps {
   children: React.ReactNode;
-  /** 背景色，默认 #fff */
+  /** 页面背景色，默认 #fff */
   backgroundColor?: string;
   /**
-   * 状态栏样式
-   * - 'dark': 黑色文字 (默认)
-   * - 'light': 白色文字 (深色背景时用)
+   * 状态栏文字样式。
+   * 深色背景使用 light，浅色背景使用 dark。
    */
   statusBarStyle?: 'auto' | 'inverted' | 'light' | 'dark';
   /**
-   * 状态栏背景色
-   * - 默认 'transparent' 以支持沉浸式
-   * - Android 下如果需要不透明，可传入具体颜色
+   * 状态栏背景色，默认透明。
    */
   statusBarColor?: string;
   /**
-   * 安全区控制 (关键属性)
-   * - 默认: ['top', 'left', 'right', 'bottom'] (全避让)
-   * - 沉浸式 Header: 去掉 'top'
-   * - 自定义底部: 去掉 'bottom'
+   * 需要避让的安全区方向。
+   * 沉浸式页头可去掉 top，自行处理底部留白时可去掉 bottom。
    */
   safeAreaEdges?: Edge[];
   /** 自定义容器样式 */
@@ -136,26 +69,24 @@ const KeyboardAwareScrollable = ({
   extraPadding,
   contentInsetBehaviorIOS,
 }: KeyboardAwareProps) => {
-  // 获取原始组件的 props
   const childAttrs = element.props || {};
   const originStyle = childAttrs.contentContainerStyle as ViewStyle | ViewStyle[] | undefined;
   const merged = StyleSheet.flatten(originStyle) || {};
   const currentPB = typeof merged.paddingBottom === 'number' ? merged.paddingBottom : 0;
 
-  // 合并 paddingBottom (安全区 + 额外留白)
+  // 在页面原有底部留白上加上安全区和键盘避让距离。
   const enhancedContentStyle = [{ ...merged, paddingBottom: currentPB + extraPadding }];
 
-  // 基础配置 props，用于传递给 KeyboardAware 组件
   const commonProps = {
     ...childAttrs,
     contentContainerStyle: enhancedContentStyle,
     keyboardShouldPersistTaps: childAttrs.keyboardShouldPersistTaps ?? 'handled',
     keyboardDismissMode: childAttrs.keyboardDismissMode ?? 'on-drag',
     enableOnAndroid: true,
-    // 类似于原代码中的 setTimeout/scrollToEnd 逻辑，这里设置额外的滚动高度确保输入框可见
+    // 给输入框留出额外滚动距离，键盘弹出后仍能看到当前输入项。
     extraHeight: SCREEN_KEYBOARD_EXTRA_HEIGHT,
     extraScrollHeight: SCREEN_KEYBOARD_EXTRA_SCROLL_HEIGHT,
-    // 禁用自带的 ScrollView 自动 inset，由外部 padding 控制
+    // 关闭系统自动留白，统一使用页面计算的 padding。
     enableAutomaticScroll: true,
     ...(Platform.OS === 'ios'
       ? { contentInsetAdjustmentBehavior: childAttrs.contentInsetAdjustmentBehavior ?? contentInsetBehaviorIOS }
@@ -164,8 +95,8 @@ const KeyboardAwareScrollable = ({
 
   const t = element.type;
 
-  // 根据组件类型返回对应的 KeyboardAware 版本
-  // 注意：不再使用 KeyboardAvoidingView，直接替换为增强版 ScrollView
+  // 保留原滚动组件类型，并补上键盘避让能力。
+  // 直接使用可感知键盘的滚动容器，避免再套一层视图改变页面高度。
   if (t === ScrollView) {
     return <KeyboardAwareScrollView {...(commonProps as React.ComponentProps<typeof KeyboardAwareScrollView>)} />;
   }
@@ -198,13 +129,13 @@ export const Screen = ({
   const insets = useSafeAreaInsets();
   const keyboardShown = false;
 
-  // 自动检测：若子树中包含 ScrollView/FlatList/SectionList，则认为页面自身处理滚动
+  // 页面里已有滚动列表时，不再套第二层滚动容器。
   const isNodeScrollable = (node: React.ReactNode): boolean => {
     const isScrollableElement = (el: unknown): boolean => {
       if (!React.isValidElement(el)) return false;
       const element = el as ScreenElement;
       const t = element.type;
-      // 不递归检查 Modal 内容，避免将弹窗内的 ScrollView 误判为页面已具备垂直滚动
+      // 弹窗内的滚动区域不属于页面主体。
       if (t === Modal) return false;
       const props = element.props as Record<string, unknown> | undefined;
       // 仅识别“垂直”滚动容器；横向滚动不视为页面已处理垂直滚动
@@ -224,8 +155,7 @@ export const Screen = ({
   const childIsNativeScrollable = isNodeScrollable(children);
 
   // 说明：避免双重补白
-  // KeyboardAwareScrollView 内部会自动处理键盘高度。
-  // 我们主要关注非键盘状态下的 Safe Area 管理。
+  // 键盘高度由滚动容器处理，这里只计算页面安全区。
 
   // 解析安全区设置
   const hasTop = safeAreaEdges.includes('top');
@@ -233,7 +163,7 @@ export const Screen = ({
   const hasLeft = safeAreaEdges.includes('left');
   const hasRight = safeAreaEdges.includes('right');
 
-  // 强制禁用 iOS 自动调整内容区域，完全由手动 padding 控制，消除系统自动计算带来的多余空白
+  // iOS 也使用同一套手动留白，避免系统再次增加空白。
   const contentInsetBehaviorIOS = 'never';
 
   const wrapperStyle: ViewStyle = {
@@ -242,23 +172,23 @@ export const Screen = ({
     paddingTop: hasTop ? insets.top : 0,
     paddingLeft: hasLeft ? insets.left : 0,
     paddingRight: hasRight ? insets.right : 0,
-    // 当页面不使用外层 ScrollView 时（子树本身可滚动），由外层 View 负责底部安全区
+    // 页面自己滚动时，由外层容器补底部安全区。
     paddingBottom: (childIsNativeScrollable && hasBottom)
       ? (keyboardShown ? 0 : insets.bottom)
       : 0,
   };
 
-  // 若子树不可滚动，则外层使用 KeyboardAwareScrollView 提供“全局页面滑动”能力
+  // 普通页面内容过长时允许整页滚动。
   const useScrollContainer = !disableAutoScroll && !childIsNativeScrollable;
 
-  // 2. 滚动容器配置
-  // 如果使用滚动容器，则使用 KeyboardAwareScrollView 替代原有的 ScrollView
+  // 页面本身能滚动时，只补齐安全区和键盘避让。
+  // 需要整页滚动时使用带键盘避让的滚动容器。
   const Container = useScrollContainer ? KeyboardAwareScrollView : View;
 
   const containerProps = useScrollContainer ? {
     contentContainerStyle: {
       flexGrow: 1,
-      // 滚动模式下，Bottom 安全区由内容容器处理，保证内容能完整显示且不被 Home Indicator 遮挡，同时背景色能延伸到底部
+      // 滚动内容自行补底部安全区，避免被系统手势区域挡住。
       paddingBottom: hasBottom ? (keyboardShown ? 0 : insets.bottom) : 0,
     },
     keyboardShouldPersistTaps: 'handled' as const,
@@ -273,7 +203,7 @@ export const Screen = ({
       : {}),
   } : {};
 
-  // 3. 若子元素自身包含滚动容器，给该滚动容器单独添加键盘避让，不影响其余固定元素（如底部栏）
+  // 只增强页面里的滚动区域，底部固定栏保持原位。
   const wrapScrollableWithKeyboardAvoid = (nodes: React.ReactNode): React.ReactNode => {
     const isVerticalScrollable = (el: ScreenElement): boolean => {
       const t = el.type;
@@ -315,26 +245,21 @@ export const Screen = ({
       ? wrapScrollableWithKeyboardAvoid(children)
       : children;
 
-  // 根据背景色自动判断状态栏背景色
-  // 深色背景使用半透明黑色背景，浅色背景使用半透明白色背景
-  const isDarkBg = useMemo(() => isColorDark(backgroundColor), [backgroundColor]);
-  const statusBarBgColor = statusBarColor === 'transparent' 
-    ? (isDarkBg ? 'rgba(0,0,0,0.95)' : 'rgba(255,255,255,0.95)')
-    : statusBarColor;
-
   return (
-    // 核心原则：严禁使用 SafeAreaView，统一使用 View + padding 手动管理
+    // 用 padding 统一处理安全区，避免和页面自己的内边距重复。
     <View style={wrapperStyle}>
       <StatusBar
         style={statusBarStyle}
-        backgroundColor={statusBarBgColor}
-        translucent={statusBarColor === 'transparent'}
       />
+      {/* 默认透出页面背景；仅显式指定颜色时绘制状态栏底色。 */}
+      {hasTop && insets.top > 0 && statusBarColor !== 'transparent' && (
+        <View testID="screen-status-bar-background" pointerEvents="none" style={{ position: 'absolute', top: 0, left: 0, right: 0, height: insets.top, backgroundColor: statusBarColor }} />
+      )}
 
       {/* 键盘避让：仅当外层使用 ScrollView 时启用，避免固定底部栏随键盘上移 */}
       {useScrollContainer ? (
-         // 替换为 KeyboardAwareScrollView，移除原先的 KeyboardAvoidingView 包裹
-         // 因为 KeyboardAwareScrollView 已经内置了处理逻辑
+         // 表单页由滚动容器处理键盘遮挡。
+         // 键盘避让由滚动容器内部处理。
         <Container style={[styles.innerContainer, style]} {...containerProps}>
           {children}
         </Container>

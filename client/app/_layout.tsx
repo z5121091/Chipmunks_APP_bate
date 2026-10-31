@@ -30,6 +30,7 @@ import {
   AUTO_NAS_BACKUP_CHECK_INTERVAL_MS,
   maybeRunAutoNasBackup,
 } from '@/utils/autoNasBackup';
+import { setSyncConnectionActive } from '@/utils/syncConnection';
 
 SplashScreen.setOptions({ duration: 200, fade: true });
 
@@ -38,29 +39,32 @@ void SplashScreen.preventAutoHideAsync().catch((error) => {
 });
 
 const STACK_ROUTES = [
-  'index',
+  '(tabs)',
   'inbound',
   'purchase-receive',
   'outbound',
   'inventory',
   'stock-query',
-  'document-management',
   'inbound-records',
   'inventory-records',
   'orders',
   'warehouse-management',
   'rules',
+  'rule-diagnostics',
   'custom-fields',
   'rule-prefixes',
   'rule-prefix-edit',
   'outbound-order-rules',
   'inventory-binding',
   'detail',
-  'settings',
   'help',
   'changelog',
   'privacy-policy',
 ] as const;
+
+export const unstable_settings = {
+  initialRouteName: '(tabs)',
+};
 
 const getErrorMessage = (error: unknown): string => {
   return error instanceof Error ? error.message : String(error || '未知错误');
@@ -171,7 +175,7 @@ export default function RootLayout() {
   }, []);
 
   useEffect(() => {
-    // Hide only after the ready page (or database error screen) has committed.
+    // 等首页或数据库错误页显示后再关闭启动画面，避免中间闪白。
     if (!databaseInitializing) {
       void SplashScreen.hideAsync().catch((error) => {
         logger.warn('[App] hide splash failed:', error);
@@ -201,6 +205,7 @@ export default function RootLayout() {
     }
 
     let currentAppState = AppState.currentState;
+    setSyncConnectionActive(currentAppState === 'active' || currentAppState == null);
     let checkpointInFlight = false;
     let resumeCheckInFlight = false;
     let lastCheckpointAt = 0;
@@ -270,6 +275,7 @@ export default function RootLayout() {
       const shouldCheckpoint = appStateChanged && nextAppState !== 'active';
       const shouldResumeCheck = appStateChanged && nextAppState === 'active';
       currentAppState = nextAppState;
+      setSyncConnectionActive(nextAppState === 'active');
 
       if (shouldCheckpoint) {
         void pauseFeedbackForAppInactive();
@@ -290,6 +296,7 @@ export default function RootLayout() {
     return () => {
       clearInterval(autoBackupTimer);
       subscription.remove();
+      setSyncConnectionActive(false);
     };
   }, [databaseReady]);
 

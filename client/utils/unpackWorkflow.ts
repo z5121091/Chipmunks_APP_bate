@@ -85,14 +85,20 @@ export const getUnpackSyncFailureMessage = (error: unknown): string => {
   return formatSyncErrorMessage(message, '请检查网络和同步服务');
 };
 
-export const syncUnpackRecordsToComputer = async (
+export interface UnpackPrintSubmission {
+  status: 'submitted' | 'skipped';
+  printJobId: string;
+  fileName: string;
+  message: string;
+  duplicate: boolean;
+  templateNames: string[];
+}
+
+export const submitUnpackRecordsToComputer = async (
   records: UnpackRecord[],
-  syncConfig?: SyncConfig
-): Promise<string> => {
-  const config = syncConfig || (await loadLabelSyncConfig());
-  const enrichedRecords = await enrichUnpackRecordsWithSuppliers(records);
-  const labelSheet = buildUnpackLabelSheet(enrichedRecords, '标签数据');
-  const nameSuffix = records[0]?.order_no || '拆包标签';
+  syncConfig?: SyncConfig,
+  options: { retryConfirmed?: boolean } = {}
+): Promise<UnpackPrintSubmission> => {
   const printJobIds = [
     ...new Set(
       records
@@ -101,9 +107,17 @@ export const syncUnpackRecordsToComputer = async (
     ),
   ];
   const [printJobId] = printJobIds;
-  if (printJobIds.length !== 1 || !printJobId) {
+  if (
+    printJobIds.length !== 1 ||
+    !printJobId ||
+    records.some((record) => record.pair_id?.trim() !== printJobId)
+  ) {
     throw new Error('拆包标签缺少统一的打印任务标识');
   }
+  const config = syncConfig || (await loadLabelSyncConfig());
+  const enrichedRecords = await enrichUnpackRecordsWithSuppliers(records);
+  const labelSheet = buildUnpackLabelSheet(enrichedRecords, '标签数据');
+  const nameSuffix = records[0]?.order_no || '拆包标签';
   const result = await syncExcelToComputer(
     [labelSheet],
     '/labels',
@@ -116,6 +130,7 @@ export const syncUnpackRecordsToComputer = async (
       queryParams: {
         print_mode: NATIVE_LABEL_PRINT_MODE,
         print_job_id: printJobId,
+        ...(options.retryConfirmed === true ? { retry_confirmed: 'true' } : {}),
       },
       requireNativePrint: true,
       acceptNativePrintPolicySkip: true,
@@ -126,5 +141,35 @@ export const syncUnpackRecordsToComputer = async (
     throw new Error(result.message || '拆包标签自动打印失败');
   }
 
-  return result.fileName || nameSuffix;
+  if (result.nativePrintJobId && result.nativePrintJobId !== printJobId) {
+    throw new Error('同步助手返回的打印任务标识不一致，请先核对标签');
+  }
+  if (result.nativePrintSkipped === true && result.nativePrint === true) {
+    throw new Error('同步助手返回的打印状态冲突，请先核对标签');
+  }
+  if (result.nativePrintSkipped !== true && result.nativePrint !== true) {
+    throw new Error('同步助手未确认打印任务结果，请先核对标签');
+  }
+
+  const status = result.nativePrintSkipped === true ? 'skipped' : 'submitted';
+  return {
+    status,
+    printJobId,
+    fileName: result.fileName || nameSuffix,
+    message:
+      status === 'skipped'
+        ? result.nativePrintSkipReason || '按供应商策略跳过，未自动打印'
+        : result.nativePrintDuplicate === true
+          ? '同步助手已识别为同一任务，请核对已有标签'
+          : '已提交同步助手，实际标签请核对',
+    duplicate: result.nativePrintDuplicate === true,
+    templateNames: result.nativePrintTemplateNames || [],
+  };
 };
+
+/** Existing export callers retain their file-name result. */
+export const syncUnpackRecordsToComputer = async (
+  records: UnpackRecord[],
+  syncConfig?: SyncConfig
+): Promise<string> =>
+  (await submitUnpackRecordsToComputer(records, syncConfig)).fileName;

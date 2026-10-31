@@ -1,4 +1,3 @@
-import { AuthProvider } from '@/contexts/AuthContext';
 import { type ReactNode } from 'react';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { ColorSchemeProvider } from '@/hooks/useColorScheme';
@@ -10,11 +9,9 @@ function Provider({ children }: { children: ReactNode }) {
     <GestureHandlerRootView style={{ flex: 1 }}>
       <ColorSchemeProvider>
         <WebOnlyPrettyScrollbar>
-          <AuthProvider>
-            <HeroUINativeProvider>
-              {children}
-            </HeroUINativeProvider>
-          </AuthProvider>
+          <HeroUINativeProvider>
+            {children}
+          </HeroUINativeProvider>
         </WebOnlyPrettyScrollbar>
       </ColorSchemeProvider>
     </GestureHandlerRootView>

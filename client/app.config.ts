@@ -3,7 +3,7 @@ import versionConfig from './version.json';
 import updateServerConfig from './update-server.json';
 
 const projectId = process.env.COZE_PROJECT_ID || process.env.EXPO_PUBLIC_COZE_PROJECT_ID;
-const slugAppName = projectId ? `app${projectId}` : 'myapp';
+const slugAppName = projectId ? `app${projectId}` : 'palm-warehouse';
 const configuredUpdateServer = (
   process.env.UPDATE_SERVER_URL ||
   process.env.EXPO_PUBLIC_UPDATE_SERVER_URL ||
@@ -41,7 +41,7 @@ const defaultUpdateServer = restoreMatchingUpdateServerCredentials(
   configuredUpdateServer,
   updateServerConfig.defaultServer
 ).replace(/\/+$/, '');
-const selfUpdateEnabled = process.env.EXPO_PUBLIC_ENABLE_SELF_UPDATE !== 'false';
+const selfUpdateEnabled = versionConfig.selfUpdateEnabled && process.env.EXPO_PUBLIC_ENABLE_SELF_UPDATE !== 'false';
 const splashBackgroundColor = '#FFFFFF';
 const splashDarkBackgroundColor = '#121212';
 const splashImage = './assets/images/splash-logo.png';
@@ -57,26 +57,13 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
     "icon": "./assets/images/icon.png",
     "scheme": "chipmunkswarehouse",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
-    "splash": {
-      "image": splashImage,
-      "resizeMode": "contain",
-      "backgroundColor": splashBackgroundColor
-    },
     "ios": {
       "supportsTablet": true,
-      "splash": {
-        "image": splashImage,
-        "resizeMode": "contain",
-        "backgroundColor": splashBackgroundColor,
-        "dark": {
-          "image": splashDarkImage,
-          "backgroundColor": splashDarkBackgroundColor
-        }
-      }
+      "bundleIdentifier": versionConfig.androidPackage
     },
     "android": {
-      "package": "com.chipmunks.traceability",
+      "package": versionConfig.androidPackage,
+      "allowBackup": false,
       "versionCode": versionConfig.versionCode,
       "permissions": [
         "android.permission.INTERNET",
@@ -98,16 +85,7 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
         "android.permission.RECORD_AUDIO",
         "android.permission.SYSTEM_ALERT_WINDOW",
         ...(!selfUpdateEnabled ? ["android.permission.REQUEST_INSTALL_PACKAGES"] : [])
-      ],
-      "splash": {
-        "image": splashImage,
-        "resizeMode": "contain",
-        "backgroundColor": splashBackgroundColor,
-        "dark": {
-          "image": splashDarkImage,
-          "backgroundColor": splashDarkBackgroundColor
-        }
-      }
+      ]
     },
     "web": {
       "bundler": "metro",
@@ -159,7 +137,8 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
           useSQLCipher: false
         }
       ],
-      "./plugins/withAutoDatabaseBackup"
+      "./plugins/withAutoDatabaseBackup",
+      "./plugins/withWarehouseAndroid"
     ],
     "extra": {
       ...(config.extra || {}),

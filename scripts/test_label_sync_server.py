@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 import tempfile
 import unittest
@@ -8,7 +9,16 @@ from openpyxl import Workbook
 
 from scripts import label_sync_server
 from scripts import label_templates
-from scripts.label_templates import apm, boya, unpack_time
+from scripts.label_templates import apm, boya, union, unpack_time
+
+
+class SyncVersionTest(unittest.TestCase):
+    def test_health_reports_v1(self):
+        with patch.object(label_sync_server, 'enable_cors'), patch.object(
+            label_sync_server, 'get_lan_ipv4_addresses', return_value=['192.168.1.10'],
+        ):
+            response = json.loads(label_sync_server.Health().GET())
+        self.assertEqual(response['version'], 'V1.0')
 
 
 class LocalNetworkAddressTest(unittest.TestCase):
@@ -219,6 +229,98 @@ class NativeLabelWithoutTraceTest(unittest.TestCase):
         )
         self.assertIn(b'PRINT 1,2', commands)
 
+    def test_union_supplier_keeps_printed_fields_and_qr_in_sync(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append([
+            '型号', '标签数量', '追溯码', '批次', '生产日期',
+            '箱号', '版本号', '供应商',
+        ])
+        sheet.append([
+            'UMISO7723AHS8', 200, '621TCP0683.06', 'CP0683.06', '2627',
+            'OY', 'ISO7723AHS8', '盈力半导体(上海)有限公司',
+        ])
+        [record] = label_sync_server.get_native_label_records(workbook)
+        template = label_sync_server.get_native_label_template(record)
+        captured = {}
+
+        def capture_bitmap(text_items, image_items=(), **_options):
+            captured['text_items'] = text_items
+            captured['image_items'] = image_items
+            captured['line_items'] = _options.get('line_items', ())
+            return b'BITMAP\r\n'
+
+        with patch.object(union, 'build_native_text_bitmap', side_effect=capture_bitmap), patch.object(
+            union, 'get_native_image_mask', wraps=union.get_native_image_mask,
+        ) as image_mask:
+            commands = label_sync_server.build_native_label(record, template)
+
+        self.assertEqual(template, label_templates.NATIVE_LABEL_TEMPLATE_UNION)
+        displayed = {item[2] for item in captured['text_items']}
+        for value in ('UMISO7723AHS8', '200', '621TCP0683.06', 'CP0683.06', 'OY', 'ISO7723AHS8', '2627'):
+            self.assertIn(value, displayed)
+        self.assertIn((450, 100, 'DATE CODE:', False), captured['text_items'])
+        self.assertIn((600, 100, 'OY', False), captured['text_items'])
+        self.assertIn((450, 164, 'MARK:', False), captured['text_items'])
+        self.assertIn((540, 164, 'ISO7723AHS8', False), captured['text_items'])
+        self.assertEqual(len(captured['image_items']), 4)
+        self.assertEqual(
+            [call.args[0] for call in image_mask.call_args_list],
+            ['union-logo.png', 'pb-logo.png', 'esd-warning.png', 'keep-dry.png'],
+        )
+        self.assertEqual([item[1] for item in captured['image_items'][2:]], [(365, 10), (422, 7)])
+        self.assertEqual(len(captured['line_items']), 2)
+        self.assertNotIn('ESD', displayed)
+        self.assertIn((494, 20, 'RoHS', True), captured['text_items'])
+        self.assertIn((587, 20, 'HF', True), captured['text_items'])
+        self.assertNotIn('QA PASS', displayed)
+        self.assertIn(b'SIZE 100 mm,50 mm', commands)
+        self.assertIn(b'QRCODE 620,235,L,4', commands)
+        self.assertIn(b'BARCODE 20,131,"128",22,0,0,2,2,"UMISO7723AHS8"', commands)
+        self.assertIn(b'BARCODE 450,259,"128",22,0,0,2,2,"2627"', commands)
+        self.assertIn(
+            b'"UMISO7723AHS8;200;621TCP0683.06;CP0683.06;OY;ISO7723AHS8;2627"',
+            commands,
+        )
+        self.assertTrue(commands.endswith(b'PRINT 1,2\r\n'))
+
+        record['source_no'] = 'BOX-2'
+        with patch.object(union, 'build_native_text_bitmap', side_effect=capture_bitmap):
+            updated = label_sync_server.build_native_label(record, template)
+        self.assertIn('BOX-2', {item[2] for item in captured['text_items']})
+        self.assertIn(b';BOX-2;ISO7723AHS8;2627"', updated)
+
+    def test_union_label_rejects_invalid_qr_delimiters(self):
+        record = {
+            'model': 'UMISO7723AHS8', 'quantity': '200', 'trace_no': 'T;1',
+            'batch': 'CP0683.06', 'source_no': 'OY',
+            'version': 'ISO7723AHS8', 'production_date': '2627',
+        }
+        with self.assertRaisesRegex(ValueError, '二维码分隔符'):
+            union.build_native_union_label(record)
+
+    def test_union_label_shrinks_long_qr_to_keep_it_on_paper(self):
+        record = {
+            'model': 'UMISO7723AHS8', 'quantity': '200',
+            'trace_no': '621TCP0683.06EXTRA', 'batch': 'CP0683.06XX',
+            'source_no': 'BOX-123456789', 'version': 'ISO7723AHS8',
+            'production_date': '2627',
+        }
+        with patch.object(union, 'build_native_text_bitmap', return_value=b'BITMAP\r\n'):
+            commands = union.build_native_union_label(record)
+        self.assertIn(b'QRCODE 620,235,L,3', commands)
+
+    def test_union_label_keeps_long_barcode_clear_of_qr(self):
+        record = {
+            'model': 'UMISO7723AHS8', 'quantity': '200',
+            'trace_no': '621TCP0683.06', 'batch': 'CP0683.06',
+            'source_no': 'OY', 'version': 'ISO7723AHS8',
+            'production_date': '26/09/2',
+        }
+        with patch.object(union, 'build_native_text_bitmap', return_value=b'BITMAP\r\n'):
+            commands = union.build_native_union_label(record)
+        self.assertIn(b'BARCODE 450,259,"128",22,0,0,1,1,"26/09/2"', commands)
+
 
 class UnpackTimeLabelTest(unittest.TestCase):
     def setUp(self):
@@ -235,9 +337,180 @@ class UnpackTimeLabelTest(unittest.TestCase):
     def records(self, supplier='珠海极海半导体有限公司'):
         workbook = Workbook()
         workbook.active.append(['型号', '存货编码', '标签数量', '追溯码', '标签类型', '供应商', '拆包时间'])
-        for label_type, quantity in [('发货标签', 200), ('剩余标签', 2300)]:
-            workbook.active.append(['DEMO', 'IC.TEST.00', quantity, '', label_type, supplier, '2026-09-15 14:30'])
+        for sequence, (label_type, quantity) in enumerate([('发货标签', 200), ('剩余标签', 2300)], start=1):
+            trace_no = f'DEMO-{sequence}' if supplier == '南京沁恒微电子股份有限公司' else ''
+            workbook.active.append(['DEMO', 'IC.TEST.00', quantity, trace_no, label_type, supplier, '2026-09-15 14:30'])
         return label_sync_server.get_native_label_records(workbook)
+
+    @patch.object(label_sync_server, 'log')
+    def test_durable_submitting_marker_precedes_windows_and_blocks_after_crash(self, _log):
+        records = self.records()
+
+        def crash(_printer, _commands, _name, submission_callback=None):
+            self.assertEqual(label_sync_server.load_native_print_history()['CRASH']['state'], 'submitting')
+            submission_callback()
+            raise KeyboardInterrupt('simulate process exit after Windows may have accepted data')
+
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer', side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                label_sync_server.submit_native_unpack_labels(records, 'CRASH')
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer', return_value=43) as send:
+            with self.assertRaises(label_sync_server.UnpackPrintOutcomeUnknownError):
+                label_sync_server.submit_native_unpack_labels(records, 'CRASH')
+            send.assert_not_called()
+            result = label_sync_server.submit_native_unpack_labels(records, 'CRASH', retry_confirmed=True)
+            self.assertFalse(result['duplicate'])
+            self.assertTrue(label_sync_server.submit_native_unpack_labels(records, 'CRASH')['duplicate'])
+            send.assert_called_once()
+
+    @patch.object(label_sync_server, 'log')
+    def test_pre_spool_history_failure_never_reaches_printer(self, _log):
+        with patch.object(label_sync_server, 'save_native_print_history', side_effect=PermissionError('read-only')), \
+                patch.object(label_sync_server, 'send_raw_tspl_to_printer') as send:
+            with self.assertRaisesRegex(RuntimeError, '本次未提交打印'):
+                label_sync_server.submit_native_unpack_labels(self.records(), 'PRE-SAVE')
+            send.assert_not_called()
+
+    @patch.object(label_sync_server, 'log')
+    def test_post_spool_history_failure_retains_durable_unknown_marker(self, _log):
+        save = label_sync_server.save_native_print_history
+        save_count = 0
+
+        def fail_second_save(jobs):
+            nonlocal save_count
+            save_count += 1
+            if save_count == 2:
+                raise PermissionError('audit simulated disk failure')
+            save(jobs)
+
+        records = self.records()
+        with patch.object(label_sync_server, 'save_native_print_history', side_effect=fail_second_save), \
+                patch.object(label_sync_server, 'send_raw_tspl_to_printer', return_value=42) as send:
+            with self.assertRaisesRegex(label_sync_server.UnpackPrintOutcomeUnknownError, '提交结果无法保存'):
+                label_sync_server.submit_native_unpack_labels(records, 'POST-SAVE')
+            self.assertEqual(label_sync_server.load_native_print_history()['POST-SAVE']['state'], 'submitting')
+            with self.assertRaises(label_sync_server.UnpackPrintOutcomeUnknownError):
+                label_sync_server.submit_native_unpack_labels(records, 'POST-SAVE')
+            send.assert_called_once()
+            label_sync_server.submit_native_unpack_labels(records, 'POST-SAVE', retry_confirmed=True)
+            self.assertEqual(send.call_count, 2)
+            self.assertTrue(label_sync_server.submit_native_unpack_labels(records, 'POST-SAVE')['duplicate'])
+            self.assertEqual(send.call_count, 2)
+
+    @patch.object(label_sync_server, 'log')
+    def test_partial_spool_failure_requires_confirmation_and_does_not_forget_old_uncertainty(self, _log):
+        records = self.records()
+
+        def partial_failure(_printer, _commands, _name, submission_callback=None):
+            submission_callback()
+            raise RuntimeError('Windows accepted only part of the job')
+
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer', side_effect=partial_failure) as send:
+            with self.assertRaises(label_sync_server.UnpackPrintOutcomeUnknownError):
+                label_sync_server.submit_native_unpack_labels(records, 'PARTIAL')
+            with self.assertRaises(label_sync_server.UnpackPrintOutcomeUnknownError):
+                label_sync_server.submit_native_unpack_labels(records, 'PARTIAL')
+            send.assert_called_once()
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer', side_effect=ValueError('printer now missing')):
+            with self.assertRaises(label_sync_server.UnpackPrintOutcomeUnknownError):
+                label_sync_server.submit_native_unpack_labels(records, 'PARTIAL', retry_confirmed=True)
+        self.assertEqual(label_sync_server.load_native_print_history()['PARTIAL']['state'], 'unknown')
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer', return_value=43) as send:
+            with self.assertRaises(label_sync_server.UnpackPrintOutcomeUnknownError):
+                label_sync_server.submit_native_unpack_labels(records, 'PARTIAL')
+            label_sync_server.submit_native_unpack_labels(records, 'PARTIAL', retry_confirmed=True)
+            label_sync_server.submit_native_unpack_labels(records, 'PARTIAL', retry_confirmed=True)
+            send.assert_called_once()
+
+    @patch.object(label_sync_server, 'log')
+    def test_known_pre_spool_setup_failure_can_retry_without_confirmation(self, _log):
+        records = self.records()
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer', side_effect=[ValueError('printer missing'), 42]) as send:
+            with self.assertRaisesRegex(ValueError, 'printer missing'):
+                label_sync_server.submit_native_unpack_labels(records, 'SETUP')
+            self.assertEqual(label_sync_server.load_native_print_history()['SETUP']['state'], 'failed')
+            self.assertFalse(label_sync_server.submit_native_unpack_labels(records, 'SETUP')['duplicate'])
+            self.assertEqual(send.call_count, 2)
+
+    @patch.object(label_sync_server, 'log')
+    def test_corrupt_existing_history_never_silently_rebuilds_and_reprints(self, _log):
+        for content in ('{broken', '{"jobs": []}', '{"jobs": {"CORRUPT": {"state": "invalid"}}}'):
+            with self.subTest(content=content):
+                with open(label_sync_server.NATIVE_PRINT_HISTORY_FILE, 'w', encoding='utf-8') as output:
+                    output.write(content)
+                with patch.object(label_sync_server, 'send_raw_tspl_to_printer') as send:
+                    with self.assertRaisesRegex(RuntimeError, '打印历史无法读取'):
+                        label_sync_server.submit_native_unpack_labels(self.records(), 'CORRUPT')
+                    send.assert_not_called()
+
+    @patch.object(label_sync_server, 'log')
+    def test_unknown_task_fingerprint_cannot_be_reused_with_changed_label(self, _log):
+        records = self.records()
+
+        def crash(_printer, _commands, _name, submission_callback=None):
+            raise KeyboardInterrupt('simulate exit')
+
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer', side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                label_sync_server.submit_native_unpack_labels(records, 'CHANGED')
+        changed = [dict(record) for record in records]
+        changed[0]['quantity'] = '1'
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer') as send:
+            with self.assertRaisesRegex(ValueError, '标签内容已变化'):
+                label_sync_server.submit_native_unpack_labels(changed, 'CHANGED', retry_confirmed=True)
+            send.assert_not_called()
+
+    @patch.object(label_sync_server, 'log')
+    def test_long_term_ledger_never_evicts_completed_or_uncertain_jobs(self, _log):
+        history = {
+            'unknown-1': {'state': 'unknown', 'submittedAt': '2026-01-01'},
+            'unknown-2': {'state': 'submitting', 'submittedAt': '2026-01-02'},
+        }
+        history.update({f'completed-{index}': {'state': 'submitted', 'labelCount': 2} for index in range(650)})
+        label_sync_server.save_native_print_history(history)
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer', return_value=42) as send:
+            self.assertTrue(label_sync_server.submit_native_unpack_labels(self.records(), 'completed-0')['duplicate'])
+            send.assert_not_called()
+            self.assertFalse(label_sync_server.submit_native_unpack_labels(self.records(), 'THIRD')['duplicate'])
+            send.assert_called_once()
+        self.assertEqual(set(label_sync_server.load_native_print_history()), set(history) | {'THIRD'})
+
+    @patch.object(label_sync_server, 'log')
+    def test_json_history_migrates_once_without_deleting_legacy_receipts(self, _log):
+        content = json.dumps({'jobs': {
+            'OLD': {'labelCount': 2, 'copiesPerLabel': 2},
+            'UNKNOWN': {'state': 'submitting'},
+        }})
+        with open(label_sync_server.NATIVE_PRINT_HISTORY_FILE, 'w', encoding='utf-8') as output:
+            output.write(content)
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer') as send:
+            self.assertTrue(label_sync_server.submit_native_unpack_labels(self.records(), 'OLD')['duplicate'])
+            with self.assertRaises(label_sync_server.UnpackPrintOutcomeUnknownError):
+                label_sync_server.submit_native_unpack_labels(self.records(), 'UNKNOWN')
+            send.assert_not_called()
+        with open(label_sync_server.NATIVE_PRINT_HISTORY_FILE, encoding='utf-8') as source:
+            self.assertEqual(source.read(), content)
+        # Once imported, an old file copied back later cannot overwrite a newer outcome.
+        label_sync_server.save_native_print_history({'OLD': {'state': 'unknown'}})
+        self.assertEqual(label_sync_server.load_native_print_job('OLD')['state'], 'unknown')
+        self.assertEqual(label_sync_server.load_native_print_job('UNKNOWN')['state'], 'submitting')
+
+    @patch.object(label_sync_server, 'log')
+    def test_corrupt_sqlite_ledger_fails_closed_before_spool(self, _log):
+        path = os.path.splitext(label_sync_server.NATIVE_PRINT_HISTORY_FILE)[0] + '.sqlite3'
+        with open(path, 'wb') as output:
+            output.write(b'not a sqlite database')
+        with patch.object(label_sync_server, 'send_raw_tspl_to_printer') as send:
+            with self.assertRaisesRegex(RuntimeError, '打印历史无法读取'):
+                label_sync_server.submit_native_unpack_labels(self.records(), 'UNSAFE')
+            send.assert_not_called()
+
+    def test_each_task_uses_indexed_lookup_without_loading_the_entire_ledger(self):
+        label_sync_server.save_native_print_history({'OLD': {'labelCount': 2}})
+        with patch.object(label_sync_server, 'load_native_print_history', side_effect=AssertionError('full scan')), \
+                patch.object(label_sync_server, 'send_raw_tspl_to_printer') as send:
+            self.assertTrue(label_sync_server.submit_native_unpack_labels(self.records(), 'OLD')['duplicate'])
+            send.assert_not_called()
 
     @patch.object(label_sync_server, 'log')
     @patch.object(label_sync_server, 'send_raw_tspl_to_printer', return_value=42)
@@ -245,6 +518,12 @@ class UnpackTimeLabelTest(unittest.TestCase):
         for index, supplier in enumerate(label_templates.NATIVE_LABEL_TEMPLATE_BY_SUPPLIER):
             with self.subTest(supplier=supplier):
                 records = self.records(supplier)
+                if supplier == '荣湃半导体(上海)有限公司':
+                    for row_index, record in enumerate(records):
+                        record.update(model='Pai8485E-W1R', batch='A552588.1',
+                                      production_date='2528HE', version='LEVEL2',
+                                      trace_no='2507260140109-' + str(row_index + 1),
+                                      source_no='3001-250721001', package='01-A0162')
                 send.reset_mock()
                 result = label_sync_server.submit_native_unpack_labels(records, f'PAIR-{index}')
                 self.assertEqual(records[1]['unpacked_at'], '2026-09-15 14:30')

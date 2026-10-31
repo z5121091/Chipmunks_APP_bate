@@ -70,6 +70,7 @@ interface UiToolbarButtonProps {
   disabled?: boolean;
   onPress: () => void;
   style?: StyleProp<ViewStyle>;
+  containerStyle?: StyleProp<ViewStyle>;
 }
 
 interface UiTagProps {
@@ -291,6 +292,7 @@ export function UiToolbarButton({
   disabled,
   onPress,
   style,
+  containerStyle,
 }: UiToolbarButtonProps) {
   const { theme } = useTheme();
   const styles = useMemo(() => createStyles(theme), [theme]);
@@ -318,6 +320,7 @@ export function UiToolbarButton({
 
   return (
     <AnimatedButton
+      containerStyle={containerStyle}
       style={[
         styles.toolbarButton,
         isCompact ? styles.toolbarButtonCompact : styles.toolbarButtonDefault,

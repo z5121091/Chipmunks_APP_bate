@@ -7,8 +7,13 @@ import { Base64 } from 'js-base64';
 import { STORAGE_KEYS, ExportType, SyncConfig } from '@/constants/config';
 import { getISODateTime, getTodayLocal } from './time';
 import { parseQuantity } from './quantity';
+import { buildSalesReturnNotes } from './salesReturn';
 import { assertValidRuleTerminator, stripRuleTerminator } from './ruleTerminator';
-import { CONDITION_OPERATORS, type ConditionOperator, isConditionOperator, isIgnoredRuleField, matchesRuleCondition } from './ruleConditions';
+import {
+  type ConditionOperator, type RuleConditionMode, type RuleConditionGroup,
+  isConditionOperator, isRuleConditionMode, isRuleConditionGroup,
+  isIgnoredRuleField, evaluateRuleConditions,
+} from './ruleConditions';
 import { migrateLegacyRuleFields } from './legacyRuleFields';
 import { safeJsonParseNullable } from './json';
 import { logger } from './logger';
@@ -22,7 +27,16 @@ import {
 } from './outboundOrderRule';
 import { getSyncConfigError, normalizeSyncConfig } from './heartbeat';
 import { APP_NAME } from '@/constants/version';
-import { ERP_ACCOUNTS, getErpAccountByOutboundOrderNo } from './erpAccounts';
+import { getErpAccountByOutboundOrderNo } from './erpAccounts';
+import {
+  beginWorkDraftIsolation, completeWorkDraftIsolation, recoverInterruptedWorkDraftIsolation,
+  releaseWorkDraftIsolationAttempt, rollbackWorkDraftIsolation,
+} from './workDraftIsolation';
+import {
+  beginDatabaseRestoreJournal, completeDatabaseRestoreJournal,
+  recoverInterruptedDatabaseRestore, releaseDatabaseRestoreJournal,
+  DATABASE_RESTORE_JOURNAL_KEY,
+} from './databaseRestoreJournal';
 import {
   buildInboundModelKey,
   buildInboundModelVersionKey,
@@ -32,8 +46,8 @@ import {
   resolveInboundInventoryCodeFromBindings,
 } from './inboundRecords';
 
-// 使用 any 绕过类型检查
-const FS = FileSystem as any;
+// 旧版文件系统接口在当前 SDK 中仍用于数据库导入和导出。
+const FS = FileSystem;
 
 // 重新导出 STORAGE_KEYS，供其他模块使用
 export { STORAGE_KEYS };
@@ -47,10 +61,14 @@ const DATABASE_TABLE_NAMES = {
   orders: '出库单',
   materials: '出库明细',
   unpack_records: '拆包记录',
+  unpack_print_tasks: '拆包打印任务',
+  sales_return_records: '销售退货记录',
+  sales_return_allocations: '退货再出库关联',
   qr_code_rules: '扫码解析规则',
   custom_fields: '规则占位字段',
   warehouses: '仓库',
   inventory_bindings: '物料绑定',
+  inventory_suppliers: '物料供应商',
   inbound_records: '入库记录',
   inventory_check_records: '盘点记录',
   recycle_bin: '删除回收站',
@@ -121,6 +139,19 @@ const WRITE_CHECKPOINT_BATCH_SIZE = 20;
 // 检测是否为 Web 平台
 const isWebPlatform = Platform.OS === 'web';
 
+// 旧库的 UNIQUE(model, version) 对大小写、空白敏感；历史 JOIN 必须一组只产生一行。
+// 有冲突的缺码记录保留空值，由业务入口要求核对，不能任意选择一个存货编码。
+// Web 预览适配器不执行 JOIN，继续使用其原有的简单表表达式。
+const INVENTORY_BINDING_HISTORY_SOURCE = isWebPlatform ? 'inventory_bindings' : `(
+  SELECT TRIM(scan_model) AS scan_model, COALESCE(TRIM(version), '') AS version,
+    CASE WHEN COUNT(DISTINCT NULLIF(UPPER(TRIM(inventory_code)), '')) = 1
+      THEN MIN(NULLIF(TRIM(inventory_code), '')) ELSE NULL END AS inventory_code,
+    CASE WHEN COUNT(DISTINCT NULLIF(TRIM(supplier), '') COLLATE NOCASE) = 1
+      THEN MIN(NULLIF(TRIM(supplier), '')) ELSE NULL END AS supplier
+  FROM inventory_bindings
+  GROUP BY TRIM(scan_model) COLLATE NOCASE, COALESCE(TRIM(version), '') COLLATE NOCASE
+)`;
+
 // 数据版本
 const CURRENT_DATA_VERSION = 12;
 
@@ -129,6 +160,7 @@ export interface MatchCondition {
   fieldIndex: number; // 字段位置（从0开始）
   keyword: string; // 匹配关键字（字段值包含此关键字即匹配）
   operator?: ConditionOperator;
+  group?: RuleConditionGroup;
 }
 
 export class QRCodeRuleConflictError extends Error {
@@ -158,7 +190,9 @@ export interface QRCodeRule {
   fieldPrefixes?: FieldPrefixes; // 字段前缀配置，key 与 fieldOrder 保持一致
   isActive: boolean; // 是否启用
   supplierName?: string; // 供应商名称（可选）
+  supplierId?: string; // 显式关联供应商名录；旧 supplierName 仅保留为备注，不自动升级关联。
   matchConditions?: MatchCondition[]; // 识别条件（可选，用于区分相同分隔符和字段数的规则）
+  conditionMode?: RuleConditionMode; // 缺失时保持历史“全部满足”；混合模式为全部组 AND 任意组。
   created_at: string;
   updated_at: string;
 }
@@ -281,7 +315,7 @@ export interface MaterialRecord {
   id: string;
   order_no: string;
   customer_name: string;
-  operation_type: 'inbound' | 'outbound' | 'inventory';
+  operation_type: 'inbound' | 'outbound' | 'inventory' | 'sales_return';
   rule_id?: string; // 使用的规则ID
   rule_name?: string; // 使用的规则名称
   // 核心字段
@@ -305,12 +339,28 @@ export interface MaterialRecord {
   unpackCount?: number; // 拆包次数
   original_quantity?: string; // 原始数量（第一次拆包时记录）
   remaining_quantity?: string; // 剩余数量（用于下次扫码拆包）
-  // V3.0 新增字段
+  // 出库订单对应的仓库信息
   warehouse_id?: string; // 仓库ID
   warehouse_name?: string; // 仓库名称（冗余存储）
   inventory_code?: string; // 存货编码
   erp_account_key?: string;
+  user_notes?: string; // 销售退货的可选补充备注，自动来源说明独立保留。
 }
+
+// SQLite stores JSON and boolean columns as scalar values. Keep that boundary
+// separate from the hydrated records used by screens and business operations.
+type MaterialRecordRow = Omit<MaterialRecord, 'customFields' | 'isUnpacked'> & {
+  customFields: string | null;
+  isUnpacked: number | boolean | null;
+};
+type WarehouseRow = Omit<Warehouse, 'is_default'> & { is_default: number | null };
+type InboundRecordRow = Omit<InboundRecord, 'customFields'> & {
+  customFields: string | null;
+  raw_content?: string | null;
+};
+type InventoryCheckRecordRow = Omit<InventoryCheckRecord, 'customFields'> & {
+  customFields: string | null;
+};
 
 export interface OutboundExportRow {
   order_no: string;
@@ -334,9 +384,31 @@ export interface Order {
   order_no: string;
   customer_name: string;
   created_at: string;
-  // V3.0 新增字段
+  // 出库订单对应的仓库信息
   warehouse_id?: string; // 仓库ID
   warehouse_name?: string; // 仓库名称（冗余存储，方便显示）
+  operation_type?: 'outbound' | 'sales_return';
+}
+
+export type SalesReturnSourceKind = 'trace_matched' | 'trace_unknown' | 'batch';
+export interface SalesReturnRecord extends Omit<MaterialRecord, 'operation_type'> {
+  operation_type: 'sales_return';
+  inventory_code: string;
+  warehouse_id: string;
+  source_kind: SalesReturnSourceKind;
+  source_material_ids: string[];
+  notes: string;
+  returned_at: string;
+}
+
+export interface MaterialRemarkDTO {
+  id: string;
+  pair_id: string;
+  order_no: string;
+  notes: string;
+  unpacked_at: string;
+  new_quantity: string;
+  new_traceNo: string;
 }
 
 export type RecentDocumentType = 'outbound' | 'inbound' | 'inventory';
@@ -350,7 +422,7 @@ export interface RecentDocumentSummary {
   created_at: string;
 }
 
-// ============== V3.0 新增接口 ==============
+// 仓库档案
 
 // 仓库接口
 export interface Warehouse {
@@ -380,6 +452,14 @@ export interface InventoryBindingPageResult {
   pageSize: number;
 }
 
+export interface InventorySupplier {
+  id: string;
+  name: string;
+  binding_count: number;
+  rule_count?: number;
+  created_at: string;
+}
+
 export interface InventoryBindingImportResult {
   inserted: number;
   updated: number;
@@ -388,7 +468,10 @@ export interface InventoryBindingImportResult {
 }
 
 // 入库记录接口
+export type InboundCompletionStatus = 'partial' | 'complete';
+
 export interface InboundRecord {
+  completion_status?: InboundCompletionStatus;
   id: string;
   inbound_no: string; // 入库单号（RK+日期+序号）
   warehouse_id: string; // 仓库ID
@@ -420,6 +503,7 @@ export interface InboundRecord {
 export type DocumentSyncStatus = 'pending' | 'success' | 'failed';
 
 export interface InboundDocumentSummary {
+  completion_status?: InboundCompletionStatus;
   inbound_no: string;
   warehouse_id: string;
   warehouse_name: string;
@@ -527,10 +611,10 @@ export interface UnpackRecord {
   batch: string;
   package: string;
   version: string;
-  // V3.0 新增：仓库信息
+  // 拆包作业使用的仓库信息
   warehouse_id?: string;
   warehouse_name?: string;
-  // V3.0 新增：存货编码
+  // ERP 存货编码
   inventory_code?: string;
   // 由物料绑定查询补充，不在拆包记录表中重复存储
   supplier?: string;
@@ -553,6 +637,30 @@ export interface UnpackRecord {
   // 操作信息
   unpacked_at: string; // 拆包时间
   printed_at: string | null; // 打印时间
+  created_at: string;
+  updated_at: string;
+}
+
+export type UnpackPrintTaskStatus = 'pending' | 'submitting' | 'submitted' | 'skipped' | 'failed';
+
+export interface UnpackPrintTask {
+  pair_id: string;
+  order_no: string;
+  warehouse_id: string;
+  warehouse_name: string;
+  shipment_record_id: string;
+  remainder_record_id: string;
+  status: UnpackPrintTaskStatus;
+  attempt_count: number;
+  last_error?: string;
+  last_message?: string;
+  submitted_at?: string;
+  // Display-only details read from the original pair, never duplicated in SQL.
+  model?: string;
+  shipped_traceNo?: string;
+  remainder_traceNo?: string;
+  shipped_quantity?: string;
+  remaining_quantity?: string;
   created_at: string;
   updated_at: string;
 }
@@ -627,7 +735,8 @@ const isSyncConfigShape = (value: unknown): value is SyncConfig => {
   return (
     isPlainObject(value) &&
     typeof value.ip === 'string' &&
-    typeof value.port === 'string'
+    typeof value.port === 'string' &&
+    (value.pairingKey === undefined || typeof value.pairingKey === 'string')
   );
 };
 
@@ -637,7 +746,8 @@ const isMatchConditionShape = (value: unknown): value is MatchCondition => {
     typeof value.fieldIndex === 'number' &&
     Number.isInteger(value.fieldIndex) &&
     typeof value.keyword === 'string' &&
-    (value.operator === undefined || isConditionOperator(value.operator))
+    (value.operator === undefined || isConditionOperator(value.operator)) &&
+    (value.group === undefined || isRuleConditionGroup(value.group))
   );
 };
 
@@ -661,6 +771,8 @@ const isQRCodeRuleShape = (value: unknown): value is QRCodeRule => {
     (value.customFieldIds === undefined || isStringArray(value.customFieldIds)) &&
     (value.fieldPrefixes === undefined || isStringRecord(value.fieldPrefixes)) &&
     (value.supplierName === undefined || typeof value.supplierName === 'string') &&
+    (value.supplierId === undefined || typeof value.supplierId === 'string') &&
+    (value.conditionMode === undefined || isRuleConditionMode(value.conditionMode)) &&
     (value.matchConditions === undefined ||
       (Array.isArray(value.matchConditions) &&
         value.matchConditions.every((item) => isMatchConditionShape(item))))
@@ -806,9 +918,11 @@ type RuleRecordRow = {
   display_order?: number | string | null;
   is_active: number | boolean;
   supplier_name?: string | null;
+  supplier_id?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
   match_conditions?: string | null;
+  condition_mode?: string | null;
 };
 
 const getRuleDisplayOrder = (value: unknown): number | undefined => {
@@ -831,20 +945,29 @@ const normalizeRuleRecord = (record: RuleRecordRow): QRCodeRule => {
     }
     return acc;
   }, {});
-  const rawMatchConditions = safeJsonParseNullable<MatchCondition[]>(record.match_conditions ?? null, 'database.safeJsonParseNullable') || [];
-  const matchConditions = rawMatchConditions
-    .filter(
-      (condition) =>
-        condition &&
-        Number.isInteger(condition.fieldIndex) &&
-        typeof condition.keyword === 'string' &&
-        condition.keyword.trim().length > 0
-    )
-    .map((condition) => ({
-      fieldIndex: condition.fieldIndex,
-      keyword: condition.keyword.trim(),
-      ...(condition.operator === undefined ? {} : { operator: condition.operator }),
-    }));
+  let rawMatchConditions: unknown = [];
+  try {
+    if (record.match_conditions != null && record.match_conditions !== '') {
+      rawMatchConditions = JSON.parse(record.match_conditions);
+    }
+  } catch {
+    throw new Error(`解析规则“${record.name}”的识别条件损坏，请重新配置`);
+  }
+  if (!Array.isArray(rawMatchConditions) || !rawMatchConditions.every(isMatchConditionShape)) {
+    throw new Error(`解析规则“${record.name}”的识别条件配置无效`);
+  }
+  const conditionMode = record.condition_mode === undefined ? 'all' : record.condition_mode;
+  if (!isRuleConditionMode(conditionMode)) throw new Error(`解析规则“${record.name}”的识别条件逻辑无效`);
+  const matchConditions: MatchCondition[] = rawMatchConditions.map(condition => ({
+    fieldIndex: condition.fieldIndex,
+    keyword: condition.keyword.trim(),
+    ...(condition.operator === undefined ? {} : { operator: condition.operator }),
+    ...(condition.group === undefined ? {} : { group: condition.group }),
+  }));
+  if (matchConditions.some(condition => !condition.keyword || condition.fieldIndex < 0 ||
+      condition.fieldIndex >= fieldOrder.length)) {
+    throw new Error(`解析规则“${record.name}”的识别条件位置或关键字无效`);
+  }
 
   return {
     id: record.id,
@@ -858,7 +981,9 @@ const normalizeRuleRecord = (record: RuleRecordRow): QRCodeRule => {
     fieldPrefixes,
     isActive: record.is_active === 1,
     supplierName: record.supplier_name || undefined,
+    supplierId: record.supplier_id || undefined,
     matchConditions,
+    ...(conditionMode === 'all' ? {} : { conditionMode }),
     created_at: record.created_at || '',
     updated_at: record.updated_at || record.created_at || '',
   };
@@ -1019,6 +1144,12 @@ const refreshDatabaseConnectionAfterTransientError = async (
 ): Promise<void> => {
   if (!shouldRefreshDatabaseConnectionAfterError(error)) {
     return;
+  }
+
+  // Initialization owns cleanup/retry for its connection. A migration's nested
+  // transaction retry must not reopen and then wait for its own init promise.
+  if (initPromise) {
+    throw error;
   }
 
   if (databaseConnectionRefreshPromise) {
@@ -1304,6 +1435,10 @@ const assertUnpackTraceNoAvailable = async (
   if (existingUnpack) {
     throw new Error(`新追踪码已存在拆包记录：${trimmedNewTraceNo}`);
   }
+  if (await database.getFirstAsync('SELECT id FROM sales_return_records WHERE TRIM(traceNo) = ? LIMIT 1',
+    [trimmedNewTraceNo])) {
+    throw new Error(`新追踪码已存在销售退货记录：${trimmedNewTraceNo}`);
+  }
 };
 
 const getBaseUnpackTraceNo = (traceNo?: string | null): string => {
@@ -1335,7 +1470,7 @@ const canUseRemainingUnpackTraceNo = async (
     return false;
   }
 
-  const matchingMaterials = await database.getAllAsync<any>(
+  const matchingMaterials = await database.getAllAsync<MaterialRecordRow>(
     `SELECT *
      FROM materials
      WHERE traceNo = ? AND warehouse_id = ?
@@ -1467,15 +1602,20 @@ const getDb = (): SQLite.SQLiteDatabase => {
 
 // 创建 mock 数据库（用于 Web 预览）
 // 使用内存存储模拟数据库功能，尽可能模拟 SQLite 行为
-const mockTables: Record<string, any[]> = {
+type MockRow = Record<string, unknown>;
+const mockTables: Record<string, MockRow[]> = {
   warehouses: [],
   orders: [],
   materials: [],
   inventory_bindings: [],
+  inventory_suppliers: [],
   qr_code_rules: [],
   inbound_records: [],
   inventory_check_records: [],
   unpack_records: [],
+  unpack_print_tasks: [],
+  sales_return_records: [],
+  sales_return_allocations: [],
   custom_fields: [],
   system_config: [],
 };
@@ -1597,7 +1737,7 @@ const getMockColumnName = (expression: string): string | null => {
   return columnMatch ? columnMatch[1] : null;
 };
 
-const getMockExpressionValue = (row: any, expression: string): unknown => {
+const getMockExpressionValue = (row: MockRow, expression: string): unknown => {
   const expr = stripWrappingParentheses(expression);
   const quotedMatch = expr.match(/^'([^']*)'$|^"([^"]*)"$/);
   if (quotedMatch) {
@@ -1620,9 +1760,9 @@ const getMockExpressionValue = (row: any, expression: string): unknown => {
 };
 
 const getMockRightValue = (
-  row: any,
+  row: MockRow,
   expression: string,
-  params: any[],
+  params: SQLite.SQLiteBindValue[],
   cursor: { index: number }
 ): unknown => {
   if (expression.includes('?')) {
@@ -1664,9 +1804,9 @@ const compareMockValues = (
 };
 
 const evaluateMockCondition = (
-  row: any,
+  row: MockRow,
   condition: string,
-  params: any[],
+  params: SQLite.SQLiteBindValue[],
   cursor: { index: number }
 ): boolean => {
   const normalized = stripWrappingParentheses(normalizeSqlText(condition));
@@ -1687,7 +1827,7 @@ const evaluateMockCondition = (
   if (andParts.length > 1) {
     let matched = true;
     for (const part of andParts) {
-      // Consume every placeholder even if an earlier condition did not match.
+      // 即使前面的条件没有命中，也要按顺序取完所有占位参数。
       matched = evaluateMockCondition(row, part, params, cursor) && matched;
     }
     return matched;
@@ -1742,7 +1882,7 @@ const evaluateMockCondition = (
 };
 
 // 解析 WHERE 条件并过滤数据
-const filterByWhere = (rows: any[], whereClause: string, params: any[] = []): any[] => {
+const filterByWhere = (rows: MockRow[], whereClause: string, params: SQLite.SQLiteBindValue[] = []): MockRow[] => {
   logger.log(`[MockDB] filterByWhere: whereClause="${whereClause}", params=`, params);
 
   if (!whereClause) return rows;
@@ -1804,7 +1944,7 @@ const getMockSelectExpressionParts = (expression: string) => {
 };
 
 const getMockAggregateValue = (
-  rows: any[],
+  rows: MockRow[],
   expression: string
 ): { handled: boolean; value: unknown } => {
   const normalized = stripWrappingParentheses(expression.trim());
@@ -1852,7 +1992,7 @@ const getMockAggregateValue = (
   return { handled: false, value: undefined };
 };
 
-const getMockDocumentSyncStatus = (rows: any[]): DocumentSyncStatus => {
+const getMockDocumentSyncStatus = (rows: MockRow[]): DocumentSyncStatus => {
   if (rows.length > 0 && rows.every((row) => row.sync_status === 'success')) {
     return 'success';
   }
@@ -1862,17 +2002,17 @@ const getMockDocumentSyncStatus = (rows: any[]): DocumentSyncStatus => {
   return 'pending';
 };
 
-const getMockMaxValue = (rows: any[], columnName: string): string => {
+const getMockMaxValue = (rows: MockRow[], columnName: string): string => {
   return rows.reduce((current, row) => {
     const value = String(row[columnName] ?? '');
     return value > current ? value : current;
   }, '');
 };
 
-const getMockModelCount = (rows: any[]): number => {
+const getMockModelCount = (rows: MockRow[]): number => {
   return new Set(
     rows
-      .map((row) => buildInboundModelKey(row.scan_model))
+      .map((row) => buildInboundModelKey(String(row.scan_model ?? '')))
       .filter(Boolean)
   ).size;
 };
@@ -1889,8 +2029,8 @@ const sortMockDocumentRows = <T extends { created_at: string }>(
     return String(b[documentNoKey] || '').localeCompare(String(a[documentNoKey] || ''));
   });
 
-const getMockInboundDocumentSummaries = (rows: any[]): InboundDocumentSummary[] => {
-  const groups = new Map<string, any[]>();
+const getMockInboundDocumentSummaries = (rows: MockRow[]): InboundDocumentSummary[] => {
+  const groups = new Map<string, MockRow[]>();
 
   rows.forEach((row) => {
     const key = `${row.warehouse_id || ''}::${row.inbound_no || ''}`;
@@ -1903,14 +2043,15 @@ const getMockInboundDocumentSummaries = (rows: any[]): InboundDocumentSummary[] 
     Array.from(groups.values()).map((groupRows) => {
       const first = groupRows[0] || {};
       return {
-        inbound_no: first.inbound_no || '',
-        warehouse_id: first.warehouse_id || '',
+        inbound_no: String(first.inbound_no || ''),
+        warehouse_id: String(first.warehouse_id || ''),
         warehouse_name: getMockMaxValue(groupRows, 'warehouse_name'),
         in_date: getMockMaxValue(groupRows, 'in_date'),
         created_at: getMockMaxValue(groupRows, 'created_at'),
         record_count: groupRows.length,
         model_count: getMockModelCount(groupRows),
         total_quantity: groupRows.reduce((total, row) => total + Number(row.quantity || 0), 0),
+        completion_status: groupRows.some(row => row.completion_status === 'partial') ? 'partial' : 'complete',
         sync_status: getMockDocumentSyncStatus(groupRows),
         sync_file_name: getMockMaxValue(groupRows, 'sync_file_name') || undefined,
         synced_at: getMockMaxValue(groupRows, 'synced_at') || undefined,
@@ -1921,8 +2062,8 @@ const getMockInboundDocumentSummaries = (rows: any[]): InboundDocumentSummary[] 
   );
 };
 
-const getMockInventoryDocumentSummaries = (rows: any[]): InventoryCheckDocumentSummary[] => {
-  const groups = new Map<string, any[]>();
+const getMockInventoryDocumentSummaries = (rows: MockRow[]): InventoryCheckDocumentSummary[] => {
+  const groups = new Map<string, MockRow[]>();
 
   rows.forEach((row) => {
     const key = `${row.warehouse_id || ''}::${row.check_no || ''}`;
@@ -1935,8 +2076,8 @@ const getMockInventoryDocumentSummaries = (rows: any[]): InventoryCheckDocumentS
     Array.from(groups.values()).map((groupRows) => {
       const first = groupRows[0] || {};
       return {
-        check_no: first.check_no || '',
-        warehouse_id: first.warehouse_id || '',
+        check_no: String(first.check_no || ''),
+        warehouse_id: String(first.warehouse_id || ''),
         warehouse_name: getMockMaxValue(groupRows, 'warehouse_name'),
         check_date: getMockMaxValue(groupRows, 'check_date'),
         created_at: getMockMaxValue(groupRows, 'created_at'),
@@ -1960,7 +2101,7 @@ const getMockInventoryDocumentSummaries = (rows: any[]): InventoryCheckDocumentS
   );
 };
 
-const getMockDocumentSummaryRows = (tableName: string, sql: string, rows: any[]): any[] | null => {
+const getMockDocumentSummaryRows = (tableName: string, sql: string, rows: MockRow[]): (InboundDocumentSummary | InventoryCheckDocumentSummary)[] | null => {
   const normalizedSql = normalizeSqlText(sql);
   if (
     tableName === 'inbound_records' &&
@@ -1979,12 +2120,12 @@ const getMockDocumentSummaryRows = (tableName: string, sql: string, rows: any[])
   return null;
 };
 
-const mapMockSelectRow = (row: any, selectClause: string, groupRows?: any[]): any => {
+const mapMockSelectRow = (row: MockRow, selectClause: string, groupRows?: MockRow[]): MockRow => {
   if (selectClause === '*') {
     return row;
   }
 
-  const result: any = {};
+  const result: MockRow = {};
   splitSqlComma(selectClause).forEach((rawExpression) => {
     const { valueExpression, alias } = getMockSelectExpressionParts(rawExpression);
     if (/^(?:\w+\.)?\*$/.test(valueExpression)) {
@@ -2004,9 +2145,9 @@ const mapMockSelectRow = (row: any, selectClause: string, groupRows?: any[]): an
   return result;
 };
 
-const groupMockRows = (rows: any[], groupByClause: string): any[][] => {
+const groupMockRows = (rows: MockRow[], groupByClause: string): MockRow[][] => {
   const groupExpressions = splitSqlComma(groupByClause);
-  const groups = new Map<string, any[]>();
+  const groups = new Map<string, MockRow[]>();
   rows.forEach((row) => {
     const key = groupExpressions
       .map((expression) => String(getMockExpressionValue(row, expression) ?? ''))
@@ -2026,11 +2167,11 @@ const matchesMockLike = (value: unknown, pattern: string): boolean => {
   return new RegExp(`^${regexPattern}$`, 'i').test(String(value ?? ''));
 };
 
-const getMockStatisticsResult = (params: any[] = []) => {
+const getMockStatisticsResult = (params: SQLite.SQLiteBindValue[] = []) => {
   const [todayOrderPattern = '', todayMaterialPattern = '', todayQuantityPattern = ''] = params;
   const orders = mockTables.orders || [];
   const materials = mockTables.materials || [];
-  const sumQuantity = (rows: any[]) =>
+  const sumQuantity = (rows: MockRow[]) =>
     rows.reduce((total, row) => {
       const nextValue = Number(row.quantity ?? 0);
       return total + (Number.isFinite(nextValue) ? nextValue : 0);
@@ -2054,7 +2195,6 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
   return {
     execAsync: async (sql: string) => {
       logger.log('[MockDB] execAsync:', sql);
-      // 处理 CREATE TABLE 语句
       if (sql.includes('CREATE TABLE')) {
         const match = sql.match(/CREATE TABLE IF NOT EXISTS (\w+)/);
         if (match) {
@@ -2070,10 +2210,9 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
         logger.log('[MockDB] PRAGMA:', sql);
       }
     },
-    runAsync: async (sql: string, params?: any[]) => {
+    runAsync: async (sql: string, params?: SQLite.SQLiteBindValue[]) => {
       logger.log('[MockDB] runAsync:', sql, params);
 
-      // 处理 INSERT 语句
       const insertMatch = sql
         .trim()
         .match(/^INSERT(?:\s+OR\s+(REPLACE|IGNORE))?\s+INTO\s+(\w+)\s*\((.*?)\)/is);
@@ -2082,7 +2221,7 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
         const conflictMode = insertMatch[1]?.toUpperCase();
         const tableName = insertMatch[2];
         const columns = splitSqlComma(insertMatch[3]);
-        const row: any = {};
+        const row: MockRow = {};
         params?.forEach((value, index) => {
           if (index < columns.length) {
             row[columns[index]] = value;
@@ -2118,7 +2257,6 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
         return { changes: 1, lastInsertRowId: mockTables[tableName].length };
       }
 
-      // 处理 UPDATE 语句
       if (sql.trim().startsWith('UPDATE')) {
         const match = sql.match(/UPDATE (\w+) SET (.*?) WHERE (.*)/s);
         if (match) {
@@ -2150,7 +2288,6 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
         }
       }
 
-      // 处理 DELETE 语句
       if (sql.trim().startsWith('DELETE')) {
         const match = sql.match(/DELETE FROM (\w+) WHERE (.*)/);
         if (match) {
@@ -2180,10 +2317,9 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
 
       return { changes: 0, lastInsertRowId: 0 };
     },
-    getAllAsync: async <T>(sql: string, params?: any[]): Promise<T[]> => {
+    getAllAsync: async <T>(sql: string, params?: SQLite.SQLiteBindValue[]): Promise<T[]> => {
       logger.log('[MockDB] getAllAsync:', sql, params);
 
-      // 处理 SELECT 语句
       if (sql.trim().startsWith('SELECT')) {
         const match = sql.match(/FROM (\w+)/);
         if (match) {
@@ -2284,10 +2420,9 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
 
       return [];
     },
-    getFirstAsync: async <T>(sql: string, params?: any[]): Promise<T | null> => {
+    getFirstAsync: async <T>(sql: string, params?: SQLite.SQLiteBindValue[]): Promise<T | null> => {
       logger.log('[MockDB] getFirstAsync:', sql, params);
 
-      // 处理 SELECT 语句
       if (sql.trim().startsWith('SELECT')) {
         if (sql.includes('totalOrders') && sql.includes('todayQuantity')) {
           const result = getMockStatisticsResult(params || []);
@@ -2643,58 +2778,68 @@ export const initDatabase = async (): Promise<void> => {
   logger.log('[initDatabase] 当前db状态', db ? '已初始化' : 'null');
   logger.log('[initDatabase] 当前isInitializing', isInitializing);
 
-  try {
-    // Web 平台跳过数据库初始化（用于预览）
-    if (isWebPlatform) {
-      logger.log('[Web Platform] Skipping database initialization (preview mode)');
-      return;
-    }
+  // Web 平台跳过数据库初始化（用于预览）
+  if (isWebPlatform) {
+    logger.log('[Web Platform] Skipping database initialization (preview mode)');
+    return;
+  }
 
-    // 防止重复初始化
-    if (isInitializing) {
-      logger.log('[initDatabase] 数据库正在初始化中，等待完成...');
-      if (initPromise) {
-        await initPromise;
-      }
-      return;
-    }
+  // Install the shared promise before any recovery await. Recovery and opening
+  // must be one attempt; another caller must never see a partially opened DB.
+  if (initPromise) {
+    await initPromise;
+    return;
+  }
 
-    // 修复：立即设置并发控制标志，防止竞态条件
-    isInitializing = true;
-    logger.log('[initDatabase] 开始初始化数据库');
+  isInitializing = true;
+  const initializingPromise = (async () => {
+    await recoverInterruptedDatabaseRestore();
+    await recoverInterruptedWorkDraftIsolation();
 
-    // 检查是否已经初始化
     if (db) {
       logger.log('[initDatabase] 数据库已初始化，直接返回');
-      isInitializing = false;
       return;
     }
 
-    // 创建初始化 Promise，用于并发调用等待
-    initPromise = (async () => {
+    await runWithTransientDatabaseRetry('initDatabase', async () => {
+      const attempt: { connection: SQLite.SQLiteDatabase | null } = { connection: null };
       try {
-        await performDatabaseInitialization();
+        await performDatabaseInitialization((connection) => { attempt.connection = connection; });
       } catch (error) {
-        logger.error('[initDatabase] 数据库初始化失败:', error);
-        db = null;
+        // Do not lose the native handle: expo-sqlite can reuse it on the next
+        // open. Release this attempt before a bounded retry or the Retry button.
+        const openedDatabase = attempt.connection;
+        if (db === openedDatabase) db = null;
+        if (openedDatabase) {
+          try {
+            await openedDatabase.closeAsync();
+          } catch (closeError) {
+            logger.warn('[initDatabase] 关闭初始化失败的数据库连接失败:', closeError);
+          }
+        }
         throw error;
-      } finally {
-        isInitializing = false;
-        initPromise = null;
       }
-    })();
+    }, [120, 300]);
+  })();
+  initPromise = initializingPromise;
 
-    // 等待初始化完成
-    await initPromise;
+  try {
+    await initializingPromise;
   } catch (error) {
     logger.error('[initDatabase] 数据库初始化异常:', error);
-    isInitializing = false;
     throw error;
+  } finally {
+    if (initPromise === initializingPromise) {
+      isInitializing = false;
+      initPromise = null;
+    }
   }
 };
 
 // 执行数据库初始化的核心逻辑（提取为独立函数，便于 Promise 管理）
-const performDatabaseInitialization = async (): Promise<void> => {
+const performDatabaseInitialization = async (
+  onOpened: (connection: SQLite.SQLiteDatabase) => void
+): Promise<void> => {
   logger.log('[performDatabaseInitialization] 开始执行初始化逻辑');
 
   // 如果已经初始化，先关闭旧连接
@@ -2713,6 +2858,10 @@ const performDatabaseInitialization = async (): Promise<void> => {
   db = wrapDatabaseWithChineseTableNames(
     await SQLite.openDatabaseAsync(DATABASE_FILE_NAME)
   );
+  onOpened(db);
+  // The first CREATE/DELETE can also be locked during native reload or backup.
+  // Set the wait policy before any schema, cleanup write or journal-mode change.
+  await db.execAsync('PRAGMA busy_timeout = 5000;');
   logger.log(
     '[performDatabaseInitialization] openDatabaseAsync 完成，db对象:',
     db ? '已创建' : 'null'
@@ -2784,7 +2933,6 @@ const performDatabaseInitialization = async (): Promise<void> => {
       -- 可靠性与性能配置
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
-      PRAGMA busy_timeout = 5000;
       PRAGMA wal_autocheckpoint = 1000;
       PRAGMA cache_size = -64000;
       PRAGMA temp_store = MEMORY;
@@ -2860,6 +3008,61 @@ const performDatabaseInitialization = async (): Promise<void> => {
       );
 
       -- 二维码规则表
+      CREATE TABLE IF NOT EXISTS unpack_print_tasks (
+        pair_id TEXT PRIMARY KEY,
+        order_no TEXT NOT NULL,
+        warehouse_id TEXT NOT NULL,
+        warehouse_name TEXT,
+        shipment_record_id TEXT NOT NULL,
+        remainder_record_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        last_message TEXT,
+        submitted_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      -- 实收退货数量独立保存，不能混进正数出库统计和导出。
+      CREATE TABLE IF NOT EXISTS sales_return_records (
+        id TEXT PRIMARY KEY,
+        order_no TEXT NOT NULL,
+        customer_name TEXT NOT NULL,
+        warehouse_id TEXT NOT NULL,
+        warehouse_name TEXT,
+        erp_account_key TEXT,
+        inventory_code TEXT NOT NULL,
+        model TEXT NOT NULL,
+        version TEXT,
+        package TEXT,
+        batch TEXT,
+        quantity INTEGER NOT NULL CHECK (quantity > 0),
+        productionDate TEXT,
+        traceNo TEXT,
+        sourceNo TEXT,
+        raw_content TEXT NOT NULL,
+        separator TEXT,
+        customFields TEXT,
+        rule_id TEXT,
+        rule_name TEXT,
+        scanned_at TEXT NOT NULL,
+        returned_at TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        source_material_ids TEXT NOT NULL DEFAULT '[]',
+        notes TEXT NOT NULL,
+        user_notes TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS sales_return_allocations (
+        id TEXT PRIMARY KEY,
+        return_id TEXT NOT NULL,
+        material_id TEXT NOT NULL,
+        pair_id TEXT NOT NULL DEFAULT '',
+        quantity INTEGER NOT NULL CHECK (quantity > 0),
+        created_at TEXT NOT NULL,
+        UNIQUE (return_id, material_id, pair_id)
+      );
+
       CREATE TABLE IF NOT EXISTS qr_code_rules (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -2869,7 +3072,9 @@ const performDatabaseInitialization = async (): Promise<void> => {
         custom_field_ids TEXT,
         is_active INTEGER DEFAULT 1,
         supplier_name TEXT,
+        supplier_id TEXT,
         match_conditions TEXT,
+        condition_mode TEXT NOT NULL DEFAULT 'all',
         field_prefixes TEXT,
         terminator TEXT NOT NULL DEFAULT '',
         display_order INTEGER,
@@ -2909,6 +3114,13 @@ const performDatabaseInitialization = async (): Promise<void> => {
         description TEXT,
         created_at TEXT NOT NULL,
         UNIQUE(scan_model, version)
+      );
+
+      -- 物料绑定使用的供应商名录，绑定仍保存原有供应商文本。
+      CREATE TABLE IF NOT EXISTS inventory_suppliers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        created_at TEXT NOT NULL
       );
 
       -- 入库记录表
@@ -2973,12 +3185,24 @@ const performDatabaseInitialization = async (): Promise<void> => {
     `);
 
   await ensureInventoryCheckErpSnapshotColumns(db);
+  const inboundCompletionColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(inbound_records)');
+  if (!inboundCompletionColumns.some(column => column.name === 'completion_status')) {
+    // Existing receipts were only savable after full reconciliation; preserve that lock.
+    await db.execAsync("ALTER TABLE inbound_records ADD COLUMN completion_status TEXT NOT NULL DEFAULT 'complete'");
+  }
+
   const ruleColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(qr_code_rules)');
   if (!ruleColumns.some(column => column.name === 'terminator')) {
     await db.execAsync("ALTER TABLE qr_code_rules ADD COLUMN terminator TEXT NOT NULL DEFAULT ''");
   }
   if (!ruleColumns.some(column => column.name === 'display_order')) {
     await db.execAsync('ALTER TABLE qr_code_rules ADD COLUMN display_order INTEGER');
+  }
+  if (!ruleColumns.some(column => column.name === 'condition_mode')) {
+    await db.execAsync("ALTER TABLE qr_code_rules ADD COLUMN condition_mode TEXT NOT NULL DEFAULT 'all'");
+  }
+  if (!ruleColumns.some(column => column.name === 'supplier_id')) {
+    await db.execAsync('ALTER TABLE qr_code_rules ADD COLUMN supplier_id TEXT');
   }
   await runExclusiveWriteTransaction(db, 'migrateLegacyRuleFields', async transaction => {
     const rows = await transaction.getAllAsync<RuleRecordRow>('SELECT * FROM qr_code_rules');
@@ -2993,7 +3217,7 @@ const performDatabaseInitialization = async (): Promise<void> => {
       );
     }
   });
-  // Retire the derived ledger only; parsed batch/date fields on business records remain intact.
+  // 只移除已停用的派生台账，业务记录中的批次和日期字段继续保留。
   await db.execAsync('DROP TABLE IF EXISTS "批次库存流水"; DROP TABLE IF EXISTS batch_stock_events;');
   for (const table of ['materials', 'inbound_records']) {
     const columns = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
@@ -3004,6 +3228,7 @@ const performDatabaseInitialization = async (): Promise<void> => {
   await ensureTraceNoUniqueIndexes(db);
   await ensureRollingInventoryTraceNoIndex(db);
   await ensureRecycleBinTableAndTriggers(db);
+  await runExclusiveWriteTransaction(db, 'seedInventorySuppliers', seedInventorySuppliersWithDatabase);
 
   await db.execAsync(`
       CREATE INDEX IF NOT EXISTS idx_orders_warehouse_created
@@ -3033,6 +3258,21 @@ const performDatabaseInitialization = async (): Promise<void> => {
       CREATE INDEX IF NOT EXISTS idx_unpack_records_original_material
       ON unpack_records (original_material_id);
 
+      CREATE INDEX IF NOT EXISTS idx_unpack_records_pair
+      ON unpack_records (pair_id);
+
+      CREATE INDEX IF NOT EXISTS idx_sales_return_order_warehouse
+      ON sales_return_records (order_no, warehouse_id, inventory_code);
+      CREATE INDEX IF NOT EXISTS idx_sales_return_trace
+      ON sales_return_records (traceNo, inventory_code, warehouse_id);
+      CREATE INDEX IF NOT EXISTS idx_sales_return_allocation_return
+      ON sales_return_allocations (return_id);
+      CREATE INDEX IF NOT EXISTS idx_sales_return_allocation_material
+      ON sales_return_allocations (material_id);
+
+      CREATE INDEX IF NOT EXISTS idx_unpack_print_tasks_order_warehouse
+      ON unpack_print_tasks (order_no, warehouse_id, created_at);
+
       CREATE INDEX IF NOT EXISTS idx_inbound_records_no
       ON inbound_records (inbound_no);
 
@@ -3047,6 +3287,12 @@ const performDatabaseInitialization = async (): Promise<void> => {
 
       CREATE INDEX IF NOT EXISTS idx_warehouses_sort
       ON warehouses (sort_order ASC, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_inventory_bindings_supplier
+      ON inventory_bindings (TRIM(supplier) COLLATE NOCASE);
+
+      CREATE INDEX IF NOT EXISTS idx_qr_code_rules_supplier
+      ON qr_code_rules (supplier_id);
     `);
 
   // 初始化默认数据
@@ -3167,7 +3413,7 @@ const upsertOrderWithDatabase = async (
     );
     // 更新现有订单
     const updates: string[] = [];
-    const params: any[] = [];
+    const params: SQLite.SQLiteBindValue[] = [];
 
     if (customerChanged) {
       updates.push('customer_name = ?');
@@ -3187,7 +3433,7 @@ const upsertOrderWithDatabase = async (
 
       // 如果更新了客户名称或仓库信息，同步更新物料
       const materialUpdates: string[] = [];
-      const materialParams: any[] = [];
+      const materialParams: SQLite.SQLiteBindValue[] = [];
 
       if (customerChanged) {
         materialUpdates.push('customer_name = ?');
@@ -3201,7 +3447,7 @@ const upsertOrderWithDatabase = async (
       }
 
       if (materialUpdates.length > 0) {
-        const scopeParams: any[] = [orderNo];
+        const scopeParams: SQLite.SQLiteBindValue[] = [orderNo];
         let scopeSql = 'order_no = ?';
 
         if (existingOrder.warehouse_id) {
@@ -3257,7 +3503,7 @@ export const upsertOrder = async (
   warehouse?: OrderWarehouseInfo
 ): Promise<void> => {
   try {
-    // 🔥 强制初始化保护
+    // 首次使用时先建立数据库连接。
     if (!db) {
       logger.warn('[upsertOrder] 数据库未初始化，等待初始化...');
       await initDatabase();
@@ -3329,7 +3575,7 @@ export const getRecentDocumentSummaries = async (
 
   try {
     const rows = await runDatabaseReadWithRetry('getRecentDocumentSummaries', () =>
-      getDb().getAllAsync<any>(
+      getDb().getAllAsync<Omit<RecentDocumentSummary, 'type'> & { document_type: RecentDocumentType }>(
         `SELECT
           document_type,
           document_no,
@@ -3525,7 +3771,7 @@ const deduplicateOrdersByBusinessKey = (orders: Order[]): Order[] => {
 
 const appendCreatedAtDateWhere = (
   conditions: string[],
-  params: any[],
+  params: SQLite.SQLiteBindValue[],
   filter: OrderTimeFilter
 ) => {
   const createdAtPrefixes = getCreatedAtDatePrefixesForFilter(filter);
@@ -3612,7 +3858,7 @@ export const getFilteredOrders = async (params: {
     }
 
     const conditions: string[] = [];
-    const queryParams: any[] = [];
+    const queryParams: SQLite.SQLiteBindValue[] = [];
 
     if (params.warehouseId) {
       conditions.push('warehouse_id = ?');
@@ -3627,7 +3873,7 @@ export const getFilteredOrders = async (params: {
         queryParams.push(`%${searchText}%`);
       } else if (searchType === 'batch') {
         const materialConditions = ['batch LIKE ?'];
-        const materialParams: any[] = [`%${searchText}%`];
+        const materialParams: SQLite.SQLiteBindValue[] = [`%${searchText}%`];
 
         if (params.warehouseId) {
           materialConditions.push('warehouse_id = ?');
@@ -3675,6 +3921,9 @@ export const deleteOrder = async (orderNo: string, warehouseId?: string | null):
     const params = normalizedWarehouseId ? [trimmedOrderNo, normalizedWarehouseId] : [trimmedOrderNo];
 
     await runExclusiveWriteTransaction(database, 'deleteOrder', async (transactionDatabase) => {
+      const returns = await transactionDatabase.getAllAsync<{ id: string }>(
+        `SELECT id FROM sales_return_records WHERE order_no = ?${warehouseClause}`, params);
+      for (const row of returns) await deleteSalesReturnWithDatabase(transactionDatabase, row.id);
       const rows = await transactionDatabase.getAllAsync<{ id: string }>(`SELECT id FROM materials WHERE order_no = ?${warehouseClause}`, params);
       await deleteMaterialsWithDatabase(transactionDatabase, rows.map(row => row.id));
       // 删除关联的拆包记录，避免留下孤儿数据
@@ -3692,9 +3941,383 @@ export const deleteOrder = async (orderNo: string, warehouseId?: string | null):
   }
 };
 
+// ========== 销售退货：实收事件与再次出库额度 ==========
+
+type SalesReturnStoredRow = Omit<SalesReturnRecord, 'source_material_ids' | 'customFields'> & {
+  source_material_ids: string;
+  customFields?: string | null;
+};
+
+const mapSalesReturnRecord = (row: SalesReturnStoredRow): SalesReturnRecord => ({
+  ...row,
+  // 旧自动备注按结构化来源重新展示；人工补充说明原样保留。
+  notes: buildStoredSalesReturnNotes(row),
+  operation_type: 'sales_return',
+  quantity: Number(row.quantity),
+  rule_id: row.rule_id || undefined,
+  rule_name: row.rule_name || undefined,
+  erp_account_key: row.erp_account_key || undefined,
+  separator: row.separator || undefined,
+  source_material_ids: safeJsonParseNullable<string[]>(row.source_material_ids,
+    'salesReturn.sourceMaterials') || [],
+  customFields: safeJsonParseNullable<Record<string, string>>(row.customFields ?? null,
+    'salesReturn.customFields') || undefined,
+});
+
+export type SalesReturnSourceResult = {
+  kind: SalesReturnSourceKind;
+  customers: string[];
+  message: string;
+};
+
+const buildStoredSalesReturnNotes = (record: {
+  quantity: number; source_kind: SalesReturnSourceKind;
+  batch?: string; user_notes?: string;
+}): string => {
+  if (record.source_kind === 'batch' && !record.batch?.trim()) {
+    return ['销售退货',
+      '无追溯码及批次；历史来源未知', record.user_notes?.trim(), `实收 ${record.quantity}`]
+      .filter(Boolean).join('；');
+  }
+  return [buildSalesReturnNotes(record.source_kind, record.user_notes),
+    `实收 ${record.quantity}`, record.source_kind === 'batch' && record.batch?.trim()
+      ? `批次：${record.batch.trim()}` : ''].filter(Boolean).join('；');
+};
+
+const checkSalesReturnSourceWithDatabase = async (
+  database: SQLite.SQLiteDatabase,
+  params: { traceNo?: string; batch?: string; inventoryCode: string; customerName: string; accountKey?: string }
+): Promise<SalesReturnSourceResult & { sourceMaterialIds: string[] }> => {
+  const traceNo = normalizeComparableText(params.traceNo);
+  const batch = normalizeComparableText(params.batch);
+  const code = normalizeComparableText(params.inventoryCode).toUpperCase();
+  const codeMatches = (row: { inventory_code?: string }) =>
+    !row.inventory_code?.trim() || row.inventory_code.trim().toUpperCase() === code;
+  let history: Array<{ id: string; customer_name?: string; inventory_code?: string; erp_account_key?: string }>;
+  if (traceNo) {
+    const direct = await database.getAllAsync<MaterialRecord>(
+      `SELECT m.*, COALESCE(NULLIF(TRIM(m.inventory_code), ''), ib.inventory_code) AS inventory_code
+       FROM materials m LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
+       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(m.model) COLLATE NOCASE
+       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE = COALESCE(TRIM(m.version), '') COLLATE NOCASE
+       WHERE m.operation_type = 'outbound' AND TRIM(m.traceNo) = ?`, [traceNo]);
+    const labels = await database.getAllAsync<UnpackRecord>(
+      `SELECT u.*, COALESCE(NULLIF(TRIM(u.inventory_code), ''), ib.inventory_code) AS inventory_code
+       FROM unpack_records u LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
+       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(u.model) COLLATE NOCASE
+       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE = COALESCE(TRIM(u.version), '') COLLATE NOCASE
+       WHERE u.label_type = 'shipped' AND (TRIM(u.traceNo) = ? OR TRIM(u.new_traceNo) = ?)`, [traceNo, traceNo]);
+    history = [...direct, ...labels.map(row => ({
+      id: row.original_material_id, customer_name: row.customer_name,
+      inventory_code: row.inventory_code,
+    }))];
+    if (history.some(row => !row.inventory_code?.trim())) {
+      throw new Error(`追溯码 ${traceNo} 历史存货信息不完整，请先核对型号绑定，本次未录入`);
+    }
+    if (history.length && !history.some(codeMatches)) {
+      throw new Error(`追溯码 ${traceNo} 对应其他存货编码，本次退货未录入`);
+    }
+    history = history.filter(codeMatches);
+  } else {
+    history = batch ? (await database.getAllAsync<MaterialRecord>(
+      'SELECT * FROM materials WHERE TRIM(batch) = ?', [batch]))
+      .filter(codeMatches) : [];
+  }
+  const customers = Array.from(new Set(history.map(row => row.customer_name?.trim() || '').filter(Boolean)));
+  const sourceMaterialIds = Array.from(new Set(history.map(row => row.id)));
+  if (!traceNo) return {
+    kind: 'batch', customers, sourceMaterialIds,
+    message: batch ? `无追溯码，按批次 ${batch} 登记；批次不限制客户` : '无追溯码及批次，历史来源未知',
+  };
+  if (!history.length || !customers.length) return {
+    kind: 'trace_unknown', customers, sourceMaterialIds,
+    message: `未查到可核验的历史发货客户，按客户 ${params.customerName.trim()} 退货登记；历史来源未知`,
+  };
+  if (!customers.some(customer => customer === params.customerName.trim())) {
+    throw new Error(`该追溯码对应客户 ${customers.join('、')}，与当前退货客户 ${params.customerName.trim()} 不符，本次未录入`);
+  }
+  return { kind: 'trace_matched', customers, sourceMaterialIds,
+    message: `追溯码客户核对通过：${params.customerName.trim()}` };
+};
+
+export const checkSalesReturnSource = async (params: {
+  traceNo?: string; batch?: string; inventoryCode: string; customerName: string; accountKey?: string
+}): Promise<SalesReturnSourceResult> => runDatabaseReadWithRetry('checkSalesReturnSource', () =>
+  checkSalesReturnSourceWithDatabase(getDb(), params));
+
+const getReturnCreditsWithDatabase = async (
+  database: SQLite.SQLiteDatabase,
+  traceNo: string,
+  inventoryCode: string,
+  warehouseId?: string | null,
+  batch?: string
+): Promise<Array<{ record: SalesReturnRecord; available: number }>> => {
+  const trace = traceNo.trim();
+  let records: SalesReturnStoredRow[];
+  if (trace) {
+    records = await database.getAllAsync<SalesReturnStoredRow>(
+      'SELECT * FROM sales_return_records WHERE TRIM(traceNo) = ?', [trace]);
+    // 拆包剩余新码沿用它的退货来源额度，扣减仍落在原实收记录上。
+    const remainingLabels = await database.getAllAsync<UnpackRecord>(
+      `SELECT * FROM unpack_records WHERE label_type = 'remaining'
+       AND (TRIM(traceNo) = ? OR TRIM(new_traceNo) = ?)`, [trace, trace]);
+    const parentIds = Array.from(new Set(remainingLabels.map(row => row.original_material_id)));
+    if (parentIds.length) {
+      const origins = await database.getAllAsync<{ return_id: string }>(
+        `SELECT return_id FROM sales_return_allocations WHERE material_id IN (${parentIds.map(() => '?').join(',')})`, parentIds);
+      const originIds = Array.from(new Set(origins.map(row => row.return_id)));
+      if (originIds.length) records.push(...await database.getAllAsync<SalesReturnStoredRow>(
+        `SELECT * FROM sales_return_records WHERE id IN (${originIds.map(() => '?').join(',')})`, originIds));
+    }
+  } else {
+    records = batch?.trim() ? await database.getAllAsync<SalesReturnStoredRow>(
+      `SELECT * FROM sales_return_records WHERE COALESCE(TRIM(traceNo), '') = '' AND TRIM(batch) = ?`,
+      [batch.trim()]) : [];
+  }
+  const code = inventoryCode.trim().toUpperCase();
+  const unique = new Map<string, SalesReturnRecord>();
+  for (const row of records) {
+    if ((code && row.inventory_code.trim().toUpperCase() !== code) ||
+      (warehouseId?.trim() && row.warehouse_id !== warehouseId.trim())) continue;
+    unique.set(row.id, mapSalesReturnRecord(row));
+  }
+  const ids = [...unique.keys()];
+  if (!ids.length) return [];
+  const allocations = await database.getAllAsync<{ return_id: string; quantity: number }>(
+    `SELECT return_id, quantity FROM sales_return_allocations WHERE return_id IN (${ids.map(() => '?').join(',')})`, ids);
+  const consumed = new Map<string, number>();
+  for (const item of allocations) consumed.set(item.return_id,
+    (consumed.get(item.return_id) || 0) + Number(item.quantity));
+  return [...unique.values()].sort((a, b) => a.returned_at.localeCompare(b.returned_at) || a.id.localeCompare(b.id))
+    .map(record => ({ record, available: Math.max(0, record.quantity - (consumed.get(record.id) || 0)) }));
+};
+
+export const getReturnedTraceAllowance = async (
+  traceNo: string, inventoryCode: string, warehouseId?: string
+): Promise<{ quantity: number; hasHistory: boolean }> => runDatabaseReadWithRetry('getReturnedTraceAllowance', async () => {
+  const credits = await getReturnCreditsWithDatabase(getDb(), traceNo, inventoryCode, warehouseId);
+  const sale = traceNo.trim() ? await getDb().getFirstAsync<{ id: string }>(
+    'SELECT id FROM materials WHERE TRIM(traceNo) = ? LIMIT 1', [traceNo.trim()]) : null;
+  const label = traceNo.trim() ? await getDb().getFirstAsync<{ id: string }>(
+    'SELECT id FROM unpack_records WHERE TRIM(traceNo) = ? OR TRIM(new_traceNo) = ? LIMIT 1',
+    [traceNo.trim(), traceNo.trim()]) : null;
+  return { quantity: credits.reduce((sum, item) => sum + item.available, 0),
+    hasHistory: credits.length > 0 || !!sale || !!label };
+});
+
+const allocateSalesReturnWithDatabase = async (
+  database: SQLite.SQLiteDatabase,
+  material: Pick<MaterialWritePayload, 'id' | 'traceNo' | 'inventory_code' | 'warehouse_id' | 'batch'>,
+  quantity: number,
+  pairId = ''
+): Promise<void> => {
+  const credits = await getReturnCreditsWithDatabase(database, material.traceNo || '',
+    material.inventory_code || '', material.warehouse_id, material.batch);
+  if (!credits.length) {
+    if (material.traceNo?.trim()) {
+      const otherScope = await getReturnCreditsWithDatabase(database, material.traceNo, '');
+      if (otherScope.length) throw new Error('该追溯码已关联销售退货，存货编码或回库仓库与当前出库不一致，本次未录入');
+    }
+    return; // 未涉及退货的普通库存沿用原规则。
+  }
+  const existing = await database.getAllAsync<{ quantity: number }>(
+    'SELECT quantity FROM sales_return_allocations WHERE material_id = ? AND pair_id = ?', [material.id || '', pairId]);
+  if (existing.length) {
+    if (existing.reduce((sum, row) => sum + Number(row.quantity), 0) !== quantity) {
+      throw new Error('退货再次出库任务已保存且数量不同，请重新加载核对');
+    }
+    return;
+  }
+  const available = credits.reduce((sum, item) => sum + item.available, 0);
+  if (material.traceNo?.trim() && quantity > available) {
+    throw new Error(`退货可再次出库数量仅 ${available}，本次 ${quantity} 超出已验收数量`);
+  }
+  let remaining = Math.min(quantity, available);
+  for (const item of credits) {
+    const allocated = Math.min(item.available, remaining);
+    if (!allocated) continue;
+    await database.runAsync(
+      'INSERT INTO sales_return_allocations (id, return_id, material_id, pair_id, quantity, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [generateId(), item.record.id, material.id || '', pairId, allocated, getISODateTime()]);
+    remaining -= allocated;
+    if (!remaining) break;
+  }
+};
+
+export const saveSalesReturnWithOrder = async (params: {
+  material: MaterialWritePayload; requiredQuantity: number; notes?: string
+}): Promise<SalesReturnRecord> => {
+  if (!db) await initDatabase();
+  const material = prepareMaterialWritePayload(params.material);
+  const quantity = parseQuantity(material.quantity, { min: 1 });
+  const required = parseQuantity(params.requiredQuantity, { min: 1 });
+  if (quantity === null || required === null) throw new Error('退货实收数量和应退数量必须为正整数');
+  if (!material.order_no?.trim() || !material.customer_name?.trim() ||
+    !material.warehouse_id?.trim() || !material.inventory_code?.trim() || !material.model?.trim()) {
+    throw new Error('退货单、客户、仓库或存货信息不完整，本次未录入');
+  }
+  if (typeof material.raw_content !== 'string' || !material.raw_content.trim()) {
+    throw new Error('退货扫码原始内容为空，本次未录入');
+  }
+  return runExclusiveWriteTransaction(getDb(), 'saveSalesReturnWithOrder', async transaction => {
+    const existing = await transaction.getFirstAsync<SalesReturnStoredRow>(
+      'SELECT * FROM sales_return_records WHERE id = ?', [material.id || '']);
+    if (existing) {
+      const same = ['order_no', 'customer_name', 'warehouse_id', 'inventory_code', 'model', 'version',
+        'package', 'batch', 'traceNo', 'sourceNo', 'productionDate', 'raw_content', 'erp_account_key', 'separator']
+        .every(key => normalizeComparableText(existing[key as keyof SalesReturnStoredRow]) ===
+          normalizeComparableText(material[key as keyof MaterialWritePayload]));
+      const fieldsKey = (fields?: Record<string, string>) => JSON.stringify(Object.entries(fields || {})
+        .sort(([left], [right]) => left.localeCompare(right)));
+      if (!same || Number(existing.quantity) !== quantity ||
+        fieldsKey(safeJsonParseNullable<Record<string, string>>(existing.customFields ?? null,
+          'salesReturn.idempotencyFields') || undefined) !== fieldsKey(material.customFields)) {
+        throw new Error('退货扫码任务已保存且内容不同，请重新加载核对');
+      }
+      return mapSalesReturnRecord(existing);
+    }
+    if (await transaction.getFirstAsync('SELECT id FROM materials WHERE id = ?', [material.id || ''])) {
+      throw new Error('退货扫码任务 ID 与已有出库记录冲突');
+    }
+    const prior = await transaction.getAllAsync<SalesReturnStoredRow>(
+      'SELECT * FROM sales_return_records WHERE order_no = ? AND warehouse_id = ?',
+      [material.order_no.trim(), material.warehouse_id!.trim()]);
+    const traceNo = material.traceNo?.trim() || '';
+    if (traceNo && prior.some(row => row.traceNo?.trim() === traceNo)) {
+      throw new Error(`追溯码 ${traceNo} 已在本退货单登记，本次未录入`);
+    }
+    const received = prior.filter(row => row.inventory_code.trim().toUpperCase() === material.inventory_code!.trim().toUpperCase())
+      .reduce((sum, row) => sum + Number(row.quantity), 0);
+    if (received + quantity > required) throw new Error(`退货数量超出应退数量，应退 ${required}、已收 ${received}、本次 ${quantity}`);
+    if (traceNo) {
+      const credits = await getReturnCreditsWithDatabase(transaction, traceNo, material.inventory_code!, undefined);
+      if (credits.some(item => item.available > 0)) {
+        throw new Error(`追溯码 ${traceNo} 已验收回库且尚未再次发出，本次未录入`);
+      }
+    }
+    const source = await checkSalesReturnSourceWithDatabase(transaction, {
+      traceNo, batch: material.batch, inventoryCode: material.inventory_code!,
+      customerName: material.customer_name, accountKey: material.erp_account_key,
+    });
+    const timestamp = material.scanned_at || getISODateTime();
+    const userNotes = params.notes?.trim() || '';
+    const notes = buildStoredSalesReturnNotes({ quantity,
+      source_kind: source.kind, batch: material.batch, user_notes: userNotes });
+    const row: SalesReturnStoredRow = {
+      ...material, id: material.id!, operation_type: 'sales_return', quantity,
+      order_no: material.order_no.trim(), customer_name: material.customer_name.trim(),
+      warehouse_id: material.warehouse_id!, warehouse_name: material.warehouse_name || '',
+      inventory_code: material.inventory_code!, package: material.package || '', version: material.version || '',
+      productionDate: material.productionDate || '', traceNo, sourceNo: material.sourceNo || '',
+      raw_content: material.raw_content, scanned_at: timestamp, returned_at: timestamp,
+      source_kind: source.kind, source_material_ids: JSON.stringify(source.sourceMaterialIds), notes, user_notes: userNotes,
+      customFields: material.customFields ? JSON.stringify(material.customFields) : null,
+    };
+    const columns = ['id', 'order_no', 'customer_name', 'warehouse_id', 'warehouse_name', 'erp_account_key',
+      'inventory_code', 'model', 'version', 'package', 'batch', 'quantity', 'productionDate', 'traceNo',
+      'sourceNo', 'raw_content', 'separator', 'customFields', 'rule_id', 'rule_name', 'scanned_at', 'returned_at',
+      'source_kind', 'source_material_ids', 'notes', 'user_notes'] as const;
+    await transaction.runAsync(`INSERT INTO sales_return_records (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`,
+      columns.map(column => row[column] ?? null));
+    return mapSalesReturnRecord(row);
+  });
+};
+
+export const getSalesReturnById = async (id: string): Promise<SalesReturnRecord | null> =>
+  runDatabaseReadWithRetry('getSalesReturnById', async () => {
+    const row = await getDb().getFirstAsync<SalesReturnStoredRow>('SELECT * FROM sales_return_records WHERE id = ?', [id.trim()]);
+    return row ? mapSalesReturnRecord(row) : null;
+  });
+
+export const getSalesReturnsByOrder = async (orderNo: string, warehouseId?: string): Promise<SalesReturnRecord[]> =>
+  runDatabaseReadWithRetry('getSalesReturnsByOrder', async () => {
+    const params = [orderNo.trim()];
+    const scope = warehouseId?.trim() ? ' AND warehouse_id = ?' : '';
+    if (scope) params.push(warehouseId!.trim());
+    const rows = await getDb().getAllAsync<SalesReturnStoredRow>(
+      `SELECT * FROM sales_return_records WHERE order_no = ?${scope} ORDER BY returned_at DESC, id DESC`, params);
+    return rows.map(mapSalesReturnRecord);
+  });
+
+const deleteSalesReturnWithDatabase = async (database: SQLite.SQLiteDatabase, id: string): Promise<void> => {
+  if (!await database.getFirstAsync('SELECT id FROM sales_return_records WHERE id = ?', [id])) {
+    throw new Error('退货记录不存在，请重新加载');
+  }
+  if (await database.getFirstAsync('SELECT id FROM sales_return_allocations WHERE return_id = ? LIMIT 1', [id])) {
+    throw new Error('该退货记录已有再次出库，请先撤销后续出库，再删除退货');
+  }
+  await database.runAsync('DELETE FROM sales_return_records WHERE id = ?', [id]);
+};
+
+export const deleteSalesReturn = async (id: string): Promise<void> => {
+  if (!id?.trim()) throw new Error('退货记录 ID 为空');
+  await runExclusiveWriteTransaction(getDb(), 'deleteSalesReturn', database =>
+    deleteSalesReturnWithDatabase(database, id.trim()));
+};
+
+export const updateSalesReturnNotes = async (id: string, userNotes: string): Promise<void> => {
+  if (!id?.trim() || typeof userNotes !== 'string') throw new Error('退货记录或备注无效');
+  await runExclusiveWriteTransaction(getDb(), 'updateSalesReturnNotes', async database => {
+    const row = await database.getFirstAsync<SalesReturnStoredRow>(
+      'SELECT * FROM sales_return_records WHERE id = ?', [id.trim()]);
+    if (!row) throw new Error('退货记录不存在，请重新加载');
+    const supplemental = userNotes.trim();
+    await database.runAsync('UPDATE sales_return_records SET user_notes = ?, notes = ? WHERE id = ?',
+      [supplemental, buildStoredSalesReturnNotes({ ...mapSalesReturnRecord(row), user_notes: supplemental }), id.trim()]);
+  });
+};
+
+const buildSalesReturnOrders = (records: SalesReturnRecord[]): Order[] => {
+  const groups = new Map<string, Order>();
+  for (const record of records) {
+    const key = `${record.order_no}\u0000${record.warehouse_id || ''}`;
+    const previous = groups.get(key);
+    if (previous) {
+      if (record.returned_at < previous.created_at) previous.created_at = record.returned_at;
+      continue;
+    }
+    groups.set(key, { id: `sales_return:${record.warehouse_id || ''}:${record.order_no}`,
+      order_no: record.order_no, customer_name: record.customer_name,
+      warehouse_id: record.warehouse_id, warehouse_name: record.warehouse_name,
+      created_at: record.returned_at, operation_type: 'sales_return' });
+  }
+  return [...groups.values()];
+};
+
+export const getQueryOrder = async (orderNo: string, warehouseId?: string): Promise<Order | null> => {
+  const returned = buildSalesReturnOrders(await getSalesReturnsByOrder(orderNo, warehouseId))[0];
+  return returned || getOrder(orderNo, warehouseId);
+};
+
+export const getQueryMaterialsByOrder = async (orderNo: string, warehouseId?: string): Promise<MaterialRecord[]> => {
+  const [outbound, returned] = await Promise.all([
+    getMaterialsByOrder(orderNo, warehouseId), getSalesReturnsByOrder(orderNo, warehouseId),
+  ]);
+  return [...outbound, ...returned].sort((a, b) => b.scanned_at.localeCompare(a.scanned_at) || b.id.localeCompare(a.id));
+};
+
+export const getQueryFilteredOrders = async (params: Parameters<typeof getFilteredOrders>[0]): Promise<Order[]> => {
+  const [ordinary, returned] = await Promise.all([
+    getFilteredOrders(params), runDatabaseReadWithRetry('getQueryFilteredOrders.returns', () =>
+      getDb().getAllAsync<SalesReturnStoredRow>('SELECT * FROM sales_return_records')),
+  ]);
+  const rows = returned.map(mapSalesReturnRecord);
+  const keyword = params.searchText?.trim().toLowerCase() || '';
+  const batchOrderNos = params.searchType === 'batch' && keyword ? new Set(rows
+    .filter(record => (!params.warehouseId || record.warehouse_id === params.warehouseId) &&
+      record.batch.toLowerCase().includes(keyword)).map(record => record.order_no)) : undefined;
+  const returnOrders = filterOrdersInMemory(buildSalesReturnOrders(rows), {
+    ...params, searchType: params.searchType || 'order', timeFilter: params.timeFilter || 'all', batchOrderNos,
+  });
+  const returnKeys = new Set(buildSalesReturnOrders(rows).map(getOrderBusinessKey));
+  return sortOrdersByOrderNo(deduplicateOrdersByBusinessKey([
+    ...ordinary.filter(order => !returnKeys.has(getOrderBusinessKey(order))), ...returnOrders,
+  ]));
+};
+
 // ========== 物料相关函数 ==========
 
-// 🔥 新增：批量添加物料（使用事务，速度提升 10 倍）
+// 批量写入物料记录。
 export const addMaterialsBatch = async (
   materials: Array<{
     order_no: string;
@@ -3720,7 +4343,7 @@ export const addMaterialsBatch = async (
   }>
 ): Promise<string[]> => {
   try {
-    // 🔥 强制初始化保护
+    // 首次使用时先建立数据库连接。
     if (!db) {
       logger.warn('[addMaterialsBatch] 数据库未初始化，等待初始化...');
       await initDatabase();
@@ -3752,65 +4375,13 @@ export const addMaterialsBatch = async (
           material.operation_type === 'outbound' || material.operation_type === 'inventory'
             ? material.operation_type
             : 'outbound';
-
-        await transactionDatabase.runAsync(
-          `INSERT OR IGNORE INTO materials (
-            id, order_no, customer_name, operation_type, model, batch, quantity,
-            package, version, productionDate, traceNo, sourceNo, scanned_at, raw_content,
-            customFields, isUnpacked, original_quantity, remaining_quantity,
-            warehouse_id, warehouse_name, inventory_code, rule_id, rule_name
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            id,
-            material.order_no || '',
-            material.customer_name || '',
-            operationType,
-            material.model || '',
-            material.batch || '',
-            parseQuantity(material.quantity, { min: 0 }) ?? 0,
-            material.package || '',
-            material.version || '',
-            material.productionDate || '',
-            material.traceNo || '',
-            material.sourceNo || '',
-            scannedAt,
-            material.raw_content,
-            material.customFields ? JSON.stringify(material.customFields) : null,
-            0,
-            null,
-            null,
-            material.warehouse_id || null,
-            material.warehouse_name || null,
-            material.inventory_code || null,
-            material.rule_id || null,
-            material.rule_name || null,
-          ]
-        );
-
-        const inserted = await transactionDatabase.getFirstAsync<{
-          id: string;
-          order_no: string | null;
-          operation_type: string | null;
-          model: string | null;
-          raw_content: string | null;
-        }>(
-          'SELECT id, order_no, operation_type, model, raw_content FROM materials WHERE id = ?',
-          [id]
-        );
-        verifyMaterialWriteResult(
-          inserted,
-          {
-            ...material,
-            id,
-            customer_name: material.customer_name || '',
-            operation_type: operationType,
-            batch: material.batch || '',
-            quantity: parseQuantity(material.quantity, { min: 0 }) ?? 0,
-            raw_content: material.raw_content,
-            scanned_at: scannedAt,
-          },
-          id
-        );
+        if (material.operation_type === 'sales_return') throw new Error('销售退货必须通过退货验收接口保存');
+        const quantity = parseQuantity(material.quantity, { min: operationType === 'outbound' ? 1 : 0 });
+        if (quantity === null) throw new Error('物料数量无效，拒绝保存');
+        await insertMaterialWithDatabase(transactionDatabase, {
+          ...material, id, customer_name: material.customer_name || '', operation_type: operationType,
+          batch: material.batch || '', quantity, scanned_at: scannedAt,
+        });
       }
     });
 
@@ -3845,7 +4416,7 @@ export type MaterialWritePayload = {
   isUnpacked?: boolean;
   original_quantity?: string;
   remaining_quantity?: string;
-  // V3.0 新增字段
+  // 出库订单对应的仓库信息
   warehouse_id?: string;
   warehouse_name?: string;
   inventory_code?: string;
@@ -3886,13 +4457,12 @@ const verifyMaterialWriteResult = (
 
 const insertMaterialWithDatabase = async (
   database: SQLite.SQLiteDatabase,
-  material: MaterialWritePayload
+  material: MaterialWritePayload,
+  deferReturnAllocation = false
 ): Promise<string> => {
-  // 参数验证
   if (!material.order_no || typeof material.order_no !== 'string') {
     throw new Error('无效的 order_no');
   }
-  // 🔥 临时修复：允许 model 为空，仅做类型检查
   if (typeof material.model !== 'string') {
     throw new Error('无效的 model');
   }
@@ -3901,6 +4471,7 @@ const insertMaterialWithDatabase = async (
   }
 
   const operationType = material.operation_type || 'outbound';
+  if ((material.operation_type as string) === 'sales_return') throw new Error('销售退货必须通过退货验收接口保存');
   if (operationType === 'outbound') {
     if (material.model.trim() === '') {
       throw new Error('出库物料型号为空，拒绝保存');
@@ -3911,8 +4482,45 @@ const insertMaterialWithDatabase = async (
   }
 
   const materialId = material.id || generateId();
+  if (await database.getFirstAsync('SELECT id FROM sales_return_records WHERE id = ?', [materialId])) {
+    throw new Error('出库扫码任务 ID 与退货记录冲突');
+  }
   const scannedAt = material.scanned_at || getISODateTime();
-  const quantity = parseQuantity(material.quantity, { min: 0 }) ?? 0;
+  const quantity = parseQuantity(material.quantity, { min: operationType === 'outbound' ? 1 : 0 });
+  if (quantity === null) {
+    throw new Error(operationType === 'outbound' ? '出库数量必须为正整数，拒绝保存' : '物料数量无效，拒绝保存');
+  }
+
+  // A scan event owns its ID. Identical physical packs without trace numbers
+  // still receive different IDs, while retrying one event cannot append it twice.
+  const existing = await database.getFirstAsync<{
+    id: string; order_no: string | null; operation_type: string | null;
+    model: string | null; raw_content: string | null; quantity: number | string;
+    warehouse_id?: string | null; inventory_code?: string | null; batch?: string | null;
+    version?: string | null; traceNo?: string | null;
+    package?: string | null; productionDate?: string | null; sourceNo?: string | null;
+    customFields?: string | null;
+  }>('SELECT * FROM materials WHERE id = ?', [materialId]);
+  if (existing) {
+    verifyMaterialWriteResult(existing, material, materialId);
+    const sameValue = (left: unknown, right: unknown) => String(left ?? '') === String(right ?? '');
+    const customFieldsKey = (fields?: Record<string, string> | null) =>
+      JSON.stringify(Object.entries(fields || {}).sort(([left], [right]) => left.localeCompare(right)));
+    if (!sameValue(existing.quantity, quantity) ||
+      !sameValue(existing.warehouse_id, material.warehouse_id) ||
+      !sameValue(existing.inventory_code, material.inventory_code) ||
+      !sameValue(existing.batch, material.batch) ||
+      !sameValue(existing.version, material.version) ||
+      !sameValue(existing.traceNo, material.traceNo) ||
+      !sameValue(existing.package, material.package) ||
+      !sameValue(existing.productionDate, material.productionDate) ||
+      !sameValue(existing.sourceNo, material.sourceNo) ||
+      customFieldsKey(safeJsonParseNullable<Record<string, string>>(existing.customFields ?? null,
+        'materialIdempotency.customFields')) !== customFieldsKey(material.customFields)) {
+      throw new Error(`扫码任务已保存且内容不同，请重新加载核对: ${materialId}`);
+    }
+    return materialId;
+  }
 
   await database.runAsync(
     `INSERT OR IGNORE INTO materials (
@@ -3965,6 +4573,10 @@ const insertMaterialWithDatabase = async (
     await database.runAsync('UPDATE materials SET erp_account_key = ? WHERE id = ?', [accountKey, materialId]);
   }
 
+  if (operationType === 'outbound' && !deferReturnAllocation) {
+    await allocateSalesReturnWithDatabase(database, { ...material, id: materialId }, quantity);
+  }
+
   return materialId;
 };
 
@@ -4000,11 +4612,10 @@ const checkpointAfterCriticalWrite = async (
 // 添加物料记录（完整版）
 export const addMaterial = async (material: MaterialWritePayload): Promise<string> => {
   try {
-    // 🔍 测试：打印 db 状态
     logger.log('[addMaterial] db状态', db ? '已初始化' : 'null');
     logger.log('[addMaterial] 全局isInitializing', isInitializing);
 
-    // 🔥 强制初始化保护：如果 db 为 null，等待初始化完成
+    // 首次使用时先建立数据库连接。
     if (!db) {
       logger.warn('[addMaterial] 数据库未初始化，等待初始化...');
       await initDatabase();
@@ -4062,15 +4673,15 @@ export const getMaterial = async (id: string): Promise<MaterialRecord | null> =>
     }
 
     const result = await runDatabaseReadWithRetry('getMaterial', () =>
-      getDb().getFirstAsync<any>('SELECT * FROM materials WHERE id = ?', [id.trim()])
+      getDb().getFirstAsync<MaterialRecordRow>('SELECT * FROM materials WHERE id = ?', [id.trim()])
     );
 
-    if (!result) return null;
+    if (!result) return getSalesReturnById(id.trim());
 
     // 转换 customFields
     return {
       ...result,
-      customFields: safeJsonParseNullable<Record<string, string>>(result.customFields, 'database.safeJsonParseNullable'),
+      customFields: safeJsonParseNullable<Record<string, string>>(result.customFields, 'database.safeJsonParseNullable') ?? undefined,
       isUnpacked: result.isUnpacked === 1,
     };
   } catch (error) {
@@ -4078,6 +4689,8 @@ export const getMaterial = async (id: string): Promise<MaterialRecord | null> =>
     throw error;
   }
 };
+
+export const getMaterialById = getMaterial;
 
 // 获取订单下的所有物料记录
 export const getMaterialsByOrder = async (
@@ -4095,12 +4708,12 @@ export const getMaterialsByOrder = async (
       m.*,
       COALESCE(NULLIF(TRIM(m.inventory_code), ''), ib.inventory_code) AS inventory_code
     FROM materials m
-    LEFT JOIN inventory_bindings ib
+    LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(m.model) COLLATE NOCASE
       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
         COALESCE(TRIM(m.version), '') COLLATE NOCASE
     WHERE m.order_no = ?`;
-    const params: any[] = [orderNo.trim()];
+    const params: SQLite.SQLiteBindValue[] = [orderNo.trim()];
 
     if (warehouseId && typeof warehouseId === 'string' && warehouseId.trim() !== '') {
       sql += ' AND m.warehouse_id = ?';
@@ -4110,12 +4723,12 @@ export const getMaterialsByOrder = async (
     sql += ' ORDER BY m.scanned_at DESC, m.id DESC';
 
     const results = await runDatabaseReadWithRetry('getMaterialsByOrder', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<MaterialRecordRow>(sql, params)
     );
 
     return results.map((r) => ({
       ...r,
-      customFields: safeJsonParseNullable<Record<string, string>>(r.customFields, 'database.safeJsonParseNullable'),
+      customFields: safeJsonParseNullable<Record<string, string>>(r.customFields, 'database.safeJsonParseNullable') ?? undefined,
       isUnpacked: r.isUnpacked === 1,
     }));
   } catch (error) {
@@ -4161,9 +4774,9 @@ export const checkMaterialExists = async (
       throw new Error(`非法的重复校验字段: ${duplicateIdentifier.field}`);
     }
 
-    const mapMaterialRecord = (record: any): MaterialRecord => ({
+    const mapMaterialRecord = (record: MaterialRecordRow): MaterialRecord => ({
       ...record,
-      customFields: safeJsonParseNullable<Record<string, string>>(record.customFields, 'database.safeJsonParseNullable'),
+      customFields: safeJsonParseNullable<Record<string, string>>(record.customFields, 'database.safeJsonParseNullable') ?? undefined,
       isUnpacked: record.isUnpacked === 1,
     });
 
@@ -4173,7 +4786,7 @@ export const checkMaterialExists = async (
         : null;
 
     let sql = `SELECT * FROM materials WHERE order_no = ? AND ${duplicateIdentifier.field} = ?`;
-    const sqlParams: any[] = [trimmedOrderNo, duplicateIdentifier.value];
+    const sqlParams: SQLite.SQLiteBindValue[] = [trimmedOrderNo, duplicateIdentifier.value];
     if (trimmedWarehouseId) {
       sql += " AND (warehouse_id = ? OR warehouse_id IS NULL OR warehouse_id = '')";
       sqlParams.push(trimmedWarehouseId);
@@ -4186,7 +4799,7 @@ export const checkMaterialExists = async (
       sqlParams
     );
 
-    const existingInSameOrder = await database.getFirstAsync<any>(sql, sqlParams);
+    const existingInSameOrder = await database.getFirstAsync<MaterialRecordRow>(sql, sqlParams);
 
     if (existingInSameOrder) {
       const material = mapMaterialRecord(existingInSameOrder);
@@ -4195,7 +4808,7 @@ export const checkMaterialExists = async (
     }
 
     let otherOrderSql = `SELECT * FROM materials WHERE order_no != ? AND ${duplicateIdentifier.field} = ?`;
-    const otherOrderParams: any[] = [trimmedOrderNo, duplicateIdentifier.value];
+    const otherOrderParams: SQLite.SQLiteBindValue[] = [trimmedOrderNo, duplicateIdentifier.value];
     if (trimmedWarehouseId) {
       otherOrderSql += " AND (warehouse_id = ? OR warehouse_id IS NULL OR warehouse_id = '')";
       otherOrderParams.push(trimmedWarehouseId);
@@ -4208,7 +4821,7 @@ export const checkMaterialExists = async (
       otherOrderParams
     );
 
-    const existingInOtherOrder = await database.getFirstAsync<any>(otherOrderSql, otherOrderParams);
+    const existingInOtherOrder = await database.getFirstAsync<MaterialRecordRow>(otherOrderSql, otherOrderParams);
 
     if (existingInOtherOrder) {
       const material = mapMaterialRecord(existingInOtherOrder);
@@ -4218,10 +4831,12 @@ export const checkMaterialExists = async (
         trimmedOrderNo,
         warehouseId
       );
+      const returned = await getReturnCreditsWithDatabase(database, duplicateIdentifier.value,
+        material.inventory_code || '', trimmedWarehouseId);
       return {
         material,
         isUnpacked: !!material.isUnpacked,
-        canRescan: canUseRemainingTraceNo,
+        canRescan: canUseRemainingTraceNo || returned.some(item => item.available > 0),
       };
     }
 
@@ -4230,7 +4845,7 @@ export const checkMaterialExists = async (
       FROM unpack_records u
       JOIN materials m ON m.id = u.original_material_id
       WHERE (TRIM(u.traceNo) = ? OR TRIM(u.new_traceNo) = ?)`;
-    const unpackTraceParams: any[] = [duplicateIdentifier.value, duplicateIdentifier.value];
+    const unpackTraceParams: SQLite.SQLiteBindValue[] = [duplicateIdentifier.value, duplicateIdentifier.value];
     if (trimmedWarehouseId) {
       unpackTraceSql += " AND (u.warehouse_id = ? OR u.warehouse_id IS NULL OR u.warehouse_id = '')";
       unpackTraceParams.push(trimmedWarehouseId);
@@ -4241,13 +4856,15 @@ export const checkMaterialExists = async (
                u.id DESC
       LIMIT 1`;
 
-    const existingInUnpackRecord = await database.getFirstAsync<any>(
+    const existingInUnpackRecord = await database.getFirstAsync<MaterialRecordRow>(
       unpackTraceSql,
       unpackTraceParams
     );
     if (existingInUnpackRecord) {
       const material = mapMaterialRecord(existingInUnpackRecord);
-      return { material, isUnpacked: true, canRescan: false };
+      const returned = await getReturnCreditsWithDatabase(database, duplicateIdentifier.value,
+        material.inventory_code || '', trimmedWarehouseId);
+      return { material, isUnpacked: true, canRescan: returned.some(item => item.available > 0) };
     }
 
     return { material: null, isUnpacked: false, canRescan: false };
@@ -4273,6 +4890,8 @@ export const hasAnyMaterials = async (): Promise<boolean> => {
 
 export const hasAnyBusinessData = async (): Promise<boolean> => {
   try {
+    if (isWebPlatform) return ['orders', 'materials', 'inbound_records', 'inventory_check_records',
+      'unpack_records', 'sales_return_records'].some(table => (mockTables[table]?.length || 0) > 0);
     const result = await runDatabaseReadWithRetry('hasAnyBusinessData', () =>
       getDb().getFirstAsync<{ exists: number }>(`
         SELECT CASE
@@ -4281,6 +4900,7 @@ export const hasAnyBusinessData = async (): Promise<boolean> => {
             OR EXISTS (SELECT 1 FROM inbound_records LIMIT 1)
             OR EXISTS (SELECT 1 FROM inventory_check_records LIMIT 1)
             OR EXISTS (SELECT 1 FROM unpack_records LIMIT 1)
+            OR EXISTS (SELECT 1 FROM sales_return_records LIMIT 1)
           THEN 1
           ELSE 0
         END AS [exists]
@@ -4301,11 +4921,11 @@ export const getAllMaterials = async (warehouseId?: string): Promise<MaterialRec
       m.*,
       COALESCE(NULLIF(TRIM(m.inventory_code), ''), ib.inventory_code) AS inventory_code
     FROM materials m
-    LEFT JOIN inventory_bindings ib
+    LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(m.model) COLLATE NOCASE
       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
         COALESCE(TRIM(m.version), '') COLLATE NOCASE`;
-    const params: any[] = [];
+    const params: SQLite.SQLiteBindValue[] = [];
 
     if (warehouseId) {
       sql += ' WHERE m.warehouse_id = ?';
@@ -4315,12 +4935,12 @@ export const getAllMaterials = async (warehouseId?: string): Promise<MaterialRec
     sql += ' ORDER BY m.scanned_at DESC';
 
     const results = await runDatabaseReadWithRetry('getAllMaterials', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<MaterialRecordRow>(sql, params)
     );
 
     return results.map((r) => ({
       ...r,
-      customFields: safeJsonParseNullable<Record<string, string>>(r.customFields, 'database.safeJsonParseNullable'),
+      customFields: safeJsonParseNullable<Record<string, string>>(r.customFields, 'database.safeJsonParseNullable') ?? undefined,
       isUnpacked: r.isUnpacked === 1,
     }));
   } catch (error) {
@@ -4349,7 +4969,7 @@ export const getOutboundExportRows = async (warehouseId?: string): Promise<Outbo
       COALESCE(m.sourceNo, '') AS sourceNo,
       COALESCE(m.scanned_at, '') AS scanned_at
     FROM materials m
-    LEFT JOIN inventory_bindings ib
+    LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(m.model) COLLATE NOCASE
       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
         COALESCE(TRIM(m.version), '') COLLATE NOCASE`;
@@ -4362,7 +4982,7 @@ export const getOutboundExportRows = async (warehouseId?: string): Promise<Outbo
     sql += ` WHERE ${conditions.join(' AND ')}
       ORDER BY m.scanned_at DESC, m.id DESC`;
 
-    const rows = await database.getAllAsync<any>(sql, params);
+    const rows = await database.getAllAsync<OutboundExportRow>(sql, params);
     return rows.map((row) => ({
       order_no: row.order_no || '',
       customer_name: row.customer_name || '',
@@ -4398,7 +5018,7 @@ export const searchMaterials = async (params: {
 }): Promise<MaterialRecord[]> => {
   try {
     const conditions: string[] = [];
-    const queryParams: any[] = [];
+    const queryParams: SQLite.SQLiteBindValue[] = [];
 
     if (params.operation_type) {
       conditions.push('m.operation_type = ?');
@@ -4449,7 +5069,7 @@ export const searchMaterials = async (params: {
       m.*,
       COALESCE(NULLIF(TRIM(m.inventory_code), ''), ib.inventory_code) AS inventory_code
     FROM materials m
-    LEFT JOIN inventory_bindings ib
+    LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(m.model) COLLATE NOCASE
       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
         COALESCE(TRIM(m.version), '') COLLATE NOCASE
@@ -4457,12 +5077,12 @@ export const searchMaterials = async (params: {
     ORDER BY m.scanned_at DESC, m.id DESC`;
 
     const results = await runDatabaseReadWithRetry('searchMaterials', () =>
-      getDb().getAllAsync<any>(sql, queryParams)
+      getDb().getAllAsync<MaterialRecordRow>(sql, queryParams)
     );
 
     return results.map((r) => ({
       ...r,
-      customFields: safeJsonParseNullable<Record<string, string>>(r.customFields, 'database.safeJsonParseNullable'),
+      customFields: safeJsonParseNullable<Record<string, string>>(r.customFields, 'database.safeJsonParseNullable') ?? undefined,
       isUnpacked: r.isUnpacked === 1,
     }));
   } catch (error) {
@@ -4471,12 +5091,20 @@ export const searchMaterials = async (params: {
   }
 };
 
-// Deleting either split label cancels the parent operation, never just half of a label pair.
+// 删除任一拆包标签时撤销整次拆包，不能只留下成对标签中的一张。
 const deleteMaterialsWithDatabase = async (
   transactionDatabase: SQLite.SQLiteDatabase,
   ids: string[]
 ): Promise<void> => {
   const deleting = new Set(ids);
+  const returnedSources = await transactionDatabase.getAllAsync<{ source_material_ids: string }>(
+    'SELECT source_material_ids FROM sales_return_records');
+  for (const returned of returnedSources) {
+    const sources = safeJsonParseNullable<string[]>(returned.source_material_ids, 'deleteMaterial.returnSources') || [];
+    if (sources.some(id => deleting.has(id))) {
+      throw new Error('该出库记录已关联销售退货，请先撤销后续出库及退货，保留原发货来源');
+    }
+  }
   for (const id of deleting) {
     const dependents = await transactionDatabase.getAllAsync<{ id: string }>(
       `SELECT m.id FROM materials m
@@ -4499,6 +5127,12 @@ const deleteMaterialsWithDatabase = async (
       order_no: string | null;
       warehouse_id: string | null;
     }>('SELECT order_no, warehouse_id FROM materials WHERE id = ?', [trimmedId]);
+    const unpackPairs = await transactionDatabase.getAllAsync<{ pair_id: string }>(
+      'SELECT pair_id FROM unpack_records WHERE original_material_id = ?', [trimmedId]);
+    for (const pair of unpackPairs) {
+      await transactionDatabase.runAsync('DELETE FROM unpack_print_tasks WHERE pair_id = ?', [pair.pair_id]);
+    }
+    await transactionDatabase.runAsync('DELETE FROM sales_return_allocations WHERE material_id = ?', [trimmedId]);
     await transactionDatabase.runAsync('DELETE FROM unpack_records WHERE original_material_id = ?', [trimmedId]);
     await transactionDatabase.runAsync('DELETE FROM materials WHERE id = ?', [trimmedId]);
 
@@ -4529,8 +5163,11 @@ export const deleteMaterial = async (id: string): Promise<void> => {
       logger.warn('[deleteMaterial] 无效的 id:', id);
       return;
     }
-    await runExclusiveWriteTransaction(getDb(), 'deleteMaterial', transactionDatabase =>
-      deleteMaterialsWithDatabase(transactionDatabase, [id.trim()]));
+    await runExclusiveWriteTransaction(getDb(), 'deleteMaterial', async transactionDatabase => {
+      const returned = await transactionDatabase.getFirstAsync('SELECT id FROM sales_return_records WHERE id = ?', [id.trim()]);
+      if (returned) await deleteSalesReturnWithDatabase(transactionDatabase, id.trim());
+      else await deleteMaterialsWithDatabase(transactionDatabase, [id.trim()]);
+    });
   } catch (error) {
     logger.error('[deleteMaterial] 删除物料记录失败:', error);
     throw error;
@@ -4582,6 +5219,7 @@ export const updateMaterialQuantity = async (id: string, newQuantity: number): P
 
     const database = getDb();
     await runExclusiveWriteTransaction(database, 'updateMaterialQuantity', async (transactionDatabase) => {
+      await assertSalesReturnLinkedMaterialEdit(transactionDatabase, id.trim(), { quantity: parsedQuantity });
       await updateMaterialWithDatabase(transactionDatabase, id.trim(), { quantity: parsedQuantity });
     });
   } catch (error) {
@@ -4607,6 +5245,28 @@ type MaterialUpdatePayload = Partial<
     | 'isUnpacked'
   >
 >;
+
+const assertSalesReturnLinkedMaterialEdit = async (
+  database: SQLite.SQLiteDatabase, id: string, updates: MaterialUpdatePayload
+): Promise<void> => {
+  if (await database.getFirstAsync('SELECT id FROM sales_return_records WHERE id = ?', [id])) {
+    throw new Error('退货数量及追溯信息不能直接修改，请撤销未再次出库的退货记录后重新验收');
+  }
+  const current = await database.getFirstAsync<MaterialRecord>('SELECT * FROM materials WHERE id = ?', [id]);
+  if (!current) return;
+  const sensitive = ['quantity', 'traceNo', 'model', 'batch', 'version', 'customer_name', 'original_quantity', 'remaining_quantity', 'isUnpacked'] as const;
+  const changed = sensitive.some(key => updates[key] !== undefined &&
+    (key === 'isUnpacked'
+      ? Boolean(updates.isUnpacked) !== (current.isUnpacked === true || Number(current.isUnpacked) === 1)
+      : normalizeComparableText(updates[key]) !== normalizeComparableText(current[key])));
+  if (!changed) return;
+  const allocated = await database.getFirstAsync('SELECT id FROM sales_return_allocations WHERE material_id = ? LIMIT 1', [id]);
+  const sources = await database.getAllAsync<{ source_material_ids: string }>('SELECT source_material_ids FROM sales_return_records');
+  if (allocated || sources.some(row =>
+    (safeJsonParseNullable<string[]>(row.source_material_ids, 'materialEdit.returnSources') || []).includes(id))) {
+    throw new Error('物料已关联销售退货或再次出库，不能直接修改数量和追溯信息，请先撤销后续记录');
+  }
+};
 
 const MATERIAL_UPDATE_FIELDS = [
   'model',
@@ -4699,6 +5359,7 @@ export const updateMaterial = async (id: string, updates: MaterialUpdatePayload)
   try {
     const database = getDb();
     await runExclusiveWriteTransaction(database, 'updateMaterial', async (transactionDatabase) => {
+      await assertSalesReturnLinkedMaterialEdit(transactionDatabase, id, updates);
       await updateMaterialWithDatabase(transactionDatabase, id, updates);
     });
   } catch (error) {
@@ -4778,11 +5439,11 @@ export const getAllUnpackRecords = async (warehouseId?: string): Promise<UnpackR
       COALESCE(NULLIF(TRIM(u.inventory_code), ''), ib.inventory_code) AS inventory_code,
       NULLIF(TRIM(ib.supplier), '') AS supplier
     FROM unpack_records u
-    LEFT JOIN inventory_bindings ib
+    LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(u.model) COLLATE NOCASE
       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
         COALESCE(TRIM(u.version), '') COLLATE NOCASE`;
-    const params: any[] = [];
+    const params: SQLite.SQLiteBindValue[] = [];
 
     if (warehouseId) {
       sql += ' WHERE u.warehouse_id = ?';
@@ -4792,9 +5453,9 @@ export const getAllUnpackRecords = async (warehouseId?: string): Promise<UnpackR
     sql += ' ORDER BY u.unpacked_at DESC';
 
     const results = await runDatabaseReadWithRetry('getAllUnpackRecords', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<UnpackRecord>(sql, params)
     );
-    return results as UnpackRecord[];
+    return results;
   } catch (error) {
     logger.error('获取拆包记录失败:', error);
     throw error;
@@ -4809,12 +5470,12 @@ export const getPendingUnpackRecords = async (warehouseId?: string): Promise<Unp
       COALESCE(NULLIF(TRIM(u.inventory_code), ''), ib.inventory_code) AS inventory_code,
       NULLIF(TRIM(ib.supplier), '') AS supplier
     FROM unpack_records u
-    LEFT JOIN inventory_bindings ib
+    LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(u.model) COLLATE NOCASE
       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
         COALESCE(TRIM(u.version), '') COLLATE NOCASE
     WHERE u.status = 'pending'`;
-    const params: any[] = [];
+    const params: SQLite.SQLiteBindValue[] = [];
 
     if (warehouseId) {
       sql += ' AND u.warehouse_id = ?';
@@ -4824,9 +5485,9 @@ export const getPendingUnpackRecords = async (warehouseId?: string): Promise<Unp
     sql += ' ORDER BY u.unpacked_at DESC';
 
     const results = await runDatabaseReadWithRetry('getPendingUnpackRecords', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<UnpackRecord>(sql, params)
     );
-    return results as UnpackRecord[];
+    return results;
   } catch (error) {
     logger.error('获取待打印记录失败:', error);
     throw error;
@@ -4837,13 +5498,13 @@ export const getPendingUnpackRecords = async (warehouseId?: string): Promise<Unp
 export const getPrintedUnpackRecords = async (): Promise<UnpackRecord[]> => {
   try {
     const results = await runDatabaseReadWithRetry('getPrintedUnpackRecords', () =>
-      getDb().getAllAsync<any>(
+      getDb().getAllAsync<UnpackRecord>(
         `SELECT
         u.*,
         COALESCE(NULLIF(TRIM(u.inventory_code), ''), ib.inventory_code) AS inventory_code,
         NULLIF(TRIM(ib.supplier), '') AS supplier
       FROM unpack_records u
-      LEFT JOIN inventory_bindings ib
+      LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
         ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(u.model) COLLATE NOCASE
         AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
           COALESCE(TRIM(u.version), '') COLLATE NOCASE
@@ -4851,7 +5512,7 @@ export const getPrintedUnpackRecords = async (): Promise<UnpackRecord[]> => {
       ORDER BY u.unpacked_at DESC`
       )
     );
-    return results as UnpackRecord[];
+    return results;
   } catch (error) {
     logger.error('获取已打印记录失败:', error);
     throw error;
@@ -4990,6 +5651,7 @@ export const saveUnpackOperation = async (params: {
   remainingQuantity: number;
   newTraceNo: string;
   notes?: string;
+  operationId?: string;
 }): Promise<{
   pairId: string;
   shippedRecord: UnpackRecord;
@@ -5007,7 +5669,7 @@ export const saveUnpackOperation = async (params: {
   }
 
   const database = getDb();
-  const pairId = generateId();
+  const pairId = params.operationId || generateId();
   const notes = params.notes || '';
   const timestamp = getISODateTime();
 
@@ -5016,6 +5678,24 @@ export const saveUnpackOperation = async (params: {
       database,
       'saveUnpackOperation',
       async (transactionDatabase) => {
+        // 带稳定操作 ID，或新扫描事件已生成此标签对时，重试返回原作业。
+        const priorRecords = await transactionDatabase.getAllAsync<UnpackRecord>(
+          params.operationId
+            ? 'SELECT * FROM unpack_records WHERE pair_id = ?'
+            : 'SELECT * FROM unpack_records WHERE original_material_id = ?',
+          [params.operationId || params.material.id]);
+        const priorShipped = priorRecords.find(record => record.label_type === 'shipped' &&
+          (params.operationId || (params.createMaterial && record.new_traceNo === trimmedNewTraceNo)));
+        const priorRemaining = priorShipped && priorRecords.find(record =>
+          record.pair_id === priorShipped.pair_id && record.label_type === 'remaining');
+        if (priorShipped && priorRemaining) {
+          if (priorShipped.original_material_id !== params.material.id ||
+            Number(priorShipped.new_quantity) !== params.shippedQuantity ||
+            Number(priorRemaining.new_quantity) !== params.remainingQuantity) {
+            throw new Error('拆包任务已保存且数量不同，请重新加载核对');
+          }
+          return { pairId: priorShipped.pair_id, shippedRecord: priorShipped, remainingRecord: priorRemaining };
+        }
         if (params.createMaterial) {
           const materialToCreate = prepareMaterialWritePayload({
             ...params.createMaterial.material,
@@ -5027,10 +5707,10 @@ export const saveUnpackOperation = async (params: {
             params.createMaterial.customerName,
             params.createMaterial.warehouse
           );
-          await insertMaterialWithDatabase(transactionDatabase, materialToCreate);
+          await insertMaterialWithDatabase(transactionDatabase, materialToCreate, true);
         }
 
-        const currentMaterial = await transactionDatabase.getFirstAsync<any>(
+        const currentMaterial = await transactionDatabase.getFirstAsync<MaterialRecordRow>(
           'SELECT * FROM materials WHERE id = ? LIMIT 1',
           [params.material.id]
         );
@@ -5047,6 +5727,11 @@ export const saveUnpackOperation = async (params: {
         const availableQuantity = parseQuantity(currentAvailableValue, { min: 1 });
         if (availableQuantity === null) {
           throw new Error('当前可拆数量无效，无法拆包');
+        }
+        const returnedPackage = await getReturnCreditsWithDatabase(transactionDatabase,
+          currentMaterial.traceNo || '', currentMaterial.inventory_code || '', currentMaterial.warehouse_id);
+        if (returnedPackage.length && availableQuantity > returnedPackage.reduce((sum, item) => sum + item.available, 0)) {
+          throw new Error('此标签整包数量超过尚可再次出库的退货数量，请使用当前剩余包装标签');
         }
 
         const shippedQuantity = parseQuantity(params.shippedQuantity, {
@@ -5152,12 +5837,31 @@ export const saveUnpackOperation = async (params: {
           }
         );
 
+        await allocateSalesReturnWithDatabase(transactionDatabase, {
+          id: params.material.id, traceNo: sourceTraceNo,
+          inventory_code: currentMaterial.inventory_code, warehouse_id: currentMaterial.warehouse_id,
+          batch: currentMaterial.batch,
+        }, shippedQuantity, pairId);
+
         await updateMaterialWithDatabase(transactionDatabase, params.material.id, {
           traceNo: nextMaterialTraceNo,
           quantity: updatedShippedQuantity,
           original_quantity: materialOriginalQuantity,
           remaining_quantity: remainingQuantity.toString(),
           isUnpacked: true,
+        });
+
+        await insertUnpackPrintTask(transactionDatabase, {
+          pair_id: pairId,
+          order_no: shippedRecord.order_no,
+          warehouse_id: shippedRecord.warehouse_id || '',
+          warehouse_name: shippedRecord.warehouse_name || '',
+          shipment_record_id: shippedRecord.id,
+          remainder_record_id: remainingRecord.id,
+          status: 'pending',
+          attempt_count: 0,
+          created_at: timestamp,
+          updated_at: timestamp,
         });
 
         return { pairId, shippedRecord, remainingRecord };
@@ -5168,6 +5872,133 @@ export const saveUnpackOperation = async (params: {
     logger.error('保存拆包操作失败:', error);
     throw error;
   }
+};
+
+const insertUnpackPrintTask = async (database: SQLite.SQLiteDatabase, task: UnpackPrintTask): Promise<void> => {
+  await database.runAsync(
+    `INSERT OR IGNORE INTO unpack_print_tasks (
+      pair_id, order_no, warehouse_id, warehouse_name, shipment_record_id, remainder_record_id,
+      status, attempt_count, last_error, last_message, submitted_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [task.pair_id, task.order_no, task.warehouse_id, task.warehouse_name,
+      task.shipment_record_id, task.remainder_record_id, task.status, task.attempt_count,
+      task.last_error || '', task.last_message || '', task.submitted_at || '', task.created_at, task.updated_at]
+  );
+};
+
+const enrichUnpackPrintTask = (task: UnpackPrintTask, records: UnpackRecord[]): UnpackPrintTask => {
+  const shipped = records.find(record => record.id === task.shipment_record_id &&
+    record.pair_id === task.pair_id && record.order_no === task.order_no &&
+    (record.warehouse_id || '') === task.warehouse_id);
+  const remaining = records.find(record => record.id === task.remainder_record_id &&
+    record.pair_id === task.pair_id && record.order_no === task.order_no &&
+    (record.warehouse_id || '') === task.warehouse_id);
+  return { ...task, model: shipped?.model || remaining?.model,
+    shipped_traceNo: shipped?.new_traceNo || shipped?.traceNo,
+    remainder_traceNo: remaining?.new_traceNo || remaining?.traceNo,
+    shipped_quantity: shipped?.new_quantity, remaining_quantity: remaining?.new_quantity };
+};
+
+export const getUnpackPrintTask = async (pairId: string): Promise<UnpackPrintTask | null> => {
+  const task = await runDatabaseReadWithRetry('getUnpackPrintTask', () =>
+    getDb().getFirstAsync<UnpackPrintTask>('SELECT * FROM unpack_print_tasks WHERE pair_id = ?', [pairId]));
+  if (!task) return null;
+  const records = await runDatabaseReadWithRetry('getUnpackPrintTask.details', () =>
+    getDb().getAllAsync<UnpackRecord>('SELECT * FROM unpack_records WHERE pair_id = ?', [pairId]));
+  return enrichUnpackPrintTask(task, records);
+};
+
+export const getUnpackPrintTasks = async (orderNo: string, warehouseId: string): Promise<UnpackPrintTask[]> => {
+  if (!orderNo.trim() || !warehouseId.trim()) return [];
+  await runDatabaseReadWithRetry('getUnpackPrintTasks.ensureReady', () =>
+    getDb().getFirstAsync('SELECT pair_id FROM unpack_print_tasks LIMIT 1'));
+  // Historical records do not contain an automatic-print receipt. Preserve that
+  // uncertainty instead of sending their labels again merely by opening a page.
+  await runExclusiveWriteTransaction(getDb(), 'backfillUnpackPrintTasks', async transaction => {
+    const existing = await transaction.getAllAsync<UnpackPrintTask>(
+      'SELECT * FROM unpack_print_tasks WHERE order_no = ? AND warehouse_id = ?', [orderNo, warehouseId]);
+    const known = new Set(existing.map(task => task.pair_id));
+    const records = await transaction.getAllAsync<UnpackRecord>(
+      'SELECT * FROM unpack_records WHERE order_no = ? AND warehouse_id = ?', [orderNo, warehouseId]);
+    const pairs = new Map<string, UnpackRecord[]>();
+    for (const record of records) {
+      if (!record.pair_id || known.has(record.pair_id)) continue;
+      pairs.set(record.pair_id, [...(pairs.get(record.pair_id) || []), record]);
+    }
+    for (const [pairId, pair] of pairs) {
+      const shipped = pair.find(record => record.label_type === 'shipped');
+      const remaining = pair.find(record => record.label_type === 'remaining');
+      if (pair.length !== 2 || !shipped || !remaining) {
+        logger.warn('[getUnpackPrintTasks] 历史成对标签不完整，保留原记录:', pairId);
+        continue;
+      }
+      await insertUnpackPrintTask(transaction, {
+        pair_id: pairId, order_no: orderNo, warehouse_id: warehouseId,
+        warehouse_name: shipped.warehouse_name || '', shipment_record_id: shipped.id,
+        remainder_record_id: remaining.id, status: 'failed', attempt_count: 0,
+        last_error: '历史拆包没有可核验的自动打印结果，请先核对标签，再决定是否重试',
+        last_message: '历史记录待核对', created_at: shipped.created_at, updated_at: getISODateTime(),
+      });
+    }
+  });
+  const tasks = await runDatabaseReadWithRetry('getUnpackPrintTasks', () =>
+    getDb().getAllAsync<UnpackPrintTask>(
+      'SELECT * FROM unpack_print_tasks WHERE order_no = ? AND warehouse_id = ? ORDER BY created_at DESC',
+      [orderNo, warehouseId]));
+  const records = await runDatabaseReadWithRetry('getUnpackPrintTasks.details', () =>
+    getDb().getAllAsync<UnpackRecord>(
+      'SELECT * FROM unpack_records WHERE order_no = ? AND warehouse_id = ?', [orderNo, warehouseId]));
+  return tasks.map(task => enrichUnpackPrintTask(task, records));
+};
+
+export const getUnpackPrintTaskRecords = async (pairId: string): Promise<UnpackRecord[]> => {
+  const task = await getUnpackPrintTask(pairId);
+  if (!task) throw new Error('拆包打印任务不存在，请重新加载');
+  const records = await runDatabaseReadWithRetry('getUnpackPrintTaskRecords', () =>
+    getDb().getAllAsync<UnpackRecord>(
+      `SELECT u.*, NULLIF(TRIM(ib.supplier), '') AS supplier FROM unpack_records u
+       LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(u.model) COLLATE NOCASE
+       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE = COALESCE(TRIM(u.version), '') COLLATE NOCASE
+       WHERE u.pair_id = ?`, [pairId]));
+  const shipped = records.find(record => record.id === task.shipment_record_id && record.label_type === 'shipped');
+  const remaining = records.find(record => record.id === task.remainder_record_id && record.label_type === 'remaining');
+  if (!shipped || !remaining || records.length !== 2 ||
+    records.some(record => record.order_no !== task.order_no || (record.warehouse_id || '') !== task.warehouse_id)) {
+    throw new Error('拆包标签记录缺失或归属已变化，请重新加载核对');
+  }
+  return [shipped, remaining];
+};
+
+export const updateUnpackPrintTask = async (
+  pairId: string,
+  patch: Partial<Pick<UnpackPrintTask, 'status' | 'last_error' | 'last_message' | 'submitted_at'>>,
+  expectedStatus?: UnpackPrintTaskStatus
+): Promise<boolean> => {
+  if (!db) await initDatabase();
+  return runExclusiveWriteTransaction(getDb(), 'updateUnpackPrintTask', async transaction => {
+    const existing = await transaction.getFirstAsync<UnpackPrintTask>(
+      'SELECT * FROM unpack_print_tasks WHERE pair_id = ?', [pairId]);
+    if (!existing || (expectedStatus && existing.status !== expectedStatus)) return false;
+    const next = { ...existing, ...patch };
+    const result = await transaction.runAsync(
+      `UPDATE unpack_print_tasks SET status = ?, last_error = ?, last_message = ?, submitted_at = ?, updated_at = ?
+       WHERE pair_id = ?`,
+      [next.status, next.last_error || '', next.last_message || '', next.submitted_at || '', getISODateTime(), pairId]);
+    return result.changes > 0;
+  });
+};
+
+export const claimUnpackPrintTask = async (pairId: string): Promise<boolean> => {
+  if (!db) await initDatabase();
+  return runExclusiveWriteTransaction(getDb(), 'claimUnpackPrintTask', async transaction => {
+    const existing = await transaction.getFirstAsync<UnpackPrintTask>(
+      'SELECT * FROM unpack_print_tasks WHERE pair_id = ?', [pairId]);
+    if (!existing || !['pending', 'failed'].includes(existing.status)) return false;
+    const result = await transaction.runAsync(
+      'UPDATE unpack_print_tasks SET status = ?, attempt_count = ?, last_error = ?, updated_at = ? WHERE pair_id = ?',
+      ['submitting', existing.attempt_count + 1, '', getISODateTime(), pairId]);
+    return result.changes > 0;
+  });
 };
 
 // 标记拆包记录为已打印
@@ -5223,17 +6054,58 @@ export const deleteUnpackRecords = async (ids: string[]): Promise<void> => {
   }
 };
 
+// 详情备注按物料、订单和仓库读取；读取失败需与“没有备注”区分。
+export const getMaterialRemarks = async (
+  materialId: string,
+  orderNo: string,
+  warehouseId?: string
+): Promise<MaterialRemarkDTO[]> => {
+  const normalizedMaterialId = materialId?.trim();
+  const normalizedOrderNo = orderNo?.trim();
+  if (!normalizedMaterialId || !normalizedOrderNo) {
+    throw new Error('缺少物料或订单信息，无法读取备注');
+  }
+
+  const returned = await getSalesReturnById(normalizedMaterialId);
+  if (returned) {
+    if (returned.order_no !== normalizedOrderNo ||
+      (warehouseId?.trim() && returned.warehouse_id !== warehouseId.trim())) return [];
+    return returned.notes.trim() ? [{ id: returned.id, pair_id: returned.id,
+      order_no: returned.order_no, notes: returned.notes, unpacked_at: returned.returned_at,
+      new_quantity: String(returned.quantity), new_traceNo: returned.traceNo }] : [];
+  }
+
+  let sql = `SELECT * FROM unpack_records
+    WHERE original_material_id = ? AND order_no = ? AND label_type = 'shipped'`;
+  const params = [normalizedMaterialId, normalizedOrderNo];
+  if (warehouseId?.trim()) {
+    sql += " AND (warehouse_id = ? OR warehouse_id IS NULL OR warehouse_id = '')";
+    params.push(warehouseId.trim());
+  }
+  sql += ' ORDER BY unpacked_at DESC, created_at DESC, id DESC';
+  const records = await runDatabaseReadWithRetry('getMaterialRemarks', () =>
+    getDb().getAllAsync<UnpackRecord>(sql, params));
+  const seen = new Set<string>();
+  return records.filter((record) => {
+    if (!record.notes?.trim()) return false;
+    const key = record.pair_id || record.id;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
 // 获取物料的拆包历史记录
 export const getUnpackHistoryByMaterialId = async (materialId: string): Promise<UnpackRecord[]> => {
   try {
     const database = getDb();
-    const results = await database.getAllAsync<any>(
+    const results = await database.getAllAsync<UnpackRecord>(
       `SELECT
         u.*,
         COALESCE(NULLIF(TRIM(u.inventory_code), ''), ib.inventory_code) AS inventory_code,
         NULLIF(TRIM(ib.supplier), '') AS supplier
       FROM unpack_records u
-      LEFT JOIN inventory_bindings ib
+      LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
         ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(u.model) COLLATE NOCASE
         AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
           COALESCE(TRIM(u.version), '') COLLATE NOCASE
@@ -5241,7 +6113,7 @@ export const getUnpackHistoryByMaterialId = async (materialId: string): Promise<
       ORDER BY u.unpacked_at DESC`,
       [materialId]
     );
-    return results as UnpackRecord[];
+    return results;
   } catch (error) {
     logger.error('获取拆包历史失败:', error);
     return [];
@@ -5258,13 +6130,13 @@ export const getUnpackHistoryByTraceNo = async (traceNo: string): Promise<Unpack
     }
 
     const database = getDb();
-    const results = await database.getAllAsync<any>(
+    const results = await database.getAllAsync<UnpackRecord>(
       `SELECT
         u.*,
         COALESCE(NULLIF(TRIM(u.inventory_code), ''), ib.inventory_code) AS inventory_code,
         NULLIF(TRIM(ib.supplier), '') AS supplier
       FROM unpack_records u
-      LEFT JOIN inventory_bindings ib
+      LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
         ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(u.model) COLLATE NOCASE
         AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
           COALESCE(TRIM(u.version), '') COLLATE NOCASE
@@ -5272,7 +6144,7 @@ export const getUnpackHistoryByTraceNo = async (traceNo: string): Promise<Unpack
       ORDER BY u.unpacked_at DESC`,
       [traceNo.trim(), traceNo.trim()]
     );
-    return results as UnpackRecord[];
+    return results;
   } catch (error) {
     logger.error('[getUnpackHistoryByTraceNo] 获取拆包历史失败:', error);
     return [];
@@ -5297,8 +6169,10 @@ export const getNextUnpackIndex = async (traceNo: string): Promise<number> => {
     const rows = await database.getAllAsync<{ traceNo: string }>(
       `SELECT traceNo FROM materials WHERE traceNo LIKE ? ESCAPE '\\'
        UNION ALL
-       SELECT new_traceNo AS traceNo FROM unpack_records WHERE new_traceNo LIKE ? ESCAPE '\\'`,
-      [`${likePrefix}%`, `${likePrefix}%`]
+       SELECT new_traceNo AS traceNo FROM unpack_records WHERE new_traceNo LIKE ? ESCAPE '\\'
+       UNION ALL
+       SELECT traceNo FROM sales_return_records WHERE traceNo LIKE ? ESCAPE '\\'`,
+      [`${likePrefix}%`, `${likePrefix}%`, `${likePrefix}%`]
     );
 
     const maxExistingIndex = rows.reduce((maxIndex, row) => {
@@ -5338,7 +6212,7 @@ export const getAllWarehouses = async (): Promise<Warehouse[]> => {
   try {
     logger.log('[getAllWarehouses] 开始获取仓库列表');
     const results = await runDatabaseReadWithRetry('getAllWarehouses', () =>
-      getDb().getAllAsync<any>(
+      getDb().getAllAsync<WarehouseRow>(
         'SELECT * FROM warehouses ORDER BY sort_order ASC, created_at DESC, id DESC'
       )
     );
@@ -5351,7 +6225,7 @@ export const getAllWarehouses = async (): Promise<Warehouse[]> => {
       is_default: r.is_default === 1,
       sort_order: typeof r.sort_order === 'number' ? r.sort_order : Number(r.sort_order) || 0,
       created_at: typeof r.created_at === 'string' ? r.created_at : undefined,
-    })) as Warehouse[];
+    }));
 
     logger.log(
       '[getAllWarehouses] 返回数据:',
@@ -5371,7 +6245,7 @@ export const getAllWarehouses = async (): Promise<Warehouse[]> => {
 export const getDefaultWarehouse = async (): Promise<Warehouse | null> => {
   try {
     const result = await runDatabaseReadWithRetry('getDefaultWarehouse', () =>
-      getDb().getFirstAsync<any>(
+      getDb().getFirstAsync<WarehouseRow>(
         'SELECT * FROM warehouses WHERE is_default = 1 ORDER BY created_at ASC, id ASC LIMIT 1'
       )
     );
@@ -5381,7 +6255,7 @@ export const getDefaultWarehouse = async (): Promise<Warehouse | null> => {
     return {
       ...result,
       is_default: result.is_default === 1,
-    } as Warehouse;
+    };
   } catch (error) {
     logger.error('获取默认仓库失败:', error);
     throw error;
@@ -5457,7 +6331,7 @@ export const updateWarehouse = async (id: string, updates: Partial<Warehouse>): 
   try {
     const database = getDb();
     const updateFields: string[] = [];
-    const values: any[] = [];
+    const values: SQLite.SQLiteBindValue[] = [];
 
     Object.entries(updates).forEach(([key, value]) => {
       if (key === 'is_default' && value !== undefined) {
@@ -5533,6 +6407,10 @@ export const deleteWarehouse = async (id: string): Promise<void> => {
           'SELECT COUNT(*) as count FROM unpack_records WHERE warehouse_id = ?',
           [trimmedId]
         ),
+        await transactionDatabase.getFirstAsync<{ count: number }>(
+          'SELECT COUNT(*) as count FROM sales_return_records WHERE warehouse_id = ?',
+          [trimmedId]
+        ),
       ];
       const referencedCount = countRows.reduce((sum, row) => sum + (row?.count || 0), 0);
 
@@ -5552,12 +6430,140 @@ export const deleteWarehouse = async (id: string): Promise<void> => {
 
 // ========== 物料管理（存货编码绑定）相关函数 ==========
 
+const registerInventorySupplierWithDatabase = async (
+  database: SQLite.SQLiteDatabase,
+  supplier?: string | null
+): Promise<string | null> => {
+  const name = typeof supplier === 'string' ? supplier.trim() : '';
+  if (!name) return null;
+  const existing = await database.getFirstAsync<{ id: string }>(
+    'SELECT id FROM inventory_suppliers WHERE name = ? COLLATE NOCASE LIMIT 1',
+    [name]
+  );
+  if (existing) return existing.id;
+  const id = generateId();
+  await database.runAsync(
+    'INSERT INTO inventory_suppliers (id, name, created_at) VALUES (?, ?, ?)',
+    [id, name, getISODateTime()]
+  );
+  return id;
+};
+
+const seedInventorySuppliersWithDatabase = async (database: SQLite.SQLiteDatabase): Promise<void> => {
+  if (isWebPlatform) {
+    const bindings = await database.getAllAsync<{ supplier?: string | null }>(
+      'SELECT supplier FROM inventory_bindings WHERE supplier IS NOT NULL'
+    );
+    for (const binding of bindings) await registerInventorySupplierWithDatabase(database, binding.supplier);
+    return;
+  }
+  // 在旧库和整库恢复后补齐名录；不改写任何既有绑定的供应商文本。
+  await database.runAsync(
+    `INSERT OR IGNORE INTO inventory_suppliers (id, name, created_at)
+     SELECT 'legacy-supplier:' || MIN(TRIM(supplier)), MIN(TRIM(supplier)), ?
+     FROM inventory_bindings
+     WHERE supplier IS NOT NULL AND TRIM(supplier) != ''
+     GROUP BY TRIM(supplier) COLLATE NOCASE`,
+    [getISODateTime()]
+  );
+};
+
+/** The catalogue belongs to material data, not configuration JSON backups. */
+export const getInventorySuppliers = async (): Promise<InventorySupplier[]> =>
+  runExclusiveWriteTransaction(getDb(), 'getInventorySuppliers', async (database) => {
+    await seedInventorySuppliersWithDatabase(database);
+    if (isWebPlatform) {
+      const suppliers = await database.getAllAsync<Omit<InventorySupplier, 'binding_count'>>(
+        'SELECT * FROM inventory_suppliers ORDER BY name COLLATE NOCASE ASC'
+      );
+      const bindings = await database.getAllAsync<{ supplier?: string | null }>(
+        'SELECT supplier FROM inventory_bindings WHERE supplier IS NOT NULL'
+      );
+      const rules = await database.getAllAsync<{ supplier_id?: string | null }>(
+        'SELECT supplier_id FROM qr_code_rules WHERE supplier_id IS NOT NULL'
+      );
+      return suppliers.map((supplier) => ({
+        ...supplier,
+        binding_count: bindings.filter(binding =>
+          binding.supplier?.trim().toUpperCase() === supplier.name.toUpperCase()).length,
+        rule_count: rules.filter(rule => rule.supplier_id === supplier.id).length,
+      }));
+    }
+    return database.getAllAsync<InventorySupplier>(
+      `SELECT s.id, s.name, s.created_at,
+        (SELECT COUNT(*) FROM inventory_bindings b
+         WHERE TRIM(b.supplier) = s.name COLLATE NOCASE) AS binding_count,
+        (SELECT COUNT(*) FROM qr_code_rules r WHERE r.supplier_id = s.id) AS rule_count
+       FROM inventory_suppliers s
+       ORDER BY s.name COLLATE NOCASE ASC, s.id ASC`
+    );
+  });
+
+/** Read-only lookup for scan validation; never seeds or writes the catalogue. */
+export const getInventorySupplierById = async (
+  id: string
+): Promise<Pick<InventorySupplier, 'id' | 'name' | 'created_at'> | null> => {
+  const supplierId = typeof id === 'string' ? id.trim() : '';
+  if (!supplierId) return null;
+  return runDatabaseReadWithRetry('getInventorySupplierById', async () => {
+    return getDb().getFirstAsync<Pick<InventorySupplier, 'id' | 'name' | 'created_at'>>(
+      'SELECT * FROM inventory_suppliers WHERE id = ? LIMIT 1', [supplierId]
+    );
+  });
+};
+
+export const addInventorySupplier = async (name: string): Promise<string> => {
+  const normalizedName = typeof name === 'string' ? name.trim() : '';
+  if (!normalizedName) throw new Error('请输入供应商名称');
+  return runExclusiveWriteTransaction(getDb(), 'addInventorySupplier', async (database) => {
+    await seedInventorySuppliersWithDatabase(database);
+    return (await registerInventorySupplierWithDatabase(database, normalizedName))!;
+  });
+};
+
+export const deleteInventorySupplier = async (id: string): Promise<void> => {
+  const normalizedId = typeof id === 'string' ? id.trim() : '';
+  if (!normalizedId) throw new Error('未找到要删除的供应商，请刷新列表');
+  await runExclusiveWriteTransaction(getDb(), 'deleteInventorySupplier', async (database) => {
+    const supplier = await database.getFirstAsync<{ name: string }>(
+      'SELECT name FROM inventory_suppliers WHERE id = ?', [normalizedId]
+    );
+    if (!supplier) throw new Error('未找到要删除的供应商，请刷新列表');
+    const usage = await database.getFirstAsync<{ count: number }>(
+      'SELECT COUNT(*) AS count FROM inventory_bindings WHERE TRIM(supplier) = ? COLLATE NOCASE',
+      [supplier.name]
+    );
+    if (usage && usage.count > 0) {
+      throw new Error(`供应商「${supplier.name}」正在被 ${usage.count} 条物料绑定使用，请先修改这些物料的供应商。`);
+    }
+    const ruleUsage = await database.getFirstAsync<{ count: number }>(
+      'SELECT COUNT(*) AS count FROM qr_code_rules WHERE supplier_id = ?', [normalizedId]
+    );
+    if (ruleUsage && ruleUsage.count > 0) {
+      throw new Error(`供应商「${supplier.name}」正在被 ${ruleUsage.count} 条解析规则使用，请先修改这些规则的供应商。`);
+    }
+    await database.runAsync('DELETE FROM inventory_suppliers WHERE id = ?', [normalizedId]);
+  });
+};
+
 const normalizeInventoryBinding = (binding: InventoryBinding): InventoryBinding => ({
   ...binding,
   version: typeof binding.version === 'string' ? binding.version : '',
   supplier: typeof binding.supplier === 'string' ? binding.supplier : undefined,
   description: typeof binding.description === 'string' ? binding.description : undefined,
 });
+
+/** Exact inventory-code lookup. An empty supplier remains empty without version fallback. */
+export const getInventoryBindingByCode = async (inventoryCode: string): Promise<InventoryBinding | null> => {
+  const code = typeof inventoryCode === 'string' ? inventoryCode.trim() : '';
+  if (!code) return null;
+  const binding = await runDatabaseReadWithRetry('getInventoryBindingByCode', () =>
+    getDb().getFirstAsync<InventoryBinding>(
+      'SELECT * FROM inventory_bindings WHERE TRIM(inventory_code) = ? COLLATE NOCASE LIMIT 1', [code]
+    )
+  );
+  return binding ? normalizeInventoryBinding(binding) : null;
+};
 
 const buildInventoryBindingSearchClause = (keyword?: string) => {
   const normalizedKeyword = keyword?.trim() || '';
@@ -5592,7 +6598,7 @@ export const getAllInventoryBindings = async (): Promise<InventoryBinding[]> => 
   }
 };
 
-const hydrateInboundRecordRows = async (rows: any[]): Promise<InboundRecord[]> => {
+const hydrateInboundRecordRows = async (rows: InboundRecordRow[]): Promise<InboundRecord[]> => {
   const uniqueRows = deduplicateInboundRowsById(rows);
   const normalizedRows = uniqueRows.map((row) => ({
     ...row,
@@ -5628,10 +6634,10 @@ const hydrateInboundRecordRows = async (rows: any[]): Promise<InboundRecord[]> =
           ? safeJsonParseNullable<Record<string, string>>(
               row.customFields,
               'database.inboundRecordCustomFields'
-            )
+            ) ?? undefined
           : row.customFields || undefined,
     };
-  }) as InboundRecord[];
+  });
 };
 
 // 分页获取物料绑定
@@ -5714,6 +6720,26 @@ export const getInventoryCodeByModel = async (
     logger.error('[getInventoryCodeByModel] 获取存货编码失败:', error);
     return null;
   }
+};
+
+export interface InventoryBindingMatch {
+  inventoryCode: string | null;
+  matchKind: 'exact' | 'generic' | 'none';
+}
+
+export const getInventoryBindingMatchByModel = async (
+  scanModel: string, version?: string
+): Promise<InventoryBindingMatch> => {
+  const normalizedModel = typeof scanModel === 'string' ? scanModel.trim() : '';
+  if (!normalizedModel) return { inventoryCode: null, matchKind: 'none' };
+  const normalizedVersion = typeof version === 'string' ? version.trim() : '';
+  const exact = await getExactInventoryCodeByModelVersion(normalizedModel, normalizedVersion);
+  if (exact) return { inventoryCode: exact, matchKind: 'exact' };
+  if (normalizedVersion) {
+    const generic = await getExactInventoryCodeByModelVersion(normalizedModel, '');
+    if (generic) return { inventoryCode: generic, matchKind: 'generic' };
+  }
+  return { inventoryCode: null, matchKind: 'none' };
 };
 
 /**
@@ -5821,6 +6847,44 @@ export const getSupplierForInventoryBinding = async ({
   }
 };
 
+const assertInventoryBindingReturnLinks = async (
+  database: SQLite.SQLiteDatabase,
+  scanModel: string,
+  version: string,
+  inventoryCode: string | null
+): Promise<void> => {
+  const codeKey = normalizeComparableText(inventoryCode).toUpperCase();
+  const returns = await database.getAllAsync<{
+    id: string; model: string; version?: string; inventory_code: string; source_material_ids: string;
+  }>('SELECT id, model, version, inventory_code, source_material_ids FROM sales_return_records');
+  const incompatible = returns.filter(record =>
+    normalizeComparableText(record.inventory_code).toUpperCase() !== codeKey);
+  if (!incompatible.length) return;
+
+  const sameModelVersion = (record: { model: string; version?: string }) =>
+    normalizeComparableText(record.model).toUpperCase() === scanModel.toUpperCase() &&
+    normalizeComparableText(record.version).toUpperCase() === version.toUpperCase();
+  const failure = () => new Error('该型号及版本已关联销售退货或再次出库，不能更改存货编码。请先核对并撤销相关后续记录，再修改绑定。');
+  if (incompatible.some(sameModelVersion)) throw failure();
+
+  const materials = await database.getAllAsync<{ id: string }>(
+    "SELECT id FROM materials WHERE TRIM(model) = ? COLLATE NOCASE AND COALESCE(TRIM(version), '') = ? COLLATE NOCASE",
+    [scanModel, version]);
+  const materialIds = new Set(materials.map(record => record.id));
+  if (!materialIds.size) return;
+  if (incompatible.some(record =>
+    (safeJsonParseNullable<string[]>(record.source_material_ids, 'binding.returnSources') || [])
+      .some(id => materialIds.has(id)))) throw failure();
+
+  const allocations = await database.getAllAsync<{ return_id: string }>(
+    `SELECT a.return_id FROM sales_return_allocations a
+     JOIN materials m ON m.id = a.material_id
+     WHERE TRIM(m.model) = ? COLLATE NOCASE AND COALESCE(TRIM(m.version), '') = ? COLLATE NOCASE`,
+    [scanModel, version]);
+  const protectedReturnIds = new Set(incompatible.map(record => record.id));
+  if (allocations.some(record => protectedReturnIds.has(record.return_id))) throw failure();
+};
+
 const syncInventoryCodeToHistoricalRecordsWithDatabase = async (
   database: SQLite.SQLiteDatabase,
   scanModel: string,
@@ -5835,6 +6899,9 @@ const syncInventoryCodeToHistoricalRecordsWithDatabase = async (
 
   const normalizedInventoryCode =
     typeof inventoryCode === 'string' && inventoryCode.trim() ? inventoryCode.trim() : null;
+
+  // 发货、退货实收及再次出库额度必须保留同一个存货身份；不能只改写旧明细。
+  await assertInventoryBindingReturnLinks(database, normalizedModel, normalizedVersion, normalizedInventoryCode);
 
   await database.runAsync(
     "UPDATE materials SET inventory_code = ? WHERE TRIM(model) = ? COLLATE NOCASE AND COALESCE(TRIM(version), '') = ? COLLATE NOCASE",
@@ -5904,6 +6971,7 @@ export const addInventoryBinding = async (
         inventoryCode,
         version
       );
+      await registerInventorySupplierWithDatabase(transactionDatabase, binding.supplier);
     });
 
     return id;
@@ -6001,12 +7069,15 @@ export const updateInventoryBinding = async (
           [...values, id]
         );
 
-        await syncInventoryCodeToHistoricalRecordsWithDatabase(
-          transactionDatabase,
-          nextBinding.scan_model,
-          nextBinding.inventory_code,
-          nextBinding.version
-        );
+        if (updates.scan_model !== undefined || updates.version !== undefined || updates.inventory_code !== undefined) {
+          await syncInventoryCodeToHistoricalRecordsWithDatabase(
+            transactionDatabase,
+            nextBinding.scan_model,
+            nextBinding.inventory_code,
+            nextBinding.version
+          );
+        }
+        await registerInventorySupplierWithDatabase(transactionDatabase, nextBinding.supplier);
       });
     }
   } catch (error) {
@@ -6101,6 +7172,7 @@ export const importInventoryBindings = async (
             currentSupplier === nextSupplier &&
             currentDescription === nextDescription
           ) {
+            await registerInventorySupplierWithDatabase(transactionDatabase, nextSupplier);
             result.unchanged++;
             continue;
           }
@@ -6109,6 +7181,7 @@ export const importInventoryBindings = async (
             'UPDATE inventory_bindings SET supplier = ?, description = ? WHERE id = ?',
             [nextSupplier || null, nextDescription || null, existing.id]
           );
+          await registerInventorySupplierWithDatabase(transactionDatabase, nextSupplier);
           result.updated++;
           continue;
         }
@@ -6132,6 +7205,7 @@ export const importInventoryBindings = async (
           normalizedInventoryCode,
           normalizedVersion
         );
+        await registerInventorySupplierWithDatabase(transactionDatabase, normalizedSupplier);
 
         result.inserted++;
       }
@@ -6210,7 +7284,7 @@ export const generateInboundNo = async (): Promise<string> => {
 export const getAllInboundRecords = async (warehouseId?: string): Promise<InboundRecord[]> => {
   try {
     let sql = 'SELECT i.* FROM inbound_records i';
-    const params: any[] = [];
+    const params: SQLite.SQLiteBindValue[] = [];
 
     if (warehouseId) {
       sql += ' WHERE i.warehouse_id = ?';
@@ -6220,7 +7294,7 @@ export const getAllInboundRecords = async (warehouseId?: string): Promise<Inboun
     sql += ' ORDER BY i.created_at DESC';
 
     const results = await runDatabaseReadWithRetry('getAllInboundRecords', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<InboundRecordRow>(sql, params)
     );
 
     return await hydrateInboundRecordRows(results);
@@ -6244,7 +7318,7 @@ export const getInboundExportSummaryRows = async (
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const rows = await runDatabaseReadWithRetry('getInboundExportSummaryRows', () =>
-      getDb().getAllAsync<any>(
+      getDb().getAllAsync<InboundExportSummaryRow>(
         `SELECT
         COALESCE(i.warehouse_name, '') AS warehouse_name,
         COALESCE(NULLIF(TRIM(i.inventory_code), ''), ib.inventory_code, '') AS inventory_code,
@@ -6254,7 +7328,7 @@ export const getInboundExportSummaryRows = async (
         SUM(COALESCE(i.quantity, 0)) AS total_quantity,
         COALESCE(i.in_date, '') AS in_date
       FROM inbound_records i
-      LEFT JOIN inventory_bindings ib
+      LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
         ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(i.scan_model) COLLATE NOCASE
         AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
           COALESCE(TRIM(i.version), '') COLLATE NOCASE
@@ -6297,6 +7371,7 @@ export const getInboundDocumentSummaries = async (
         MAX(warehouse_name) AS warehouse_name,
         MAX(in_date) AS in_date,
         MAX(created_at) AS created_at,
+        CASE WHEN SUM(CASE WHEN completion_status = 'partial' THEN 1 ELSE 0 END) > 0 THEN 'partial' ELSE 'complete' END AS completion_status,
         COUNT(*) AS record_count,
         COUNT(DISTINCT UPPER(TRIM(scan_model))) AS model_count,
         SUM(CAST(quantity AS INTEGER)) AS total_quantity,
@@ -6309,7 +7384,7 @@ export const getInboundDocumentSummaries = async (
         MAX(synced_at) AS synced_at,
         MAX(sync_message) AS sync_message
       FROM inbound_records`;
-    const params: any[] = [];
+    const params: SQLite.SQLiteBindValue[] = [];
 
     if (warehouseId) {
       sql += ' WHERE warehouse_id = ?';
@@ -6321,7 +7396,7 @@ export const getInboundDocumentSummaries = async (
       ORDER BY MAX(created_at) DESC, inbound_no DESC`;
 
     const rows = await runDatabaseReadWithRetry('getInboundDocumentSummaries', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<InboundDocumentSummary>(sql, params)
     );
 
     return rows.map((row) => ({
@@ -6330,6 +7405,7 @@ export const getInboundDocumentSummaries = async (
       warehouse_name: row.warehouse_name,
       in_date: row.in_date,
       created_at: row.created_at,
+      completion_status: row.completion_status === 'partial' ? 'partial' : 'complete',
       record_count: Number(row.record_count || 0),
       model_count: Number(row.model_count || 0),
       total_quantity: Number(row.total_quantity || 0),
@@ -6373,13 +7449,17 @@ export const getInboundRecordsByNo = async (
       i.traceNo,
       i.sourceNo,
       i.customFields,
+      i.completion_status,
+      i.erp_account_key,
+      i.rule_id,
+      i.rule_name,
       i.sync_status,
       i.sync_file_name,
       i.synced_at,
       i.sync_message
     FROM inbound_records i
     WHERE i.inbound_no = ?`;
-    const params: any[] = [trimmedInboundNo];
+    const params: SQLite.SQLiteBindValue[] = [trimmedInboundNo];
 
     if (warehouseId) {
       sql += ' AND i.warehouse_id = ?';
@@ -6389,7 +7469,7 @@ export const getInboundRecordsByNo = async (
     sql += ' ORDER BY i.created_at DESC, i.id DESC';
 
     const rows = await runDatabaseReadWithRetry('getInboundRecordsByNo', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<InboundRecordRow>(sql, params)
     );
 
     return await hydrateInboundRecordRows(rows);
@@ -6427,7 +7507,7 @@ export const checkInboundTraceNoExists = async (
 
     sql += ' LIMIT 1';
 
-    const row = await database.getFirstAsync<any>(sql, params);
+    const row = await database.getFirstAsync<{ id: string }>(sql, params);
     return !!row;
   } catch (error) {
     logger.error('[checkInboundTraceNoExists] 查询追踪码失败:', error);
@@ -6522,7 +7602,10 @@ export const addInboundRecord = async (record: InboundRecordInsert): Promise<str
   }
 };
 
-export const addInboundRecordsBatch = async (records: InboundRecordInsert[]): Promise<string[]> => {
+export const addInboundRecordsBatch = async (
+  records: InboundRecordInsert[],
+  options?: { completionStatus: InboundCompletionStatus; expectedSavedIds: string[] },
+): Promise<string[]> => {
   if (records.length === 0) {
     return [];
   }
@@ -6571,10 +7654,29 @@ export const addInboundRecordsBatch = async (records: InboundRecordInsert[]): Pr
         return;
       }
 
+      const scope = records[0];
+      if (options) {
+        if (records.some(record => record.inbound_no !== scope.inbound_no || record.warehouse_id !== scope.warehouse_id ||
+          record.erp_account_key !== scope.erp_account_key)) throw new Error('入库批次不能混合不同单据或账套');
+        const saved = await transactionDatabase.getAllAsync<{ id: string; completion_status?: string }>(
+          'SELECT id, completion_status FROM inbound_records WHERE inbound_no = ? AND warehouse_id = ?',
+          [scope.inbound_no, scope.warehouse_id],
+        );
+        if (saved.some(record => record.completion_status !== 'partial')) throw new Error('本单已入库完成，不能继续扫码');
+        if (JSON.stringify(saved.map(record => record.id).sort()) !== JSON.stringify([...options.expectedSavedIds].sort())) {
+          throw new Error('本单已保存记录发生变化，请返回后重新进入再确认');
+        }
+      }
       await assertInboundTraceNosNotAlreadySaved(transactionDatabase, records);
 
       for (const record of recordsToInsert) {
         ids.push(await insertInboundRecord(transactionDatabase, record));
+      }
+      if (options) {
+        await transactionDatabase.runAsync(
+          "UPDATE inbound_records SET completion_status = ?, sync_status = 'pending' WHERE inbound_no = ? AND warehouse_id = ?",
+          [options.completionStatus, scope.inbound_no, scope.warehouse_id],
+        );
       }
     });
     return ids;
@@ -6706,11 +7808,11 @@ export const getAllInventoryCheckRecords = async (
       c.*,
       COALESCE(NULLIF(TRIM(c.inventory_code), ''), ib.inventory_code) AS inventory_code
     FROM inventory_check_records c
-    LEFT JOIN inventory_bindings ib
+    LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(c.scan_model) COLLATE NOCASE
       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
         COALESCE(TRIM(c.version), '') COLLATE NOCASE`;
-    const params: any[] = [];
+    const params: SQLite.SQLiteBindValue[] = [];
 
     if (warehouseId) {
       sql += ' WHERE c.warehouse_id = ?';
@@ -6725,13 +7827,13 @@ export const getAllInventoryCheckRecords = async (
     sql += ' ORDER BY c.created_at DESC';
 
     const results = await runDatabaseReadWithRetry('getAllInventoryCheckRecords', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<InventoryCheckRecordRow>(sql, params)
     );
 
     return results.map((r) => ({
       ...r,
-      customFields: safeJsonParseNullable<Record<string, string>>(r.customFields, 'database.safeJsonParseNullable'),
-    })) as InventoryCheckRecord[];
+      customFields: safeJsonParseNullable<Record<string, string>>(r.customFields, 'database.safeJsonParseNullable') ?? undefined,
+    }));
   } catch (error) {
     logger.error('获取盘点记录失败:', error);
     throw error;
@@ -6758,7 +7860,7 @@ export const getInventoryCheckExportSummaryRows = async (
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const rows = await runDatabaseReadWithRetry('getInventoryCheckExportSummaryRows', () =>
-      getDb().getAllAsync<any>(
+      getDb().getAllAsync<InventoryCheckExportSummaryRow>(
         `SELECT
         COALESCE(c.warehouse_name, '') AS warehouse_name,
         COALESCE(NULLIF(TRIM(c.inventory_code), ''), ib.inventory_code, '') AS inventory_code,
@@ -6768,7 +7870,7 @@ export const getInventoryCheckExportSummaryRows = async (
         SUM(COALESCE(c.actual_quantity, c.quantity, 0)) AS total_quantity,
         COALESCE(c.check_date, '') AS check_date
       FROM inventory_check_records c
-      LEFT JOIN inventory_bindings ib
+      LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
         ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(c.scan_model) COLLATE NOCASE
         AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
           COALESCE(TRIM(c.version), '') COLLATE NOCASE
@@ -6828,7 +7930,7 @@ export const getInventoryCheckDocumentSummaries = async (
         MAX(erp_account_key) AS erp_account_key,
         MAX(erp_account_name) AS erp_account_name
       FROM inventory_check_records`;
-    const params: any[] = [];
+    const params: SQLite.SQLiteBindValue[] = [];
 
     const conditions: string[] = [];
     if (warehouseId) {
@@ -6848,7 +7950,7 @@ export const getInventoryCheckDocumentSummaries = async (
       ORDER BY MAX(created_at) DESC, check_no DESC`;
 
     const rows = await runDatabaseReadWithRetry('getInventoryCheckDocumentSummaries', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<InventoryCheckDocumentSummary>(sql, params)
     );
 
     return rows.map((row) => ({
@@ -6915,12 +8017,12 @@ export const getInventoryCheckRecordsByNo = async (
       c.erp_account_name,
       c.erp_quantity
     FROM inventory_check_records c
-    LEFT JOIN inventory_bindings ib
+    LEFT JOIN ${INVENTORY_BINDING_HISTORY_SOURCE} ib
       ON TRIM(ib.scan_model) COLLATE NOCASE = TRIM(c.scan_model) COLLATE NOCASE
       AND COALESCE(TRIM(ib.version), '') COLLATE NOCASE =
         COALESCE(TRIM(c.version), '') COLLATE NOCASE
     WHERE c.check_no = ?`;
-    const params: any[] = [trimmedCheckNo];
+    const params: SQLite.SQLiteBindValue[] = [trimmedCheckNo];
 
     if (warehouseId) {
       sql += ' AND c.warehouse_id = ?';
@@ -6930,13 +8032,13 @@ export const getInventoryCheckRecordsByNo = async (
     sql += ' ORDER BY c.created_at DESC, c.id DESC';
 
     const rows = await runDatabaseReadWithRetry('getInventoryCheckRecordsByNo', () =>
-      getDb().getAllAsync<any>(sql, params)
+      getDb().getAllAsync<InventoryCheckRecordRow>(sql, params)
     );
 
     return rows.map((row) => ({
       ...row,
-      customFields: safeJsonParseNullable<Record<string, string>>(row.customFields, 'database.safeJsonParseNullable'),
-    })) as InventoryCheckRecord[];
+      customFields: safeJsonParseNullable<Record<string, string>>(row.customFields, 'database.safeJsonParseNullable') ?? undefined,
+    }));
   } catch (error) {
     logger.error('[getInventoryCheckRecordsByNo] 获取盘点单明细失败:', error);
     throw error;
@@ -7289,7 +8391,8 @@ export const deleteInventoryCheckDocument = async (
 
 type QRCodeRuleConfiguration = Pick<
   QRCodeRule,
-  'name' | 'separator' | 'terminator' | 'fieldOrder' | 'matchConditions' | 'fieldPrefixes'
+  'name' | 'separator' | 'terminator' | 'fieldOrder' | 'matchConditions' | 'conditionMode' | 'fieldPrefixes' |
+  'supplierId' | 'supplierName'
 >;
 
 export const normalizeQRCodeRuleName = (name: string): string =>
@@ -7343,6 +8446,18 @@ const assertValidQRCodeRuleConfiguration = (
     throw new Error(`解析规则“${rule.name}”的分隔符不能为空`);
   }
   assertValidRuleTerminator(rule.terminator);
+  if (rule.supplierId !== undefined && typeof rule.supplierId !== 'string') {
+    throw new Error(`解析规则“${rule.name}”的供应商关联无效`);
+  }
+  if (rule.supplierName !== undefined && typeof rule.supplierName !== 'string') {
+    throw new Error(`解析规则“${rule.name}”的供应商名称必须为文本`);
+  }
+  if (rule.conditionMode !== undefined && !isRuleConditionMode(rule.conditionMode)) {
+    throw new Error(`解析规则“${rule.name}”的识别条件逻辑无效`);
+  }
+  if (rule.matchConditions !== undefined && !Array.isArray(rule.matchConditions)) {
+    throw new Error(`解析规则“${rule.name}”的识别条件配置无效`);
+  }
   if (!Array.isArray(rule.fieldOrder) || rule.fieldOrder.length < 2) {
     throw new Error(`解析规则“${rule.name}”至少需要配置 2 个字段`);
   }
@@ -7361,6 +8476,9 @@ const assertValidQRCodeRuleConfiguration = (
   });
 
   (rule.matchConditions || []).forEach((condition, index) => {
+    if (!condition || typeof condition.keyword !== 'string') {
+      throw new Error(`解析规则“${rule.name}”第 ${index + 1} 个识别条件配置无效`);
+    }
     if (
       !Number.isInteger(condition.fieldIndex) ||
       condition.fieldIndex < 0 ||
@@ -7373,6 +8491,9 @@ const assertValidQRCodeRuleConfiguration = (
     }
     if (condition.operator !== undefined && !isConditionOperator(condition.operator)) {
       throw new Error(`解析规则“${rule.name}”第 ${index + 1} 个识别条件类型无效`);
+    }
+    if (condition.group !== undefined && !isRuleConditionGroup(condition.group)) {
+      throw new Error(`解析规则“${rule.name}”第 ${index + 1} 个识别条件分组无效`);
     }
   });
 
@@ -7387,7 +8508,7 @@ const assertValidQRCodeRuleConfiguration = (
 export const getAllRules = async (): Promise<QRCodeRule[]> => {
   try {
     const results = await runDatabaseReadWithRetry('getAllRules', () =>
-      getDb().getAllAsync<any>('SELECT * FROM qr_code_rules')
+      getDb().getAllAsync<RuleRecordRow>('SELECT * FROM qr_code_rules')
     );
 
     return sortRulesForDisplay(results.map(normalizeRuleRecord));
@@ -7410,13 +8531,20 @@ export const getActiveRules = async (): Promise<QRCodeRule[]> => {
 
 // 保存规则列表的手工展示顺序（只影响列表展示，不参与扫码匹配与冲突判断）。
 export const setRulesDisplayOrder = async (orderedIds: string[]): Promise<void> => {
+  const ids = orderedIds.slice();
   try {
     const database = getDb();
     await runExclusiveWriteTransaction(database, 'setRulesDisplayOrder', async (transactionDatabase) => {
-      for (let index = 0; index < orderedIds.length; index++) {
+      const currentRules = await transactionDatabase.getAllAsync<{ id: string }>('SELECT id FROM qr_code_rules');
+      const currentIds = new Set(currentRules.map(rule => rule.id));
+      if (new Set(ids).size !== ids.length || ids.length !== currentIds.size ||
+          ids.some(id => !currentIds.has(id))) {
+        throw new Error('规则列表已变化，请取消排序后重新调整');
+      }
+      for (let index = 0; index < ids.length; index++) {
         await transactionDatabase.runAsync(
           'UPDATE qr_code_rules SET display_order = ? WHERE id = ?',
-          [index + 1, orderedIds[index]]
+          [index + 1, ids[index]]
         );
       }
     });
@@ -7427,6 +8555,22 @@ export const setRulesDisplayOrder = async (orderedIds: string[]): Promise<void> 
 };
 
 // 添加规则
+const resolveRuleSupplierWithDatabase = async (
+  database: SQLite.SQLiteDatabase,
+  rule: Pick<QRCodeRule, 'supplierId' | 'supplierName'>
+): Promise<Pick<QRCodeRule, 'supplierId' | 'supplierName'>> => {
+  if (rule.supplierId !== undefined && typeof rule.supplierId !== 'string') {
+    throw new Error('供应商关联无效，请重新选择供应商');
+  }
+  const supplierId = rule.supplierId?.trim() || '';
+  if (!supplierId) return { supplierId: '', supplierName: rule.supplierName?.trim() || '' };
+  const supplier = await database.getFirstAsync<{ id: string; name: string }>(
+    'SELECT id, name FROM inventory_suppliers WHERE id = ? LIMIT 1', [supplierId]
+  );
+  if (!supplier) throw new Error('关联的供应商不存在，请重新选择供应商');
+  return { supplierId: supplier.id, supplierName: supplier.name };
+};
+
 export const addRule = async (
   rule: Omit<QRCodeRule, 'id' | 'created_at' | 'updated_at'>
 ): Promise<string> => {
@@ -7439,11 +8583,21 @@ export const addRule = async (
     await runExclusiveWriteTransaction(database, 'addRule', async (transactionDatabase) => {
       assertValidQRCodeRuleConfiguration(rule);
       await assertUniqueQRCodeRuleName(transactionDatabase, rule.name);
+      const supplier = await resolveRuleSupplierWithDatabase(transactionDatabase, rule);
+      const currentRows = await transactionDatabase.getAllAsync<RuleRecordRow>('SELECT * FROM qr_code_rules');
+      const currentRules = sortRulesForDisplay(currentRows.map(normalizeRuleRecord));
+      // 新建规则置顶，保留旧列表的相对顺序；只调整展示序号，不修改识别优先级或更新时间。
+      for (let index = 0; index < currentRules.length; index++) {
+        await transactionDatabase.runAsync(
+          'UPDATE qr_code_rules SET display_order = ? WHERE id = ?',
+          [index + 2, currentRules[index].id]
+        );
+      }
       await transactionDatabase.runAsync(
         `INSERT INTO qr_code_rules (
           id, name, description, separator, field_order, custom_field_ids, is_active,
-          supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at, condition_mode, supplier_id, display_order
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
           rule.name,
@@ -7452,12 +8606,15 @@ export const addRule = async (
           JSON.stringify(rule.fieldOrder),
           rule.customFieldIds ? JSON.stringify(rule.customFieldIds) : null,
           rule.isActive ? 1 : 0,
-          rule.supplierName || null,
+          supplier.supplierName || null,
           rule.matchConditions ? JSON.stringify(rule.matchConditions) : null,
           rule.fieldPrefixes ? JSON.stringify(rule.fieldPrefixes) : null,
           rule.terminator || '',
           isoDateTime,
           isoDateTime,
+          rule.conditionMode ?? 'all',
+          supplier.supplierId || null,
+          1,
         ]
       );
     });
@@ -7487,7 +8644,7 @@ export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Prom
     }
     const database = getDb();
     const updateFields: string[] = [];
-    const values: any[] = [];
+    const values: SQLite.SQLiteBindValue[] = [];
 
     Object.entries(updates).forEach(([key, value]) => {
       if (value === undefined) {
@@ -7506,12 +8663,17 @@ export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Prom
       } else if (key === 'matchConditions') {
         updateFields.push('match_conditions = ?');
         values.push(JSON.stringify(value));
+      } else if (key === 'conditionMode') {
+        if (!isRuleConditionMode(value)) throw new Error('识别条件逻辑无效');
+        updateFields.push('condition_mode = ?');
+        values.push(value);
       } else if (key === 'fieldPrefixes') {
         updateFields.push('field_prefixes = ?');
         values.push(JSON.stringify(value));
       } else if (key === 'supplierName') {
-        updateFields.push('supplier_name = ?');
-        values.push(value || null);
+        if (typeof value !== 'string') throw new Error('供应商名称必须为文本');
+      } else if (key === 'supplierId') {
+        if (typeof value !== 'string') throw new Error('供应商关联无效，请重新选择供应商');
       } else if (key === 'id' || key === 'created_at' || key === 'updated_at') {
         return;
       } else {
@@ -7520,17 +8682,17 @@ export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Prom
           logger.warn('[updateRule] 忽略不支持更新的字段:', key);
           return;
         }
+        if (typeof value !== 'string') throw new Error(`解析规则字段 ${key} 必须为文本`);
         updateFields.push(`${column} = ?`);
         values.push(value);
       }
     });
 
-    if (updateFields.length > 0) {
-      updateFields.push('updated_at = ?');
-      values.push(getISODateTime());
-      values.push(trimmedId);
+    const hasSupplierUpdate = Object.prototype.hasOwnProperty.call(updates, 'supplierId') ||
+      Object.prototype.hasOwnProperty.call(updates, 'supplierName');
+    if (updateFields.length > 0 || hasSupplierUpdate) {
       await runExclusiveWriteTransaction(database, 'updateRule', async (transactionDatabase) => {
-        const rawRule = await transactionDatabase.getFirstAsync<any>(
+        const rawRule = await transactionDatabase.getFirstAsync<RuleRecordRow>(
           'SELECT * FROM qr_code_rules WHERE id = ? LIMIT 1',
           [trimmedId]
         );
@@ -7539,8 +8701,18 @@ export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Prom
         }
         const currentRule = normalizeRuleRecord(rawRule);
         const mergedRule: QRCodeRule = { ...currentRule, ...updates, id: currentRule.id };
+        if (hasSupplierUpdate) {
+          // Clearing an explicit association also clears its old name snapshot unless supplied anew.
+          if (Object.prototype.hasOwnProperty.call(updates, 'supplierId') && !updates.supplierId &&
+              updates.supplierName === undefined) mergedRule.supplierName = '';
+          const supplier = await resolveRuleSupplierWithDatabase(transactionDatabase, mergedRule);
+          updateFields.push('supplier_id = ?', 'supplier_name = ?');
+          values.push(supplier.supplierId || null, supplier.supplierName || null);
+        }
         assertValidQRCodeRuleConfiguration(mergedRule);
         await assertUniqueQRCodeRuleName(transactionDatabase, mergedRule.name, currentRule.id);
+        updateFields.push('updated_at = ?');
+        values.push(getISODateTime(), trimmedId);
         await transactionDatabase.runAsync(
           `UPDATE qr_code_rules SET ${updateFields.join(', ')} WHERE id = ?`,
           values
@@ -7582,7 +8754,7 @@ export const getRuleById = async (id: string): Promise<QRCodeRule | null> => {
     }
 
     const result = await runDatabaseReadWithRetry('getRuleById', () =>
-      getDb().getFirstAsync<any>('SELECT * FROM qr_code_rules WHERE id = ?', [id.trim()])
+      getDb().getFirstAsync<RuleRecordRow>('SELECT * FROM qr_code_rules WHERE id = ?', [id.trim()])
     );
 
     if (!result) return null;
@@ -7764,7 +8936,7 @@ export const deleteCustomField = async (id: string): Promise<void> => {
     const customFieldKey = createCustomFieldKey(trimmedId);
 
     await runExclusiveWriteTransaction(database, 'deleteCustomField', async (transactionDatabase) => {
-      const rules = await transactionDatabase.getAllAsync<any>('SELECT * FROM qr_code_rules');
+      const rules = await transactionDatabase.getAllAsync<RuleRecordRow>('SELECT * FROM qr_code_rules');
       const referencedRules = rules
         .map((rawRule) => normalizeRuleRecord(rawRule))
         .filter(
@@ -7883,9 +9055,8 @@ const normalizeSplitPartsForRule = (parts: string[], rule: QRCodeRule): string[]
     return parts;
   }
 
-  // Some supplier QR codes use the separator as a record terminator, for example
-  // "MODEL;LOT;QTY;". Ignore only surplus empty fields at the end so empty fields
-  // in the middle continue to preserve their configured positions.
+  // 有些二维码会把分隔符同时当作结束符，例如 "MODEL;LOT;QTY;"。
+  // 只忽略末尾多出来的空段，中间空段仍保留原来的字段位置。
   const effectiveParts = [...parts];
   while (
     effectiveParts.length > expectedCount &&
@@ -7919,7 +9090,7 @@ const normalizeSplitPartsForRule = (parts: string[], rule: QRCodeRule): string[]
         .join(rule.separator)
         .trim();
 
-      // Reassemble dates split by their own delimiter, not a complete date plus another field.
+      // 只合并被自身分隔符拆开的日期，不能把完整日期和下一个字段拼在一起。
       if (
         consumeCount > 1 &&
         (!isLikelyDateValue(stripConfiguredFieldPrefix(mergedValue, rule.fieldPrefixes?.[fieldName])) ||
@@ -7944,7 +9115,7 @@ const normalizeSplitPartsForRule = (parts: string[], rule: QRCodeRule): string[]
 };
 
 const splitContentByRule = (content: string, rule: QRCodeRule): string[] => {
-  // Same-as-separator endings are handled by field count, preserving required empty fields.
+  // 结束符和分隔符相同时按字段数处理，保留规则要求的空字段。
   const terminator = rule.terminator === rule.separator ? undefined : rule.terminator;
   const normalizedContent = stripRuleTerminator(content, terminator).content.trim();
   const configuredBracketPair = getBracketPairFromSeparator(rule.separator);
@@ -7986,6 +9157,93 @@ const doesConfiguredFieldPrefixMatch = (value: string, prefix?: string): boolean
   return getConfiguredFieldPrefixMatchLength(value, prefix) !== null;
 };
 
+export interface QRCodeRuleValueSpan {
+  field: string;
+  value: string;
+  start: number;
+  end: number;
+}
+
+/** Read-only offsets for editing a scanned label without rebuilding its formatting. */
+export const getQRCodeRuleValueSpans = (content: string, originalRule: QRCodeRule): QRCodeRuleValueSpan[] => {
+  const rule = migrateLegacyRuleFields(originalRule);
+  if (!rule.separator || !rule.fieldOrder.length) {
+    throw new Error('解析规则缺少分隔符或字段，无法定位标签内容。');
+  }
+  const terminator = rule.terminator === rule.separator ? undefined : rule.terminator;
+  const stripped = stripRuleTerminator(content, terminator).content;
+  let start = stripped.length - stripped.trimStart().length;
+  let end = stripped.trimEnd().length;
+  const normalizedContent = stripped.trim();
+  const bracket = getBracketPairFromSeparator(rule.separator);
+  let delimiter = rule.separator;
+  if (bracket && matchesBracketPair(normalizedContent, bracket.left, bracket.right)) {
+    start += bracket.left.length;
+    end -= bracket.right.length;
+    delimiter = bracket.right + bracket.left;
+  }
+  const tokens: { value: string; start: number; end: number }[] = [];
+  let cursor = start;
+  while (cursor <= end) {
+    const next = content.indexOf(delimiter, cursor);
+    const tokenEnd = next >= 0 && next < end ? next : end;
+    tokens.push({ value: content.slice(cursor, tokenEnd).trim(), start: cursor, end: tokenEnd });
+    if (tokenEnd === end) break;
+    cursor = tokenEnd + delimiter.length;
+  }
+  // Bound an editing-only projection; ordinary scanning continues to use its existing parser.
+  if (tokens.length > 256) throw new Error('二维码分段过多，无法安全修改数量。');
+  const values = normalizeSplitPartsForRule(tokens.map(token => token.value), rule);
+  if (values.length !== rule.fieldOrder.length) {
+    throw new Error('二维码字段数量与解析规则不一致，无法安全修改数量。');
+  }
+  while (tokens.length > rule.fieldOrder.length && tokens[tokens.length - 1].value === '') tokens.pop();
+  // Find a unique projection of the parser's normalized date merges back to source offsets.
+  const memo = new Map<string, { first: number[] | null; count: number }>();
+  const locate = (fieldIndex: number, tokenIndex: number): { first: number[] | null; count: number } => {
+    if (fieldIndex === values.length) return { first: [], count: tokenIndex === tokens.length ? 1 : 0 };
+    const key = `${fieldIndex}:${tokenIndex}`;
+    const cached = memo.get(key);
+    if (cached) return cached;
+    let first: number[] | null = null;
+    let count = 0;
+    const max = tokens.length - tokenIndex - (values.length - fieldIndex - 1);
+    for (let consumed = 1; consumed <= max; consumed += 1) {
+      if (tokens.slice(tokenIndex, tokenIndex + consumed).map(token => token.value).join(rule.separator).trim() !== values[fieldIndex]) continue;
+      const tail = locate(fieldIndex + 1, tokenIndex + consumed);
+      if (tail.count && tail.first) {
+        first ??= [consumed, ...tail.first];
+        count = Math.min(2, count + tail.count);
+        if (count > 1) break;
+      }
+    }
+    const result = { first, count };
+    memo.set(key, result);
+    return result;
+  };
+  const located = locate(0, 0);
+  if (located.count !== 1 || !located.first) throw new Error('二维码字段位置无法唯一确定，无法安全修改数量。');
+  let tokenIndex = 0;
+  return rule.fieldOrder.map((field, index) => {
+    const consumed = located.first![index];
+    let valueStart = tokens[tokenIndex].start;
+    let valueEnd = tokens[tokenIndex + consumed - 1].end;
+    tokenIndex += consumed;
+    let sourceValue = content.slice(valueStart, valueEnd);
+    valueStart += sourceValue.length - sourceValue.trimStart().length;
+    valueEnd = valueStart + sourceValue.trim().length;
+    sourceValue = content.slice(valueStart, valueEnd);
+    const prefixLength = getConfiguredFieldPrefixMatchLength(sourceValue, rule.fieldPrefixes?.[field]);
+    if (prefixLength !== null) {
+      valueStart += prefixLength;
+      sourceValue = content.slice(valueStart, valueEnd);
+      valueStart += sourceValue.length - sourceValue.trimStart().length;
+      valueEnd = valueStart + sourceValue.trim().length;
+    }
+    return { field, value: stripConfiguredFieldPrefix(values[index], rule.fieldPrefixes?.[field]), start: valueStart, end: valueEnd };
+  });
+};
+
 const getRulePrefixStats = (rule: QRCodeRule, parts: string[]) => {
   let configuredCount = 0;
   let matchedCount = 0;
@@ -8006,7 +9264,7 @@ const getRulePrefixStats = (rule: QRCodeRule, parts: string[]) => {
   return { configuredCount, matchedCount };
 };
 
-// Shared by the editor and live detection so diagnostic results cannot drift from scanning.
+// 编辑器和实时识别共用这段判断，保证诊断结果与实际扫码一致。
 export const inspectQRCodeRule = (content: string, rule: QRCodeRule) => {
   rule = migrateLegacyRuleFields(rule);
   const parts = splitContentByRule(content, rule);
@@ -8026,11 +9284,14 @@ export const inspectQRCodeRule = (content: string, rule: QRCodeRule) => {
       errors.push(`第${index + 1}段前缀不匹配：${prefix}`);
     }
   });
-  (rule.matchConditions || []).forEach(condition => {
-    if (parts[condition.fieldIndex] === undefined || !matchesRuleCondition(parts[condition.fieldIndex], condition)) {
-      errors.push(`第${condition.fieldIndex + 1}段不满足“${CONDITION_OPERATORS[condition.operator ?? 'contains'] ?? '未知条件'} ${condition.keyword}”`);
-    }
-  });
+  const conditions = evaluateRuleConditions(parts,
+    rule.matchConditions === undefined ? [] : rule.matchConditions,
+    rule.conditionMode === undefined ? 'all' : rule.conditionMode);
+  errors.push(...conditions.errors);
+  if (Array.isArray(rule.matchConditions) && rule.matchConditions.some(condition =>
+    condition && condition.fieldIndex >= rule.fieldOrder.length)) {
+    errors.push('识别条件位置超出规则字段范围');
+  }
   return { parts, errors, matched: errors.length === 0,
     values: parts.map((part, index) => stripConfiguredFieldPrefix(part, rule.fieldPrefixes?.[rule.fieldOrder[index]])),
   };
@@ -8116,7 +9377,9 @@ const buildRuleDetectionCandidate = (
     rule,
     parts,
     fieldCount,
-    matchConditionCount: rule.matchConditions?.length || 0,
+    matchConditionCount: evaluateRuleConditions(parts,
+      rule.matchConditions === undefined ? [] : rule.matchConditions,
+      rule.conditionMode === undefined ? 'all' : rule.conditionMode).specificity,
     separatorLength: Array.from(rule.separator || '').length,
     configuredPrefixCount: prefixStats.configuredCount,
     matchedPrefixCount: prefixStats.matchedCount,
@@ -8333,6 +9596,9 @@ export const importBackupData = async (
       }
       ruleIds.add(id);
       assertValidQRCodeRuleConfiguration(rule);
+      if (rule.supplierId?.trim() && !rule.supplierName?.trim()) {
+        throw new Error(`备份中解析规则“${rule.name}”缺少关联的供应商名称，无法安全恢复关联`);
+      }
     });
 
     const warehouseIds = new Set<string>();
@@ -8384,6 +9650,8 @@ export const importBackupData = async (
       SELECT DISTINCT warehouse_id AS id FROM inventory_check_records WHERE warehouse_id IS NOT NULL AND TRIM(warehouse_id) != ''
       UNION
       SELECT DISTINCT warehouse_id AS id FROM unpack_records WHERE warehouse_id IS NOT NULL AND TRIM(warehouse_id) != ''
+      UNION
+      SELECT DISTINCT warehouse_id AS id FROM sales_return_records WHERE warehouse_id IS NOT NULL AND TRIM(warehouse_id) != ''
     `);
     const referencedWarehouseIds = referencedWarehouseRows
       .map((row) => row.id)
@@ -8442,11 +9710,19 @@ export const importBackupData = async (
       if (backup.rules && backup.rules.length > 0) {
         for (const rule of backup.rules) {
           try {
+            // Cross-device IDs are not portable: rebuild explicit references by canonical name.
+            // Old supplierName-only backups stay unassociated and never become scan validation rules.
+            const supplierId = rule.supplierId?.trim()
+              ? await registerInventorySupplierWithDatabase(transactionDatabase, rule.supplierName)
+              : null;
+            const supplier = supplierId
+              ? await resolveRuleSupplierWithDatabase(transactionDatabase, { supplierId })
+              : { supplierName: rule.supplierName || '' };
             await transactionDatabase.runAsync(
               `INSERT INTO qr_code_rules (
                 id, name, description, separator, field_order, custom_field_ids,
-                is_active, supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                is_active, supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at, display_order, condition_mode, supplier_id
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 rule.id,
                 rule.name,
@@ -8455,12 +9731,15 @@ export const importBackupData = async (
                 JSON.stringify(rule.fieldOrder || []),
                 JSON.stringify(rule.customFieldIds || []),
                 rule.isActive ? 1 : 0,
-                rule.supplierName || '',
+                supplier.supplierName || '',
                 JSON.stringify(rule.matchConditions || []),
                 JSON.stringify(rule.fieldPrefixes || {}),
                 rule.terminator || '',
                 rule.created_at || getISODateTime(),
                 rule.updated_at || getISODateTime(),
+                getRuleDisplayOrder(rule.displayOrder) ?? null,
+                rule.conditionMode ?? 'all',
+                supplierId,
               ]
             );
           } catch (e) {
@@ -8694,7 +9973,20 @@ const RESTORE_SCHEMA_REQUIREMENTS: Record<string, string[]> = {
   custom_fields: ['id', 'name', 'type', 'required', 'sort_order'],
   warehouses: ['id', 'name', 'is_default', 'created_at'],
   inventory_bindings: ['id', 'scan_model', 'inventory_code', 'created_at'],
+  inventory_suppliers: ['id', 'name', 'created_at'],
   unpack_records: ['id', 'original_material_id', 'new_quantity', 'pair_id', 'unpacked_at'],
+  unpack_print_tasks: [
+    'pair_id', 'order_no', 'warehouse_id', 'warehouse_name', 'shipment_record_id',
+    'remainder_record_id', 'status', 'attempt_count', 'last_error', 'last_message',
+    'submitted_at', 'created_at', 'updated_at',
+  ],
+  sales_return_records: [
+    'id', 'order_no', 'customer_name', 'warehouse_id', 'warehouse_name', 'erp_account_key',
+    'inventory_code', 'model', 'version', 'package', 'batch', 'quantity', 'productionDate',
+    'traceNo', 'sourceNo', 'raw_content', 'separator', 'customFields', 'rule_id', 'rule_name',
+    'scanned_at', 'returned_at', 'source_kind', 'source_material_ids', 'notes', 'user_notes',
+  ],
+  sales_return_allocations: ['id', 'return_id', 'material_id', 'pair_id', 'quantity', 'created_at'],
   inbound_records: ['id', 'inbound_no', 'warehouse_id', 'scan_model', 'quantity', 'created_at'],
   inventory_check_records: [
     'id',
@@ -8712,7 +10004,12 @@ const RESTORE_SCHEMA_REQUIREMENTS: Record<string, string[]> = {
     'expires_at',
   ],
 };
-const RESTORE_REQUIRED_TABLES = new Set(Object.keys(RESTORE_SCHEMA_REQUIREMENTS));
+// Older full backups legitimately lack the later print, return and supplier tables.
+// If present, however, their complete schema is required.
+const RESTORE_REQUIRED_TABLES = new Set(
+  Object.keys(RESTORE_SCHEMA_REQUIREMENTS).filter(tableName =>
+    !['unpack_print_tasks', 'sales_return_records', 'sales_return_allocations', 'inventory_suppliers'].includes(tableName))
+);
 
 const getSelectedDatabaseFileName = (asset: { name?: string; uri: string }): string => {
   if (asset.name?.trim()) {
@@ -8746,10 +10043,11 @@ const hasSQLiteHeader = async (fileUri: string): Promise<boolean> => {
   }
 };
 
-const validateRestoredDatabaseSchema = async (
+export const validateRestoredDatabaseSchema = async (
   database: SQLite.SQLiteDatabase
 ): Promise<void> => {
-  const integrityRows = await database.getAllAsync<{ quick_check: string }>('PRAGMA quick_check');
+  const schemaDatabase = wrapDatabaseWithChineseTableNames(database);
+  const integrityRows = await schemaDatabase.getAllAsync<{ quick_check: string }>('PRAGMA quick_check');
   const integrityMessages = integrityRows
     .map((row) => String(row.quick_check || '').trim())
     .filter(Boolean);
@@ -8757,8 +10055,18 @@ const validateRestoredDatabaseSchema = async (
     throw new Error(`数据库完整性校验失败: ${integrityMessages.join('；') || '未返回校验结果'}`);
   }
 
+  const returnTable = await schemaDatabase.getFirstAsync<{ name: string }>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    [getPhysicalDatabaseTableName('sales_return_records')]);
+  const allocationTable = await schemaDatabase.getFirstAsync<{ name: string }>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    [getPhysicalDatabaseTableName('sales_return_allocations')]);
+  if (Boolean(returnTable) !== Boolean(allocationTable)) {
+    throw new Error('销售退货数据表不完整：退货记录和再次出库关联必须同时存在');
+  }
+
   for (const [tableName, requiredColumns] of Object.entries(RESTORE_SCHEMA_REQUIREMENTS)) {
-    const tableExists = await database.getFirstAsync<{ name: string }>(
+    const tableExists = await schemaDatabase.getFirstAsync<{ name: string }>(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
       [getPhysicalDatabaseTableName(tableName)]
     );
@@ -8770,7 +10078,7 @@ const validateRestoredDatabaseSchema = async (
       continue;
     }
 
-    const columns = await database.getAllAsync<{ name: string }>(`PRAGMA table_info(${tableName})`);
+    const columns = await schemaDatabase.getAllAsync<{ name: string }>(`PRAGMA table_info(${tableName})`);
     const columnSet = new Set(columns.map((column) => column.name));
     const missingColumns = requiredColumns.filter((column) => !columnSet.has(column));
 
@@ -9040,6 +10348,8 @@ export const importDatabaseFile = async (): Promise<{
     warehouses: number;
   };
 }> => {
+  let draftIsolationId: string | undefined;
+  let restoreTouchedDatabase = false;
   try {
     if (isWebPlatform) {
       return {
@@ -9103,7 +10413,10 @@ export const importDatabaseFile = async (): Promise<{
     let restoredDatabasePath = '';
     let rollbackDatabasePath = '';
     let hasRollbackDatabase = false;
+    // No active work is removed until its complete recovery copy has been persisted.
+    draftIsolationId = await beginWorkDraftIsolation(selectedFileName);
     const importResult = await runSerializedDatabaseOperation('importDatabaseFile', async () => {
+      restoreTouchedDatabase = true;
       // 关闭当前数据库连接
       const database = db;
       if (database) {
@@ -9120,6 +10433,11 @@ export const importDatabaseFile = async (): Promise<{
       const dbBackupPath = `${dbFilePath}.backup`;
       restoredDatabasePath = dbFilePath;
       rollbackDatabasePath = dbBackupPath;
+      let replacementStarted = false;
+
+      if (await AsyncStorage.getItem(DATABASE_RESTORE_JOURNAL_KEY)) {
+        throw new Error('上次数据库恢复保护尚未完成，请先重启完成恢复检查；原库副本已保留');
+      }
 
       try {
         // 1. 备份当前数据库文件（如果存在）
@@ -9133,6 +10451,10 @@ export const importDatabaseFile = async (): Promise<{
           });
           hasRollbackDatabase = true;
         }
+
+        await beginDatabaseRestoreJournal({ databasePath: dbFilePath, backupPath: dbBackupPath,
+          hadOriginal: hasRollbackDatabase });
+        replacementStarted = true;
 
         // 2. 删除当前数据库文件及 WAL/SHM 辅助文件
         await FS.deleteAsync(dbFilePath, { idempotent: true });
@@ -9193,15 +10515,18 @@ export const importDatabaseFile = async (): Promise<{
 
         // 恢复失败，尝试回滚到备份
         const backupInfo = await FS.getInfoAsync(dbBackupPath);
-        if (backupInfo.exists) {
+        if (replacementStarted && hasRollbackDatabase &&
+          (!backupInfo.exists || backupInfo.isDirectory || backupInfo.size <= 0)) {
+          throw new Error('原数据库恢复副本缺失或不完整，已停止操作以保护当前数据，请重启后检查');
+        }
+        if (replacementStarted && backupInfo.exists) {
           await FS.deleteAsync(dbFilePath, { idempotent: true });
           await deleteDatabaseSidecarFiles(dbFilePath);
           await FS.copyAsync({
             from: dbBackupPath,
             to: dbFilePath,
           });
-          await FS.deleteAsync(dbBackupPath, { idempotent: true });
-        } else {
+        } else if (replacementStarted) {
           await FS.deleteAsync(dbFilePath, { idempotent: true });
           await deleteDatabaseSidecarFiles(dbFilePath);
         }
@@ -9218,6 +10543,9 @@ export const importDatabaseFile = async (): Promise<{
     if (shouldReinitialize) {
       if (!importResult.success) {
         await initDatabase();
+        await rollbackWorkDraftIsolation(draftIsolationId);
+        draftIsolationId = undefined;
+        await completeDatabaseRestoreJournal();
         return importResult;
       }
 
@@ -9237,18 +10565,17 @@ export const importDatabaseFile = async (): Promise<{
             db = null;
           }
 
-          await FS.deleteAsync(restoredDatabasePath, { idempotent: true });
-          await deleteDatabaseSidecarFiles(restoredDatabasePath);
-
           if (hasRollbackDatabase && rollbackDatabasePath) {
             const rollbackInfo = await FS.getInfoAsync(rollbackDatabasePath);
-            if (rollbackInfo.exists) {
-              await FS.copyAsync({
-                from: rollbackDatabasePath,
-                to: restoredDatabasePath,
-              });
-              restoredOriginalDatabase = true;
+            if (!rollbackInfo.exists || rollbackInfo.isDirectory || rollbackInfo.size <= 0) {
+              throw new Error('原数据库恢复副本缺失或不完整，已停止回滚以保护当前数据');
             }
+          }
+          await FS.deleteAsync(restoredDatabasePath, { idempotent: true });
+          await deleteDatabaseSidecarFiles(restoredDatabasePath);
+          if (hasRollbackDatabase && rollbackDatabasePath) {
+            await FS.copyAsync({ from: rollbackDatabasePath, to: restoredDatabasePath });
+            restoredOriginalDatabase = true;
           }
         });
 
@@ -9258,6 +10585,7 @@ export const importDatabaseFile = async (): Promise<{
           logger.error('回滚数据库后初始化失败:', rollbackInitializationError);
           return {
             success: false,
+            needRestart: true,
             message: `恢复后的数据库初始化失败，自动恢复也未完成: ${
               initializationError instanceof Error ? initializationError.message : '未知错误'
             }；恢复错误: ${
@@ -9268,12 +10596,14 @@ export const importDatabaseFile = async (): Promise<{
           };
         }
 
-        if (restoredOriginalDatabase && rollbackDatabasePath) {
-          await FS.deleteAsync(rollbackDatabasePath, { idempotent: true });
-        }
+        if (restoredOriginalDatabase) await rollbackWorkDraftIsolation(draftIsolationId);
+        else await completeWorkDraftIsolation(draftIsolationId);
+        draftIsolationId = undefined;
+        await completeDatabaseRestoreJournal();
 
         return {
           success: false,
+          needRestart: !restoredOriginalDatabase,
           message: `恢复后的数据库初始化失败，${
             restoredOriginalDatabase ? '已回滚到原数据库' : '已移除无效数据库并重新创建空数据库'
           }: ${
@@ -9283,13 +10613,17 @@ export const importDatabaseFile = async (): Promise<{
       }
     }
 
-    if (hasRollbackDatabase && rollbackDatabasePath) {
-      await FS.deleteAsync(rollbackDatabasePath, { idempotent: true });
-    }
+    await completeWorkDraftIsolation(draftIsolationId);
+    draftIsolationId = undefined;
+
+    await completeDatabaseRestoreJournal();
 
     return importResult;
   } catch (error) {
     logger.error('导入数据库文件失败:', error);
+
+    releaseDatabaseRestoreJournal();
+    if (draftIsolationId) releaseWorkDraftIsolationAttempt();
 
     // 尝试重新打开数据库
     try {
@@ -9302,7 +10636,12 @@ export const importDatabaseFile = async (): Promise<{
 
     return {
       success: false,
-      message: error instanceof Error ? error.message : '导入数据库文件失败',
+      needRestart: restoreTouchedDatabase,
+      message: `${error instanceof Error ? error.message : '导入数据库文件失败'}${draftIsolationId
+        ? '。未完成作业已保存为恢复前作业副本，请重启后在设置中核对。' : ''}`,
     };
+  } finally {
+    releaseDatabaseRestoreJournal();
+    if (draftIsolationId) releaseWorkDraftIsolationAttempt();
   }
 };

@@ -18,6 +18,8 @@ import { Screen } from '@/components/Screen';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
+import { useHardwareBack } from '@/hooks/useHardwareBack';
+import { feedbackDeleted } from '@/utils/feedback';
 import {
   deleteInventoryCheckDocument,
   deleteInventoryCheckRecord,
@@ -94,6 +96,10 @@ export default function InventoryRecordsScreen() {
   const styles = useMemo(() => createStyles(theme), [theme]);
 
   const [selectedAccountKey, setSelectedAccountKey] = useState<ErpAccountKey | null>(null);
+  const selectedAccountRef = useRef(selectedAccountKey);
+  const pageActiveRef = useRef(false);
+  const pageSessionRef = useRef(0);
+  const documentRequestRef = useRef(0);
   const [documents, setDocuments] = useState<InventoryCheckDocumentSummary[]>([]);
   const [detailsByKey, setDetailsByKey] = useState<DetailMap>({});
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
@@ -105,6 +111,12 @@ export default function InventoryRecordsScreen() {
   const [syncingKeys, setSyncingKeys] = useState<Set<string>>(new Set());
   const [notice, setNotice] = useState<{ text: string; type: NoticeType } | null>(null);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useHardwareBack(useCallback(() => {
+    if (!showAccountPicker) return false;
+    setShowAccountPicker(false);
+    return true;
+  }, [showAccountPicker]));
 
   const showNotice = useCallback((text: string, type: NoticeType = 'success') => {
     if (noticeTimerRef.current) {
@@ -136,51 +148,53 @@ export default function InventoryRecordsScreen() {
     return { documentCount };
   }, [documents]);
 
-  const loadDocuments = useCallback(async (accountKey: ErpAccountKey | null, asRefresh = false) => {
-    if (asRefresh) {
-      setRefreshing(true);
-    } else {
-      setLoading(true);
+  const capturePageOwner = useCallback((accountKey: ErpAccountKey | null) => {
+    const sessionId = pageSessionRef.current;
+    return () => pageActiveRef.current && pageSessionRef.current === sessionId &&
+      selectedAccountRef.current === accountKey;
+  }, []);
+
+  const loadDocuments = useCallback(async (accountKey: ErpAccountKey | null, asRefresh = false, silent = false) => {
+    const ownsPage = capturePageOwner(accountKey);
+    if (!ownsPage()) return null;
+    const requestId = ++documentRequestRef.current;
+    const isCurrent = () => ownsPage() && documentRequestRef.current === requestId;
+    if (!silent) {
+      setRefreshing(asRefresh);
+      setLoading(!asRefresh);
     }
 
     try {
       const rows = await getInventoryCheckDocumentSummaries(undefined, accountKey || undefined);
+      if (!isCurrent()) return null;
       setDocuments(rows);
-    } catch (error) {
-      showNotice('盘点记录加载失败', 'error');
+      return { rows, isCurrent };
+    } catch {
+      if (isCurrent()) showNotice('盘点记录加载失败', 'error');
+      return null;
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (isCurrent()) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  }, [showNotice]);
+  }, [capturePageOwner, showNotice]);
 
   useFocusEffect(
     useCallback(() => {
-      let cancelled = false;
-
-      const run = async () => {
-        setLoading(true);
-        const documentRows = await getInventoryCheckDocumentSummaries(
-          undefined,
-          selectedAccountKey || undefined
-        );
-
-        if (cancelled) return;
-        setDocuments(documentRows);
-        setLoading(false);
-      };
-
-      run().catch(() => {
-        if (!cancelled) {
-          setLoading(false);
-          showNotice('盘点记录加载失败', 'error');
-        }
-      });
+      pageActiveRef.current = true;
+      const sessionId = ++pageSessionRef.current;
+      setLoadingKeys(new Set());
+      setSyncingKeys(new Set());
+      void loadDocuments(selectedAccountKey);
 
       return () => {
-        cancelled = true;
+        if (pageSessionRef.current !== sessionId) return;
+        pageActiveRef.current = false;
+        pageSessionRef.current += 1;
+        documentRequestRef.current += 1;
       };
-    }, [selectedAccountKey, showNotice])
+    }, [loadDocuments, selectedAccountKey])
   );
 
   const handleRefresh = useCallback(async () => {
@@ -188,6 +202,11 @@ export default function InventoryRecordsScreen() {
   }, [loadDocuments, selectedAccountKey]);
 
   const handleAccountSelect = useCallback((accountKey: ErpAccountKey | null) => {
+    if (selectedAccountRef.current !== accountKey) {
+      selectedAccountRef.current = accountKey;
+      pageSessionRef.current += 1;
+      documentRequestRef.current += 1;
+    }
     setSelectedAccountKey(accountKey);
     setShowAccountPicker(false);
     setExpandedKeys(new Set());
@@ -196,6 +215,7 @@ export default function InventoryRecordsScreen() {
   }, []);
 
   const toggleDocument = useCallback(async (item: InventoryCheckDocumentSummary) => {
+    const ownsPage = capturePageOwner(selectedAccountRef.current);
     const key = getDocumentKey(item);
     const isExpanded = expandedKeys.has(key);
 
@@ -217,30 +237,29 @@ export default function InventoryRecordsScreen() {
     setLoadingKeys((prev) => new Set(prev).add(key));
     try {
       const records = await getInventoryCheckRecordsByNo(item.check_no, item.warehouse_id);
+      if (!ownsPage()) return;
       setDetailsByKey((prev) => ({ ...prev, [key]: records }));
-    } catch (error) {
-      showNotice('明细加载失败', 'error');
+    } catch {
+      if (ownsPage()) showNotice('明细加载失败', 'error');
     } finally {
-      setLoadingKeys((prev) => {
+      if (ownsPage()) setLoadingKeys((prev) => {
         const next = new Set(prev);
         next.delete(key);
         return next;
       });
     }
-  }, [detailsByKey, expandedKeys, showNotice]);
+  }, [capturePageOwner, detailsByKey, expandedKeys, showNotice]);
 
   const reloadAfterDelete = useCallback(async (
     documentKey?: string,
     document?: InventoryCheckDocumentSummary
   ) => {
-    const nextDocuments = await getInventoryCheckDocumentSummaries(
-      undefined,
-      selectedAccountKey || undefined
-    );
-    setDocuments(nextDocuments);
+    const result = await loadDocuments(selectedAccountKey, false, true);
+    if (!result) return false;
+    const { rows: nextDocuments, isCurrent } = result;
 
     if (!documentKey || !document) {
-      return;
+      return true;
     }
 
     const stillExists = nextDocuments.some((item) => getDocumentKey(item) === documentKey);
@@ -264,15 +283,18 @@ export default function InventoryRecordsScreen() {
         delete next[documentKey];
         return next;
       });
-      return;
+      return true;
     }
 
     const records = await getInventoryCheckRecordsByNo(document.check_no, document.warehouse_id);
+    if (!isCurrent()) return false;
     setDetailsByKey((prev) => ({ ...prev, [documentKey]: records }));
-  }, [selectedAccountKey]);
+    return true;
+  }, [loadDocuments, selectedAccountKey]);
 
   const handleDeleteDocument = useCallback((item: InventoryCheckDocumentSummary) => {
     const key = getDocumentKey(item);
+    const ownsPage = capturePageOwner(selectedAccountKey);
     alert.showConfirm(
       '删除盘点单',
       `将删除 ${item.check_no} 的 ${item.record_count} 条明细。`,
@@ -280,22 +302,24 @@ export default function InventoryRecordsScreen() {
         void (async () => {
           try {
             await deleteInventoryCheckDocument(item.check_no, item.warehouse_id);
-            await reloadAfterDelete(key, item);
+            if (!ownsPage() || !await reloadAfterDelete(key, item) || !ownsPage()) return;
             showNotice('盘点单已删除', 'success');
-          } catch (error) {
-            showNotice('删除失败', 'error');
+            void feedbackDeleted();
+          } catch {
+            if (ownsPage()) showNotice('删除失败', 'error');
           }
         })();
       },
       true
     );
-  }, [alert, reloadAfterDelete, showNotice]);
+  }, [alert, capturePageOwner, reloadAfterDelete, selectedAccountKey, showNotice]);
 
   const handleDeleteRecord = useCallback((
     record: InventoryCheckRecord,
     document: InventoryCheckDocumentSummary
   ) => {
     const key = getDocumentKey(document);
+    const ownsPage = capturePageOwner(selectedAccountKey);
     alert.showConfirm(
       '删除盘点明细',
       `将删除 ${record.scan_model}${formatVersion(record.version)}，实盘 ${formatQuantity(getEffectiveQuantity(record))}。`,
@@ -312,24 +336,21 @@ export default function InventoryRecordsScreen() {
             } catch {
               // 明细已删除时，同步状态刷新失败不应反向提示删除失败。
             }
-            await reloadAfterDelete(key, document);
+            if (!ownsPage() || !await reloadAfterDelete(key, document) || !ownsPage()) return;
             showNotice('明细已删除', 'success');
-          } catch (error) {
-            showNotice('删除失败', 'error');
+            void feedbackDeleted();
+          } catch {
+            if (ownsPage()) showNotice('删除失败', 'error');
           }
         })();
       },
       true
     );
-  }, [alert, reloadAfterDelete, showNotice]);
+  }, [alert, capturePageOwner, reloadAfterDelete, selectedAccountKey, showNotice]);
 
   const refreshDocumentSummaries = useCallback(async () => {
-    const nextDocuments = await getInventoryCheckDocumentSummaries(
-      undefined,
-      selectedAccountKey || undefined
-    );
-    setDocuments(nextDocuments);
-  }, [selectedAccountKey]);
+    return loadDocuments(selectedAccountKey, false, true);
+  }, [loadDocuments, selectedAccountKey]);
 
   const getSyncStatusMeta = useCallback((status: DocumentSyncStatus) => {
     if (status === 'success') {
@@ -346,12 +367,14 @@ export default function InventoryRecordsScreen() {
   const handleResyncDocument = useCallback((item: InventoryCheckDocumentSummary) => {
     const key = getDocumentKey(item);
     if (syncingKeys.has(key)) return;
+    const ownsPage = capturePageOwner(selectedAccountKey);
 
     void (async () => {
       setSyncingKeys((prev) => new Set(prev).add(key));
 
       try {
         const syncConfig = await getStoredSyncConfig();
+        if (!ownsPage()) return;
         if (!syncConfig?.ip) {
           showNotice('请先在设置中配置电脑同步', 'warning');
           return;
@@ -394,13 +417,15 @@ export default function InventoryRecordsScreen() {
           // 同步结果已经产生，状态写入失败只影响列表标识，不影响文件同步结果。
         }
 
+        if (!ownsPage()) return;
         if (result.success) {
           showNotice('盘点单已重新同步', 'success');
         } else {
           showNotice(`同步失败：${formatSyncErrorMessage(result.message)}`, 'warning');
         }
 
-        await refreshDocumentSummaries();
+        const refreshed = await refreshDocumentSummaries();
+        if (!ownsPage() || !refreshed?.isCurrent()) return;
         if (!detailsByKey[key]) {
           setDetailsByKey((prev) => ({ ...prev, [key]: records }));
         }
@@ -412,17 +437,19 @@ export default function InventoryRecordsScreen() {
           undefined,
           error instanceof Error ? error.message : String(error)
         );
-        showNotice('重新同步失败，请检查同步助手', 'error');
-        await refreshDocumentSummaries();
+        if (ownsPage()) {
+          showNotice('重新同步失败，请检查同步助手', 'error');
+          await refreshDocumentSummaries();
+        }
       } finally {
-        setSyncingKeys((prev) => {
+        if (ownsPage()) setSyncingKeys((prev) => {
           const next = new Set(prev);
           next.delete(key);
           return next;
         });
       }
     })();
-  }, [detailsByKey, refreshDocumentSummaries, showNotice, syncingKeys]);
+  }, [capturePageOwner, detailsByKey, refreshDocumentSummaries, selectedAccountKey, showNotice, syncingKeys]);
 
   const getDetailGroups = useCallback((records: InventoryCheckRecord[]): InventoryDetailGroup[] => {
     const groupMap = new Map<string, InventoryDetailGroup>();
@@ -707,7 +734,7 @@ export default function InventoryRecordsScreen() {
           </TouchableOpacity>
           <View style={styles.headerTextBlock}>
             <Text style={styles.title}>盘点记录</Text>
-            <Text style={styles.subtitle}>按盘点单查看，长按可删除误保存数据</Text>
+            <Text style={styles.subtitle}>按盘点单查看明细，长按可删除本机记录</Text>
           </View>
         </View>
 

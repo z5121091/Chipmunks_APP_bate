@@ -8,6 +8,11 @@ import { CustomAlert } from '../CustomAlert';
 import { UiPageHeader } from '../UiRedesign';
 
 jest.mock('@/hooks/useTheme', () => ({ useTheme: jest.fn() }));
+jest.mock('@/utils/feedback', () => ({
+  feedbackCancel: jest.fn(),
+  feedbackConfirm: jest.fn(),
+  feedbackDeleted: jest.fn(),
+}));
 jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon', FontAwesome6: 'Icon' }));
 jest.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ bottom: 0, left: 0, right: 0, top: 0 }),
@@ -57,6 +62,24 @@ describe('shared UI visual contracts', () => {
       });
       const darkText = findText(root!, '扫码成功');
       expect(darkText!.props.style[1].color).toBe(Colors.dark.buttonPrimaryText);
+    } finally {
+      if (root) await act(async () => { root!.unmount(); });
+    }
+  });
+
+  it('keeps long error feedback fully wrapped instead of truncating it', async () => {
+    let root: TestRenderer.ReactTestRenderer | undefined;
+    const message = '扫码失败：二维码无法解析，请检查识别规则与物料绑定后重新扫描。'.repeat(3);
+
+    try {
+      await act(async () => {
+        root = TestRenderer.create(<AppPillToast text={message} type="error" />);
+      });
+      const errorText = findText(root!, message);
+      expect(errorText).toBeDefined();
+      expect(errorText!.props.numberOfLines).toBeUndefined();
+      expect(errorText!.props.style).toContainEqual(expect.objectContaining({ flexShrink: 1, textAlign: 'left' }));
+      expect(root!.root.findAllByProps({ pointerEvents: 'none' }).length).toBeGreaterThan(0);
     } finally {
       if (root) await act(async () => { root!.unmount(); });
     }

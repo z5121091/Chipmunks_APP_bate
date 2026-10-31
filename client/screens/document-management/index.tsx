@@ -1,6 +1,5 @@
 import { useMemo } from 'react';
-import { ScrollView, Text, TouchableOpacity, View } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { ScrollView, Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
@@ -21,7 +20,6 @@ type DocumentCard = {
 export default function DocumentManagementScreen() {
   const { theme, isDark } = useTheme();
   const router = useSafeRouter();
-  const insets = useSafeAreaInsets();
   const alert = useCustomAlert();
   const styles = useMemo(() => createStyles(theme), [theme]);
 
@@ -30,7 +28,7 @@ export default function DocumentManagementScreen() {
       {
         id: 'orders',
         title: '出库订单',
-        description: '编辑数量、拆包打印、查看出库追溯记录',
+        description: '查询当前、当天及历史出库订单和明细',
         icon: 'file-text',
         route: '/orders',
         tone: 'primary',
@@ -38,7 +36,7 @@ export default function DocumentManagementScreen() {
       {
         id: 'inbound',
         title: '入库记录',
-        description: '按仓库查看入库单，删除误保存的入库明细',
+        description: '按仓库查看入库单及明细，可删除本机记录',
         icon: 'log-in',
         route: '/inbound-records',
         tone: 'primary',
@@ -46,7 +44,7 @@ export default function DocumentManagementScreen() {
       {
         id: 'inventory',
         title: '盘点记录',
-        description: '按仓库查看盘点单，删除误保存的盘点明细',
+        description: '按账套查看盘点单及明细，可删除本机记录',
         icon: 'check-square',
         route: '/inventory-records',
         tone: 'primary',
@@ -57,7 +55,7 @@ export default function DocumentManagementScreen() {
 
   const handleCardPress = (card: DocumentCard) => {
     if (card.route) {
-      router.push(card.route as any);
+      router.push(card.route);
       return;
     }
 
@@ -70,23 +68,17 @@ export default function DocumentManagementScreen() {
   };
 
   return (
-    <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
+    <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}
+      safeAreaEdges={['top', 'left', 'right']} disableAutoScroll>
       <ScrollView
         style={styles.container}
-        contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 28 }]}
+        contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.header}>
-          <TouchableOpacity
-            style={styles.backButton}
-            activeOpacity={0.7}
-            onPress={() => router.back()}
-          >
-            <Feather name="arrow-left" size={20} color={theme.textPrimary} />
-          </TouchableOpacity>
           <View style={styles.headerTextBlock}>
             <Text style={styles.title}>单据管理</Text>
-            <Text style={styles.subtitle}>查历史、改错单、补同步都从这里进入</Text>
+            <Text style={styles.subtitle}>查看出库订单、入库记录和盘点记录</Text>
           </View>
         </View>
 

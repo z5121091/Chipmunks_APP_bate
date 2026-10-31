@@ -55,19 +55,6 @@ export const createStyles = (theme: Theme) => {
       color: theme.textSecondary,
       marginTop: 1,
     },
-    headerActionButton: {
-      width: 42,
-      height: 42,
-      borderRadius: BorderRadius.full,
-      alignItems: 'center',
-      justifyContent: 'center',
-      backgroundColor: theme.primary,
-      shadowColor: theme.primary,
-      shadowOffset: { width: 0, height: 6 },
-      shadowOpacity: theme.isDark ? 0.18 : 0.22,
-      shadowRadius: 10,
-      elevation: 3,
-    },
     // 搜索框
     searchContainer: {
       flexDirection: 'row',
@@ -229,20 +216,6 @@ export const createStyles = (theme: Theme) => {
       color: theme.textMuted,
       fontStyle: 'italic',
     },
-    editBtn: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      paddingVertical: Spacing.xs,
-      paddingHorizontal: Spacing.sm,
-      backgroundColor: withAlpha(theme.primary, 0.06),
-      borderRadius: BorderRadius.sm,
-      gap: 3,
-      minHeight: 36,
-    },
-    editBtnText: {
-      ...Typography.captionMedium,
-      color: theme.primary,
-    },
     orderItemExpanded: {
       borderBottomLeftRadius: 0,
       borderBottomRightRadius: 0,
@@ -299,22 +272,6 @@ export const createStyles = (theme: Theme) => {
       fontSize: rf(10),
       color: theme.textMuted,
     },
-    // 拆包按钮
-    unpackBtn: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      paddingVertical: Spacing.xs,
-      paddingHorizontal: Spacing.xs,
-      backgroundColor: withAlpha(theme.primary, 0.06),
-      borderRadius: BorderRadius.sm,
-      marginLeft: Spacing.xs,
-      gap: 2,
-    },
-    unpackBtnText: {
-      fontSize: rf(11),
-      fontWeight: '600',
-      color: theme.primary,
-    },
     emptyContainer: {
       alignItems: 'center',
       paddingVertical: Spacing.xl,
@@ -348,111 +305,6 @@ export const createStyles = (theme: Theme) => {
       color: theme.buttonPrimaryText,
       fontWeight: '600',
     },
-    // Modal样式
-    modalOverlay: {
-      flex: 1,
-      backgroundColor: theme.overlay,
-      justifyContent: 'center',
-      alignItems: 'center',
-      padding: Spacing.md,
-    },
-    modalContent: {
-      width: '100%',
-      maxWidth: APP_MODAL_MAX_WIDTH,
-      minHeight: 280,
-    },
-    unpackModalContent: {
-      width: '100%',
-      maxWidth: APP_MODAL_MAX_WIDTH,
-      maxHeight: '82%',
-    },
-    customerModalContent: {
-      width: '100%',
-      maxWidth: APP_MODAL_MAX_WIDTH,
-    },
-    customerModalBody: {
-      paddingBottom: 0,
-      justifyContent: 'center',
-    },
-    modalBody: {
-      paddingBottom: 0,
-    },
-    unpackModalBodyContent: {
-      paddingBottom: Spacing['2xl'],
-    },
-    modalActions: {
-      marginTop: 0,
-    },
-    modalInput: {
-      fontSize: rf(14),
-      fontWeight: '500',
-      color: theme.textPrimary,
-      paddingVertical: Spacing.sm,
-      paddingHorizontal: Spacing.md,
-      backgroundColor: theme.backgroundTertiary,
-      borderRadius: BorderRadius.md,
-      borderWidth: BorderWidth.normal,
-      borderColor: theme.border,
-      minHeight: 48,
-    },
-    unpackTextInput: {
-      fontSize: rf(16),
-      color: theme.textPrimary,
-      paddingVertical: Spacing.md,
-      paddingHorizontal: Spacing.lg,
-      minHeight: 48,
-      backgroundColor: theme.backgroundTertiary,
-      borderRadius: BorderRadius.md,
-      borderWidth: BorderWidth.normal,
-      borderColor: theme.border,
-    },
-    readOnlyInputContent: {
-      justifyContent: 'center',
-    },
-    editReadOnlyInput: {
-      justifyContent: 'center',
-      backgroundColor: theme.backgroundTertiary,
-      opacity: 0.7,
-    },
-    unpackReadOnlyText: {
-      fontSize: rf(15),
-      color: theme.textSecondary,
-    },
-    unpackQuantityText: {
-      fontSize: rf(15),
-      fontWeight: '700',
-      color: theme.primary,
-    },
-    unpackTraceText: {
-      fontSize: rf(16),
-      fontWeight: '600',
-      color: theme.primary,
-    },
-    unpackRemainingPreview: {
-      flexDirection: 'row',
-      justifyContent: 'space-between',
-      alignItems: 'center',
-      paddingHorizontal: Spacing.md,
-      paddingVertical: Spacing.md,
-      marginTop: Spacing.sm,
-    },
-    unpackRemainingLabel: {
-      fontSize: rf(14),
-      color: theme.textSecondary,
-    },
-    unpackRemainingValue: {
-      fontSize: rf(16),
-      fontWeight: '600',
-      color: theme.textPrimary,
-    },
-    unpackNotesInput: {
-      minHeight: 88,
-      textAlignVertical: 'top',
-    },
-    editReadOnlyText: {
-      fontSize: rf(16),
-      color: theme.textSecondary,
-    },
     // 仓库选择器弹窗样式
     pickerOverlay: {
       position: 'absolute',
@@ -471,6 +323,7 @@ export const createStyles = (theme: Theme) => {
       padding: Spacing.md,
       width: '100%',
       maxWidth: APP_MODAL_MAX_WIDTH,
+      maxHeight: '80%',
     },
     pickerTitle: {
       fontSize: rf(15),

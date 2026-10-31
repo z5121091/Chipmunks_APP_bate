@@ -27,7 +27,7 @@ export const displayRuleTerminator = (value: string): string => Array.from(value
 
 export const stripRuleTerminator = (content: string, terminator?: string) => {
   if (terminator) {
-    // Allow scanner-appended whitespace after the exact terminator, but strip only once.
+    // 扫码头可能在结束符后补空白；结束符只去掉一次。
     for (let end = content.length; end >= terminator.length; end--) {
       if (content.slice(end - terminator.length, end) === terminator) {
         return { content: content.slice(0, end - terminator.length), matched: true };

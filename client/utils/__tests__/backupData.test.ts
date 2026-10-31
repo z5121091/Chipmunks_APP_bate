@@ -87,6 +87,7 @@ describe('native automatic database backup', () => {
       '入库记录',
       '盘点记录',
       '拆包记录',
+      '销售退货记录',
     ];
 
     for (const workerPath of workerPaths) {

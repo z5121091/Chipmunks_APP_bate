@@ -53,8 +53,7 @@ type BackendJsonRequestOptions = BackendUrlOptions & {
   timeoutMs?: number;
 };
 
-// Keep the client timeout above the proxy and Chanjet upstream timeouts so the
-// server can return a structured error before the app aborts the request.
+// 客户端超时要晚于代理和畅捷通上游超时，让服务端有时间返回完整错误。
 const DEFAULT_BACKEND_TIMEOUT_MS = 25_000;
 
 export class BackendApiError extends Error {

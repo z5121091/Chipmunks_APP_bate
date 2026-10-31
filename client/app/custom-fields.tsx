@@ -1,6 +1,6 @@
 import { Redirect } from 'expo-router';
 
-// Preserve old deep links without exposing the retired field manager.
+// 保留旧链接入口，打开时跳转到当前页面。
 export default function LegacyCustomFieldsRoute() {
   return <Redirect href="/rules" />;
 }

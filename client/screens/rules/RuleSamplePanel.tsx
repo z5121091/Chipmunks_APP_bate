@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Keyboard, StyleSheet, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Keyboard, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import {
   analyzeQRCodeRuleDetection,
@@ -8,9 +8,8 @@ import {
   inspectQRCodeRule,
   type QRCodeRule,
 } from '@/utils/database';
-import { isIgnoredRuleField, visualizeScanCharacters, suggestRuleFieldPrefix, suggestRuleSeparators } from '@/utils/ruleConditions';
+import { isIgnoredRuleField, suggestRuleFieldPrefix, suggestRuleSeparators } from '@/utils/ruleConditions';
 import { parseQuantity } from '@/utils/quantity';
-import { displayRuleTerminator } from '@/utils/ruleTerminator';
 import { useTheme } from '@/hooks/useTheme';
 import { RuleOptionPicker } from './RuleOptionPicker';
 import { Typography } from '@/constants/theme';
@@ -22,8 +21,6 @@ export function RuleSamplePanel({ sample, onSampleChange, rule, rules, configura
   onSeparatorSelect: (separator: string) => void;
 }) {
   const { theme } = useTheme();
-  const [showHidden, setShowHidden] = useState(true);
-  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [mappingIndex, setMappingIndex] = useState<number | null>(null);
   const [separatorPicker, setSeparatorPicker] = useState(false);
   const [continuousMapping, setContinuousMapping] = useState(false);
@@ -142,21 +139,6 @@ export function RuleSamplePanel({ sample, onSampleChange, rule, rules, configura
         {conflictingRuleNames.length > 0 && <Text style={[Typography.caption, { color: theme.error }]}>当前样本与 {conflictingRuleNames.join('、')} 优先级相同，扫码无法自动区分。</Text>}
         {!conflictingRuleNames.length && selectedOtherRule && <Text style={[Typography.caption, { color: theme.warning }]}>当前样本会优先使用“{selectedOtherRule.name}”，本规则不会处理该样本。</Text>}
         {isAutomaticallyDistinguished && <Text style={[Typography.caption, { color: theme.success }]}>已与 {otherMatchedRules.map(other => other.name).join('、')} 自动区分，扫码会优先使用本规则。</Text>}
-        <TouchableOpacity accessibilityRole="button" accessibilityLabel="解析诊断" accessibilityState={{ expanded: showDiagnostics }}
-          onPress={() => setShowDiagnostics(value => !value)} style={[styles.heading, { minHeight: 44 }]}>
-          <Feather name="activity" size={16} color={theme.textSecondary} />
-          <Text style={[Typography.caption, { flex: 1, color: theme.textSecondary }]}>解析诊断</Text>
-          <Feather name={showDiagnostics ? 'chevron-up' : 'chevron-down'} size={16} color={theme.textMuted} />
-        </TouchableOpacity>
-        {showDiagnostics && <View style={{ gap: 8 }}>
-          <Text style={[Typography.caption, { color: theme.textSecondary }]}>当前分隔符：{rule.separator === ' ' ? '空格' : displayRuleTerminator(rule.separator) || '未设置'}</Text>
-          <View style={styles.heading}>
-            <Text style={[Typography.small, { color: theme.textSecondary }]}>显示隐藏字符</Text>
-            <Switch accessibilityLabel="显示隐藏字符" value={showHidden} onValueChange={setShowHidden} />
-          </View>
-          {showHidden && <Text selectable style={[styles.raw, { color: theme.textSecondary }]}>{visualizeScanCharacters(sample)}</Text>}
-          {inspection?.errors.map((error, index) => <Text key={index} style={[Typography.caption, { color: theme.error }]}>{error}</Text>)}
-        </View>}
       </>}
       {(separatorPicker || mappingIndex !== null) && <RuleOptionPicker
         title={separatorPicker ? '确认分隔符' : `第${(mappingIndex ?? 0) + 1} / ${segmentCount}段`}
@@ -196,7 +178,6 @@ const styles = StyleSheet.create({
   noticeRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 6 },
   title: { ...Typography.smallMedium },
   sample: { ...Typography.small, minHeight: 88, maxHeight: 160, padding: 12, borderWidth: 1, borderRadius: 8 },
-  raw: { ...Typography.caption },
   row: { minHeight: 64, flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, gap: 12 },
   mapping: { minHeight: 44, width: 104, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 4 },
   iconButton: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },

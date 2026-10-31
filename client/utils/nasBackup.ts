@@ -8,7 +8,7 @@ import { logger } from './logger';
 import { scanQueue } from './scanQueue';
 import { safeJsonParseNullable } from './json';
 
-const FileSystem = FileSystemLegacy as any;
+const FileSystem = FileSystemLegacy;
 
 type WebDavServer = {
   baseUrl: string;
@@ -219,7 +219,7 @@ export const uploadDatabaseBackupToNas = async (
 
     const status = await uploadToWebDav(fileUri, remoteUrl, server.headers);
     if (status >= 200 && status <= 299) {
-      logger.log('NAS 数据库备份上传成功:', remoteUrl);
+      logger.log('NAS 数据库备份上传成功:', fileName);
       const result = { fileName, remoteUrl };
       await recordNasDatabaseBackupSuccess(result, dateStr, source).catch((error) => {
         logger.warn('记录 NAS 数据库备份成功状态失败:', error);

@@ -5,17 +5,19 @@
  */
 import * as XLSX from 'xlsx';
 import { Base64 } from 'js-base64';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { InteractionManager } from 'react-native';
-import { EXPORT_CONFIG, STORAGE_KEYS, SyncConfig } from '@/constants/config';
+import { EXPORT_CONFIG, SyncConfig } from '@/constants/config';
 import type { JsonValidator } from '@/utils/json';
 import { logger } from '@/utils/logger';
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 import {
   getSyncConfigError,
+  getSyncPairingHeaders,
   getSyncServiceBaseUrl,
+  invalidateSuccessfulHealthCheck,
   testConnection,
 } from '@/utils/heartbeat';
+import { reportSyncConnectionResult } from '@/utils/syncConnection';
 
 const BACKEND_ACCESS_KEY = process.env.EXPO_PUBLIC_BACKEND_ACCESS_KEY?.trim() || '';
 
@@ -118,9 +120,13 @@ export const formatSyncErrorMessage = (
   return normalized ? formatUserFacingErrorMessage(normalized, fallback) : fallback;
 };
 
-const setStoredConnectionStatus = async (status: 'success' | 'disconnected') => {
+const setStoredConnectionStatus = async (
+  config: SyncConfig,
+  status: 'success' | 'disconnected'
+) => {
+  if (status === 'disconnected') invalidateSuccessfulHealthCheck(config);
   try {
-    await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, status);
+    await reportSyncConnectionResult(config, status);
   } catch (error) {
     logger.warn('[syncExcelToComputer] 保存连接状态失败:', error);
   }
@@ -252,12 +258,12 @@ export const syncExcelToComputer = async (
   const serviceOnline = await testConnection(syncConfig);
   if (!serviceOnline) {
     const message = '同步助手未连接，请确认电脑端同步助手已启动';
-    await setStoredConnectionStatus('disconnected');
+    await setStoredConnectionStatus(syncConfig, 'disconnected');
     onError?.(message);
     return { success: false, message };
   }
 
-  await setStoredConnectionStatus('success');
+  await setStoredConnectionStatus(syncConfig, 'success');
 
   try {
     await waitForExportIdle();
@@ -291,6 +297,7 @@ export const syncExcelToComputer = async (
         headers: {
           'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
           ...(BACKEND_ACCESS_KEY ? { 'X-Backend-Access-Key': BACKEND_ACCESS_KEY } : {}),
+          ...getSyncPairingHeaders(syncConfig),
         },
         body,
         signal: controller.signal,
@@ -317,7 +324,7 @@ export const syncExcelToComputer = async (
           serverMessage,
           `电脑端同步服务异常（${response.status}）`
         );
-        await setStoredConnectionStatus('disconnected');
+        await setStoredConnectionStatus(syncConfig, 'disconnected');
         onError?.(message);
         return {
           success: false,
@@ -382,7 +389,7 @@ export const syncExcelToComputer = async (
       errorName === 'AbortError'
         ? '同步超时，请确认电脑端同步助手仍在运行'
         : `同步失败: ${errorMessage}`;
-    await setStoredConnectionStatus('disconnected');
+    await setStoredConnectionStatus(syncConfig, 'disconnected');
     onError?.(errorMsg);
     return { success: false, message: errorMsg };
   }

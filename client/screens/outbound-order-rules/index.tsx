@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { FlatList, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -9,6 +9,7 @@ import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { Screen } from '@/components/Screen';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
+import { useHardwareBack } from '@/hooks/useHardwareBack';
 import { useTheme } from '@/hooks/useTheme';
 import { logger } from '@/utils/logger';
 import { feedbackClear, feedbackClearFailed } from '@/utils/feedback';
@@ -36,6 +37,7 @@ export default function OutboundOrderRulesScreen() {
   const [warehouseRules, setWarehouseRules] = useState<OutboundWarehouseSampleRuleMap>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const [activeWarehouse, setActiveWarehouse] = useState<Warehouse | null>(null);
   const [activeSampleText, setActiveSampleText] = useState('');
 
@@ -101,15 +103,22 @@ export default function OutboundOrderRulesScreen() {
   );
 
   const closeWarehouseEditor = useCallback(() => {
-    if (saving) {
+    if (savingRef.current) {
       return;
     }
     setActiveWarehouse(null);
     setActiveSampleText('');
-  }, [saving]);
+  }, []);
+
+  useHardwareBack(useCallback(() => {
+    if (!activeWarehouse) return false;
+    closeWarehouseEditor();
+    // Consume back even while saving so it cannot pop the settings route.
+    return true;
+  }, [activeWarehouse, closeWarehouseEditor]));
 
   const handleSaveWarehouseRule = useCallback(async () => {
-    if (!activeWarehouse || !activeParseResult.rule) {
+    if (savingRef.current || !activeWarehouse || !activeParseResult.rule) {
       return;
     }
 
@@ -131,6 +140,7 @@ export default function OutboundOrderRulesScreen() {
       return;
     }
 
+    savingRef.current = true;
     setSaving(true);
     try {
       const nextRules = await saveOutboundWarehouseOrderRule(
@@ -144,15 +154,17 @@ export default function OutboundOrderRulesScreen() {
     } catch (error) {
       alert.showWarning(error instanceof Error ? error.message : '仓库规则保存失败');
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }, [activeParseResult.rule, activeWarehouse, alert, warehouseRules, warehouses]);
 
   const handleClearWarehouseRule = useCallback(async () => {
-    if (!activeWarehouse) {
+    if (savingRef.current || !activeWarehouse) {
       return;
     }
 
+    savingRef.current = true;
     setSaving(true);
     try {
       const nextRules = await clearOutboundWarehouseOrderRule(String(activeWarehouse.id));
@@ -166,6 +178,7 @@ export default function OutboundOrderRulesScreen() {
       alert.showWarning(error instanceof Error ? error.message : '清空样例失败');
       void feedbackClearFailed();
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }, [activeWarehouse, alert]);
@@ -252,6 +265,7 @@ export default function OutboundOrderRulesScreen() {
 
       return (
         <TouchableOpacity
+          accessibilityLabel={`编辑 ${item.name} 的出库单号规则`}
           style={[styles.warehouseCard, configured && styles.warehouseCardConfigured]}
           activeOpacity={0.78}
           onPress={() => openWarehouseEditor(item)}
@@ -313,6 +327,7 @@ export default function OutboundOrderRulesScreen() {
         <View style={[styles.editorScreen, { paddingTop: insets.top }]}>
           <View style={styles.header}>
             <TouchableOpacity
+              accessibilityLabel="返回仓库规则列表"
               style={styles.backButton}
               activeOpacity={0.7}
               onPress={closeWarehouseEditor}
@@ -353,6 +368,7 @@ export default function OutboundOrderRulesScreen() {
                   placeholderTextColor={theme.textMuted}
                   autoCapitalize="characters"
                   autoCorrect={false}
+                  editable={!saving}
                 />
               </View>
               <Text style={styles.editorHint}>
@@ -382,6 +398,7 @@ export default function OutboundOrderRulesScreen() {
       <View style={[styles.container, { paddingTop: insets.top }]}>
         <View style={styles.header}>
           <TouchableOpacity
+            accessibilityLabel="返回设置"
             style={styles.backButton}
             activeOpacity={0.7}
             onPress={() => router.back()}

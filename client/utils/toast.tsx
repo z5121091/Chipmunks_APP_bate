@@ -6,11 +6,11 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { AppPillToast } from '@/components/AppPillToast';
 
-// Toast 类型
+// 页面提示类型
 type ToastType = 'success' | 'warning' | 'error';
 
 // ============================================================================
-// Toast Hook - 页面使用
+// 页面内提示
 // ============================================================================
 
 interface ToastOptions {
@@ -67,9 +67,12 @@ export function useToast(options: ToastOptions = {}): UseToastReturn {
       type: toastType,
     });
 
-    const displayDuration =
-      duration ?? (toastType === 'error' ? 2800 : toastType === 'warning' ? 2400 : 2200);
-    timerRef.current = setTimeout(hideToast, displayDuration);
+    // 错误提示保留到下一条操作反馈到来，避免扫码设备来不及读完就消失。
+    // Toast 本身 pointerEvents=none，保持扫码和页面操作可继续；下一次扫码结果会自然替换它。
+    if (toastType !== 'error') {
+      const displayDuration = duration ?? (toastType === 'warning' ? 2400 : 2200);
+      timerRef.current = setTimeout(hideToast, displayDuration);
+    }
   }, [duration, hideToast]);
 
   // 组件卸载时清理
@@ -97,7 +100,7 @@ export function useToast(options: ToastOptions = {}): UseToastReturn {
 }
 
 // ============================================================================
-// 全局 Toast（可选，不推荐使用）
+// 兼容仍在使用全局提示的旧页面。
 // ============================================================================
 
 // 全局状态（简单实现）

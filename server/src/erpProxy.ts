@@ -129,7 +129,7 @@ export const fetchProxyUpstream = async (
     }
 
     console.warn(
-      `[Coze ERP proxy] domain connection failed for ${targetHost} (${readNetworkErrorCode(primaryError)}); retrying configured address`
+      `[ERP proxy] domain connection failed for ${targetHost} (${readNetworkErrorCode(primaryError)}); retrying configured address`
     );
     try {
       return {

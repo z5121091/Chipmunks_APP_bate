@@ -57,6 +57,9 @@ export interface PurchaseReceiveListResult {
 }
 
 const pendingListRequests = new Map<string, Promise<PurchaseReceiveListResult>>();
+const pendingListSnapshots = new Map<ErpAccountKey, PurchaseReceiveCacheEntry<PurchaseReceiveListResult>>();
+const pendingListRevalidations = new Map<ErpAccountKey, Promise<PurchaseReceiveCacheEntry<PurchaseReceiveListResult>>>();
+const automaticPendingListRevalidations = new Map<ErpAccountKey, Promise<PurchaseReceiveCacheEntry<PurchaseReceiveListResult>>>();
 const purchaseReceiveStatusRequests = new Map<
   ErpAccountKey,
   Promise<PurchaseReceiveVoucherStatus[]>
@@ -110,7 +113,7 @@ export const getPurchaseReceiveBindingLines = (
     '珠海领芯科技有限公司',
   ].includes(voucher.partnerName.trim())) return voucher.lines;
 
-  // Only the matching copy uses the binding code; ERP details and cached vouchers stay unchanged.
+  // 只有匹配副本使用绑定编码，ERP 原明细和缓存单据保持不变。
   return voucher.lines.map(line => ({
     ...line,
     inventoryCode: line.inventoryCode.trim().replace(/^IC\.M(\d{7}\.\d{2})$/i, 'IC.0$1'),
@@ -230,6 +233,16 @@ export const mapPurchaseReceiveVoucher = (
 const getListCacheKey = (accountKey: ErpAccountKey) =>
   `${PURCHASE_RECEIVE_CACHE_PREFIX}:pending:${accountKey}`;
 
+const getAutomaticListAttemptKey = (accountKey: ErpAccountKey) =>
+  `${PURCHASE_RECEIVE_CACHE_PREFIX}:automatic-attempt:${accountKey}`;
+
+const getLocalDateKey = (value: string | number = Date.now()) => {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime())
+    ? `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`
+    : '';
+};
+
 const getDetailCacheKey = (accountKey: ErpAccountKey, voucherCode: string) =>
   `${PURCHASE_RECEIVE_CACHE_PREFIX}:detail:${accountKey}:${voucherCode.trim().toUpperCase()}`;
 
@@ -247,14 +260,22 @@ const writeCache = async <T>(key: string, data: T): Promise<PurchaseReceiveCache
   return entry;
 };
 
+export const getPendingPurchaseReceivesSnapshot = (accountKey: ErpAccountKey) =>
+  pendingListSnapshots.get(accountKey) || null;
+
 export const loadCachedPendingPurchaseReceives = async (accountKey: ErpAccountKey) => {
+  const memory = getPendingPurchaseReceivesSnapshot(accountKey);
+  if (memory) return memory;
   const cached = await readCache<PurchaseReceiveListResult>(getListCacheKey(accountKey));
+  // A completed network refresh must win over an older disk read.
+  const refreshed = getPendingPurchaseReceivesSnapshot(accountKey);
+  if (refreshed) return refreshed;
   const account = getErpAccountByKey(accountKey);
-  if (!cached || !account) {
-    return cached;
+  if (!cached || !account || !Array.isArray(cached.data?.items)) {
+    return null;
   }
 
-  return {
+  const snapshot = {
     ...cached,
     data: {
       ...cached.data,
@@ -263,12 +284,18 @@ export const loadCachedPendingPurchaseReceives = async (accountKey: ErpAccountKe
       ),
     },
   };
+  pendingListSnapshots.set(accountKey, snapshot);
+  return snapshot;
 };
 
-export const savePendingPurchaseReceivesCache = (
+export const savePendingPurchaseReceivesCache = async (
   accountKey: ErpAccountKey,
   data: PurchaseReceiveListResult
-) => writeCache(getListCacheKey(accountKey), data);
+) => {
+  const snapshot = await writeCache(getListCacheKey(accountKey), data);
+  pendingListSnapshots.set(accountKey, snapshot);
+  return snapshot;
+};
 
 export const loadCachedPurchaseReceiveVoucher = async (
   accountKey: ErpAccountKey,
@@ -483,6 +510,71 @@ export const fetchAllPendingPurchaseReceives = async (
     totalPages = Math.max(totalPages, pageCount(result));
   }
   return { ...first, items: [...items.values()], totalPageNum: totalPages };
+};
+
+const refreshPendingPurchaseReceives = async (
+  account: ErpAccountConfig
+): Promise<PurchaseReceiveCacheEntry<PurchaseReceiveListResult>> => {
+  const existing = pendingListRevalidations.get(account.key);
+  if (existing) return existing;
+  const request = (async () => {
+    // Publish only after every ERP page succeeds. A failed refresh keeps the last snapshot.
+    const data = await fetchAllPendingPurchaseReceives(account, { bypassCache: true });
+    return savePendingPurchaseReceivesCache(account.key, data);
+  })();
+  pendingListRevalidations.set(account.key, request);
+  try {
+    return await request;
+  } finally {
+    if (pendingListRevalidations.get(account.key) === request) {
+      pendingListRevalidations.delete(account.key);
+    }
+  }
+};
+
+export const revalidatePendingPurchaseReceives = async (
+  account: ErpAccountConfig,
+  options: { forceRefresh?: boolean } = {}
+): Promise<PurchaseReceiveCacheEntry<PurchaseReceiveListResult>> => {
+  // Manual refresh shares a real network request, but never an automatic cache-only check.
+  requireErpAccountBackend(account);
+  const existing = pendingListRevalidations.get(account.key);
+  if (existing) return existing;
+  if (options.forceRefresh) return refreshPendingPurchaseReceives(account);
+
+  const automatic = automaticPendingListRevalidations.get(account.key);
+  if (automatic) return automatic;
+  const request = (async () => {
+    const cached = await loadCachedPendingPurchaseReceives(account.key);
+    const today = getLocalDateKey();
+    const attemptKey = getAutomaticListAttemptKey(account.key);
+    const lastAttemptDay = await AsyncStorage.getItem(attemptKey);
+    const concurrent = pendingListRevalidations.get(account.key);
+    if (concurrent) return concurrent;
+    const latest = getPendingPurchaseReceivesSnapshot(account.key) || cached;
+    // Today's manual refresh or persisted cache also fulfils today's automatic preload.
+    if (latest && getLocalDateKey(latest.cachedAt) === today) return latest;
+    if (lastAttemptDay === today) {
+      if (latest) return latest;
+      throw new Error('今天已尝试自动加载采购单，暂无可用列表，请点击刷新重试');
+    }
+
+    // Reserve before calling ERP so failures and app restarts cannot repeatedly spend quota.
+    await AsyncStorage.setItem(attemptKey, today);
+    const afterReservation = pendingListRevalidations.get(account.key);
+    if (afterReservation) return afterReservation;
+    const updated = getPendingPurchaseReceivesSnapshot(account.key);
+    if (updated && getLocalDateKey(updated.cachedAt) === today) return updated;
+    return refreshPendingPurchaseReceives(account);
+  })();
+  automaticPendingListRevalidations.set(account.key, request);
+  try {
+    return await request;
+  } finally {
+    if (automaticPendingListRevalidations.get(account.key) === request) {
+      automaticPendingListRevalidations.delete(account.key);
+    }
+  }
 };
 
 export const fetchPurchaseReceiveVoucher = async (

@@ -1,6 +1,7 @@
 ﻿import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { View, Text, TouchableOpacity, TextInput, Modal, Platform, FlatList } from 'react-native';
+import { View, Text, TouchableOpacity, TextInput, Modal, Platform, FlatList, type NativeSyntheticEvent, type TextInputSubmitEditingEventData } from 'react-native';
 import { useFocusEffect } from 'expo-router';
+import { usePreventRemove } from 'expo-router/react-navigation';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, Spacing, Typography } from '@/constants/theme';
@@ -22,6 +23,7 @@ import { WarehouseScanInput, type WarehouseScanInputHandle } from '@/components/
 import { useCustomAlert } from '@/components/CustomAlert';
 import { createStyles } from './styles';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
+import { useHardwareBack } from '@/hooks/useHardwareBack';
 import { logger } from '@/utils/logger';
 import {
   Warehouse,
@@ -34,7 +36,7 @@ import {
   generateId,
   updateInventoryCheckDocumentSyncStatus,
 } from '@/utils/database';
-import { isQRCode } from '@/utils/qrcodeParser';
+import { isQRCode, recoverConfirmedScannerContent, shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
 import { parseQuantity } from '@/utils/quantity';
 import {
   feedbackSuccess,
@@ -46,10 +48,11 @@ import {
   feedbackConfirm,
   feedbackInventoryComplete,
   feedbackNotBound,
+  feedbackDeleted,
   useFeedbackCleanup,
 } from '@/utils/feedback';
 import { useToast } from '@/utils/toast';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { workDraftStorage as AsyncStorage } from '@/utils/workDraftIsolation';
 import { safeJsonParseNullable } from '@/utils/json';
 import { formatDateTime, formatDate, getISODateTime } from '@/utils/time';
 import { STORAGE_KEYS, SyncConfig } from '@/constants/config';
@@ -62,7 +65,10 @@ import {
 } from '@/utils/inventoryExport';
 import {
   cancelScanSubmit,
-  scheduleScanSubmit,
+  MATERIAL_SCAN_QUIET_MS,
+  scheduleScanSubmitWithCompletionCheck,
+  resolvePendingScannerSubmit,
+  RECENT_SCAN_DUPLICATE_WINDOW_MS,
   hasMatchingTraceNo,
   sanitizeStructuredScannerInput,
 } from '@/utils/scannerInput';
@@ -181,14 +187,21 @@ export default function InventoryScreen() {
   const inputRef = useRef<WarehouseScanInputHandle>(null);
   const [inputValue, setInputValue] = useState('');
   const liveInputValueRef = useRef('');
+  const inputRevisionRef = useRef(0);
+  const pendingNativeSubmitTextRef = useRef<string | null>(null);
+  const lastConsumedInputRef = useRef<{ text: string; at: number } | null>(null);
+  const activeRulesRef = useRef<Awaited<ReturnType<typeof getActiveRules>> | null>(null);
   const processingRef = useRef(false);
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const postProcessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const screenActiveRef = useRef(true);
+  const inventorySessionRef = useRef(0);
+  const draftReadyRef = useRef(false);
+  const [draftReady, setDraftReady] = useState(false);
   const scannerFocusBlockedRef = useRef(false);
   // 扫码队列 - 暂存处理中的新扫码
-  const scanQueueRef = useRef<string[]>([]);
-  const processScanRef = useRef<(code: string) => void>(() => undefined);
+  const scanQueueRef = useRef<{ code: string; previousNativeText: string | null }[]>([]);
+  const processScanRef = useRef<(code: string, previousNativeText?: string | null) => void>(() => undefined);
 
   // 盘点仓库由账套固定映射，不允许再手动组合账套与仓库。
   const [currentWarehouse, setCurrentWarehouse] = useState<Warehouse>(() =>
@@ -203,13 +216,6 @@ export default function InventoryScreen() {
   const replaceScanRecords = useCallback((records: ScanRecord[]) => {
     scanRecordsRef.current = records;
     setScanRecords(records);
-  }, []);
-  const updateScanRecords = useCallback((updater: (records: ScanRecord[]) => ScanRecord[]) => {
-    setScanRecords((prev) => {
-      const next = updater(prev);
-      scanRecordsRef.current = next;
-      return next;
-    });
   }, []);
 
   const draftMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -231,7 +237,7 @@ export default function InventoryScreen() {
 
     const parsed = safeJsonParseNullable<unknown>(savedRecords, 'inventory.scanRecords');
     if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
-      return {};
+      throw new Error('盘点草稿格式异常，未覆盖原草稿');
     }
 
     return parsed as InventoryDraftStore;
@@ -254,11 +260,14 @@ export default function InventoryScreen() {
 
       const parsed = safeJsonParseNullable<unknown>(savedRecords, 'inventory.scanRecords');
       if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
-        return [];
+        throw new Error('盘点草稿格式异常，未覆盖原草稿');
       }
 
       const store = parsed as InventoryDraftStore;
       const records = store[getDraftScopeKey(accountKey, warehouse.id)];
+      if (records !== undefined && !Array.isArray(records)) {
+        throw new Error('本账套盘点草稿格式异常，未覆盖原草稿');
+      }
       return Array.isArray(records) ? records : [];
     },
     []
@@ -266,7 +275,7 @@ export default function InventoryScreen() {
 
   // 每个 ERP 账套拥有独立盘点草稿；仓库由账套固定映射。
   const loadCheckRecords = useCallback(
-    async (warehouse: Warehouse | null | undefined, account: ErpAccountConfig) => {
+    async (warehouse: Warehouse | null | undefined, account: ErpAccountConfig, session: number) => {
       try {
         if (!warehouse) {
           logger.log('[盘点] 当前仓库未加载，跳过恢复');
@@ -274,6 +283,7 @@ export default function InventoryScreen() {
         }
 
         const records = await getDraftRecords(warehouse, account.key);
+        if (!screenActiveRef.current || session !== inventorySessionRef.current) return;
         replaceScanRecords(records);
 
         if (records.length > 0) {
@@ -281,6 +291,7 @@ export default function InventoryScreen() {
         }
       } catch (error) {
         logger.error('[盘点] 加载记录失败:', error);
+        throw error;
       }
     },
     [getDraftRecords, replaceScanRecords, showToast]
@@ -369,10 +380,41 @@ export default function InventoryScreen() {
 
   // 保存状态
   const [saving, setSaving] = useState(false);
+  const [scanBusy, setScanBusy] = useState(false);
   const [saveConfirmVisible, setSaveConfirmVisible] = useState(false);
   const saveConfirmRef = useRef(false);
   const [reconciliationProgress, setReconciliationProgress] = useState('');
   const saveInProgressRef = useRef(false);
+  const saveOperationRef = useRef<{ settled: Promise<void>; finish: () => void } | null>(null);
+  const beginSaveOperation = useCallback(() => {
+    let finish!: () => void;
+    const settled = new Promise<void>(resolve => { finish = resolve; });
+    const operation = { settled, finish };
+    saveOperationRef.current = operation;
+    return operation;
+  }, []);
+  const finishSaveOperation = useCallback((operation: { settled: Promise<void>; finish: () => void }, session: number) => {
+    if (saveOperationRef.current === operation) {
+      saveOperationRef.current = null;
+      saveInProgressRef.current = false;
+      if (screenActiveRef.current && session === inventorySessionRef.current) {
+        setSaving(false);
+        setReconciliationProgress('');
+      }
+    }
+    operation.finish();
+  }, []);
+
+  const blockBackDuringWork = useCallback(() => {
+    if (!saveInProgressRef.current && !processingRef.current && scanQueueRef.current.length === 0 && !liveInputValueRef.current.trim()) return false;
+    showToast(saveInProgressRef.current ? '正在完成盘点，请稍候' : '正在处理扫码，请稍候再返回', 'warning');
+    return true;
+  }, [showToast]);
+
+  // Hardware back can arrive before the saving state commits; the ref closes that gap.
+  useHardwareBack(blockBackDuringWork);
+  // Cover scan parsing, queued scans, persistence and final reconciliation on every exit path.
+  usePreventRemove(saving || scanBusy || Boolean(inputValue.trim()), blockBackDuringWork);
 
   useEffect(() => {
     scannerFocusBlockedRef.current = quantityModalVisible || saveConfirmVisible || saving || switchingAccount || alert.visible;
@@ -390,7 +432,7 @@ export default function InventoryScreen() {
 
     const nextCode = scanQueueRef.current.shift();
     if (nextCode) {
-      processScanRef.current(nextCode);
+      processScanRef.current(nextCode.code, nextCode.previousNativeText);
       return;
     }
 
@@ -431,13 +473,6 @@ export default function InventoryScreen() {
     setExpandedGroups(next);
   }, []);
 
-  // 数据变化时自动保存
-  useEffect(() => {
-    if (scanRecords.length > 0) {
-      void saveCheckRecords(scanRecords, currentWarehouse, selectedAccount.key);
-    }
-  }, [currentWarehouse, saveCheckRecords, scanRecords, selectedAccount.key]);
-
   // 删除单条记录
   const handleDeleteRecord = useCallback(
     (record: ScanRecord) => {
@@ -448,26 +483,37 @@ export default function InventoryScreen() {
         () => {
           if (saveInProgressRef.current || accountSwitchInProgressRef.current ||
             selectedAccountRef.current.key !== selectedAccount.key) return;
+          if (processingRef.current || scanQueueRef.current.length > 0 || autoSubmitTimerRef.current) {
+            showToast('请等待当前扫码处理完成后再删除记录', 'warning');
+            return;
+          }
+          saveInProgressRef.current = true;
+          setSaving(true);
+          setReconciliationProgress('正在删除盘点暂存');
+          const session = inventorySessionRef.current;
+          const operation = beginSaveOperation();
           void (async () => {
-            const updated = scanRecordsRef.current.filter((r) => r.id !== record.id);
-            const saved = await saveCheckRecords(
-              updated,
-              currentWarehouse,
-              selectedAccount.key
-            );
-            if (!saved) {
-              showToast('删除暂存失败，请重试', 'error');
-              feedbackError();
-              return;
+            try {
+              const updated = scanRecordsRef.current.filter((r) => r.id !== record.id);
+              const saved = await saveCheckRecords(updated, currentWarehouse, selectedAccount.key);
+              if (!screenActiveRef.current || session !== inventorySessionRef.current) return;
+              if (!saved) {
+                showToast('删除暂存失败，请重试', 'error');
+                feedbackError();
+                return;
+              }
+              replaceScanRecords(updated);
+              showToast('记录已删除', 'success');
+              void feedbackDeleted();
+            } finally {
+              finishSaveOperation(operation, session);
             }
-            replaceScanRecords(updated);
-            showToast('记录已删除', 'success');
           })();
         },
         true
       );
     },
-    [alert, currentWarehouse, replaceScanRecords, saveCheckRecords, selectedAccount.key, showToast]
+    [alert, beginSaveOperation, currentWarehouse, finishSaveOperation, replaceScanRecords, saveCheckRecords, selectedAccount.key, showToast]
   );
 
   // 自动清理震动和提示音
@@ -477,22 +523,34 @@ export default function InventoryScreen() {
   useFocusEffect(
     useCallback(() => {
       screenActiveRef.current = true;
+      activeRulesRef.current = null;
+      const session = ++inventorySessionRef.current;
+      draftReadyRef.current = false;
+      setDraftReady(false);
+      processingRef.current = false;
+      setScanBusy(scanQueueRef.current.length > 0);
       let isActive = true;
       const init = async () => {
         try {
+          // 上一次进入可能正在提交；等其落盘后再恢复，不能把旧内存当成新草稿。
+          await saveOperationRef.current?.settled;
+          if (!isActive || session !== inventorySessionRef.current) return;
+          setSaving(false);
+          setReconciliationProgress('');
           const account = selectedAccountRef.current;
           const warehouse = getInventoryWarehouseForAccount(account);
           setCurrentWarehouse(warehouse);
-          await loadCheckRecords(warehouse, account);
+          await loadCheckRecords(warehouse, account, session);
 
-          if (isActive) {
+          if (isActive && session === inventorySessionRef.current) {
+            draftReadyRef.current = true;
+            setDraftReady(true);
             focusScannerInput(100);
           }
         } catch (error) {
           logger.error('[扫码盘点] 初始化失败:', error);
           if (isActive) {
-            showToast('数据库读取失败，请关闭应用后重试', 'error');
-            focusScannerInput(300);
+            showToast('盘点暂存读取失败，请重新进入页面重试，原草稿未覆盖', 'error');
           }
         }
       };
@@ -501,8 +559,13 @@ export default function InventoryScreen() {
 
       return () => {
         isActive = false;
+        inventorySessionRef.current += 1;
+        draftReadyRef.current = false;
         screenActiveRef.current = false;
+        scanQueueRef.current = [];
         liveInputValueRef.current = '';
+        inputRevisionRef.current += 1;
+        pendingNativeSubmitTextRef.current = null;
         setInputValue('');
         saveConfirmRef.current = false;
         setSaveConfirmVisible(false);
@@ -519,6 +582,7 @@ export default function InventoryScreen() {
     async (nextAccount: ErpAccountConfig) => {
       if (
         nextAccount.key === selectedAccount.key ||
+        !draftReadyRef.current ||
         saveInProgressRef.current ||
         accountSwitchInProgressRef.current
       ) {
@@ -561,6 +625,8 @@ export default function InventoryScreen() {
         setQuantityModalVisible(false);
         scanQueueRef.current = [];
         liveInputValueRef.current = '';
+        inputRevisionRef.current += 1;
+        pendingNativeSubmitTextRef.current = null;
         setInputValue('');
 
         if (!isErpAccountAvailable(nextAccount)) {
@@ -591,14 +657,20 @@ export default function InventoryScreen() {
 
   // 处理扫描（带参数版本）
   const processScan = useCallback(
-    async (code: string) => {
-      if (!code || processingRef.current || saveInProgressRef.current || saveConfirmRef.current) return;
+    async (code: string, previousNativeText: string | null = null) => {
+      if (!code || !draftReadyRef.current || processingRef.current || saveInProgressRef.current || saveConfirmRef.current) return;
 
       processingRef.current = true;
+      setScanBusy(true);
+      const session = inventorySessionRef.current;
+      const isCurrent = () => screenActiveRef.current && session === inventorySessionRef.current;
 
       try {
-        const rules = await getActiveRules();
-        if (!screenActiveRef.current || !isQRCode(code, rules)) return;
+        const rules = activeRulesRef.current ?? await getActiveRules();
+        if (!isCurrent()) return;
+        activeRulesRef.current = rules;
+        code = recoverConfirmedScannerContent(code, previousNativeText, rules);
+        if (!isQRCode(code, rules)) return;
         if (accountSwitchInProgressRef.current || switchingAccount) {
           showToast('正在切换账套，请稍候', 'warning');
           return;
@@ -610,6 +682,7 @@ export default function InventoryScreen() {
         }
         // 解析二维码
         const rule = await detectRule(code, rules);
+        if (!isCurrent()) return;
         if (!rule) {
           showToast('没有匹配的二维码解析规则，请先在设置中配置', 'error');
           logger.error('[盘点] 无法识别二维码格式:', code);
@@ -643,6 +716,7 @@ export default function InventoryScreen() {
 
         // 盘点必须按“型号 + 可选版本号”匹配，保持与出入库一致。
         const inventoryCode = await getInventoryCodeByModel(model, version);
+        if (!isCurrent()) return;
         if (!inventoryCode) {
           showToast(`未绑定存货编码：${model}${version ? ` / ${version}` : ''}`, 'error');
           feedbackNotBound();
@@ -677,33 +751,44 @@ export default function InventoryScreen() {
           customFields: customFields || {},
         };
 
-        updateScanRecords((prev) => [newRecord, ...prev]);
+        const nextRecords = [newRecord, ...scanRecordsRef.current];
+        if (!(await saveCheckRecords(nextRecords, currentWarehouse, selectedAccount.key))) {
+          throw new Error('盘点暂存保存失败，本次扫码未计入，请检查后重新扫描');
+        }
+        if (!isCurrent()) return;
+        replaceScanRecords(nextRecords);
         showToast(`已扫码：${model}`, 'success');
         feedbackSuccess();
       } catch (e) {
+        if (!isCurrent()) return;
         logger.error('[盘点] 处理失败:', e);
         showToast(e instanceof Error && e.message ? e.message : '处理失败，请重新扫描', 'error');
         feedbackError();
       } finally {
-        processingRef.current = false;
-        // 处理完成后，检查队列是否有待处理的扫码
-        // 注意：使用 setTimeout 让 React 有机会更新状态，避免重复检测失败
-        if (postProcessTimerRef.current) {
-          clearTimeout(postProcessTimerRef.current);
+        if (isCurrent()) {
+          processingRef.current = false;
+          setScanBusy(scanQueueRef.current.length > 0);
+          // 当前会话处理完成后再接收下一条；旧页面不得解除新页面的扫码锁。
+          if (postProcessTimerRef.current) {
+            clearTimeout(postProcessTimerRef.current);
+          }
+          postProcessTimerRef.current = setTimeout(() => {
+            postProcessTimerRef.current = null;
+            if (isCurrent()) resumeQueuedScans();
+          }, 0);
         }
-        postProcessTimerRef.current = setTimeout(() => {
-          postProcessTimerRef.current = null;
-          resumeQueuedScans();
-        }, 0);
       }
     },
     [
       resumeQueuedScans,
+      currentWarehouse,
+      replaceScanRecords,
+      saveCheckRecords,
+      selectedAccount.key,
       selectedAccount.name,
       selectedAccountAvailable,
       showToast,
       switchingAccount,
-      updateScanRecords,
     ]
   );
   useEffect(() => {
@@ -711,59 +796,92 @@ export default function InventoryScreen() {
   }, [processScan]);
 
   const flushScannerInput = useCallback(() => {
-    if (quantityModalVisibleRef.current || saveConfirmRef.current || saveInProgressRef.current ||
+    if (!draftReadyRef.current || quantityModalVisibleRef.current || saveConfirmRef.current || saveInProgressRef.current ||
       accountSwitchInProgressRef.current) return;
-    const code = sanitizeStructuredScannerInput(liveInputValueRef.current);
+    const rawCode = sanitizeStructuredScannerInput(liveInputValueRef.current);
+    const previousNativeText = lastConsumedInputRef.current?.text ?? null;
+    const code = recoverConfirmedScannerContent(rawCode, previousNativeText, activeRulesRef.current ?? []);
     liveInputValueRef.current = '';
+    inputRevisionRef.current += 1;
+    pendingNativeSubmitTextRef.current = null;
     setInputValue('');
+    inputRef.current?.clear();
     if (!code) return;
+    lastConsumedInputRef.current = { text: rawCode, at: Date.now() };
     if (processingRef.current) {
-      scanQueueRef.current.push(code);
+      scanQueueRef.current.push({ code, previousNativeText });
       return;
     }
-    processScan(code);
+    processScan(code, previousNativeText);
   }, [processScan]);
 
-  // Both Enter and debounce consume the same live buffer once.
-  const handleInputChange = useCallback(
-    (text: string) => {
-      if (quantityModalVisibleRef.current || saveConfirmRef.current || saveInProgressRef.current ||
-        accountSwitchInProgressRef.current) return;
-      // 清除之前的定时器（每次输入都重置）
-      cancelScanSubmit(autoSubmitTimerRef);
-
-      // TextInput 是受控组件，逐字符扫码时也必须保留当前输入。
-      liveInputValueRef.current = text;
-      setInputValue(text);
-
-      // 如果当前有输入内容，启动定时器检测扫码完成
-      if (text.length > 0) {
-        scheduleScanSubmit(autoSubmitTimerRef, flushScannerInput, 150);
-        return;
-      }
-    },
-    [flushScannerInput]
-  );
-
-  // 扫码完成确认（焦点录入模式：用户手动按回车）
-  const handleSubmitEditing = useCallback(() => {
+  // 字段齐全不代表末段收完；回车保持快速提交，无回车时等待静默收尾。
+  const handleInputChange = useCallback((text: string) => {
+    if (!draftReadyRef.current || quantityModalVisibleRef.current || saveConfirmRef.current || saveInProgressRef.current ||
+      accountSwitchInProgressRef.current) return;
     cancelScanSubmit(autoSubmitTimerRef);
+    const revision = ++inputRevisionRef.current;
+    if (pendingNativeSubmitTextRef.current !== text) pendingNativeSubmitTextRef.current = null;
+    liveInputValueRef.current = text;
+    setInputValue(text);
+    if (!text) return;
 
-    flushScannerInput();
+    const session = inventorySessionRef.current;
+    const isCurrent = () => screenActiveRef.current && session === inventorySessionRef.current
+      && draftReadyRef.current && !quantityModalVisibleRef.current && !saveConfirmRef.current
+      && !saveInProgressRef.current && !accountSwitchInProgressRef.current
+      && inputRevisionRef.current === revision && liveInputValueRef.current === text;
+    scheduleScanSubmitWithCompletionCheck(autoSubmitTimerRef, {
+      delay: 150,
+      minimumQuietMs: MATERIAL_SCAN_QUIET_MS,
+      isConfirmed: () => pendingNativeSubmitTextRef.current === text,
+      isCurrent,
+      shouldWaitForMore: async () => {
+        if (pendingNativeSubmitTextRef.current === text) return false;
+        const rules = activeRulesRef.current ?? await getActiveRules();
+        if (!isCurrent()) return false;
+        activeRulesRef.current = rules;
+        return shouldWaitForQRCodeContinuation(sanitizeStructuredScannerInput(text), rules);
+      },
+      submit: flushScannerInput,
+    });
   }, [flushScannerInput]);
+
+  // 原生回车可能先于最后一次 onChangeText；迟到回车不能消费另一笔扫码。
+  const handleSubmitEditing = useCallback((event?: NativeSyntheticEvent<TextInputSubmitEditingEventData>) => {
+    const nativeText = sanitizeStructuredScannerInput(event?.nativeEvent.text ?? '');
+    const previous = lastConsumedInputRef.current;
+    // Two labels of the same model share a prefix. A late Enter for the first
+    // must not replace the partially received second label with the first one.
+    if (previous && nativeText === previous.text && nativeText !== liveInputValueRef.current
+      && Date.now() - previous.at < RECENT_SCAN_DUPLICATE_WINDOW_MS) return;
+    const pending = resolvePendingScannerSubmit(liveInputValueRef.current, event?.nativeEvent.text);
+    if (!pending) return;
+    if (pending.advanced || pendingNativeSubmitTextRef.current === pending.text) {
+      pendingNativeSubmitTextRef.current = pending.text;
+      handleInputChange(pending.text);
+      return;
+    }
+    cancelScanSubmit(autoSubmitTimerRef);
+    flushScannerInput();
+  }, [flushScannerInput, handleInputChange]);
 
   // 打开数量修改弹窗
   const openQuantityModal = useCallback((record: ScanRecord) => {
-    if (saveInProgressRef.current || accountSwitchInProgressRef.current) return;
+    if (!draftReadyRef.current || saveInProgressRef.current || accountSwitchInProgressRef.current) return;
+    if (processingRef.current || scanQueueRef.current.length > 0 || autoSubmitTimerRef.current) {
+      showToast('请等待当前扫码处理完成后再修改数量', 'warning');
+      return;
+    }
     scannerFocusBlockedRef.current = true;
     quantityModalVisibleRef.current = true;
     setEditingRecord(record);
     setQuantityInput(record.actualQuantity?.toString() || record.quantity.toString());
     setQuantityModalVisible(true);
-  }, []);
+  }, [showToast]);
 
   // 确认修改数量（支持回车和按钮）
-  const handleConfirmQuantity = () => {
+  const handleConfirmQuantity = async () => {
     if (!editingRecord || saveInProgressRef.current || accountSwitchInProgressRef.current) return;
 
     const qty = parseQuantity(quantityInput, { min: 0 });
@@ -772,19 +890,36 @@ export default function InventoryScreen() {
       return;
     }
 
-    updateScanRecords((prev) =>
-      prev.map((r) => (r.id === editingRecord.id ? { ...r, actualQuantity: qty } : r))
-    );
-    scannerFocusBlockedRef.current = false;
-    quantityModalVisibleRef.current = false;
-    setQuantityModalVisible(false);
-    setEditingRecord(null);
-    showToast(`实盘数量已改为 ${qty}`, 'success');
-    feedbackConfirm();
-    setTimeout(resumeQueuedScans, 0);
+    saveInProgressRef.current = true;
+    setSaving(true);
+    setReconciliationProgress('正在保存实盘数量');
+    const session = inventorySessionRef.current;
+    const operation = beginSaveOperation();
+    try {
+      const nextRecords = scanRecordsRef.current.map((r) =>
+        r.id === editingRecord.id ? { ...r, actualQuantity: qty } : r);
+      const saved = await saveCheckRecords(nextRecords, currentWarehouse, selectedAccount.key);
+      if (!screenActiveRef.current || session !== inventorySessionRef.current) return;
+      if (!saved) {
+        showToast('实盘数量保存失败，原数量未修改，请重试', 'error');
+        feedbackError();
+        return;
+      }
+      replaceScanRecords(nextRecords);
+      scannerFocusBlockedRef.current = false;
+      quantityModalVisibleRef.current = false;
+      setQuantityModalVisible(false);
+      setEditingRecord(null);
+      showToast(`实盘数量已改为 ${qty}`, 'success');
+      feedbackConfirm();
+    } finally {
+      finishSaveOperation(operation, session);
+      if (screenActiveRef.current && session === inventorySessionRef.current) setTimeout(resumeQueuedScans, 0);
+    }
   };
 
   const handleCancelQuantity = () => {
+    if (saveInProgressRef.current) return;
     scannerFocusBlockedRef.current = false;
     quantityModalVisibleRef.current = false;
     setQuantityModalVisible(false);
@@ -846,6 +981,8 @@ export default function InventoryScreen() {
     }
     saveInProgressRef.current = true;
     setSaving(true);
+    const session = inventorySessionRef.current;
+    const operation = beginSaveOperation();
     try {
       const allDraftRecords = [...scanRecordsRef.current];
       if (allDraftRecords.length === 0) {
@@ -993,9 +1130,7 @@ export default function InventoryScreen() {
       showToast(`盘点未完成：${errorMessage}\n扫描暂存已保留`, 'error');
       feedbackError();
     } finally {
-      saveInProgressRef.current = false;
-      setSaving(false);
-      setReconciliationProgress('');
+      finishSaveOperation(operation, session);
     }
   };
 
@@ -1045,6 +1180,8 @@ export default function InventoryScreen() {
         saveInProgressRef.current = true;
         setReconciliationProgress('正在清空盘点记录');
         setSaving(true);
+        const session = inventorySessionRef.current;
+        const operation = beginSaveOperation();
         void (async () => {
           try {
             const cleared = await clearCheckRecords(currentWarehouse, selectedAccount.key);
@@ -1057,9 +1194,7 @@ export default function InventoryScreen() {
             showToast('盘点记录已清空', 'warning');
             void feedbackClear();
           } finally {
-            saveInProgressRef.current = false;
-            setSaving(false);
-            setReconciliationProgress('');
+            finishSaveOperation(operation, session);
           }
         })();
       },
@@ -1307,10 +1442,7 @@ export default function InventoryScreen() {
           <UiPageHeader
             title="库存盘点"
             onBack={() => {
-              if (saveInProgressRef.current) {
-                showToast('正在完成盘点，请稍候', 'warning');
-                return;
-              }
+              if (blockBackDuringWork()) return;
               router.back();
             }}
             rightIcon="crosshair"
@@ -1333,7 +1465,7 @@ export default function InventoryScreen() {
                     activeOpacity={0.82}
                     accessibilityRole="button"
                     accessibilityState={{ selected: active, disabled: saving || switchingAccount }}
-                    disabled={saving || switchingAccount}
+                    disabled={!draftReady || saving || switchingAccount}
                     onPress={() => {
                       void handleAccountChange(account);
                     }}
@@ -1372,7 +1504,7 @@ export default function InventoryScreen() {
                 : '继续扫码或确认盘点'
           }
           value={inputValue}
-          editable={selectedAccountAvailable && !saving && !switchingAccount && !saveConfirmVisible}
+          editable={draftReady && selectedAccountAvailable && !saving && !switchingAccount && !saveConfirmVisible}
           onChangeText={handleInputChange}
           onSubmitEditing={handleSubmitEditing}
           placeholder={currentInventoryPlaceholder}
@@ -1381,7 +1513,7 @@ export default function InventoryScreen() {
           autoFocus={!quantityModalVisible && !saveConfirmVisible && !alert.visible}
           showSoftInputOnFocus={false}
           actionLabel="提交盘点扫码内容"
-          actionDisabled={!selectedAccountAvailable || saving || switchingAccount}
+          actionDisabled={!draftReady || !selectedAccountAvailable || saving || switchingAccount}
           actionLoading={saving || switchingAccount}
           onActionPress={() => {
             if (inputValue.trim()) {
@@ -1475,6 +1607,8 @@ export default function InventoryScreen() {
                   onSecondaryPress={handleCancelQuantity}
                   primaryLabel="保存"
                   onPrimaryPress={handleConfirmQuantity}
+                  primaryDisabled={saving}
+                  secondaryDisabled={saving}
                 />
               }
             >
@@ -1484,6 +1618,7 @@ export default function InventoryScreen() {
                     ref={quantityInputRef}
                     style={quantityModalStyles.textInput}
                     value={quantityInput}
+                    editable={!saving}
                     onChangeText={setQuantityInput}
                     onSubmitEditing={() => void handleConfirmQuantity()}
                     placeholder="实际数量"

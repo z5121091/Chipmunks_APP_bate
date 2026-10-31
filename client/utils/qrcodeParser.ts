@@ -1,23 +1,14 @@
-/**
- * @file 二维码内容解析器
- * 
- * 本模块负责：
- * 1. 检测扫码内容是否为二维码（通过分隔符识别）
- * 2. 使用用户配置的规则解析二维码内容
- * 
- * 核心逻辑委托给 database.ts 中的 detectRule 和 parseWithRule 方法，
- * 确保分隔符识别规则全局统一。
- * 
- * @see database.ts - 包含 detectRule() 和 parseWithRule() 等公共解析方法
- */
+/** 扫码内容识别和解析。解析规则统一使用 database.ts 中的方法。 */
 
 import { 
   detectRule, 
-  parseWithRule 
+  parseWithRule,
+  inspectQRCodeRule,
+  type QRCodeRule,
 } from './database';
 
 
-/** 通用分隔符列表（用于 isQRCode 判断） */
+/** 没有单独配置规则时也能识别的常用分隔符。 */
 const COMMON_SEPARATORS = [
   '\r\n',
   '||',
@@ -36,7 +27,7 @@ const COMMON_SEPARATORS = [
   '\x1E',
 ];
 
-/** 预设括号对（用于检测括号格式） */
+/** 支持连续括号字段，例如 {型号}{数量}。 */
 const BRACKET_PAIRS: Record<string, string> = {
   '{': '}',
   '(': ')',
@@ -44,11 +35,7 @@ const BRACKET_PAIRS: Record<string, string> = {
   '<': '>',
 };
 
-/**
- * 检测是否为 URL（避免将 http://、ftp:// 等的 // 当成分隔符）
- * @param content 扫码内容
- * @returns true=是URL，false=不是URL
- */
+/** URL 中的双斜线不能当成字段分隔符。 */
 const isURL = (content: string): boolean => {
   const lower = content.toLowerCase();
   return (
@@ -59,12 +46,7 @@ const isURL = (content: string): boolean => {
   );
 };
 
-/**
- * 检测括号格式并返回左括号
- * 例如：{字段}{字段} → 返回 '{'
- * @param content 扫码内容
- * @returns 左括号字符，或 null（不是括号格式）
- */
+/** 识别 {字段}{字段} 这类连续括号格式，并返回左括号。 */
 const detectBracketFormat = (content: string): string | null => {
   for (const leftBracket of Object.keys(BRACKET_PAIRS)) {
     const rightBracket = BRACKET_PAIRS[leftBracket];
@@ -76,12 +58,7 @@ const detectBracketFormat = (content: string): string | null => {
   return null;
 };
 
-/**
- * 检测自定义两字符分隔符（排除单字符分隔符，避免误判）
- * 例如：+-、+=、:- 等
- * @param content 扫码内容
- * @returns 分隔符字符串，或 null
- */
+/** 识别 +-、+=、:- 等双字符分隔符。 */
 const detectCustomSeparator = (content: string): string | null => {
   const customSymbols = ['+', '-', '=', ':', '@', '!', '%', '&', '~', '^'];
   for (const left of customSymbols) {
@@ -95,18 +72,51 @@ const detectCustomSeparator = (content: string): string | null => {
 };
 
 /**
- * 检测是否为二维码内容
- * 
- * 二维码特征：包含分隔符（一维码不包含分隔符）
- * 
- * 检测顺序：
- * 1. 预设括号格式（{}、()、[]、<>）
- * 2. 通用分隔符（||、//、/、|、,、*、#、;、\t）
- * 3. 自定义两字符分隔符（+-、+= 等）
- * 
- * @param content 扫码内容
- * @returns true=二维码（需要震动处理），false=一维码（静默忽略）
+ * 自动提交前的收码检查，不参与规则选择或业务校验。
+ * 完整匹配保持原速度；还缺字段时保留缓冲区，给扫码器一次继续输入的机会。
  */
+export const shouldWaitForQRCodeContinuation = (
+  content: string,
+  rules: readonly QRCodeRule[]
+): boolean => {
+  if (!content.trim()) return false;
+  const inspections = rules
+    .filter(rule => rule.separator && (rule.fieldOrder?.length ?? 0) >= 2)
+    .map(rule => ({ rule, inspection: inspectQRCodeRule(content, rule) }));
+  if (inspections.some(({ inspection }) => inspection.matched)) return false;
+  const hasFieldStructure = isQRCode(content, rules);
+  return inspections.some(({ rule, inspection }) =>
+    inspection.parts.length < rule.fieldOrder.length &&
+    (inspection.parts.length > 1 || !hasFieldStructure)
+  );
+};
+
+/**
+ * 原生清空尚未生效时，完整回车确认过的前包可能仍累计在本包前面。
+ * 仅当累计原文不匹配任何现有规则、而明确边界后的完整后包可匹配时恢复。
+ * 有效的新二维码（如追溯码从 -1 延长为 -10）及不确定内容均保持原文。
+ */
+export const recoverConfirmedScannerContent = (
+  content: string,
+  confirmedNativeContent: string | null,
+  rules: readonly QRCodeRule[]
+): string => {
+  if (!confirmedNativeContent || content.length <= confirmedNativeContent.length ||
+      !content.startsWith(confirmedNativeContent)) return content;
+  const usableRules = rules.filter(rule => rule.isActive !== false && rule.separator &&
+    (rule.fieldOrder?.length ?? 0) >= 2);
+  if (usableRules.length === 0) return content;
+  try {
+    if (usableRules.some(rule => inspectQRCodeRule(content, rule).matched)) return content;
+    const nextContent = content.slice(confirmedNativeContent.length);
+    return usableRules.some(rule => inspectQRCodeRule(nextContent, rule).matched) ? nextContent : content;
+  } catch {
+    // 配置或原码异常仍交由正常解析入口报告，不猜测边界。
+    return content;
+  }
+};
+
+/** 根据括号、常用分隔符和用户配置判断扫码内容是否需要解析。 */
 export const isQRCode = (
   content: string,
   rules: readonly { separator: string }[] = []
@@ -117,14 +127,12 @@ export const isQRCode = (
 
   const trimmed = content.trim();
 
-  // 1. 检测括号格式
   if (detectBracketFormat(trimmed)) {
     return true;
   }
 
-  // 2. 检测通用分隔符
   for (const sep of COMMON_SEPARATORS) {
-    // 跳过 URL 中的 //
+    // URL 中的 // 不是字段分隔符。
     if (sep === '//' && isURL(trimmed)) {
       continue;
     }
@@ -133,18 +141,15 @@ export const isQRCode = (
     }
   }
 
-  // 3. 检测自定义两字符分隔符
   if (detectCustomSeparator(trimmed)) {
     return true;
   }
 
-  // Include configured separators, such as a space or a custom single character.
+  // 空格或单字符分隔符以用户配置为准。
   return rules.some(rule => Boolean(rule.separator) && trimmed.includes(rule.separator));
 };
 
-/**
- * 二维码解析结果接口
- */
+/** 扫码内容解析结果。 */
 export interface ParsedQRCode {
   model: string;           // 型号
   batch: string;            // 批次
@@ -159,19 +164,7 @@ export interface ParsedQRCode {
   separator: string;         // 分隔符
 }
 
-/**
- * 使用规则解析二维码内容
- * 
- * 本函数委托给 database.ts 的公共方法：
- * 1. detectRule() - 自动检测匹配规则
- * 2. parseWithRule() - 按规则解析字段
- * 
- * @param content 扫码原始内容
- * @returns 解析结果，或 null（解析失败）
- * 
- * @see database.ts detectRule()
- * @see database.ts parseWithRule()
- */
+/** 查找匹配规则并解析扫码内容；没有匹配规则时返回 null。 */
 export const parseQRCode = async (content: string): Promise<ParsedQRCode | null> => {
   if (!content || content.trim().length === 0) {
     return null;
@@ -179,7 +172,7 @@ export const parseQRCode = async (content: string): Promise<ParsedQRCode | null>
 
   const trimmedContent = content.trim();
 
-  // 调用 database.ts 的 detectRule 自动检测规则
+  // 使用数据库中同一套规则匹配逻辑。
   // 只匹配用户已经启用的规则，未知结构不做猜测。
   const rule = await detectRule(content);
 
@@ -227,7 +220,7 @@ export const parseQRCodeSync = (
   let separator = '';
   let fields: string[] = [];
 
-  // 1. 检测括号格式
+  // 先识别连续括号格式。
   const bracketLeft = detectBracketFormat(trimmedContent);
   if (bracketLeft) {
     const rightBracket = BRACKET_PAIRS[bracketLeft];
@@ -237,7 +230,7 @@ export const parseQRCodeSync = (
     if (str.endsWith(rightBracket)) str = str.slice(0, -1);
     fields = str.split(rightBracket + bracketLeft).map(s => s.trim());
   } else {
-    // 2. 尝试通用分隔符
+    // 再尝试常用分隔符。
     for (const sep of COMMON_SEPARATORS) {
       if (sep === '//' && isURL(trimmedContent)) continue;
       const parts = trimmedContent.split(sep).map(s => s.trim());
@@ -248,7 +241,7 @@ export const parseQRCodeSync = (
       }
     }
 
-    // 3. 尝试自定义分隔符
+    // 最后尝试双字符分隔符。
     if (fields.length === 0) {
       const customSep = detectCustomSeparator(trimmedContent);
       if (customSep) {

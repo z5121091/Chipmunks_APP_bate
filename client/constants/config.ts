@@ -49,7 +49,7 @@ export const UPDATE_CONFIG = {
   APK_FILE_NAME: 'app-release.apk',
 };
 
-// ============== Excel 导出配置 ==============
+// Excel 导出配置
 export const EXPORT_CONFIG = {
   TIMEOUT: 30000,
 } as const;
@@ -63,6 +63,8 @@ export type ConnectionStatus = 'idle' | 'testing' | 'success' | 'disconnected' |
 export interface SyncConfig {
   ip: string;
   port: string;
+  /** Optional local helper pairing key; old configurations remain valid. */
+  pairingKey?: string;
 }
 
 /** 导出计数器数据 */

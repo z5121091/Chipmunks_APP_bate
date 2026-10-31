@@ -1,4 +1,4 @@
-﻿import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+﻿import { useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   View,
@@ -9,13 +9,14 @@ import {
   useWindowDimensions,
   Platform,
   Modal,
+  FlatList,
   Linking,
   InteractionManager,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from 'expo-router';
+import { useIsFocused } from 'expo-router/react-navigation';
 import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
-import * as Updates from 'expo-updates'; // 添加重启功能
+import * as Updates from 'expo-updates';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
@@ -43,7 +44,7 @@ import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
-import { UiListItem, UiListSection, UiPageHeader } from '@/components/UiRedesign';
+import { UiListItem, UiListSection } from '@/components/UiRedesign';
 import { createStyles } from './styles';
 import { AnimatedButton } from '@/components/AnimatedButton';
 import { Spacing } from '@/constants/theme';
@@ -53,6 +54,8 @@ import { useCustomAlert } from '@/components/CustomAlert';
 import { rs } from '@/utils/responsive';
 import {
   APP_VERSION,
+  ANDROID_PACKAGE,
+  ANDROID_VERSION_CODE,
   APP_NAME,
   COMPANY_NAME,
   COMPANY_WEBSITE,
@@ -83,13 +86,21 @@ import { safeJsonParseNullable } from '@/utils/json';
 import {
   getSyncConfigError,
   normalizeSyncConfig,
-  testConnection,
 } from '@/utils/heartbeat';
+import {
+  getSyncConnectionSnapshot,
+  refreshSyncConnection,
+  saveSyncConnectionConfig,
+  subscribeSyncConnection,
+} from '@/utils/syncConnection';
 import { NETWORK_CONFIG, SyncConfig, ConnectionStatus } from '@/constants/config';
 import { parseAuthFromUrl, base64Encode, compareVersions, getUpdateServer } from '@/utils/update';
 import { getDatabaseBackupDateString } from '@/utils/backupNaming';
 import { useToast } from '@/utils/toast';
 import { scanQueue } from '@/utils/scanQueue';
+import {
+  listIsolatedWorkDrafts, restoreIsolatedWorkDraft, type IsolatedWorkDraft,
+} from '@/utils/workDraftIsolation';
 import {
   createRealtimeDatabaseBackupFile,
   createRealtimeDatabaseBackupToNas,
@@ -130,7 +141,8 @@ const isSyncConfig = (value: unknown): value is SyncConfig => {
     typeof value === 'object' &&
     value !== null &&
     typeof (value as SyncConfig).ip === 'string' &&
-    typeof (value as SyncConfig).port === 'string'
+    typeof (value as SyncConfig).port === 'string' &&
+    ((value as SyncConfig).pairingKey === undefined || typeof (value as SyncConfig).pairingKey === 'string')
   );
 };
 
@@ -281,7 +293,7 @@ const getNextDatedFileName = async (
 
 export default function SettingsScreen() {
   const { theme, isDark } = useTheme();
-  const insets = useSafeAreaInsets();
+  const isFocused = useIsFocused();
   const router = useSafeRouter();
   const alert = useCustomAlert();
   const showSettingsLoadError = alert.showError;
@@ -303,7 +315,6 @@ export default function SettingsScreen() {
   }, []);
 
   // 根据屏幕尺寸动态创建样式
-  // 注意：insets 不放入依赖数组，避免键盘弹出/收起时触发不必要的样式重建
   const styles = useMemo(
     () => createStyles(theme, screenWidth, screenHeight, undefined),
     [theme, screenWidth, screenHeight]
@@ -341,10 +352,30 @@ export default function SettingsScreen() {
 
   // 数据库恢复后的重启提示弹窗
   const [showRestartModal, setShowRestartModal] = useState(false);
+  const [restartMessage, setRestartMessage] = useState('数据库已恢复到备份状态，需要立即重启应用后才能继续安全使用。');
+  const [draftArchives, setDraftArchives] = useState<IsolatedWorkDraft[]>([]);
+  const [draftArchiveModalVisible, setDraftArchiveModalVisible] = useState(false);
+  const [selectedDraftArchiveId, setSelectedDraftArchiveId] = useState<string | null>(null);
+  const [restoringDraftArchive, setRestoringDraftArchive] = useState(false);
 
   // 电脑同步配置
   const [syncConfig, setSyncConfig] = useState<SyncConfig>({ ip: '', port: '8080' });
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
+  const [testingSyncConfig, setTestingSyncConfig] = useState(false);
+  const syncConnection = useSyncExternalStore(
+    subscribeSyncConnection,
+    getSyncConnectionSnapshot,
+    getSyncConnectionSnapshot
+  );
+  const normalizedSyncConfig = normalizeSyncConfig(syncConfig);
+  const matchesSavedSyncConfig =
+    syncConnection.config?.ip === normalizedSyncConfig.ip &&
+    syncConnection.config?.port === normalizedSyncConfig.port &&
+    (syncConnection.config?.pairingKey || '') === (normalizedSyncConfig.pairingKey || '');
+  const connectionStatus: ConnectionStatus = testingSyncConfig
+    ? 'testing'
+    : matchesSavedSyncConfig
+      ? syncConnection.status
+      : 'idle';
 
   // 声音开关
   const [soundEnabled, setSoundEnabled] = useState(true);
@@ -367,17 +398,14 @@ export default function SettingsScreen() {
     forceUpdate: boolean;
   } | null>(null);
 
-  // 心跳检测相关
-  const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const failureCountRef = useRef<number>(0);
-  const scrollingRef = useRef(false); // 滚动中标记，避免滚动时心跳触发重渲染
-
   // 加载数据
   const loadData = useCallback(async () => {
-    const [stats, savedSyncConfig, savedConnectionStatus, savedSoundEnabled] = await Promise.all([
+    await listIsolatedWorkDrafts().then(setDraftArchives).catch(error => {
+      logger.warn('[设置] 读取恢复前作业副本失败:', error);
+    });
+    const [stats, savedSyncConfig, savedSoundEnabled] = await Promise.all([
       getConfigStats(),
       AsyncStorage.getItem(STORAGE_KEYS.SYNC_CONFIG),
-      AsyncStorage.getItem(STORAGE_KEYS.CONNECTION_STATUS),
       AsyncStorage.getItem(STORAGE_KEYS.SOUND_ENABLED),
     ]);
     setConfigStats(stats);
@@ -388,12 +416,7 @@ export default function SettingsScreen() {
 
     if (!savedSyncConfig) {
       setSyncConfig({ ip: '', port: NETWORK_CONFIG.DEFAULT_PORT });
-      setConnectionStatus('idle');
-      if (savedConnectionStatus) {
-        await AsyncStorage.removeItem(STORAGE_KEYS.CONNECTION_STATUS).catch((error) => {
-          logger.warn('[设置] 清理过期同步状态失败:', error);
-        });
-      }
+      await refreshSyncConnection();
       return;
     }
 
@@ -404,37 +427,19 @@ export default function SettingsScreen() {
     );
     if (!config || getSyncConfigError(config)) {
       setSyncConfig({ ip: '', port: NETWORK_CONFIG.DEFAULT_PORT });
-      setConnectionStatus('idle');
       await Promise.all([
         AsyncStorage.removeItem(STORAGE_KEYS.SYNC_CONFIG),
         AsyncStorage.removeItem(STORAGE_KEYS.CONNECTION_STATUS),
       ]);
+      await refreshSyncConnection();
       return;
     }
 
     const normalizedConfig = normalizeSyncConfig(config);
     setSyncConfig(normalizedConfig);
 
-    // 页面恢复时复测一次，避免电脑端同步助手已经退出但手机仍显示“已连接”。
-    if (savedConnectionStatus === 'success' || savedConnectionStatus === 'testing') {
-      setConnectionStatus('testing');
-      void testConnection(normalizedConfig)
-        .then(async (success) => {
-          const status: ConnectionStatus = success ? 'success' : 'disconnected';
-          setConnectionStatus(status);
-          await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, status);
-        })
-        .catch(async () => {
-          setConnectionStatus('disconnected');
-          await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, 'disconnected');
-        });
-    } else if (savedConnectionStatus === 'disconnected') {
-      setConnectionStatus('disconnected');
-    } else if (savedConnectionStatus === 'error') {
-      setConnectionStatus('error');
-    } else {
-      setConnectionStatus('idle');
-    }
+    // 检查真实服务状态；历史失败状态不阻止重连。
+    await refreshSyncConnection();
   }, []);
 
   const loadAutoBackupStatus = useCallback(async () => {
@@ -640,73 +645,32 @@ export default function SettingsScreen() {
 
   useFocusEffect(
     useCallback(() => {
+      let active = true;
       const task = InteractionManager.runAfterInteractions(() => {
         void loadData().catch((error) => {
           logger.error('[设置] 加载设置数据失败:', error);
-          showSettingsLoadError('设置数据加载失败，请重新进入页面');
+          if (active) showSettingsLoadError('设置数据加载失败，请重新进入页面');
         });
         void loadAutoBackupStatus().catch((error) => {
           logger.error('[设置] 加载自动备份状态失败:', error);
         });
         void checkErpConnections();
       });
-      return () => task.cancel();
+      return () => {
+        active = false;
+        task.cancel();
+      };
     }, [checkErpConnections, loadAutoBackupStatus, loadData, showSettingsLoadError])
   );
-
-  const stopHeartbeat = useCallback(() => {
-    if (heartbeatTimerRef.current) {
-      clearInterval(heartbeatTimerRef.current);
-      heartbeatTimerRef.current = null;
-    }
-  }, []);
-
-  const startHeartbeat = useCallback(() => {
-    stopHeartbeat();
-    failureCountRef.current = 0;
-    const runHeartbeatCheck = async () => {
-      // 滚动中标记，避免滚动时心跳触发重渲染 setState ????
-      if (scrollingRef.current) return;
-
-      try {
-        if (await testConnection(syncConfig)) {
-          failureCountRef.current = 0;
-        } else {
-          failureCountRef.current++;
-        }
-      } catch {
-        failureCountRef.current++;
-      }
-
-      if (failureCountRef.current >= NETWORK_CONFIG.MAX_FAILURE_COUNT) {
-        setConnectionStatus('disconnected');
-        await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, 'disconnected');
-        stopHeartbeat();
-      }
-    };
-
-    void runHeartbeatCheck();
-    heartbeatTimerRef.current = setInterval(runHeartbeatCheck, NETWORK_CONFIG.HEARTBEAT_INTERVAL);
-  }, [stopHeartbeat, syncConfig]);
-
-  // 心跳检测
-  useEffect(() => {
-    if (connectionStatus === 'success' && syncConfig.ip) {
-      startHeartbeat();
-    }
-    return () => stopHeartbeat();
-  }, [connectionStatus, startHeartbeat, stopHeartbeat, syncConfig.ip]);
 
   // IP变更
   const handleIpChange = (text: string) => {
     setSyncConfig((prev) => ({ ...prev, ip: text }));
-    setConnectionStatus('idle');
   };
 
   // 端口变更
   const handlePortChange = (text: string) => {
     setSyncConfig((prev) => ({ ...prev, port: text.replace(/\D/g, '').slice(0, 5) }));
-    setConnectionStatus('idle');
   };
 
   // 测试连接
@@ -719,14 +683,15 @@ export default function SettingsScreen() {
     }
 
     setSyncConfig(normalizedConfig);
-    setConnectionStatus('testing');
-    const success = await testConnection(normalizedConfig, { force: true });
-    const status: ConnectionStatus = success ? 'success' : 'error';
-    setConnectionStatus(status);
-    await Promise.all([
-      AsyncStorage.setItem(STORAGE_KEYS.SYNC_CONFIG, JSON.stringify(normalizedConfig)),
-      AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, status),
-    ]);
+    setTestingSyncConfig(true);
+    try {
+      await saveSyncConnectionConfig(normalizedConfig);
+    } catch (error) {
+      logger.warn('[设置] 保存同步地址失败:', error);
+      alert.showError('同步地址保存失败，请重试');
+    } finally {
+      setTestingSyncConfig(false);
+    }
   };
 
   // 生成 Excel 并同步到电脑（支持多Sheet）
@@ -762,8 +727,6 @@ export default function SettingsScreen() {
           return false;
         }
 
-        setConnectionStatus('disconnected');
-        await AsyncStorage.setItem(STORAGE_KEYS.CONNECTION_STATUS, 'disconnected');
         alert.showError(formatSyncErrorMessage(result.message));
         return false;
       }
@@ -1067,6 +1030,11 @@ export default function SettingsScreen() {
 
       const data = await response.json();
 
+      if (data.androidPackage !== ANDROID_PACKAGE) {
+        alert.showWarning('NAS 上的更新清单不是当前正式版。请先上传包含正确包名的 version.json 和对应 APK，再检查更新。');
+        return;
+      }
+
       // 比较版本号
       const currentVersion = APP_VERSION.replace(/^V/, '');
       const latestVersion = (data.version || '0.0.0').replace(/^V/, '');
@@ -1074,6 +1042,10 @@ export default function SettingsScreen() {
       const isNewVersion = compareVersions(latestVersion, currentVersion) > 0;
 
       if (isNewVersion) {
+        if (!Number.isInteger(data.versionCode) || data.versionCode <= ANDROID_VERSION_CODE) {
+          alert.showWarning('NAS 上的安装编号未高于当前版本，请核对 version.json 和 APK 后重试。');
+          return;
+        }
         // 处理 changelog：可能是数组（旧格式）或对象数组（新格式）
         let changelogText = '优化用户体验';
         if (Array.isArray(data.changelog)) {
@@ -1294,7 +1266,7 @@ export default function SettingsScreen() {
           UTI: 'public.json',
         });
         alert.showSuccess(
-          `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n物料绑定请使用独立的 Excel 导入/导出。\n请妥善保管备份文件！`
+          `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 操作提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n物料绑定请使用独立的 Excel 导入/导出。\n请妥善保管备份文件！`
         );
       } else {
         alert.showError('当前设备不支持文件分享，未能导出配置备份');
@@ -1352,7 +1324,7 @@ export default function SettingsScreen() {
 
       alert.showConfirm(
         '确认恢复配置',
-        `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n即将恢复以下配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 扫码提示音: ${backupData.soundEnabled === undefined ? '沿用当前设置' : backupData.soundEnabled ? '开启' : '关闭'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n[说明] 旧规则中的占位段将自动转换为忽略段。物料绑定不会恢复或覆盖，请在物料绑定页面使用 Excel 导入。\n[注意] 恢复前会替换上述配置数据，业务数据（订单、物料、拆包记录等）不受影响；被历史业务引用的仓库会保留。此操作不可撤销！`,
+        `备份时间: ${formatDateTimeExport(backupData.backupTime)}\n\n即将恢复以下配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 操作提示音: ${backupData.soundEnabled === undefined ? '沿用当前设置' : backupData.soundEnabled ? '开启' : '关闭'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n[说明] 旧规则中的占位段将自动转换为忽略段。物料绑定不会恢复或覆盖，请在物料绑定页面使用 Excel 导入。\n[注意] 恢复前会替换上述配置数据，业务数据（订单、物料、拆包记录等）不受影响；被历史业务引用的仓库会保留。此操作不可撤销！`,
         async () => {
           setRestoreLoading(true);
           try {
@@ -1371,6 +1343,7 @@ export default function SettingsScreen() {
                 alert.showSuccess(summary);
               }
               await loadData();
+              await getUpdateServer();
             } else {
               alert.showError(result.message);
             }
@@ -1381,7 +1354,8 @@ export default function SettingsScreen() {
             setRestoreLoading(false);
           }
         },
-        true
+        true,
+        '确认恢复'
       );
     } catch (error) {
       logger.error('选择文件失败:', error);
@@ -1465,7 +1439,7 @@ export default function SettingsScreen() {
 
     alert.showAlert(
       '恢复数据库文件',
-      '[严重警告] 即将从备份文件恢复数据库！\n\n此操作将：\n• 替换当前所有数据（配置 + 业务）\n• 恢复为备份时的完整状态\n\n恢复前会自动创建当前数据库的备份文件。此操作不可撤销！',
+      '[严重警告] 即将从备份文件恢复数据库！\n\n此操作将：\n• 替换当前所有数据（配置 + 业务）\n• 恢复为备份时的完整状态\n• 将当前未完成作业保存为独立副本，不自动混入恢复后的数据库\n\n恢复前会自动备份当前数据库。作业副本可在设置中核对后恢复。',
       [
         { text: '取消', style: 'cancel' },
         {
@@ -1478,6 +1452,7 @@ export default function SettingsScreen() {
               if (result.success) {
                 // 检查是否需要重启应用
                 if (result.needRestart) {
+                  setRestartMessage('数据库已恢复。恢复前的未完成作业已单独保留，可重启后在设置的“恢复前作业副本”中核对。');
                   setShowRestartModal(true);
                 } else {
                   alert.showSuccess(
@@ -1486,7 +1461,10 @@ export default function SettingsScreen() {
                   await loadData();
                 }
               } else {
-                alert.showError(result.message);
+                if (result.needRestart) {
+                  setRestartMessage(result.message);
+                  setShowRestartModal(true);
+                } else alert.showError(result.message);
               }
             } catch (error) {
               logger.error('数据库恢复失败:', error);
@@ -1499,6 +1477,25 @@ export default function SettingsScreen() {
       ],
       'error'
     );
+  };
+
+  const handleRestoreDraftArchive = () => {
+    const archive = draftArchives.find(item => item.id === selectedDraftArchiveId);
+    if (!archive || restoringDraftArchive) return;
+    alert.showConfirm('核对后恢复未完成作业',
+      `副本时间：${formatDateTimeExport(archive.createdAt)}\n对应恢复文件：${archive.databaseFileName}\n\n这份作业可能晚于当前数据库备份。请核对原单、实物和数量。恢复后仍需在作业页按现行规则处理，不会直接生成正式业务记录。`,
+      async () => {
+        setRestoringDraftArchive(true);
+        try {
+          await restoreIsolatedWorkDraft(archive.id);
+          setDraftArchives(previous => previous.filter(item => item.id !== archive.id));
+          setDraftArchiveModalVisible(false);
+          setRestartMessage('未完成作业副本已恢复。请先重启应用，清除旧页面和待核对队列的内存状态，再进入原作业页核对后继续。');
+          setShowRestartModal(true);
+        } catch (error) {
+          alert.showError(error instanceof Error ? error.message : '恢复作业副本失败，原副本仍保留');
+        } finally { setRestoringDraftArchive(false); }
+      }, false, '确认恢复');
   };
 
   // 是否可以同步
@@ -1528,7 +1525,7 @@ export default function SettingsScreen() {
     if (connectionStatus === 'error' || connectionStatus === 'disconnected') {
       return {
         title: '同步助手未连接',
-        desc: '请确认电脑端同步助手已启动，且手机和电脑在同一网络',
+        desc: '正在自动重试，请确认同步助手已启动，且手机和电脑在同一网络',
         color: theme.error,
         icon: 'alert-circle' as keyof typeof Feather.glyphMap,
       };
@@ -1849,29 +1846,20 @@ export default function SettingsScreen() {
     <Screen
       backgroundColor={theme.backgroundRoot}
       statusBarStyle={isDark ? 'light' : 'dark'}
+      safeAreaEdges={['top', 'left', 'right']}
       disableAutoScroll
     >
       <KeyboardAwareFormScrollView
         style={styles.container}
-        contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 100 }]}
-        bottomOffset={Math.max(insets.bottom + 120, 160)}
+        contentContainerStyle={styles.scrollContent}
+        bottomOffset={Spacing.xl}
         scrollEventThrottle={16} // 控制滚动事件频率（16ms ≈ 60fps）
         decelerationRate="normal" // 正常减速率，改善滑动手感
         directionalLockEnabled={true} // 锁定滚动方向，提升跟手性
-        onScrollBeginDrag={() => {
-          scrollingRef.current = true;
-        }}
-        onScrollEndDrag={() => {
-          scrollingRef.current = false;
-        }}
-        onMomentumScrollBegin={() => {
-          scrollingRef.current = true;
-        }}
-        onMomentumScrollEnd={() => {
-          scrollingRef.current = false;
-        }}
       >
-        <UiPageHeader title="设置" onBack={() => router.back()} style={styles.settingsPageHeader} />
+        <View style={styles.settingsPageHeader}>
+          <Text style={styles.settingsPageTitle}>设置</Text>
+        </View>
 
         <UiListSection style={styles.settingsOverview}>
           <UiListItem
@@ -1898,8 +1886,8 @@ export default function SettingsScreen() {
                 `${configStats.inventoryBindings} 条`
               )}
               {renderSwitchCard(
-                '扫码提示音',
-                '扫码成功、重复、异常反馈',
+                '操作提示音',
+                '扫码、确认、取消和删除等语音反馈',
                 'radio',
                 theme.primary,
                 soundEnabled,
@@ -2003,6 +1991,20 @@ export default function SettingsScreen() {
                     keyboardType="numeric"
                   />
                 </View>
+                <View style={styles.syncConfigRow}>
+                    <Text style={styles.syncConfigLabel}>配对密钥</Text>
+                    <TextInput
+                      style={styles.syncConfigInput}
+                      value={syncConfig.pairingKey || ''}
+                      onChangeText={pairingKey => setSyncConfig(previous => ({ ...previous, pairingKey }))}
+                      placeholder="选填，与电脑助手保持一致"
+                      placeholderTextColor={theme.textMuted}
+                      secureTextEntry
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      maxLength={128}
+                    />
+                </View>
                 <View style={styles.syncConfigButtons}>
                   <AnimatedButton
                     containerStyle={styles.syncButtonWrap}
@@ -2045,11 +2047,11 @@ export default function SettingsScreen() {
                 )}
                 {connectionStatus === 'disconnected' && (
                   <Text style={styles.syncStatusHintError}>
-                    网络连接已断开，请检查网络后重新连接
+                    暂未连接，应用在前台时会自动重试；同步助手启动后可自动恢复
                   </Text>
                 )}
                 {connectionStatus === 'error' && (
-                  <Text style={styles.syncStatusHintError}>请检查服务器地址和状态后重试</Text>
+                  <Text style={styles.syncStatusHintError}>请核对电脑地址、配对密钥和助手状态后重试</Text>
                 )}
                 {connectionStatus === 'idle' && !syncConfig.ip && (
                   <Text style={styles.syncStatusHintIdle}>电脑端托盘菜单可查看服务地址</Text>
@@ -2116,6 +2118,13 @@ export default function SettingsScreen() {
                 `${configStats.rules} 条`
               )}
               {renderMenuCard(
+                '解析诊断',
+                '检查规则冲突、优先级与供应商归属',
+                'activity',
+                theme.warning,
+                () => router.push('/rule-diagnostics')
+              )}
+              {renderMenuCard(
                 '前缀配置',
                 '自动去除 PART NO.、QTY 等前缀',
                 'type',
@@ -2175,6 +2184,15 @@ export default function SettingsScreen() {
                 dbRestoreLoading
               )}
               {renderAutoBackupDiagnostic()}
+              {draftArchives.length > 0 && renderMenuCard(
+                '恢复前作业副本',
+                `${draftArchives.length} 份副本，核对后恢复未完成作业`,
+                'archive', theme.warning,
+                () => {
+                  setSelectedDraftArchiveId(draftArchives[0]?.id || null);
+                  setDraftArchiveModalVisible(true);
+                }
+              )}
             </View>
           )}
 
@@ -2346,8 +2364,30 @@ export default function SettingsScreen() {
       </KeyboardAwareFormScrollView>
 
       {/* ==================== 在线更新模态框 ==================== */}
+      <Modal visible={draftArchiveModalVisible && isFocused} transparent animationType="fade"
+        onRequestClose={() => !restoringDraftArchive && setDraftArchiveModalVisible(false)}>
+        <View style={styles.updateModalOverlay}>
+          <AppModalCard title="恢复前作业副本" size="largeForm" stretchBody
+            subtitle="副本不会自动写回业务记录。请先核对单据和实物，再恢复未完成作业。"
+            onClose={restoringDraftArchive ? undefined : () => setDraftArchiveModalVisible(false)}
+            footer={<AppModalActions primaryLabel={restoringDraftArchive ? '正在恢复' : '恢复副本'}
+              onPrimaryPress={handleRestoreDraftArchive}
+              primaryDisabled={restoringDraftArchive || !selectedDraftArchiveId}
+              secondaryLabel="稍后" secondaryDisabled={restoringDraftArchive}
+              onSecondaryPress={() => setDraftArchiveModalVisible(false)} />}>
+            <FlatList data={draftArchives} keyExtractor={item => item.id}
+              renderItem={({ item }) => <UiListItem
+                title={formatDateTimeExport(item.createdAt)}
+                subtitle={`${item.databaseFileName} · ${new Set([...item.entries, ...item.lateEntries].map(([key]) => key)).size} 项暂存`}
+                icon={selectedDraftArchiveId === item.id ? 'check-circle' : 'archive'}
+                color={selectedDraftArchiveId === item.id ? theme.primary : theme.textMuted}
+                onPress={() => !restoringDraftArchive && setSelectedDraftArchiveId(item.id)}
+              />} />
+          </AppModalCard>
+        </View>
+      </Modal>
       <Modal
-        visible={updateModalVisible}
+        visible={updateModalVisible && (isFocused || downloading)}
         transparent
         animationType="fade"
         onRequestClose={() => !downloading && setUpdateModalVisible(false)}
@@ -2418,7 +2458,7 @@ export default function SettingsScreen() {
         </View>
       </Modal>
 
-      {alert.AlertComponent}
+      {(isFocused || showRestartModal) && alert.AlertComponent}
       <ToastContainer />
 
       {/* 数据库恢复后的重启提示弹窗 - 强制重启 */}
@@ -2433,8 +2473,8 @@ export default function SettingsScreen() {
       >
         <View style={styles.restartModalOverlay}>
           <AppModalCard
-            title="数据库恢复成功"
-            subtitle="数据库已恢复到备份状态，需要立即重启应用后才能继续安全使用。"
+            title="需要重启应用"
+            subtitle={restartMessage}
             style={styles.restartModalContent}
             bodyStyle={styles.restartModalBody}
             size="form"

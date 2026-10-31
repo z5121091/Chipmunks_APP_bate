@@ -9,9 +9,10 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Base64 } from 'js-base64';
 import { UPDATE_CONFIG, STORAGE_KEYS } from '@/constants/config';
 import { logger } from './logger';
+import { syncNativeNasBackupConfiguration } from './nativeNasBackupConfig';
 
-// 使用 any 绕过类型检查
-const FileSystem = FileSystemLegacy as any;
+// 这里沿用旧版文件系统的下载接口。
+const FileSystem = FileSystemLegacy;
 const LEGACY_UPDATE_SERVER_HOSTS = new Set(['zx5121091.pw']);
 
 const isLegacyUpdateServerUrl = (url: string): boolean => {
@@ -31,7 +32,7 @@ export const extractDisplayUrl = (url: string): string => {
     const parsed = new URL(url);
     return `${parsed.protocol}//${parsed.host}`;
   } catch {
-    return url;
+    return '无效的服务器地址';
   }
 };
 
@@ -105,14 +106,32 @@ export const compareVersions = (v1: string, v2: string): number => {
 /**
  * 保存更新服务器地址
  */
-export const saveUpdateServer = async (url: string): Promise<void> => {
-  await AsyncStorage.setItem(STORAGE_KEYS.UPDATE_SERVER_URL, url.trim());
+let pendingServerOperation: Promise<unknown> = Promise.resolve();
+const serializeServerOperation = <T>(operation: () => Promise<T>): Promise<T> => {
+  const task = pendingServerOperation.catch(() => undefined).then(operation);
+  pendingServerOperation = task;
+  return task;
 };
+
+export const saveUpdateServer = (url: string): Promise<void> => serializeServerOperation(async () => {
+  const normalized = url.trim();
+  const previous = await AsyncStorage.getItem(STORAGE_KEYS.UPDATE_SERVER_URL);
+  await AsyncStorage.setItem(STORAGE_KEYS.UPDATE_SERVER_URL, normalized);
+  // An empty saved setting means the current application default, as in getUpdateServer.
+  try {
+    await syncNativeNasBackupConfiguration(normalized || UPDATE_CONFIG.DEFAULT_SERVER);
+  } catch (error) {
+    // Keep a failed address change from leaving foreground and background on different destinations.
+    if (previous === null) await AsyncStorage.removeItem(STORAGE_KEYS.UPDATE_SERVER_URL);
+    else await AsyncStorage.setItem(STORAGE_KEYS.UPDATE_SERVER_URL, previous);
+    throw error;
+  }
+});
 
 /**
  * 获取更新服务器地址
  */
-export const getUpdateServer = async (): Promise<string> => {
+const resolveUpdateServer = async (): Promise<string> => {
   const savedServer = (await AsyncStorage.getItem(STORAGE_KEYS.UPDATE_SERVER_URL))?.trim();
   if (!savedServer) {
     return UPDATE_CONFIG.DEFAULT_SERVER;
@@ -136,6 +155,12 @@ export const getUpdateServer = async (): Promise<string> => {
   return savedServer;
 };
 
+export const getUpdateServer = (): Promise<string> => serializeServerOperation(async () => {
+  const server = await resolveUpdateServer();
+  await syncNativeNasBackupConfiguration(server);
+  return server;
+});
+
 /**
  * 下载并安装更新（使用 IntentLauncher，适用于 APK）
  */
@@ -156,7 +181,7 @@ export const downloadAndInstallWithIntent = async (
         const fileInfo = await FileSystem.getInfoAsync(localUri);
         if (fileInfo.exists && 'size' in fileInfo) {
           // 估算进度（实际进度需要服务器支持）
-          const estimated = Math.min(0.9, (fileInfo as any).size / 50000000);
+          const estimated = Math.min(0.9, fileInfo.size / 50000000);
           onProgress?.(estimated);
         }
         // 静默忽略：文件还没下载完成时 getInfoAsync 可能失败，不影响主流程

@@ -8,10 +8,11 @@ import {
   getLastNasDatabaseBackupSuccess,
 } from './nasBackup';
 import { logger } from './logger';
+import { getUpdateServer } from './update';
 
 export const AUTO_NAS_BACKUP_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 
-const FileSystem = FileSystemLegacy as any;
+const FileSystem = FileSystemLegacy;
 const AUTO_NAS_BACKUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const AUTO_NAS_BACKUP_FAILURE_BACKOFF_MS = 15 * 60 * 1000;
 const AUTO_NAS_BACKUP_LAST_FAILURE_AT_KEY = '@auto_nas_backup_last_failure_at';
@@ -350,6 +351,14 @@ export const maybeRunAutoNasBackup = async (
   }
 
   if (Platform.OS === 'android') {
+    try {
+      // WorkManager and manual backups must use the same migrated/saved destination.
+      await getUpdateServer();
+    } catch {
+      const message = 'NAS 后台配置同步失败，请重试或检查服务器配置';
+      await recordAutoNasBackupStatus({ lastCheckedAt: checkedAt, trigger, status: 'failed', lastError: message });
+      return { status: 'failed', message };
+    }
     return recordSkipped('native-workmanager-primary');
   }
 

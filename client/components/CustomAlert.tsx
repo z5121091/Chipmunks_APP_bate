@@ -6,6 +6,7 @@ import { Spacing, BorderRadius, BorderWidth, Typography } from '@/constants/them
 import { APP_MODAL_MAX_WIDTH, getAppModalWidth } from '@/constants/modal';
 import { withAlpha } from '@/utils/colors';
 import { AppPillToast, AppPillToastType } from './AppPillToast';
+import { feedbackCancel, feedbackConfirm, feedbackDeleted } from '@/utils/feedback';
 
 export type AlertButtonType = {
   text: string;
@@ -76,6 +77,11 @@ export function CustomAlert({
   };
 
   const handleButtonPress = (button: AlertButtonType) => {
+    if (button.style === 'cancel' || button.text === '取消') {
+      void feedbackCancel();
+    } else if (button.text === '确认' || button.text === '确定') {
+      void feedbackConfirm();
+    }
     if (button.onPress) {
       button.onPress();
     }
@@ -210,7 +216,7 @@ export function CustomAlert({
   );
 }
 
-// Hook for easy usage
+// 页面调用弹窗时使用的 Hook。
 export interface AlertConfig {
   title: string;
   message?: string;
@@ -234,10 +240,12 @@ export function useCustomAlert() {
     }
 
     setPill({ text, type });
-    pillTimerRef.current = setTimeout(() => {
-      setPill(null);
-      pillTimerRef.current = null;
-    }, type === 'error' ? 2800 : type === 'warning' ? 2400 : 2200);
+    if (type !== 'error') {
+      pillTimerRef.current = setTimeout(() => {
+        setPill(null);
+        pillTimerRef.current = null;
+      }, type === 'warning' ? 2400 : 2200);
+    }
   }, []);
 
   useEffect(() => {
@@ -271,7 +279,8 @@ export function useCustomAlert() {
     title: string,
     message: string,
     onConfirm: () => void,
-    isDanger: boolean = false
+    isDanger: boolean = false,
+    confirmLabel?: string
   ) => {
     setConfig({
       title,
@@ -279,7 +288,7 @@ export function useCustomAlert() {
       buttons: [
         { text: '取消', style: 'cancel' },
         {
-          text: isDanger ? '删除' : '确认',
+          text: confirmLabel || (isDanger ? '删除' : '确认'),
           style: isDanger ? 'destructive' : 'default',
           onPress: onConfirm,
         },
@@ -290,6 +299,9 @@ export function useCustomAlert() {
   }, []);
 
   const showSuccess = useCallback((message: string) => {
+    if (message.includes('已删除')) {
+      void feedbackDeleted();
+    }
     if (shouldUsePill(message)) {
       showPill(message, 'success');
       return;

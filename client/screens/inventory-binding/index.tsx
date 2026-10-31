@@ -6,6 +6,7 @@ import {
   FlatList,
   TextInput,
   Modal,
+  Keyboard,
 } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import * as DocumentPicker from 'expo-document-picker';
@@ -23,6 +24,7 @@ import { AppFormField } from '@/components/AppFormField';
 import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { UiInput, UiToolbarButton } from '@/components/UiRedesign';
 import { createStyles } from './styles';
+import { SupplierManager } from './SupplierManager';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { logger } from '@/utils/logger';
 import { feedbackClear } from '@/utils/feedback';
@@ -45,7 +47,7 @@ const normalizeBindingMatchKey = (value?: string): string =>
 
 export default function InventoryBindingScreen() {
   const { theme, isDark } = useTheme();
-  const styles = createStyles(theme);
+  const styles = useMemo(() => createStyles(theme), [theme]);
   const router = useSafeRouter();
   const alert = useCustomAlert();
   const showBindingConfirm = alert.showConfirm;
@@ -55,6 +57,8 @@ export default function InventoryBindingScreen() {
   const [bindings, setBindings] = useState<InventoryBinding[]>([]);
   const [modalVisible, setModalVisible] = useState(false);
   const [dataToolsVisible, setDataToolsVisible] = useState(false);
+  const [supplierModalMode, setSupplierModalMode] = useState<'manage' | 'select' | null>(null);
+  const supplierCloseRef = useRef<(() => void) | null>(null);
   const [editingBinding, setEditingBinding] = useState<InventoryBinding | null>(null);
   const [formData, setFormData] = useState({
     scan_model: '',
@@ -72,6 +76,7 @@ export default function InventoryBindingScreen() {
   const [totalCount, setTotalCount] = useState(0);
   const [expandedBindingIds, setExpandedBindingIds] = useState<Set<string>>(new Set());
   const loadBindingsRequestRef = useRef(0);
+  const bindingQueryRef = useRef({ page: 1, keyword: '' });
 
   const toggleBindingExpanded = useCallback((id: string) => {
     setExpandedBindingIds((prev) => {
@@ -87,6 +92,7 @@ export default function InventoryBindingScreen() {
 
   // 加载绑定列表
   const loadBindings = useCallback(async (page = 1, keyword = '') => {
+    bindingQueryRef.current = { page, keyword };
     const requestId = loadBindingsRequestRef.current + 1;
     loadBindingsRequestRef.current = requestId;
     setLoading(true);
@@ -102,6 +108,7 @@ export default function InventoryBindingScreen() {
       setBindings(result.items);
       setTotalCount(result.total);
       setCurrentPage(result.page);
+      bindingQueryRef.current = { page: result.page, keyword };
     } catch (error) {
       if (requestId !== loadBindingsRequestRef.current) {
         return;
@@ -117,11 +124,12 @@ export default function InventoryBindingScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      void loadBindings(currentPage, searchKeyword);
+      const { page, keyword } = bindingQueryRef.current;
+      void loadBindings(page, keyword);
       return () => {
         loadBindingsRequestRef.current += 1;
       };
-    }, [currentPage, loadBindings, searchKeyword])
+    }, [loadBindings])
   );
 
   // 打开添加/编辑弹窗
@@ -215,7 +223,7 @@ export default function InventoryBindingScreen() {
       setModalVisible(false);
     } catch (error) {
       logger.error('保存绑定失败:', error);
-      alert.showError('保存失败，请重试');
+      alert.showError(error instanceof Error ? error.message : '保存失败，请重试');
     } finally {
       setSaving(false);
     }
@@ -644,6 +652,17 @@ export default function InventoryBindingScreen() {
 
                     <View style={styles.toolButtonWrap}>
                       <UiToolbarButton
+                        label="维护供应商"
+                        icon="truck"
+                        compact
+                        variant="secondary"
+                        style={styles.toolButton}
+                        onPress={() => { Keyboard.dismiss(); setSupplierModalMode('manage'); }}
+                      />
+                    </View>
+
+                    <View style={styles.toolButtonWrap}>
+                      <UiToolbarButton
                         label="数据工具"
                         icon="more-horizontal"
                         compact
@@ -735,21 +754,22 @@ export default function InventoryBindingScreen() {
       </View>
 
       {/* 添加/编辑弹窗 */}
-      <Modal
-        visible={modalVisible}
+      {modalVisible && <Modal
+        visible
         transparent
         animationType="fade"
         onRequestClose={() => {
+          if (supplierModalMode) { supplierCloseRef.current?.(); return; }
           if (!saving) setModalVisible(false);
         }}
       >
-        <View style={styles.modalOverlay}>
+        <View style={[styles.modalOverlay, supplierModalMode ? { display: 'none' } : null]}>
           <AppModalCard
             title={editingBinding ? '编辑绑定' : '添加绑定'}
             onClose={saving ? undefined : () => setModalVisible(false)}
             style={styles.modalContent}
             bodyStyle={styles.modalBody}
-            size="form"
+            size="largeForm"
             stretchBody
             footer={
               <AppModalActions
@@ -763,7 +783,12 @@ export default function InventoryBindingScreen() {
               />
             }
           >
-            <KeyboardAwareFormScrollView bottomOffset={16} extraScrollHeight={8}>
+            <KeyboardAwareFormScrollView
+              style={styles.bindingFormScroll}
+              bottomOffset={24}
+              extraScrollHeight={16}
+              showsVerticalScrollIndicator
+            >
               <AppFormField label="扫描型号" required>
                 <TextInput
                   style={styles.input}
@@ -789,13 +814,18 @@ export default function InventoryBindingScreen() {
               </AppFormField>
 
               <AppFormField label="供应商">
-                <TextInput
-                  style={styles.input}
-                  value={formData.supplier}
-                  onChangeText={(text) => setFormData({ ...formData, supplier: text })}
-                  placeholder="供应商名称（选填）"
-                  placeholderTextColor={theme.textMuted}
-                />
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  accessibilityLabel="选择物料供应商"
+                  accessibilityValue={{ text: formData.supplier || '未设置' }}
+                  style={[styles.input, styles.supplierPicker]}
+                  onPress={() => { Keyboard.dismiss(); setSupplierModalMode('select'); }}
+                >
+                  <Text style={[styles.supplierPickerText, !formData.supplier && styles.supplierPlaceholder]}>
+                    {formData.supplier || '请选择供应商（选填）'}
+                  </Text>
+                  <Feather name="chevron-down" size={18} color={theme.textMuted} />
+                </TouchableOpacity>
               </AppFormField>
 
               <AppFormField label="版本号">
@@ -822,7 +852,21 @@ export default function InventoryBindingScreen() {
             </KeyboardAwareFormScrollView>
           </AppModalCard>
         </View>
-      </Modal>
+        {supplierModalMode ? (
+          <SupplierManager
+            embedded
+            closeRef={supplierCloseRef}
+            mode={supplierModalMode}
+            value={formData.supplier}
+            onSelect={(supplier) => {
+              setFormData(current => ({ ...current, supplier }));
+              setSupplierModalMode(null);
+            }}
+            onDeleted={(supplier) => setFormData(current => normalizeBindingMatchKey(current.supplier) === normalizeBindingMatchKey(supplier) ? { ...current, supplier: '' } : current)}
+            onClose={() => setSupplierModalMode(null)}
+          />
+        ) : null}
+      </Modal>}
 
       <Modal
         visible={dataToolsVisible}
@@ -871,6 +915,19 @@ export default function InventoryBindingScreen() {
           </AppModalCard>
         </View>
       </Modal>
+
+      {supplierModalMode && !modalVisible ? (
+        <SupplierManager
+          mode={supplierModalMode}
+          value={formData.supplier}
+          onSelect={(supplier) => {
+            setFormData(current => ({ ...current, supplier }));
+            setSupplierModalMode(null);
+          }}
+          onDeleted={(supplier) => setFormData(current => normalizeBindingMatchKey(current.supplier) === normalizeBindingMatchKey(supplier) ? { ...current, supplier: '' } : current)}
+          onClose={() => setSupplierModalMode(null)}
+        />
+      ) : null}
 
       {/* 自定义弹窗 */}
       {alert.AlertComponent}

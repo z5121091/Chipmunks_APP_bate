@@ -73,7 +73,7 @@ export const getErpStockQuantityForAccount = (
   const matchedRows = rows.filter(
     (row) => normalizeText(row.warehouseName) === expectedWarehouse
   );
-  // Stock in another warehouse is not stock in the warehouse being counted.
+  // 其他仓库的库存不能计入当前盘点仓库。
   return sumStockRows(inventoryCode, matchedRows);
 };
 

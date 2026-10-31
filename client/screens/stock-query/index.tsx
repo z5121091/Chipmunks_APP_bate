@@ -6,6 +6,8 @@ import {
   Text,
   TouchableOpacity,
   View,
+  type NativeSyntheticEvent,
+  type TextInputSubmitEditingEventData,
 } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
@@ -26,8 +28,8 @@ import {
 } from '@/utils/erpCurrentStock';
 import { detectRule, getActiveRules, getInventoryCodeByModel, initDatabase, parseWithRule, type QRCodeRule } from '@/utils/database';
 import { feedbackNotBound, feedbackQueryFailed, feedbackQuerySuccess } from '@/utils/feedback';
-import { isQRCode } from '@/utils/qrcodeParser';
-import { cancelScanSubmit, scheduleScanSubmit, sanitizeStructuredScannerInput } from '@/utils/scannerInput';
+import { isQRCode, shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
+import { cancelScanSubmit, RECENT_SCAN_DUPLICATE_WINDOW_MS, resolvePendingScannerSubmit, scheduleScanSubmitWithCompletionCheck, sanitizeStructuredScannerInput } from '@/utils/scannerInput';
 import { logger } from '@/utils/logger';
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 import { createStyles } from './styles';
@@ -77,7 +79,15 @@ export default function StockQueryScreen() {
   const screenActiveRef = useRef(false);
   const requestIdRef = useRef(0);
   const liveInputRef = useRef('');
+  const inputRevisionRef = useRef(0);
+  const pendingNativeSubmitTextRef = useRef<string | null>(null);
+  const lastConsumedInputRef = useRef<{ text: string; at: number } | null>(null);
   const activeRulesRef = useRef<QRCodeRule[] | null>(null);
+  const focusSessionRef = useRef(0);
+  const rulesPreparationRef = useRef<{
+    session: number;
+    promise: Promise<QRCodeRule[]>;
+  } | null>(null);
   const queryingRef = useRef(false);
   const [selectedAccount, setSelectedAccount] = useState<ErpAccountConfig>(ERP_ACCOUNTS[0]);
   const [inputValue, setInputValue] = useState('');
@@ -91,21 +101,57 @@ export default function StockQueryScreen() {
     if (screenActiveRef.current) inputRef.current?.focus(delay);
   }, []);
 
+  const prepareActiveRules = useCallback((): Promise<QRCodeRule[]> => {
+    if (activeRulesRef.current) return Promise.resolve(activeRulesRef.current);
+    const session = focusSessionRef.current;
+    const existing = rulesPreparationRef.current;
+    if (existing?.session === session) return existing.promise;
+
+    const promise = (async () => {
+      // 保留数据库恢复检查，在进入页面时提前准备，首扫复用同一次读取。
+      await initDatabase();
+      const rules = await getActiveRules();
+      if (screenActiveRef.current && focusSessionRef.current === session) {
+        activeRulesRef.current = rules;
+      }
+      return rules;
+    })();
+    const preparation = { session, promise };
+    rulesPreparationRef.current = preparation;
+    const release = () => {
+      if (rulesPreparationRef.current === preparation) rulesPreparationRef.current = null;
+    };
+    void promise.then(release, release);
+    return promise;
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       screenActiveRef.current = true;
+      const session = ++focusSessionRef.current;
       activeRulesRef.current = null;
+      rulesPreparationRef.current = null;
       queryingRef.current = false;
       setQuerying(false);
       focusScannerInput(120);
+      void prepareActiveRules().catch((error) => {
+        if (screenActiveRef.current && focusSessionRef.current === session) {
+          logger.warn('[库存查询] 预读解析规则失败，将在扫码时重试:', error);
+        }
+      });
       return () => {
         screenActiveRef.current = false;
+        focusSessionRef.current += 1;
+        activeRulesRef.current = null;
+        rulesPreparationRef.current = null;
         requestIdRef.current += 1;
         liveInputRef.current = '';
+        inputRevisionRef.current += 1;
+        pendingNativeSubmitTextRef.current = null;
         setInputValue('');
         cancelScanSubmit(autoSubmitTimerRef);
       };
-    }, [focusScannerInput])
+    }, [focusScannerInput, prepareActiveRules])
   );
 
   const workflowSummaryItems = useMemo(
@@ -145,18 +191,19 @@ export default function StockQueryScreen() {
       if (!rawContent || queryingRef.current) {
         return;
       }
+      lastConsumedInputRef.current = { text: rawContent, at: Date.now() };
 
       liveInputRef.current = '';
+      inputRevisionRef.current += 1;
+      pendingNativeSubmitTextRef.current = null;
       setInputValue('');
       queryingRef.current = true;
       const requestId = ++requestIdRef.current;
       const isCurrent = () => screenActiveRef.current && requestIdRef.current === requestId;
 
       try {
-        await initDatabase();
-        const rules = activeRulesRef.current ?? await getActiveRules();
+        const rules = await prepareActiveRules();
         if (!isCurrent()) return;
-        activeRulesRef.current = rules;
         if (!isQRCode(rawContent, rules)) return;
         setQuerying(true);
         setErrorMessage('');
@@ -208,26 +255,49 @@ export default function StockQueryScreen() {
         }
       }
     },
-    [focusScannerInput, selectedAccount, selectedAccountAvailable]
+    [focusScannerInput, prepareActiveRules, selectedAccount, selectedAccountAvailable]
   );
 
-  const handleInputChange = useCallback(
-    (text: string) => {
-      cancelScanSubmit(autoSubmitTimerRef);
-      if (queryingRef.current) return;
+  const handleInputChange = useCallback((text: string) => {
+    cancelScanSubmit(autoSubmitTimerRef);
+    if (queryingRef.current) return;
+    const revision = ++inputRevisionRef.current;
+    if (pendingNativeSubmitTextRef.current !== text) pendingNativeSubmitTextRef.current = null;
+    liveInputRef.current = text;
+    setInputValue(text);
+    if (!sanitizeStructuredScannerInput(text)) return;
 
-      liveInputRef.current = text;
-      setInputValue(text);
+    const requestId = requestIdRef.current;
+    const isCurrent = () => screenActiveRef.current && !queryingRef.current
+      && requestIdRef.current === requestId && inputRevisionRef.current === revision
+      && liveInputRef.current === text;
+    scheduleScanSubmitWithCompletionCheck(autoSubmitTimerRef, {
+      delay: STOCK_QUERY_AUTO_SUBMIT_DEBOUNCE_MS,
+      isCurrent,
+      shouldWaitForMore: async () => {
+        if (pendingNativeSubmitTextRef.current === text) return false;
+        const rules = await prepareActiveRules();
+        if (!isCurrent()) return false;
+        return shouldWaitForQRCodeContinuation(sanitizeStructuredScannerInput(text), rules);
+      },
+      submit: () => { void handleQuery(text); },
+    });
+  }, [handleQuery, prepareActiveRules]);
 
-      const nextContent = sanitizeStructuredScannerInput(text);
-      if (!nextContent) return;
-
-      scheduleScanSubmit(autoSubmitTimerRef, () => {
-        void handleQuery(nextContent);
-      }, STOCK_QUERY_AUTO_SUBMIT_DEBOUNCE_MS);
-    },
-    [handleQuery]
-  );
+  const handleSubmitEditing = useCallback((event?: NativeSyntheticEvent<TextInputSubmitEditingEventData>) => {
+    const nativeText = sanitizeStructuredScannerInput(event?.nativeEvent.text ?? '');
+    const previous = lastConsumedInputRef.current;
+    if (previous && nativeText === previous.text && nativeText !== liveInputRef.current
+      && Date.now() - previous.at < RECENT_SCAN_DUPLICATE_WINDOW_MS) return;
+    const pending = resolvePendingScannerSubmit(liveInputRef.current, event?.nativeEvent.text);
+    if (!pending) return;
+    if (pending.advanced || pendingNativeSubmitTextRef.current === pending.text) {
+      pendingNativeSubmitTextRef.current = pending.text;
+      handleInputChange(pending.text);
+      return;
+    }
+    void handleQuery(pending.text);
+  }, [handleInputChange, handleQuery]);
 
   const renderAccountButton = useCallback(
     (account: ErpAccountConfig) => {
@@ -244,6 +314,8 @@ export default function StockQueryScreen() {
             cancelScanSubmit(autoSubmitTimerRef);
             requestIdRef.current += 1;
             liveInputRef.current = '';
+            inputRevisionRef.current += 1;
+            pendingNativeSubmitTextRef.current = null;
 
             setSelectedAccount(account);
             setInputValue('');
@@ -324,9 +396,7 @@ export default function StockQueryScreen() {
           }
           value={inputValue}
           onChangeText={handleInputChange}
-          onSubmitEditing={() => {
-            void handleQuery();
-          }}
+          onSubmitEditing={handleSubmitEditing}
           placeholder={
             querying
               ? '正在查询ERP库存...'

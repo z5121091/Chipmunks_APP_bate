@@ -100,6 +100,13 @@ it('includes a manually configured separator and keeps empty middle segments and
   expect(latest().fieldOrder).toEqual(initial.fieldOrder);
 });
 
+it('keeps sample field assignment while leaving the detailed diagnostics in the standalone entry', async () => {
+  await act(async () => { root = TestRenderer.create(<Harness sample="MODEL/100" initial={{ ...base, fieldOrder: ['model', 'quantity'] }} />); });
+  expect(button('设置第1段字段')).toBeDefined();
+  expect(root.root.findAllByType(TouchableOpacity).some(item => item.props.accessibilityLabel === '解析诊断')).toBe(false);
+  expect(root.root.findAllByProps({ accessibilityLabel: '显示隐藏字符' })).toHaveLength(0);
+});
+
 it('does not offer a non-responsive mapping dialog when a terminator removes the split content', async () => {
   await act(async () => { root = TestRenderer.create(<Harness sample="MODEL;END" initial={{ ...base, terminator: ';END' }} />); });
   await press('拆分并逐段分配');

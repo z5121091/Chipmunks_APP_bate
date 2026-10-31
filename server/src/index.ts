@@ -9,7 +9,6 @@ import express, {
 import { inflateSync, strFromU8 } from 'fflate';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import path from 'node:path';
 import {
@@ -24,6 +23,7 @@ import { registerErpRoutes } from './erp.ts';
 import { ErpProxyConnectionError, fetchProxyUpstream } from './erpProxy.ts';
 import { HOME_PAGE_HTML, PRIVACY_POLICY_HTML } from './publicPages.ts';
 import { SERVER_RELEASE } from './release.ts';
+import { writeFileAtomically } from './atomicFile.ts';
 
 type ErpProxyFileConfig = {
   backendAccessKey?: string;
@@ -124,7 +124,7 @@ const readErpProxyFileConfig = (): ErpProxyFileConfig => {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       console.warn(
-        '[Coze ERP proxy] ignored invalid erp-proxy.config.json:',
+        '[ERP proxy] ignored invalid erp-proxy.config.json:',
         error instanceof Error ? error.message : error
       );
     }
@@ -299,9 +299,7 @@ const readRequestedErpAccountKey = (req: Request): ErpAccountKey | null => {
     }
   }
 
-  // A direct account instance already has an unambiguous identity. Proxy mode
-  // keeps the Wuxi fallback for compatibility with older clients and the
-  // current single-domain test deployment.
+  // 直连账套已经能确定身份；代理模式继续兼容无锡账套和现有单域名部署。
   return shouldProxyCozeErp ? DEFAULT_ERP_ACCOUNT_KEY : localErpAccountKey;
 };
 
@@ -634,7 +632,7 @@ const proxyCozeErpRequest = async (
       `erp-proxy;dur=${Date.now() - requestStartedAt}`,
     ].filter(Boolean).join(', '));
 
-    // Cache ownership stays with the ERP service; proxies never restart its TTL.
+    // 缓存有效期由 ERP 服务管理，代理转发时不重新计时。
     res.status(upstreamResponse.status);
     if (upstreamResponse.body) {
       const reader = upstreamResponse.body.getReader();
@@ -664,7 +662,7 @@ const proxyCozeErpRequest = async (
     res.end();
   } catch (error) {
     console.error(
-      '[Coze ERP proxy] request failed:',
+      '[ERP proxy] request failed:',
       error instanceof Error ? error.message : error
     );
     if (res.destroyed) return;
@@ -1206,8 +1204,6 @@ const handleExcelUpload =
         return;
       }
 
-      await mkdir(uploadDir, { recursive: true });
-
       const nameSuffix =
         typeof req.query.name_suffix === 'string' ? req.query.name_suffix : undefined;
       const exactFileName =
@@ -1215,7 +1211,7 @@ const handleExcelUpload =
       const fileName = buildFileName(prefix, nameSuffix, exactFileName);
       const filePath = path.join(uploadDir, fileName);
 
-      await writeFile(filePath, rawBody);
+      await writeFileAtomically(filePath, rawBody);
 
       res.status(200).json({
         success: true,

@@ -17,12 +17,17 @@ let speechSessionGeneration = 0;
 let speechReadyAt = 0;
 let lastSpeechStartedAt = 0;
 let speechWarmupPromise: Promise<void> | null = null;
-const pendingPrioritySpeechTexts = new Set<string>();
+let speechResetPromise: Promise<void> = Promise.resolve();
+let latestOrderReadyRequest = 0;
+type SpeechMode = 'enqueue' | 'replace' | 'order-ready';
+type ActiveCompletionSpeech = { finished: Promise<void>; finish: () => void };
+let activeCompletionSpeech: ActiveCompletionSpeech | null = null;
 
 const SPEECH_MIN_INTERVAL_MS = 120;
 const SPEECH_STOP_SETTLE_MS = Platform.OS === 'android' ? 120 : 40;
 const SPEECH_RESUME_SETTLE_MS = Platform.OS === 'android' ? 350 : 120;
 const SPEECH_FINISH_TIMEOUT_MS = 2500;
+const COMPLETION_CALLBACK_TIMEOUT_MS = 10000;
 const isWebPlatform = Platform.OS === 'web';
 
 const delay = (ms: number): Promise<void> =>
@@ -63,21 +68,25 @@ const waitForSpeechReady = async (): Promise<void> => {
   }
 };
 
-const resetSpeechSession = async (
+const resetSpeechSession = (
   reason: string,
   settleMs = SPEECH_STOP_SETTLE_MS
-) => {
+): Promise<void> => {
   if (isWebPlatform) {
-    return;
+    return Promise.resolve();
   }
 
-  try {
-    await Speech.stop();
-  } catch (error) {
-    logger.warn(`[Feedback] 停止语音失败(${reason}):`, error);
-  }
+  // 串行停止，避免较早的异步 stop 在新提示开始后才返回。
+  speechResetPromise = speechResetPromise.then(async () => {
+    try {
+      await Speech.stop();
+    } catch (error) {
+      logger.warn(`[Feedback] 停止语音失败(${reason}):`, error);
+    }
 
-  speechReadyAt = Math.max(speechReadyAt, Date.now() + settleMs);
+    speechReadyAt = Math.max(speechReadyAt, Date.now() + settleMs);
+  });
+  return speechResetPromise;
 };
 
 const warmupSpeechEngine = (reason: string): Promise<void> => {
@@ -102,8 +111,27 @@ const cancelSpeechSession = (
   settleMs = SPEECH_STOP_SETTLE_MS
 ): Promise<void> => {
   speechSessionGeneration += 1;
-  pendingPrioritySpeechTexts.clear();
+  activeCompletionSpeech?.finish();
   return resetSpeechSession(reason, settleMs);
+};
+
+const trackCompletionPlayback = (): ActiveCompletionSpeech => {
+  // 以原生 onStart/onDone 为准，不能把反馈 Promise 的 2.5 秒超时当成语音播放结束。
+  activeCompletionSpeech?.finish();
+  let resolveFinished!: () => void;
+  const finished = new Promise<void>((resolve) => { resolveFinished = resolve; });
+  const playback: ActiveCompletionSpeech = {
+    finished,
+    finish: () => {
+      clearTimeout(timeout);
+      if (activeCompletionSpeech === playback) activeCompletionSpeech = null;
+      resolveFinished();
+    },
+  };
+  // 原生回调丢失时解除等待；接续提示仍采用 enqueue，不会主动截断正在播放的语音。
+  const timeout = setTimeout(playback.finish, COMPLETION_CALLBACK_TIMEOUT_MS);
+  activeCompletionSpeech = playback;
+  return playback;
 };
 
 /**
@@ -145,7 +173,11 @@ export function isSoundEnabled(): boolean {
 /**
  * 播放中文语音
  */
-async function speakChinese(text: string, mode: 'enqueue' | 'replace' = 'enqueue') {
+async function speakChinese(
+  text: string,
+  mode: SpeechMode = 'enqueue',
+  isOrderCompletion = false
+) {
   if (!soundEnabled) {
     logger.log('[Feedback] 声音已关闭，跳过语音');
     return;
@@ -161,20 +193,20 @@ async function speakChinese(text: string, mode: 'enqueue' | 'replace' = 'enqueue
     return;
   }
 
-  const trackPendingSpeech = mode === 'replace';
-  if (trackPendingSpeech && pendingPrioritySpeechTexts.has(normalizedText)) {
-    return;
-  }
-
-  if (mode === 'replace') {
-    await cancelSpeechSession(`priority:${normalizedText}`);
-  }
-
-  if (trackPendingSpeech) {
-    pendingPrioritySpeechTexts.add(normalizedText);
-  }
+  const orderReadyRequest = mode === 'order-ready' ? ++latestOrderReadyRequest : null;
+  const precedingCompletion = mode === 'order-ready' ? activeCompletionSpeech : null;
+  // 只保护已经开始播放的本单完成提示；其它优先事件仍立即停止旧语音。
+  const shouldReplace = mode === 'replace' || (mode === 'order-ready' && !precedingCompletion);
+  const resetPromise = shouldReplace
+    ? cancelSpeechSession(`priority:${normalizedText}`)
+    : speechResetPromise;
   const generation = speechSessionGeneration;
   try {
+    await resetPromise;
+    if (precedingCompletion) {
+      await precedingCompletion.finished;
+      if (orderReadyRequest !== latestOrderReadyRequest) return;
+    }
     if (!soundEnabled || generation !== speechSessionGeneration) {
       return;
     }
@@ -187,6 +219,7 @@ async function speakChinese(text: string, mode: 'enqueue' | 'replace' = 'enqueue
 
     await new Promise<void>((resolve) => {
       let settled = false;
+      let completionPlayback: ActiveCompletionSpeech | null = null;
       const resolveOnce = () => {
         if (settled) {
           return;
@@ -194,6 +227,10 @@ async function speakChinese(text: string, mode: 'enqueue' | 'replace' = 'enqueue
         settled = true;
         clearTimeout(timeoutId);
         resolve();
+      };
+      const finishPlayback = () => {
+        completionPlayback?.finish();
+        resolveOnce();
       };
       const timeoutId = setTimeout(resolveOnce, SPEECH_FINISH_TIMEOUT_MS);
 
@@ -204,14 +241,15 @@ async function speakChinese(text: string, mode: 'enqueue' | 'replace' = 'enqueue
         onStart: () => {
           if (generation === speechSessionGeneration) {
             lastSpeechStartedAt = Date.now();
+            if (isOrderCompletion) completionPlayback = trackCompletionPlayback();
           }
         },
-        onDone: resolveOnce,
-        onStopped: resolveOnce,
+        onDone: finishPlayback,
+        onStopped: finishPlayback,
         onError: (error) => {
           logger.error('播放语音失败:', error);
           speechReadyAt = Math.max(speechReadyAt, Date.now() + SPEECH_RESUME_SETTLE_MS);
-          resolveOnce();
+          finishPlayback();
         },
       });
     });
@@ -225,28 +263,31 @@ async function speakChinese(text: string, mode: 'enqueue' | 'replace' = 'enqueue
       await resetSpeechSession('speak-error', SPEECH_RESUME_SETTLE_MS);
       await warmupSpeechEngine('speak-error');
     }
-  } finally {
-    if (trackPendingSpeech) {
-      pendingPrioritySpeechTexts.delete(normalizedText);
-    }
   }
 }
+
+const notifyWithSpeech = async (
+  text: string,
+  type: Haptics.NotificationFeedbackType,
+  mode: SpeechMode = 'enqueue',
+  isOrderCompletion = false
+): Promise<void> => {
+  // 语音先登记，震动独立执行；慢震动不能让旧成功提示越过新的错误提示。
+  const speech = speakChinese(text, mode, isOrderCompletion);
+  try {
+    await performNotificationHaptic(type);
+  } catch (error) {
+    logger.error('[Feedback] 震动失败:', error);
+  }
+  await speech;
+};
 
 /**
  * 扫码成功反馈 - 震动 + "扫码成功"语音
  */
 export async function feedbackSuccess() {
   logger.log('[Feedback] feedbackSuccess 触发');
-  
-  // 震动
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-  
-  // 语音
-  await speakChinese('扫码成功');
+  await notifyWithSpeech('扫码成功', Haptics.NotificationFeedbackType.Success);
 }
 
 /**
@@ -254,16 +295,7 @@ export async function feedbackSuccess() {
  */
 export async function feedbackDuplicate() {
   logger.log('[Feedback] feedbackDuplicate 触发');
-  
-  // 震动一次
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Error);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-  
-  // 语音
-  await speakChinese('扫码重复', 'replace');
+  await notifyWithSpeech('扫码重复', Haptics.NotificationFeedbackType.Error, 'replace');
 }
 
 /**
@@ -274,34 +306,28 @@ export async function feedbackConfirm() {
   await speakChinese('确认', 'replace');
 }
 
+export async function feedbackCancel() {
+  await speakChinese('已取消', 'replace');
+}
+
+export async function feedbackDeleted() {
+  await speakChinese('已删除', 'replace');
+}
+
 /**
  * 进入采购入库扫码反馈 - 震动 + "开始入库"语音
  */
 export async function feedbackInboundStart() {
   logger.log('[Feedback] feedbackInboundStart 触发');
-
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-
-  await speakChinese('开始入库', 'replace');
+  await notifyWithSpeech('开始入库', Haptics.NotificationFeedbackType.Success, 'replace');
 }
 
 /**
- * 入库确认完成反馈 - 震动 + "入库完成"语音
+ * 入库保存结果反馈：整单完成与部分入库使用不同语音
  */
-export async function feedbackInboundComplete() {
+export async function feedbackInboundComplete(complete = true) {
   logger.log('[Feedback] feedbackInboundComplete 触发');
-
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-
-  await speakChinese('入库完成', 'replace');
+  await notifyWithSpeech(complete ? '本单已入库完成' : '本次入库已保存，本单尚未完成', Haptics.NotificationFeedbackType.Success, 'replace', true);
 }
 
 /**
@@ -309,20 +335,17 @@ export async function feedbackInboundComplete() {
  */
 export async function feedbackInventoryComplete() {
   logger.log('[Feedback] feedbackInventoryComplete 触发');
-
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-
-  await speakChinese('盘点完成', 'replace');
+  await notifyWithSpeech('盘点完成', Haptics.NotificationFeedbackType.Success, 'replace');
 }
 
 /**
- * 错误反馈（单次）
+ * 错误反馈（单次）；传入文案时，停止旧语音并明确播报错误。
  */
-export async function feedbackError() {
+export async function feedbackError(message?: string) {
+  if (message?.trim()) {
+    await notifyWithSpeech(message, Haptics.NotificationFeedbackType.Error, 'replace');
+    return;
+  }
   try {
     await performNotificationHaptic(Haptics.NotificationFeedbackType.Error);
   } catch (e) {
@@ -331,28 +354,25 @@ export async function feedbackError() {
 }
 
 export async function feedbackQuerySuccess() {
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
-  } catch (error) {
-    logger.error('[Feedback] 查询成功震动失败:', error);
-  }
-  await speakChinese('查询成功');
+  await notifyWithSpeech('查询成功', Haptics.NotificationFeedbackType.Success);
 }
 
 export async function feedbackQueryFailed() {
-  await feedbackError();
-  await speakChinese('查询失败', 'replace');
+  await feedbackError('查询失败');
 }
 
 export async function feedbackClearFailed() {
-  await feedbackError();
-  await speakChinese('清空失败', 'replace');
+  await feedbackError('清空失败');
 }
 
 /**
- * 警告反馈（单次）
+ * 警告反馈（单次）；省略文案时保留原来的仅震动行为。
  */
-export async function feedbackWarning() {
+export async function feedbackWarning(message?: string) {
+  if (message?.trim()) {
+    await notifyWithSpeech(message, Haptics.NotificationFeedbackType.Warning, 'replace');
+    return;
+  }
   try {
     await performNotificationHaptic(Haptics.NotificationFeedbackType.Warning);
   } catch (e) {
@@ -361,17 +381,11 @@ export async function feedbackWarning() {
 }
 
 export async function feedbackUnpackRequired() {
-  await feedbackWarning();
-  await speakChinese('需要拆包');
+  await notifyWithSpeech('需要拆包', Haptics.NotificationFeedbackType.Warning);
 }
 
 export async function feedbackUnpackComplete() {
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
-  } catch (error) {
-    logger.error('[Feedback] 拆包完成震动失败:', error);
-  }
-  await speakChinese('拆包完成');
+  await notifyWithSpeech('拆包完成', Haptics.NotificationFeedbackType.Success);
 }
 
 /**
@@ -379,14 +393,54 @@ export async function feedbackUnpackComplete() {
  * 使用一条完整语音，避免与普通“扫码成功”或“拆包完成”相互抢占。
  */
 export async function feedbackOutboundOrderComplete(afterUnpack = false) {
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
-  } catch (error) {
-    logger.error('[Feedback] 本单完成震动失败:', error);
-  }
-  await speakChinese(
+  await notifyWithSpeech(
     afterUnpack ? '拆包完成，本单已扫完' : '本单已扫完，可扫描下一单',
-    'replace'
+    Haptics.NotificationFeedbackType.Success,
+    'replace',
+    true
+  );
+}
+
+/** 扫描订单并恢复界面后的提示，与物料保存成功分开。 */
+export async function feedbackOutboundOrderReady(
+  status: 'loaded' | 'switched' | 'current' | 'complete' | 'verifying'
+) {
+  const messages = {
+    loaded: '订单已载入',
+    switched: '切换订单',
+    current: '当前订单，请继续扫码',
+    complete: '本单已扫完',
+    verifying: '订单正在核验，请稍候',
+  };
+  const haptic = status === 'switched' || status === 'verifying'
+    ? Haptics.NotificationFeedbackType.Warning
+    : Haptics.NotificationFeedbackType.Success;
+  await notifyWithSpeech(messages[status], haptic, 'order-ready', status === 'complete');
+}
+
+/** 销售退货使用专用文案，复用订单切换与原生完成播报的保护逻辑。 */
+export async function feedbackSalesReturnOrderReady(
+  status: 'loaded' | 'switched' | 'current' | 'complete'
+) {
+  const messages = {
+    loaded: '销售退货单已载入',
+    switched: '切换退货单',
+    current: '当前退货单，请继续扫码',
+    complete: '本单退货已收齐',
+  };
+  const haptic = status === 'switched'
+    ? Haptics.NotificationFeedbackType.Warning
+    : Haptics.NotificationFeedbackType.Success;
+  await notifyWithSpeech(messages[status], haptic, 'order-ready', status === 'complete');
+}
+
+/** 仅在退货记录保存成功之后调用；收齐时只播报一条完成提示。 */
+export async function feedbackSalesReturnSaved(complete = false) {
+  await notifyWithSpeech(
+    complete ? '本单退货已收齐' : '退货扫码成功',
+    Haptics.NotificationFeedbackType.Success,
+    complete ? 'replace' : 'enqueue',
+    complete
   );
 }
 
@@ -395,16 +449,7 @@ export async function feedbackOutboundOrderComplete(afterUnpack = false) {
  */
 export async function feedbackClear() {
   logger.log('[Feedback] feedbackClear 触发');
-  
-  // 震动
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Warning);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-  
-  // 语音
-  await speakChinese('已清空', 'replace');
+  await notifyWithSpeech('已清空', Haptics.NotificationFeedbackType.Warning, 'replace');
 }
 
 /**
@@ -412,16 +457,7 @@ export async function feedbackClear() {
  */
 export async function feedbackNewOrder() {
   logger.log('[Feedback] feedbackNewOrder 触发');
-  
-  // 震动
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Success);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-  
-  // 语音
-  await speakChinese('新订单', 'replace');
+  await notifyWithSpeech('新订单', Haptics.NotificationFeedbackType.Success, 'replace');
 }
 
 /**
@@ -429,16 +465,7 @@ export async function feedbackNewOrder() {
  */
 export async function feedbackSwitchOrder() {
   logger.log('[Feedback] feedbackSwitchOrder 触发');
-  
-  // 震动
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Warning);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-  
-  // 语音
-  await speakChinese('切换订单', 'replace');
+  await notifyWithSpeech('切换订单', Haptics.NotificationFeedbackType.Warning, 'replace');
 }
 
 /**
@@ -446,14 +473,7 @@ export async function feedbackSwitchOrder() {
  */
 export async function feedbackNotBound() {
   logger.log('[Feedback] feedbackNotBound 触发');
-
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Error);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-
-  await speakChinese('未绑定', 'replace');
+  await notifyWithSpeech('未绑定', Haptics.NotificationFeedbackType.Error, 'replace');
 }
 
 /**
@@ -461,14 +481,7 @@ export async function feedbackNotBound() {
  */
 export async function feedbackNotInOrder() {
   logger.log('[Feedback] feedbackNotInOrder 触发');
-
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Error);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-
-  await speakChinese('不在本单', 'replace');
+  await notifyWithSpeech('不在本单', Haptics.NotificationFeedbackType.Error, 'replace');
 }
 
 /**
@@ -476,14 +489,7 @@ export async function feedbackNotInOrder() {
  */
 export async function feedbackOverQuantity() {
   logger.log('[Feedback] feedbackOverQuantity 触发');
-
-  try {
-    await performNotificationHaptic(Haptics.NotificationFeedbackType.Warning);
-  } catch (e) {
-    logger.error('[Feedback] 震动失败:', e);
-  }
-
-  await speakChinese('超量了', 'replace');
+  await notifyWithSpeech('超量了', Haptics.NotificationFeedbackType.Warning, 'replace');
 }
 
 /**
@@ -513,7 +519,7 @@ export async function resumeFeedbackAfterAppActive() {
 }
 
 // ============================================================================
-// React Hook - 自动清理
+// 页面卸载时自动释放语音资源。
 // ============================================================================
 
 /**

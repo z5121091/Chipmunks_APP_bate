@@ -1,6 +1,8 @@
 import { StyleSheet } from 'react-native';
 import { Spacing, Typography, type Theme } from '@/constants/theme';
 
+export const RULE_CARD_MIN_HEIGHT = 80;
+
 export const createStyles = (theme: Theme) =>
   StyleSheet.create({
     container: { flex: 1, backgroundColor: theme.backgroundRoot },
@@ -24,6 +26,7 @@ export const createStyles = (theme: Theme) =>
       paddingHorizontal: 12,
     },
     headerActionText: { ...Typography.smallMedium, color: theme.textSecondary },
+    actionDisabled: { opacity: 0.5 },
     sortHint: { ...Typography.caption, color: theme.textSecondary, marginTop: 2 },
     addButton: {
       minHeight: 44,
@@ -45,12 +48,13 @@ export const createStyles = (theme: Theme) =>
       padding: 14,
       flexDirection: 'row',
       alignItems: 'center',
-      minHeight: 80,
+      minHeight: RULE_CARD_MIN_HEIGHT,
     },
     swipeContainer: { borderRadius: 8, overflow: 'hidden' },
     ruleContent: { flex: 1, minWidth: 0, gap: 4 },
     ruleSwitch: { marginLeft: 8, justifyContent: 'center' },
     ruleItemDragging: {
+      zIndex: 1,
       elevation: 10,
       shadowColor: '#000000',
       shadowOpacity: 0.28,
@@ -209,6 +213,10 @@ export const createStyles = (theme: Theme) =>
     },
     sectionContainer: { paddingBottom: 16 },
     conditionsList: { marginVertical: 16 },
+    conditionHint: { ...Typography.caption, color: theme.textSecondary, lineHeight: 20, marginBottom: 12 },
+    conditionGroupTitle: { ...Typography.smallMedium, color: theme.textPrimary, marginTop: 12, marginBottom: 4 },
+    conditionGroupAction: { minWidth: 64, minHeight: 44, paddingHorizontal: 6, alignItems: 'center', justifyContent: 'center' },
+    conditionPickerButton: { justifyContent: 'space-between', gap: 8 },
     conditionItem: {
       flexDirection: 'row',
       alignItems: 'center',

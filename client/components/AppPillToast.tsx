@@ -48,6 +48,7 @@ export function AppPillToast({ text, type = 'success', bottom, style }: AppPillT
           : 'check-circle';
   // 浅色主题的状态色使用深字，深色主题使用深蓝字，保证所有状态提示都有足够对比度。
   const foregroundColor = theme.isDark ? theme.buttonPrimaryText : theme.black;
+  const persistentError = type === 'error';
 
   return (
     <Animated.View
@@ -78,6 +79,7 @@ export function AppPillToast({ text, type = 'success', bottom, style }: AppPillT
       <Animated.View
         style={[
           styles.pill,
+          persistentError && styles.persistentError,
           {
             backgroundColor: color,
             borderColor: withAlpha(foregroundColor, 0.18),
@@ -85,8 +87,20 @@ export function AppPillToast({ text, type = 'success', bottom, style }: AppPillT
           },
         ]}
       >
-        <Feather name={icon} size={rf(16)} color={foregroundColor} />
-        <Text numberOfLines={2} style={[styles.text, { color: foregroundColor }]}>
+        <Feather
+          name={icon}
+          size={rf(16)}
+          color={foregroundColor}
+          style={persistentError ? styles.persistentErrorIcon : undefined}
+        />
+        <Text
+          accessibilityRole={persistentError ? 'alert' : undefined}
+          style={[
+            styles.text,
+            ...(persistentError ? [styles.persistentErrorText] : []),
+            { color: foregroundColor },
+          ]}
+        >
           {text}
         </Text>
       </Animated.View>
@@ -119,9 +133,26 @@ const styles = StyleSheet.create({
     shadowRadius: 16,
     elevation: 8,
   },
+  persistentError: {
+    width: '100%',
+    borderRadius: BorderRadius.xl,
+    alignItems: 'flex-start',
+    justifyContent: 'flex-start',
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm + 2,
+  },
+  persistentErrorIcon: {
+    marginTop: 2,
+  },
   text: {
     ...Typography.feedback,
     textAlign: 'center',
     includeFontPadding: false,
+  },
+  persistentErrorText: {
+    flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
+    textAlign: 'left',
   },
 });

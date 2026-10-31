@@ -23,7 +23,9 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -48,7 +50,7 @@ object AutoDatabaseBackupScheduler {
   private const val LAST_SUCCESS_DATABASE_SIGNATURE_KEY = "last_success_database_signature"
   private const val FORCE_NEXT_BACKUP_KEY = "force_next_backup"
   private const val LAST_NO_DATA_DATE_KEY = "last_no_data_date"
-  const val ACTION_RUN_BACKUP = "com.chipmunks.traceability.AUTO_DATABASE_BACKUP"
+  val ACTION_RUN_BACKUP = "${BuildConfig.APPLICATION_ID}.AUTO_DATABASE_BACKUP"
   private val BEIJING_TIME_ZONE: TimeZone = TimeZone.getTimeZone("Asia/Shanghai")
 
   fun schedule(context: Context) {
@@ -326,6 +328,12 @@ class AutoDatabaseBackupWorker(
   workerParams: WorkerParameters
 ) : CoroutineWorker(appContext, workerParams) {
   override suspend fun doWork(): Result {
+    // Periodic and one-time work use different WorkManager names. Their
+    // database snapshot/upload/status steps must still run one at a time.
+    if (!backupInProgress.compareAndSet(false, true)) {
+      Log.i(TAG, "Another database backup is running; retry this work later")
+      return Result.retry()
+    }
     return try {
       val today = AutoDatabaseBackupScheduler.todayBeijing()
       Log.i(TAG, "Auto database backup worker started for $today")
@@ -402,9 +410,9 @@ class AutoDatabaseBackupWorker(
         applicationContext,
         "success",
         "workmanager",
-        fileName = backupSnapshot.file.name
+        fileName = backupSnapshot.remoteFileName
       )
-      Log.i(TAG, "Auto database backup completed: ${backupSnapshot.file.name}")
+      Log.i(TAG, "Auto database backup completed: ${backupSnapshot.remoteFileName}")
       Result.success()
     } catch (error: Exception) {
       Log.w(TAG, "Auto database backup failed", error)
@@ -415,6 +423,8 @@ class AutoDatabaseBackupWorker(
         errorMessage = error.message ?: "Unknown error"
       )
       Result.retry()
+    } finally {
+      backupInProgress.set(false)
     }
   }
 
@@ -425,7 +435,8 @@ class AutoDatabaseBackupWorker(
       "出库明细",
       "入库记录",
       "盘点记录",
-      "拆包记录"
+      "拆包记录",
+      "销售退货记录"
     )
 
     SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
@@ -453,7 +464,8 @@ class AutoDatabaseBackupWorker(
 
   private data class DatabaseBackupSnapshot(
     val file: File,
-    val sourceSignature: String?
+    val sourceSignature: String?,
+    val remoteFileName: String
   )
 
   private fun createDatabaseSnapshot(
@@ -463,31 +475,36 @@ class AutoDatabaseBackupWorker(
     val backupDir = File(applicationContext.cacheDir, "auto-db-backup").apply {
       mkdirs()
     }
-    val backupFile = File(backupDir, backupFileName)
-    if (backupFile.exists() && !backupFile.delete()) {
-      throw IllegalStateException("Unable to replace stale database snapshot: ${backupFile.absolutePath}")
-    }
+    // A local snapshot belongs only to this execution. Never delete a file
+    // named after a remote sequence that another worker could be uploading.
+    val backupFile = File(backupDir, "snapshot-${UUID.randomUUID()}.db")
 
     val signatureBefore = AutoDatabaseBackupScheduler.getDatabaseSignature(databaseFile)
     val escapedPath = backupFile.absolutePath.replace("'", "''")
-    SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
-      .use { database ->
-        database.execSQL("VACUUM INTO '$escapedPath'")
-      }
+    try {
+      SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
+        .use { database ->
+          database.execSQL("VACUUM INTO '$escapedPath'")
+        }
 
-    if (!backupFile.exists() || backupFile.length() <= 0L) {
-      throw IllegalStateException("SQLite did not create a valid database snapshot")
+      if (!backupFile.exists() || backupFile.length() <= 0L) {
+        throw IllegalStateException("SQLite did not create a valid database snapshot")
+      }
+    } catch (error: Exception) {
+      backupFile.delete()
+      throw error
     }
 
     val signatureAfter = AutoDatabaseBackupScheduler.getDatabaseSignature(databaseFile)
     return DatabaseBackupSnapshot(
       file = backupFile,
-      sourceSignature = signatureBefore.takeIf { it == signatureAfter }
+      sourceSignature = signatureBefore.takeIf { it == signatureAfter },
+      remoteFileName = backupFileName
     )
   }
 
   private fun uploadBackup(databaseFile: File, date: String): DatabaseBackupSnapshot {
-    val server = WebDavServer.from(DEFAULT_UPDATE_SERVER)
+    val server = WebDavServer.from(readEffectiveUpdateServer())
     val backupDirectoryUrl = "${server.cleanBaseUrl}/backup/"
 
     for (sequence in 1..999) {
@@ -500,13 +517,41 @@ class AutoDatabaseBackupWorker(
       val backupSnapshot = createDatabaseSnapshot(databaseFile, backupFileName)
       val backupFile = backupSnapshot.file
       Log.i(TAG, "Database snapshot created: ${backupFile.absolutePath}, size=${backupFile.length()}")
-      Log.i(TAG, "Uploading database backup to: $backupFileUrl")
-      if (putFile(server, backupFileUrl, backupFile)) {
-        return backupSnapshot
+      Log.i(TAG, "Uploading database backup: $backupFileName")
+      try {
+        if (putFile(server, backupFileUrl, backupFile)) {
+          return backupSnapshot
+        }
+      } finally {
+        // Metadata remains available after deletion; the uploaded snapshot is
+        // no longer needed locally, including 412 conflicts and failed PUTs.
+        if (backupFile.exists() && !backupFile.delete()) {
+          Log.w(TAG, "Unable to remove this execution's temporary database snapshot")
+        }
       }
     }
 
     throw IllegalStateException("NAS 当日数据库备份序号已超过 999：$date")
+  }
+
+  private fun readEffectiveUpdateServer(): String {
+    // Expo's documentDirectory maps to filesDir. JS publishes with same-directory rename,
+    // so a reader sees either the old complete configuration or the new complete one.
+    val configFile = File(applicationContext.filesDir, "auto-db-backup/server-config.json")
+    if (!configFile.exists()) return DEFAULT_UPDATE_SERVER // Older installations have no mirror yet.
+    try {
+      if (configFile.length() > 64 * 1024) throw IllegalStateException()
+      val config = JSONObject(configFile.readText(StandardCharsets.UTF_8))
+      if (config.optInt("version") != 1) throw IllegalStateException()
+      val serverUrl = config.optString("serverUrl").trim()
+      val uri = URI(serverUrl)
+      if (uri.scheme?.lowercase(Locale.US) !in listOf("http", "https") || uri.host.isNullOrBlank()) throw IllegalStateException()
+      return serverUrl
+    } catch (_: Exception) {
+      // Never silently send a backup to the build-time destination when a newer setting is corrupt.
+      // Do not attach the original exception: URI/JSON errors may contain credentials.
+      throw IllegalStateException("NAS 后台配置无法读取，请打开 APP 同步服务器配置后重试")
+    }
   }
 
   private fun remoteFileExists(server: WebDavServer, targetUrl: String): Boolean {
@@ -612,7 +657,8 @@ class AutoDatabaseBackupWorker(
         )
 
         val authHeader = userInfo?.let {
-          val decodedUserInfo = URLDecoder.decode(it, StandardCharsets.UTF_8.name())
+          // URL user-info uses percent escapes, not HTML form encoding; '+' is a literal plus.
+          val decodedUserInfo = URLDecoder.decode(it.replace("+", "%2B"), StandardCharsets.UTF_8.name())
           val token = Base64.encodeToString(decodedUserInfo.toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP)
           "Basic $token"
         }
@@ -624,6 +670,7 @@ class AutoDatabaseBackupWorker(
 
   companion object {
     private const val TAG = "AutoDbBackup"
-    private const val DEFAULT_UPDATE_SERVER = __DEFAULT_UPDATE_SERVER__
+    private val DEFAULT_UPDATE_SERVER = BuildConfig.UPDATE_SERVER_URL
+    private val backupInProgress = AtomicBoolean(false)
   }
 }

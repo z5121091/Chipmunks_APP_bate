@@ -11,14 +11,14 @@ type AppColorScheme = 'light' | 'dark';
 
 const ColorSchemeContext = createContext<AppColorScheme>('light');
 
-const normalizeColorScheme = (value: ColorSchemeName): AppColorScheme | null => {
+const normalizeColorScheme = (value: ColorSchemeName | null): AppColorScheme | null => {
   return value === 'light' || value === 'dark' ? value : null;
 };
 
 const resolveColorScheme = (
   themePreference: AppThemePreference,
   systemColorScheme: ColorSchemeName,
-  workbenchColorScheme: ColorSchemeName
+  workbenchColorScheme: AppColorScheme | null
 ): AppColorScheme => {
   const normalizedWorkbenchColorScheme = normalizeColorScheme(workbenchColorScheme);
   if (normalizedWorkbenchColorScheme) {
@@ -34,7 +34,7 @@ const resolveColorScheme = (
 
 const ColorSchemeProvider = function ({ children }: { children?: ReactNode }) {
   const systemColorScheme = useReactNativeColorScheme();
-  const [workbenchColorScheme, setWorkbenchColorScheme] = useState<ColorSchemeName>(null);
+  const [workbenchColorScheme, setWorkbenchColorScheme] = useState<AppColorScheme | null>(null);
 
   const colorScheme = useMemo(
     () => resolveColorScheme(DEFAULT_THEME, systemColorScheme, workbenchColorScheme),

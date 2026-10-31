@@ -6,8 +6,7 @@ interface LegacyRuleFields {
   fieldPrefixes?: Record<string, string>;
 }
 
-// Older backups appended customFieldIds after standard fields; inline custom keys
-// are already positioned and must not be appended a second time.
+// 旧备份会把自定义字段追加在标准字段后；已经排好位置的字段不能重复追加。
 export const migrateLegacyRuleFields = <T extends LegacyRuleFields>(rule: T): T => {
   const order = [...rule.fieldOrder];
   if (!order.some(field => field.startsWith('custom:'))) {
