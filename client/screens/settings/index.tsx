@@ -23,7 +23,6 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { logger } from '@/utils/logger';
 import {
-  getAllUnpackRecords,
   getAllInboundRecords,
   getInventoryCheckDocumentSummaries,
   getInventoryCheckRecordsByNo,
@@ -79,9 +78,7 @@ import {
   buildInventorySheets,
   type InventoryExportRecord,
 } from '@/utils/inventoryExport';
-import { buildUnpackLabelSheet } from '@/utils/labelExport';
 import { buildOutboundExportFileName, buildOutboundSheets } from '@/utils/outboundExport';
-import { selectLatestOrderUnpackRecords } from '@/utils/unpackRecords';
 import { safeJsonParseNullable } from '@/utils/json';
 import {
   getSyncConfigError,
@@ -130,7 +127,7 @@ import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 
 const FileSystem = FileSystemLegacy;
 
-type SyncTaskKey = 'inbound' | 'outbound' | 'inventory' | 'order-labels';
+type SyncTaskKey = 'inbound' | 'outbound' | 'inventory';
 const activeSyncTasks = new Set<SyncTaskKey>();
 
 const getErrorMessage = (error: unknown, fallback: string) =>
@@ -384,7 +381,6 @@ export default function SettingsScreen() {
   const [syncingInbound, setSyncingInbound] = useState(false);
   const [syncingOutbound, setSyncingOutbound] = useState(false);
   const [syncingInventory, setSyncingInventory] = useState(false);
-  const [syncingLabels, setSyncingLabels] = useState(false);
 
   // 在线更新相关状态
   const [updateModalVisible, setUpdateModalVisible] = useState(false);
@@ -911,39 +907,6 @@ export default function SettingsScreen() {
     } finally {
       activeSyncTasks.delete('inventory');
       setSyncingInventory(false);
-    }
-  };
-
-  // 同步最近一个订单的全部拆包标签。
-  const handleSyncLabels = async () => {
-    if (activeSyncTasks.has('order-labels')) {
-      return;
-    }
-
-    activeSyncTasks.add('order-labels');
-    setSyncingLabels(true);
-    try {
-      const records = await getAllUnpackRecords();
-
-      if (records.length === 0) {
-        alert.showWarning('暂无订单标签可同步');
-        return;
-      }
-
-      const latestOrderRecords = selectLatestOrderUnpackRecords(records);
-      if (latestOrderRecords.length === 0) {
-        alert.showWarning('最近订单暂无标签可同步');
-        return;
-      }
-
-      const labelSheet = buildUnpackLabelSheet(latestOrderRecords);
-      await syncToComputerMultiSheet([labelSheet], '/labels', setSyncingLabels);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '请检查服务是否运行';
-      alert.showError(`同步失败：${formatSyncErrorMessage(message)}`);
-    } finally {
-      activeSyncTasks.delete('order-labels');
-      setSyncingLabels(false);
     }
   };
 
@@ -2084,15 +2047,6 @@ export default function SettingsScreen() {
                 handleSyncInventory,
                 !canSync,
                 syncingInventory
-              )}
-              {renderMenuCard(
-                '同步订单标签',
-                '生成最近订单拆包标签 Excel',
-                'copy',
-                theme.purple,
-                handleSyncLabels,
-                !canSync,
-                syncingLabels
               )}
             </View>
           )}
