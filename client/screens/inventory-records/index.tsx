@@ -109,6 +109,7 @@ export default function InventoryRecordsScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [syncingKeys, setSyncingKeys] = useState<Set<string>>(new Set());
+  const syncingKeysRef = useRef(new Set<string>());
   const [notice, setNotice] = useState<{ text: string; type: NoticeType } | null>(null);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -185,7 +186,7 @@ export default function InventoryRecordsScreen() {
       pageActiveRef.current = true;
       const sessionId = ++pageSessionRef.current;
       setLoadingKeys(new Set());
-      setSyncingKeys(new Set());
+      setSyncingKeys(new Set(syncingKeysRef.current));
       void loadDocuments(selectedAccountKey);
 
       return () => {
@@ -366,8 +367,10 @@ export default function InventoryRecordsScreen() {
 
   const handleResyncDocument = useCallback((item: InventoryCheckDocumentSummary) => {
     const key = getDocumentKey(item);
-    if (syncingKeys.has(key)) return;
     const ownsPage = capturePageOwner(selectedAccountKey);
+    if (!ownsPage() || syncingKeysRef.current.has(key)) return;
+    // Lock before the first await so rapid taps cannot submit the same document twice.
+    syncingKeysRef.current.add(key);
 
     void (async () => {
       setSyncingKeys((prev) => new Set(prev).add(key));
@@ -380,7 +383,8 @@ export default function InventoryRecordsScreen() {
           return;
         }
 
-        const records = detailsByKey[key] || await getInventoryCheckRecordsByNo(item.check_no, item.warehouse_id);
+        const records = await getInventoryCheckRecordsByNo(item.check_no, item.warehouse_id);
+        if (!ownsPage()) return;
         if (records.length === 0) {
           showNotice('该盘点单没有可同步明细', 'warning');
           return;
@@ -426,30 +430,29 @@ export default function InventoryRecordsScreen() {
 
         const refreshed = await refreshDocumentSummaries();
         if (!ownsPage() || !refreshed?.isCurrent()) return;
-        if (!detailsByKey[key]) {
-          setDetailsByKey((prev) => ({ ...prev, [key]: records }));
-        }
+        setDetailsByKey((prev) => ({ ...prev, [key]: records }));
       } catch (error) {
-        await updateInventoryCheckDocumentSyncStatus(
-          item.check_no,
-          item.warehouse_id,
-          'failed',
-          undefined,
-          error instanceof Error ? error.message : String(error)
-        );
+        try {
+          await updateInventoryCheckDocumentSyncStatus(
+            item.check_no,
+            item.warehouse_id,
+            'failed',
+            undefined,
+            error instanceof Error ? error.message : String(error)
+          );
+        } catch {
+          // A status-write failure must not swallow the sync error or prevent a retry.
+        }
         if (ownsPage()) {
           showNotice('重新同步失败，请检查同步助手', 'error');
           await refreshDocumentSummaries();
         }
       } finally {
-        if (ownsPage()) setSyncingKeys((prev) => {
-          const next = new Set(prev);
-          next.delete(key);
-          return next;
-        });
+        syncingKeysRef.current.delete(key);
+        if (pageActiveRef.current) setSyncingKeys(new Set(syncingKeysRef.current));
       }
     })();
-  }, [capturePageOwner, detailsByKey, refreshDocumentSummaries, selectedAccountKey, showNotice, syncingKeys]);
+  }, [capturePageOwner, refreshDocumentSummaries, selectedAccountKey, showNotice]);
 
   const getDetailGroups = useCallback((records: InventoryCheckRecord[]): InventoryDetailGroup[] => {
     const groupMap = new Map<string, InventoryDetailGroup>();
@@ -620,9 +623,9 @@ export default function InventoryRecordsScreen() {
     const syncActionLabel =
       syncing
         ? '同步中'
-        : item.sync_status === 'failed'
+        : item.sync_status === 'success' || item.sync_status === 'failed'
           ? '重新同步'
-          : syncMeta.label;
+          : '同步到电脑';
 
     return (
       <AnimatedCard onPress={() => toggleDocument(item)} onLongPress={() => handleDeleteDocument(item)}>
@@ -645,6 +648,8 @@ export default function InventoryRecordsScreen() {
                   ]}
                   activeOpacity={0.72}
                   disabled={syncing}
+                  accessibilityRole="button"
+                  accessibilityLabel={`${syncMeta.label}，${syncActionLabel}`}
                   onPress={(event) => {
                     event.stopPropagation();
                     handleResyncDocument(item);
@@ -660,6 +665,9 @@ export default function InventoryRecordsScreen() {
                   </Text>
                 </TouchableOpacity>
               </View>
+              <Text style={[styles.documentMeta, { color: syncMeta.color }]}>
+                {syncMeta.label}
+              </Text>
               <Text style={styles.documentMeta} numberOfLines={1}>
                 {item.check_date} · {item.warehouse_name} · {getDocumentAccountLabel(item)}
               </Text>

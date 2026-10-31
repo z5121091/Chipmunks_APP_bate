@@ -23,9 +23,6 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { logger } from '@/utils/logger';
 import {
-  getAllInboundRecords,
-  getInventoryCheckDocumentSummaries,
-  getInventoryCheckRecordsByNo,
   getOutboundExportRows,
   exportBackupData,
   importBackupData,
@@ -36,7 +33,6 @@ import {
   BackupData,
   isBackupDataShape,
   STORAGE_KEYS,
-  updateInventoryCheckDocumentSyncStatus,
 } from '@/utils/database';
 import { formatDateTimeExport } from '@/utils/time';
 import { useTheme } from '@/hooks/useTheme';
@@ -68,16 +64,6 @@ import { formatSyncErrorMessage, syncExcelToComputer, type ExcelSheet } from '@/
 import {
   getWarehouseExportSegment,
 } from '@/utils/excelSchema';
-import {
-  buildInboundExportFileName,
-  buildInboundSheets,
-  type InboundExportRecord,
-} from '@/utils/inboundExport';
-import {
-  buildInventoryExportFileNameFromNo,
-  buildInventorySheets,
-  type InventoryExportRecord,
-} from '@/utils/inventoryExport';
 import { buildOutboundExportFileName, buildOutboundSheets } from '@/utils/outboundExport';
 import { safeJsonParseNullable } from '@/utils/json';
 import {
@@ -127,7 +113,7 @@ import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 
 const FileSystem = FileSystemLegacy;
 
-type SyncTaskKey = 'inbound' | 'outbound' | 'inventory';
+type SyncTaskKey = 'outbound';
 const activeSyncTasks = new Set<SyncTaskKey>();
 
 const getErrorMessage = (error: unknown, fallback: string) =>
@@ -378,9 +364,7 @@ export default function SettingsScreen() {
   const [soundEnabled, setSoundEnabled] = useState(true);
 
   // 各数据类型的同步状态
-  const [syncingInbound, setSyncingInbound] = useState(false);
   const [syncingOutbound, setSyncingOutbound] = useState(false);
-  const [syncingInventory, setSyncingInventory] = useState(false);
 
   // 在线更新相关状态
   const [updateModalVisible, setUpdateModalVisible] = useState(false);
@@ -737,51 +721,6 @@ export default function SettingsScreen() {
     }
   };
 
-  // 同步入库单（包含所有扩展字段）
-  const handleSyncInbound = async () => {
-    if (activeSyncTasks.has('inbound')) {
-      return;
-    }
-
-    activeSyncTasks.add('inbound');
-    setSyncingInbound(true);
-    try {
-      const records = await getAllInboundRecords();
-
-      if (records.length === 0) {
-        alert.showWarning('暂无数据可同步');
-        return;
-      }
-
-      const todayCount = (await getTodayExportCount('inbound')) + 1;
-
-      const sheets = buildInboundSheets(records as InboundExportRecord[]);
-
-      const warehouseName = getWarehouseExportSegment(
-        records.map((record) => record.warehouse_name)
-      );
-      const exactFileName = buildInboundExportFileName(warehouseName, todayCount);
-
-      const synced = await syncToComputerMultiSheet(
-        sheets,
-        '/inbound',
-        setSyncingInbound,
-        undefined,
-        exactFileName
-      );
-      if (synced) {
-        await incrementExportCount('inbound');
-      }
-    } catch (error: unknown) {
-      alert.showError(
-        `同步失败：${formatSyncErrorMessage(getErrorMessage(error, ''), '请检查服务是否运行')}`
-      );
-    } finally {
-      activeSyncTasks.delete('inbound');
-      setSyncingInbound(false);
-    }
-  };
-
   // 同步出库单（扫码出库的物料信息）
   const handleSyncOutbound = async () => {
     if (activeSyncTasks.has('outbound')) {
@@ -834,79 +773,6 @@ export default function SettingsScreen() {
     } finally {
       activeSyncTasks.delete('outbound');
       setSyncingOutbound(false);
-    }
-  };
-
-  // 同步盘点单
-  const handleSyncInventory = async () => {
-    if (activeSyncTasks.has('inventory')) {
-      return;
-    }
-
-    activeSyncTasks.add('inventory');
-    setSyncingInventory(true);
-    try {
-      const documents = await getInventoryCheckDocumentSummaries();
-      const latestDocument = documents[0];
-
-      if (!latestDocument) {
-        alert.showWarning('暂无盘点数据可同步');
-        return;
-      }
-
-      const records = await getInventoryCheckRecordsByNo(
-        latestDocument.check_no,
-        latestDocument.warehouse_id
-      );
-      if (records.length === 0) {
-        alert.showWarning('最近一张盘点单没有可同步明细');
-        return;
-      }
-
-      const exportRecords: InventoryExportRecord[] = records.map((record) => ({
-        ...record,
-        account_name:
-          record.erp_account_name || latestDocument.erp_account_name || '',
-      }));
-      const sheets = buildInventorySheets(exportRecords);
-      const exactFileName = buildInventoryExportFileNameFromNo(
-        latestDocument.warehouse_name,
-        'complete',
-        latestDocument.check_no
-      );
-
-      const synced = await syncToComputerMultiSheet(
-        sheets,
-        '/inventory',
-        setSyncingInventory,
-        undefined,
-        exactFileName
-      );
-      try {
-        await updateInventoryCheckDocumentSyncStatus(
-          latestDocument.check_no,
-          latestDocument.warehouse_id,
-          synced ? 'success' : 'failed',
-          exactFileName,
-          synced ? undefined : '手动同步失败'
-        );
-      } catch (statusError) {
-        logger.warn('[设置] 最近盘点单同步状态写入失败:', statusError);
-      }
-      if (!synced) return;
-
-      logger.log('最近盘点单同步完成', {
-        checkNo: latestDocument.check_no,
-        detailCount: sheets[0]?.rows.length || 0,
-        differenceCount: sheets[1]?.rows.length || 0,
-      });
-    } catch (error: unknown) {
-      alert.showError(
-        `同步失败：${formatSyncErrorMessage(getErrorMessage(error, ''), '请检查服务是否运行')}`
-      );
-    } finally {
-      activeSyncTasks.delete('inventory');
-      setSyncingInventory(false);
     }
   };
 
@@ -2022,15 +1888,6 @@ export default function SettingsScreen() {
               </View>
 
               {renderMenuCard(
-                '同步入库单',
-                '生成入库 Excel 到电脑同步文件夹',
-                'file-plus',
-                theme.success,
-                handleSyncInbound,
-                !canSync,
-                syncingInbound
-              )}
-              {renderMenuCard(
                 '同步出库单',
                 '生成出库 Excel 到电脑同步文件夹',
                 'file-minus',
@@ -2038,15 +1895,6 @@ export default function SettingsScreen() {
                 handleSyncOutbound,
                 !canSync,
                 syncingOutbound
-              )}
-              {renderMenuCard(
-                '同步盘点单',
-                '重新生成最近一张盘点 Excel',
-                'bar-chart-2',
-                theme.accent,
-                handleSyncInventory,
-                !canSync,
-                syncingInventory
               )}
             </View>
           )}

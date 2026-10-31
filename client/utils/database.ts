@@ -7280,30 +7280,6 @@ export const generateInboundNo = async (): Promise<string> => {
   }
 };
 
-// 获取所有入库记录
-export const getAllInboundRecords = async (warehouseId?: string): Promise<InboundRecord[]> => {
-  try {
-    let sql = 'SELECT i.* FROM inbound_records i';
-    const params: SQLite.SQLiteBindValue[] = [];
-
-    if (warehouseId) {
-      sql += ' WHERE i.warehouse_id = ?';
-      params.push(warehouseId);
-    }
-
-    sql += ' ORDER BY i.created_at DESC';
-
-    const results = await runDatabaseReadWithRetry('getAllInboundRecords', () =>
-      getDb().getAllAsync<InboundRecordRow>(sql, params)
-    );
-
-    return await hydrateInboundRecordRows(results);
-  } catch (error) {
-    logger.error('获取入库记录失败:', error);
-    throw error;
-  }
-};
-
 export const getInboundExportSummaryRows = async (
   warehouseId?: string
 ): Promise<InboundExportSummaryRow[]> => {

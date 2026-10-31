@@ -1,7 +1,6 @@
 import type { ExcelSheet } from './excel';
 import {
   buildExcelSheet,
-  buildExportFileNameWithSequence,
   buildMaterialDetailColumns,
   buildMaterialSummaryHeaders,
   buildMaterialSummaryRows,
@@ -27,14 +26,6 @@ export interface InboundExportRecord {
   traceNo?: string;
   sourceNo?: string;
 }
-
-export const buildInboundExportFileName = (
-  warehouseName: string,
-  sequence: number,
-  date = new Date()
-): string => {
-  return buildExportFileNameWithSequence('入库单', [warehouseName || '未命名仓库'], sequence, date);
-};
 
 export const buildInboundExportFileNameFromNo = (
   warehouseName: string,

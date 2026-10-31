@@ -105,6 +105,7 @@ export default function InboundRecordsScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [syncingKeys, setSyncingKeys] = useState<Set<string>>(new Set());
+  const syncingKeysRef = useRef(new Set<string>());
   const [notice, setNotice] = useState<{ text: string; type: NoticeType } | null>(null);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -191,7 +192,7 @@ export default function InboundRecordsScreen() {
       pageActiveRef.current = true;
       const sessionId = ++pageSessionRef.current;
       setLoadingKeys(new Set());
-      setSyncingKeys(new Set());
+      setSyncingKeys(new Set(syncingKeysRef.current));
       void Promise.all([loadWarehouses(), loadDocuments(selectedWarehouseId)]);
 
       return () => {
@@ -375,8 +376,10 @@ export default function InboundRecordsScreen() {
 
   const handleResyncDocument = useCallback((item: InboundDocumentSummary) => {
     const key = getDocumentKey(item);
-    if (syncingKeys.has(key)) return;
     const ownsPage = capturePageOwner(selectedWarehouseId);
+    if (!ownsPage() || syncingKeysRef.current.has(key)) return;
+    // Lock before the first await so rapid taps cannot submit the same document twice.
+    syncingKeysRef.current.add(key);
 
     void (async () => {
       setSyncingKeys((prev) => new Set(prev).add(key));
@@ -389,7 +392,8 @@ export default function InboundRecordsScreen() {
           return;
         }
 
-        const records = detailsByKey[key] || await getInboundRecordsByNo(item.inbound_no, item.warehouse_id);
+        const records = await getInboundRecordsByNo(item.inbound_no, item.warehouse_id);
+        if (!ownsPage()) return;
         if (records.length === 0) {
           showNotice('该入库单没有可同步明细', 'warning');
           return;
@@ -428,30 +432,29 @@ export default function InboundRecordsScreen() {
 
         const refreshed = await refreshDocumentSummaries();
         if (!ownsPage() || !refreshed?.isCurrent()) return;
-        if (!detailsByKey[key]) {
-          setDetailsByKey((prev) => ({ ...prev, [key]: records }));
-        }
+        setDetailsByKey((prev) => ({ ...prev, [key]: records }));
       } catch (error) {
-        await updateInboundDocumentSyncStatus(
-          item.inbound_no,
-          item.warehouse_id,
-          'failed',
-          undefined,
-          error instanceof Error ? error.message : String(error)
-        );
+        try {
+          await updateInboundDocumentSyncStatus(
+            item.inbound_no,
+            item.warehouse_id,
+            'failed',
+            undefined,
+            error instanceof Error ? error.message : String(error)
+          );
+        } catch {
+          // A status-write failure must not swallow the sync error or prevent a retry.
+        }
         if (ownsPage()) {
           showNotice('重新同步失败，请检查同步助手', 'error');
           await refreshDocumentSummaries();
         }
       } finally {
-        if (ownsPage()) setSyncingKeys((prev) => {
-          const next = new Set(prev);
-          next.delete(key);
-          return next;
-        });
+        syncingKeysRef.current.delete(key);
+        if (pageActiveRef.current) setSyncingKeys(new Set(syncingKeysRef.current));
       }
     })();
-  }, [capturePageOwner, detailsByKey, refreshDocumentSummaries, selectedWarehouseId, showNotice, syncingKeys]);
+  }, [capturePageOwner, refreshDocumentSummaries, selectedWarehouseId, showNotice]);
 
   const getDetailGroups = useCallback((records: InboundRecord[]): InboundDetailGroup[] => {
     const groupMap = new Map<string, InboundDetailGroup>();
@@ -621,9 +624,9 @@ export default function InboundRecordsScreen() {
     const syncActionLabel =
       syncing
         ? '同步中'
-        : item.sync_status === 'failed'
+        : item.sync_status === 'success' || item.sync_status === 'failed'
           ? '重新同步'
-          : syncMeta.label;
+          : '同步到电脑';
 
     return (
       <AnimatedCard onPress={() => toggleDocument(item)} onLongPress={() => handleDeleteDocument(item)}>
@@ -646,6 +649,8 @@ export default function InboundRecordsScreen() {
                   ]}
                   activeOpacity={0.72}
                   disabled={syncing}
+                  accessibilityRole="button"
+                  accessibilityLabel={`${syncMeta.label}，${syncActionLabel}`}
                   onPress={(event) => {
                     event.stopPropagation();
                     handleResyncDocument(item);
@@ -663,6 +668,9 @@ export default function InboundRecordsScreen() {
               </View>
               <Text style={[styles.documentMeta, { color: item.completion_status === 'partial' ? theme.primary : theme.success }]}>
                 {item.completion_status === 'partial' ? '部分入库 · 可继续扫码' : '已入库完成'}
+              </Text>
+              <Text style={[styles.documentMeta, { color: syncMeta.color }]}>
+                {syncMeta.label}
               </Text>
               <Text style={styles.documentMeta} numberOfLines={1}>
                 {item.in_date} · {item.warehouse_name}

@@ -1,8 +1,16 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { STORAGE_KEYS } from '@/constants/config';
+import { syncExcelToComputer } from '@/utils/excel';
+import { buildInboundSheets, buildInboundExportFileNameFromNo } from '@/utils/inboundExport';
+import { buildInventorySheets, buildInventoryExportFileNameFromNo } from '@/utils/inventoryExport';
 import TestRenderer, { act } from 'react-test-renderer';
 import { FlatList, Text, TouchableOpacity } from 'react-native';
 import InboundRecordsScreen from '../index';
 import InventoryRecordsScreen from '@/screens/inventory-records';
 import {
+  getInboundRecordsByNo, getInventoryCheckRecordsByNo,
+  updateInboundDocumentSyncStatus, updateInventoryCheckDocumentSyncStatus,
+  type InboundRecord, type InventoryCheckRecord,
   getInboundDocumentSummaries,
   getInventoryCheckDocumentSummaries,
 } from '@/utils/database';
@@ -40,8 +48,6 @@ jest.mock('react-native-safe-area-context', () => ({
 }));
 jest.mock('@/utils/feedback', () => ({ feedbackDeleted: jest.fn(async () => undefined) }));
 jest.mock('@/utils/excel', () => ({ formatSyncErrorMessage: jest.fn(), syncExcelToComputer: jest.fn() }));
-jest.mock('@/utils/inboundExport', () => ({ buildInboundExportFileNameFromNo: jest.fn(), buildInboundSheets: jest.fn() }));
-jest.mock('@/utils/inventoryExport', () => ({ buildInventoryExportFileNameFromNo: jest.fn(), buildInventorySheets: jest.fn() }));
 jest.mock('@/utils/erpAccounts', () => ({ ERP_ACCOUNTS: [
   { key: 'shanghai-chipmunk', name: '账套 A' }, { key: 'wuxi-duneng', name: '账套 B' },
 ] }));
@@ -69,9 +75,9 @@ const document = (suffix: string) => ({
 });
 type Row = ReturnType<typeof document>;
 const variants = [
-  { name: 'inbound', Screen: InboundRecordsScreen, query: getInboundDocumentSummaries,
+  { name: 'inbound', Screen: InboundRecordsScreen, query: getInboundDocumentSummaries, read: getInboundRecordsByNo, update: updateInboundDocumentSyncStatus,
     all: '全部仓库', scopeA: '仓库 A', scopeB: '仓库 B', secondKey: 'W2' },
-  { name: 'inventory', Screen: InventoryRecordsScreen, query: getInventoryCheckDocumentSummaries,
+  { name: 'inventory', Screen: InventoryRecordsScreen, query: getInventoryCheckDocumentSummaries, read: getInventoryCheckRecordsByNo, update: updateInventoryCheckDocumentSyncStatus,
     all: '全部账套', scopeA: '账套 A', scopeB: '账套 B', secondKey: 'wuxi-duneng' },
 ];
 const list = (root: TestRenderer.ReactTestRenderer) => root.root.findAllByType(FlatList)
@@ -183,5 +189,97 @@ describe.each(variants)('$name document request ownership', variant => {
     await act(async () => { deletedScope.resolve([]); });
     expect(list(root).props.data).toEqual([document('B')]);
     expect(root.root.findAllByType('Notice')).toHaveLength(0);
+  });
+});
+
+
+describe.each(variants)('$name repeat document sync', variant => {
+  let root: TestRenderer.ReactTestRenderer;
+  const savedRow = (model: string, quantity: number) => ({
+    id: model, inbound_no: 'II-A', check_no: 'PD-A', warehouse_id: 'W1', warehouse_name: '仓库 A',
+    scan_model: model, model, quantity, actual_quantity: quantity, batch: 'BATCH', check_type: 'whole',
+    created_at: '2026/10/15 15:00', inventory_code: 'INV',
+    erp_account_name: '账套 A',
+  } as InboundRecord & InventoryCheckRecord);
+  const button = () => root.root.findAllByType(TouchableOpacity).find(node =>
+    node.props.accessibilityRole === 'button' && node.props.accessibilityLabel?.includes('同步'))!;
+  const pressSync = async () => {
+    await act(async () => { button().props.onPress({ stopPropagation: jest.fn() }); });
+  };
+  const mount = async (status: 'pending' | 'success' | 'failed' = 'success') => {
+    await AsyncStorage.setItem(STORAGE_KEYS.SYNC_CONFIG, JSON.stringify({ ip: '127.0.0.1', port: '8080' }));
+    jest.mocked(variant.query).mockResolvedValue([{ ...document('A'), sync_status: status }]);
+    jest.mocked(variant.read).mockResolvedValue([savedRow('OLD', 40)]);
+    jest.mocked(variant.update).mockResolvedValue(undefined);
+    jest.mocked(syncExcelToComputer).mockResolvedValue({ success: true });
+    await act(async () => { root = TestRenderer.create(<variant.Screen />); });
+  };
+  afterEach(async () => { if (root) await act(async () => { root.unmount(); }); });
+
+  it.each(['pending', 'success', 'failed'] as const)('allows %s documents to sync again using fresh complete records and the same filename', async status => {
+    await mount(status);
+    expect(button().props.disabled).toBe(false);
+    expect(button().props.accessibilityLabel).toContain(status === 'pending' ? '同步到电脑' : '重新同步');
+    await pressSync();
+    const rows = [savedRow('OLD', 40), savedRow('NEW', 60)];
+    jest.mocked(variant.read).mockResolvedValue(rows);
+    await pressSync();
+    expect(variant.read).toHaveBeenCalledTimes(2);
+    const no = variant.name === 'inbound' ? 'II-A' : 'PD-A';
+    expect(variant.read).toHaveBeenLastCalledWith(no, 'W1');
+    expect(syncExcelToComputer).toHaveBeenCalledTimes(2);
+    const calls = jest.mocked(syncExcelToComputer).mock.calls;
+    const fileName = variant.name === 'inbound'
+      ? buildInboundExportFileNameFromNo('仓库 A', no)
+      : buildInventoryExportFileNameFromNo('仓库 A', 'complete', no);
+    expect(calls.map(call => call[6])).toEqual([fileName, fileName]);
+    expect(calls[1][1]).toBe(variant.name === 'inbound' ? '/inbound' : '/inventory');
+    expect(calls[1][0]).toEqual(variant.name === 'inbound' ? buildInboundSheets(rows) : buildInventorySheets(rows.map(row => ({ ...row, account_name: '账套 A' }))));
+    expect(variant.update).toHaveBeenLastCalledWith(no, 'W1', 'success', fileName, undefined);
+    expect(button().props.disabled).toBe(false);
+  });
+
+  it('blocks rapid taps and retains the lock when leaving and returning to the page', async () => {
+    await mount();
+    const upload = deferred<{ success: boolean }>();
+    jest.mocked(syncExcelToComputer).mockReturnValueOnce(upload.promise);
+    const press = button().props.onPress;
+    await act(async () => {
+      press({ stopPropagation: jest.fn() });
+      press({ stopPropagation: jest.fn() });
+    });
+    expect(syncExcelToComputer).toHaveBeenCalledTimes(1);
+    expect(button().props.disabled).toBe(true);
+    await act(async () => {
+      mockFocusCleanup?.();
+      mockFocusCleanup = mockFocusCallback?.() || undefined;
+    });
+    await pressSync();
+    expect(syncExcelToComputer).toHaveBeenCalledTimes(1);
+    await act(async () => { upload.resolve({ success: true }); });
+    expect(button().props.disabled).toBe(false);
+    await pressSync();
+    expect(syncExcelToComputer).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases the lock after failed upload even if writing its failure status also fails', async () => {
+    await mount();
+    jest.mocked(syncExcelToComputer).mockRejectedValueOnce(new Error('offline'));
+    jest.mocked(variant.update).mockRejectedValueOnce(new Error('status write failed'));
+    await pressSync();
+    expect(button().props.disabled).toBe(false);
+    expect(root.root.findAllByType('Notice').length).toBeGreaterThan(0);
+    await pressSync();
+    expect(syncExcelToComputer).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not upload a late record read after switching the filter', async () => {
+    await mount();
+    const rows = deferred<(InboundRecord & InventoryCheckRecord)[]>();
+    jest.mocked(variant.read).mockReturnValueOnce(rows.promise);
+    await pressSync();
+    await changeScope(root, variant.all, variant.scopeB);
+    await act(async () => { rows.resolve([savedRow('OLD', 40)]); });
+    expect(syncExcelToComputer).not.toHaveBeenCalled();
   });
 });
