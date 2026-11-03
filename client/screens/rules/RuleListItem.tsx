@@ -1,5 +1,7 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { APP_MOTION } from '@/constants/motion';
 import { memo, useCallback, useMemo } from 'react';
-import { Switch, Text, TouchableOpacity, View } from 'react-native';
+import { Switch, Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { Swipeable } from 'react-native-gesture-handler';
 import { useTheme } from '@/hooks/useTheme';
@@ -112,7 +114,7 @@ export const RuleListItem = memo(function RuleListItem({
           accessibilityRole="button"
           accessibilityLabel={`删除规则${rule.name}`}
           style={styles.deleteAction}
-          activeOpacity={0.8}
+          activeOpacity={0.86}
           onPress={() => onDelete(rule)}
         >
           <Feather name="trash-2" size={18} color={theme.buttonPrimaryText} />
@@ -123,12 +125,12 @@ export const RuleListItem = memo(function RuleListItem({
       leftThreshold={48}
       failOffsetY={[-18, 18]}
       friction={2}
-      animationOptions={{ bounciness: 3, speed: 14 }}
+      animationOptions={APP_MOTION.swipe}
     >
       <View style={styles.ruleItem}>
         <TouchableOpacity
           style={styles.ruleContent}
-          activeOpacity={0.9}
+          activeOpacity={0.86}
           onPress={() => onEdit(rule)}
           onLongPress={onEnterSort}
           delayLongPress={500}

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -38,6 +38,9 @@ namespace Chipmunks.ApkBuilder
         private readonly Button signingButton;
         private readonly RichTextBox logBox = new RichTextBox();
         private readonly CheckBox followLog = new CheckBox();
+        private readonly Button otaButton;
+        private readonly TextBox otaNotes = new TextBox();
+        private string otaNotesFile;
         private readonly Button startButton;
         private readonly Button checkButton;
         private readonly Button prepareButton;
@@ -103,7 +106,7 @@ namespace Chipmunks.ApkBuilder
             versionLabel.SetBounds(278, 63, 650, 24);
             versionLabel.AutoEllipsis = true;
             versionLabel.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right;
-            signingButton = MakeButton("APK 发布签名…", "manageSigning", false, 156);
+            signingButton = MakeButton("设置…", "manageSigning", false, 156);
             signingButton.SetBounds(778, 18, 156, 35);
             signingButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             signingButton.Click += delegate { var handler = ManageSigningRequested; if (!busy && handler != null) handler(this); };
@@ -122,7 +125,7 @@ namespace Chipmunks.ApkBuilder
             body.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
             body.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             body.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
-            body.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
+            body.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
 
             var status = new CardPanel { Dock = DockStyle.Fill, Padding = new Padding(16, 12, 16, 10), Margin = new Padding(0) };
             var statusGrid = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 4, ColumnCount = 1, BackColor = Color.White };
@@ -163,7 +166,9 @@ namespace Chipmunks.ApkBuilder
             prepareButton = MakeButton("准备环境…", "prepareEnvironment", false, 128);
             cancelButton = MakeButton("停止任务", "cancelBuild", false, 112);
             cancelButton.Enabled = false;
-            commands.Controls.AddRange(new Control[] { startButton, checkButton, prepareButton, cancelButton });
+            otaButton = MakeButton("生成并发布热更新", "publishOta", false, 150);
+            otaButton.Click += delegate { StartPublish(); };
+            commands.Controls.AddRange(new Control[] { startButton, checkButton, prepareButton, cancelButton, otaButton });
             startButton.Click += delegate { StartTask(BuildMode.Build, false); };
             checkButton.Click += delegate { StartTask(BuildMode.CheckEnvironment, false); };
             prepareButton.Click += delegate { StartTask(BuildMode.PrepareEnvironment, true); };
@@ -212,11 +217,19 @@ namespace Chipmunks.ApkBuilder
             logButton.Click += delegate { OpenPath(currentLog, false); };
             errorButton.Click += delegate { TryCopy(errorSummary); };
             body.Controls.Add(fileActions, 0, 4);
-            ConfigureLabel(resultText, "请选择构建目标。APK 发布签名可在右上方管理、加密备份或恢复。", 8.5F, Muted, false);
+            ConfigureLabel(resultText, "请选择构建目标。签名与发布连接可在右上方设置中管理。", 8.5F, Muted, false);
             resultText.Name = "buildResult";
             resultText.Dock = DockStyle.Fill;
             resultText.AutoEllipsis = true;
-            body.Controls.Add(resultText, 0, 5);
+            var resultPanel = new Panel { Dock = DockStyle.Fill };
+            var noteRow = new TableLayoutPanel { Dock = DockStyle.Top, Height = 30, ColumnCount = 2 };
+            noteRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+            noteRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            noteRow.Controls.Add(new Label { Text = "热更新说明（选填）", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+            otaNotes.Name = "otaNotes"; otaNotes.Dock = DockStyle.Fill;
+            noteRow.Name = "otaNotesRow"; noteRow.Controls.Add(otaNotes, 1, 0);
+            resultPanel.Controls.Add(resultText); resultPanel.Controls.Add(noteRow);
+            body.Controls.Add(resultPanel, 0, 5);
             Controls.Add(body);
             Controls.Add(header);
 
@@ -297,6 +310,20 @@ namespace Chipmunks.ApkBuilder
         private string TargetName { get { return selectedTarget == BuildTarget.Apk ? "APK" : "同步助手 EXE"; } }
         private int StageCount { get { return selectedTarget == BuildTarget.Apk ? 6 : 5; } }
 
+        private void StartPublish()
+        {
+            if (selectedTarget != BuildTarget.Apk || busy || runner.IsRunning || disposing) return;
+            try {
+                otaNotesFile = Path.GetTempFileName();
+                File.WriteAllText(otaNotesFile, String.IsNullOrWhiteSpace(otaNotes.Text) ? "APP 热更新 · " + DateTime.Now.ToString("yyyy-MM-dd HH:mm") : otaNotes.Text.Trim(), new UTF8Encoding(false));
+                StartTask(BuildMode.PublishUpdate, false);
+            } catch {
+                stateTitle.Text = "无法启动热更新发布";
+                stateDetail.Text = "无法保存临时更新说明，请检查磁盘空间与访问权限。";
+                if (otaNotesFile != null) { try { File.Delete(otaNotesFile); } catch { } otaNotesFile = null; }
+            }
+        }
+
         private void StartTask(BuildMode mode, bool interactive)
         {
             if (busy || runner.IsRunning || disposing) return;
@@ -309,8 +336,14 @@ namespace Chipmunks.ApkBuilder
             shownStage = -1;
             shownState = BuildState.Idle;
             logBox.Clear();
+            var stageNames = mode == BuildMode.PublishUpdate
+                ? new[] { "准备任务", "检查兼容", "生成更新", "校验资源", "上传文件", "发布确认" }
+                : selectedTarget == BuildTarget.Apk
+                    ? new[] { "环境检查", "同步源码", "准备依赖", "编译 APK", "验证安装包", "保存产物" }
+                    : new[] { "环境检查", "准备依赖", "检查源码", "构建 EXE", "验证并保存", "" };
+            for (int i = 0; i < stageLabels.Length; i++) stageLabels[i].Text = (i + 1) + "  " + stageNames[i];
             stateTitle.ForeColor = Ink;
-            stateTitle.Text = mode == BuildMode.Build ? "正在启动构建" : interactive ? "正在打开环境准备窗口" : "正在检查环境";
+            stateTitle.Text = mode == BuildMode.PublishUpdate ? "正在生成并发布热更新" : mode == BuildMode.Build ? "正在启动构建" : interactive ? "正在打开环境准备窗口" : "正在检查环境";
             stateDetail.Text = interactive ? "请在新打开的窗口中查看并处理环境提示，完成后这里会更新结果。" : "任务已在后台运行，可以继续使用其他窗口。";
             resultText.Text = "本次任务的日志会自动保存。";
             progress.Style = ProgressBarStyle.Marquee;
@@ -323,12 +356,16 @@ namespace Chipmunks.ApkBuilder
         {
             BuildResult result;
             try {
-                result = interactive ? await runner.StartInteractivePreparationAsync(selectedTarget) : await runner.StartAsync(mode, selectedTarget);
+                result = mode == BuildMode.PublishUpdate ? await runner.StartPublishAsync(otaNotesFile) : interactive ? await runner.StartInteractivePreparationAsync(selectedTarget) : await runner.StartAsync(mode, selectedTarget);
             } catch (Exception error) {
                 result = new BuildResult {
                     State = BuildState.Failed, ExitCode = -1,
                     ErrorMessage = BuildRunner.ProtectOutput(error.Message)
                 };
+            }
+            if (mode == BuildMode.PublishUpdate && otaNotesFile != null) {
+                try { File.Delete(otaNotesFile); } catch { }
+                otaNotesFile = null;
             }
             if (disposing || IsDisposed) return;
             RefreshProgress();
@@ -340,10 +377,10 @@ namespace Chipmunks.ApkBuilder
             currentApk = result.State == BuildState.Succeeded && mode == BuildMode.Build ? result.ArtifactPath : null;
             switch (result.State) {
                 case BuildState.Succeeded:
-                    stateTitle.Text = mode == BuildMode.Build ? "构建成功" : mode == BuildMode.PrepareEnvironment ? "环境准备完成" : "环境检查通过";
+                    stateTitle.Text = mode == BuildMode.PublishUpdate ? "热更新发布成功" : mode == BuildMode.Build ? "构建成功" : mode == BuildMode.PrepareEnvironment ? "环境准备完成" : "环境检查通过";
                     stateTitle.ForeColor = Good;
-                    stateDetail.Text = mode == BuildMode.Build ? "本次" + TargetName + "已完成构建及校验，可以打开文件夹查看。" : "可以开始构建" + TargetName + "。";
-                    resultText.Text = currentApk ?? "环境就绪，返回主窗口后可开始构建。";
+                    stateDetail.Text = mode == BuildMode.PublishUpdate ? "服务器已确认发布。请在 PDA 检查热更新并应用。" : mode == BuildMode.Build ? "本次" + TargetName + "已完成构建及校验，可以打开文件夹查看。" : "可以开始构建" + TargetName + "。";
+                    resultText.Text = mode == BuildMode.PublishUpdate ? "完整发布记录已保存，可查看日志。" : currentApk ?? "环境就绪，返回主窗口后可开始构建。";
                     PaintStages(mode == BuildMode.Build ? StageCount - 1 : 0, true);
                     break;
                 case BuildState.NeedsAttention:
@@ -357,14 +394,14 @@ namespace Chipmunks.ApkBuilder
                     stateTitle.Text = "任务已停止";
                     stateTitle.ForeColor = Muted;
                     stateDetail.Text = "已停止本次任务，可查看日志或重新开始。";
-                    resultText.Text = "本次未交付新的" + TargetName + "。";
+                    resultText.Text = mode == BuildMode.PublishUpdate ? "本次发布任务已停止；如已开始上传，请核对服务器与 PDA 更新状态。" : "本次未交付新的" + TargetName + "。";
                     break;
                 default:
                     stateTitle.Text = "任务未完成";
                     stateTitle.ForeColor = Bad;
                     errorSummary = BuildRunner.ProtectOutput(result.ErrorMessage ?? "构建失败，请查看完整日志。");
                     stateDetail.Text = FirstLine(errorSummary);
-                    resultText.Text = "本次未生成可用" + TargetName + "。点击“查看完整日志”了解具体原因。";
+                    resultText.Text = mode == BuildMode.PublishUpdate ? "本次发布未确认成功，请查看完整日志。" : "本次未生成可用" + TargetName + "。点击“查看完整日志”了解具体原因。";
                     break;
             }
             SetCommands();
@@ -388,8 +425,8 @@ namespace Chipmunks.ApkBuilder
                         shownState = snapshot.State;
                         PaintStages(snapshot.Stage, false);
                         if (snapshot.State == BuildState.Running) {
-                            stateTitle.Text = snapshot.Mode == BuildMode.Build ? "正在构建" + TargetName : snapshot.Mode == BuildMode.CheckEnvironment ? "正在检查环境" : "正在准备环境";
-                            if (snapshot.Mode != BuildMode.PrepareEnvironment) stateDetail.Text = StageDescription(snapshot.Stage);
+                            stateTitle.Text = snapshot.Mode == BuildMode.PublishUpdate ? "正在生成并发布热更新" : snapshot.Mode == BuildMode.Build ? "正在构建" + TargetName : snapshot.Mode == BuildMode.CheckEnvironment ? "正在检查环境" : "正在准备环境";
+                            if (snapshot.Mode != BuildMode.PrepareEnvironment) stateDetail.Text = snapshot.Mode == BuildMode.PublishUpdate ? "自动检查兼容性、收集资源、生成并上传更新；进度见下方日志。" : StageDescription(snapshot.Stage);
                         }
                     }
                     var elapsed = DateTime.UtcNow - snapshot.StartedAtUtc;
@@ -438,6 +475,11 @@ namespace Chipmunks.ApkBuilder
         private void SetCommands()
         {
             startButton.Enabled = checkButton.Enabled = prepareButton.Enabled = targetSelector.Enabled = signingButton.Enabled = !busy;
+            otaButton.Visible = selectedTarget == BuildTarget.Apk;
+            otaButton.Enabled = !busy;
+            otaNotes.Enabled = !busy;
+            if (otaNotes.Parent != null) otaNotes.Parent.Visible = selectedTarget == BuildTarget.Apk;
+            signingButton.Visible = true;
             cancelButton.Enabled = busy;
             apkButton.Enabled = !busy && !String.IsNullOrEmpty(currentApk) && File.Exists(currentApk);
             errorButton.Enabled = !busy && !String.IsNullOrEmpty(errorSummary);

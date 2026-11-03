@@ -1,3 +1,4 @@
+import { beginOtaSensitiveOperation } from '@/utils/otaSafety';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NETWORK_CONFIG, STORAGE_KEYS, type SyncConfig } from '@/constants/config';
 import {
@@ -364,6 +365,7 @@ const requestJson = async <T>(
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   options.signal?.addEventListener('abort', onAbort, { once: true });
+  const finishOtaOperation = beginOtaSensitiveOperation();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
     checkActive(options);
@@ -385,6 +387,7 @@ const requestJson = async <T>(
       printing
     );
   } finally {
+    finishOtaOperation();
     clearTimeout(timer);
     options.signal?.removeEventListener('abort', onAbort);
   }

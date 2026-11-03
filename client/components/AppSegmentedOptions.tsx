@@ -1,11 +1,13 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import React from 'react';
-import { Text, TouchableOpacity, View } from 'react-native';
+import { Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderWidth, Spacing, Typography } from '@/constants/theme';
 import { UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 import { withAlpha } from '@/utils/colors';
 import { MIN_TOUCH_TARGET } from '@/utils/responsive';
+import { MotionSelection } from '@/components/AppMotion';
 
 interface AppSegmentedOption<T extends string> {
   value: T;
@@ -54,15 +56,17 @@ export function AppSegmentedOptions<T extends string>({
               justifyContent: 'center',
               flexDirection: 'row',
               gap: 6,
-              backgroundColor: active ? theme.backgroundElevated : 'transparent',
-              borderWidth: active ? BorderWidth.normal : 0,
-              borderColor: active ? withAlpha(theme.primary, 0.26) : 'transparent',
+              borderWidth: BorderWidth.normal,
+              borderColor: 'transparent',
             }}
-            activeOpacity={0.82}
+            activeOpacity={0.86}
             accessibilityRole="button"
             accessibilityState={{ selected: active }}
             onPress={() => onChange(option.value)}
           >
+            <MotionSelection selected={active} style={{ backgroundColor: theme.backgroundElevated,
+              borderRadius: UI_REDESIGN_TOKENS.radius.control, borderWidth: BorderWidth.normal,
+              borderColor: withAlpha(theme.primary, 0.26) }} />
             {option.icon ? (
               <Feather
                 name={option.icon}

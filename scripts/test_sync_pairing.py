@@ -151,9 +151,12 @@ class SyncPairingTest(unittest.TestCase):
     def test_pairing_menu_opens_window_without_creating_file_or_opening_an_editor(self):
         tray = object.__new__(server.TrayIcon)
         tray.pairing_window = unittest.mock.Mock()
+        tray.connection_qr_window = unittest.mock.Mock()
         with patch.object(server.os, 'startfile', create=True) as open_file:
             tray.open_pairing_settings()
             tray.pairing_window.show.assert_called_once_with()
+            tray.open_connection_qr()
+            tray.connection_qr_window.show.assert_called_once_with()
             open_file.assert_not_called()
         self.assertEqual(os.listdir(self.directory), [])
 
@@ -190,10 +193,12 @@ class SyncPairingTest(unittest.TestCase):
         tray.icon = unittest.mock.Mock()
         tray.address_monitor = unittest.mock.Mock()
         tray.pairing_window = unittest.mock.Mock()
+        tray.connection_qr_window = unittest.mock.Mock()
         with patch.object(server.cherrypy.engine, 'exit') as exit_service:
             tray.quit_app()
         self.assertFalse(tray.running)
         tray.pairing_window.close.assert_called_once_with()
+        tray.connection_qr_window.close.assert_called_once_with()
         exit_service.assert_called_once_with()
 
     def test_authenticated_reprint_never_creates_a_persistent_print_ledger(self):

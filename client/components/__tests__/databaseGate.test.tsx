@@ -2,6 +2,7 @@ import TestRenderer, { act } from 'react-test-renderer';
 import { ActivityIndicator, AppState, Text, TouchableOpacity, type AppStateStatus } from 'react-native';
 import { Stack } from 'expo-router';
 import RootLayout from '@/app/_layout';
+import { OtaStartup } from '@/components/OtaStartup';
 import {
   checkpointDatabaseToDisk,
   ensureDatabaseConnectionReady,
@@ -10,6 +11,8 @@ import {
 import { maybeRunAutoNasBackup } from '@/utils/autoNasBackup';
 
 jest.mock('../../global.css', () => ({}));
+// OTA native behavior is tested in OtaStartup.test.tsx; here only verify its gate.
+jest.mock('@/components/OtaStartup', () => ({ OtaStartup: jest.fn(() => null) }));
 jest.mock('expo-router', () => ({
   Stack: Object.assign(
     jest.fn(({ children }: { children: import('react').ReactNode }) => children),
@@ -83,6 +86,7 @@ const mountAndInitialize = async () => {
   await act(async () => { await jest.advanceTimersByTimeAsync(0); });
 };
 const expectDatabaseLifecycleInactive = () => {
+  expect(OtaStartup).not.toHaveBeenCalled();
   expect(AppState.addEventListener).not.toHaveBeenCalled();
   expect(listeners.size).toBe(0);
   expect(ensureDatabaseConnectionReady).not.toHaveBeenCalled();
@@ -144,6 +148,7 @@ it('starts a new initialization after a native lock error and keeps database lif
   expect(AppState.addEventListener).toHaveBeenCalledTimes(1);
   expect(listeners.size).toBe(1);
   expect(maybeRunAutoNasBackup).toHaveBeenCalledWith('app-ready');
+  expect(OtaStartup).toHaveBeenCalled();
 });
 
 it('keeps retry available after another initialization failure and admits the app on a later success', async () => {

@@ -112,6 +112,7 @@ describe('label reprint page visit', () => {
     const edited = jest.mocked(submitLabelReprint).mock.calls[0][0];
     expect(edited).toMatchObject({ id: 'CORRECT-ME', quantity: 1000, traceNo: 'TRACE-2',
       record: { quantity: 1000, trace_no: 'TRACE-2' } });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     expect(root.root.findAllByType(Modal)).toHaveLength(0);
     expect(buttons('修改数量')).toHaveLength(1);
     await scan('NEXT-ORDINARY');
@@ -158,6 +159,7 @@ describe('label reprint page visit', () => {
     await openQuantityDialog();
     await act(async () => { quantityInput().props.onChangeText('40'); });
     await act(async () => { buttons('确认打印')[0].props.onPress(); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     expect(root.root.findByType(AppModalCard).props.title).toBe('补打标签任务');
     const corrected = jest.mocked(submitLabelReprint).mock.calls[0][0];
     await act(async () => { buttons('核对后重试')[0].props.onPress(); });
@@ -170,6 +172,7 @@ describe('label reprint page visit', () => {
     expect(jest.mocked(submitLabelReprint).mock.calls[1][0]).toMatchObject({
       id: corrected.id, quantity: 40, traceNo: 'TRACE-2', sourceQr: corrected.sourceQr, record: corrected.record,
     });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     expect(root.root.findAllByType(Modal)).toHaveLength(0);
   });
 
@@ -271,6 +274,7 @@ describe('label reprint page visit', () => {
     jest.mocked(prepareLabelReprint).mockRejectedValueOnce(new IgnoredLabelReprintScan());
     await scan('LX32F003F6P6');
     expect(submitLabelReprint).not.toHaveBeenCalled();
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     expect(root.root.findAllByType(Modal)).toHaveLength(0);
     expect(root.root.findByType('Alert' as unknown as React.ElementType).props.visible).toBe(false);
     expect(text()).toContain('等待扫码');
@@ -306,6 +310,7 @@ describe('label reprint page visit', () => {
     });
     expect(submitLabelReprint).toHaveBeenNthCalledWith(2, failed,
       expect.objectContaining({ retryConfirmed: true, shouldContinue: expect.any(Function) }));
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     expect(root.root.findAllByType(Modal)).toHaveLength(0);
     expect(text()).toContain('已提交同步助手');
   });
@@ -324,6 +329,7 @@ describe('label reprint page visit', () => {
       await scan(`TASK-${index}`);
     }
     await act(async () => { buttons('打印任务')[0].props.onPress(); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
 
     const card = root.root.findByType(AppModalCard);
     const renderedCard = card.findAllByType(View).find((node) =>
@@ -348,12 +354,14 @@ describe('label reprint page visit', () => {
     }
     const submitCount = jest.mocked(submitLabelReprint).mock.calls.length;
     await act(async () => { buttons('稍后')[0].props.onPress(); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     expect(root.root.findAllByType(Modal)).toHaveLength(0);
     expect(submitLabelReprint).toHaveBeenCalledTimes(submitCount);
   });
 
   it('shrinks the card to the visible modal viewport while leaving the footer outside the task list', async () => {
     await act(async () => { buttons('打印任务')[0].props.onPress(); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     const viewport = root.root.findByProps({ testID: 'label-reprint-task-viewport' });
     await act(async () => { viewport.props.onLayout({ nativeEvent: { layout: { height: 300 } } }); });
     expect(root.root.findByType(AppModalCard).props.style).toEqual({ height: 300 });
@@ -422,6 +430,7 @@ describe('label reprint page visit', () => {
     await scan('NEW-SUBMIT');
     await act(async () => { oldSubmission.resolve(task('OLD-SUBMIT', { status: 'failed', retryAllowed: true })); });
     expect(scanner().props.processing).toBe(true);
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     expect(root.root.findAllByType(Modal)).toHaveLength(0);
     expect(text()).not.toContain('OLD-SUBMIT');
     await act(async () => { newSubmission.resolve(task('NEW-SUBMIT', { status: 'submitted' })); });

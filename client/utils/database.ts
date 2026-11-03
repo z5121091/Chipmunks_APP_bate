@@ -1,4 +1,5 @@
-﻿import * as SQLite from 'expo-sqlite';
+import { beginOtaSensitiveOperation } from '@/utils/otaSafety';
+import * as SQLite from 'expo-sqlite';
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -503,6 +504,7 @@ export interface InboundRecord {
 export type DocumentSyncStatus = 'pending' | 'success' | 'failed';
 
 export interface InboundDocumentSummary {
+  erp_account_keys?: string;
   completion_status?: InboundCompletionStatus;
   inbound_no: string;
   warehouse_id: string;
@@ -1257,6 +1259,7 @@ const runSerializedDatabaseOperation = async <T>(
   context: string,
   task: () => Promise<T>
 ): Promise<T> => {
+  const finishOtaOperation = beginOtaSensitiveOperation(context === 'checkpointDatabaseToDisk');
   const previousOperation = serializedDatabaseOperationQueue;
   let releaseCurrentOperation!: () => void;
   const currentOperation = new Promise<void>((resolve) => {
@@ -1273,6 +1276,7 @@ const runSerializedDatabaseOperation = async <T>(
     return await task();
   } finally {
     releaseCurrentOperation();
+    finishOtaOperation();
   }
 };
 
@@ -2044,6 +2048,7 @@ const getMockInboundDocumentSummaries = (rows: MockRow[]): InboundDocumentSummar
       const first = groupRows[0] || {};
       return {
         inbound_no: String(first.inbound_no || ''),
+        erp_account_keys: [...new Set(groupRows.map(row => String(row.erp_account_key || '').trim()).filter(Boolean))].join(','),
         warehouse_id: String(first.warehouse_id || ''),
         warehouse_name: getMockMaxValue(groupRows, 'warehouse_name'),
         in_date: getMockMaxValue(groupRows, 'in_date'),
@@ -7343,6 +7348,7 @@ export const getInboundDocumentSummaries = async (
     let sql = `
       SELECT
         inbound_no,
+        GROUP_CONCAT(DISTINCT NULLIF(TRIM(erp_account_key), '')) AS erp_account_keys,
         warehouse_id,
         MAX(warehouse_name) AS warehouse_name,
         MAX(in_date) AS in_date,
@@ -7377,6 +7383,7 @@ export const getInboundDocumentSummaries = async (
 
     return rows.map((row) => ({
       inbound_no: row.inbound_no,
+      erp_account_keys: row.erp_account_keys || undefined,
       warehouse_id: row.warehouse_id,
       warehouse_name: row.warehouse_name,
       in_date: row.in_date,

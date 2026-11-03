@@ -1,11 +1,6 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import React, { useCallback, useMemo, useState } from 'react';
-import {
-  ScrollView,
-  Text,
-  TouchableOpacity,
-  View,
-  useWindowDimensions,
-} from 'react-native';
+import { ScrollView, Text, View, useWindowDimensions } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
@@ -249,7 +244,7 @@ export default function HomeScreen() {
                 <TouchableOpacity
                   key={operation.id}
                   style={styles.operationCard}
-                  activeOpacity={0.76}
+                  activeOpacity={0.86}
                   onPress={() => navigateToRoute(operation.route)}
                   accessibilityRole="button"
                   accessibilityLabel={operation.title}
@@ -313,7 +308,7 @@ export default function HomeScreen() {
               <Text style={styles.sectionTitle}>最近单据</Text>
               <TouchableOpacity
                 style={styles.sectionAction}
-                activeOpacity={0.72}
+                activeOpacity={0.86}
                 onPress={() => navigateToRoute('/document-management')}
                 accessibilityRole="button"
                 accessibilityLabel="查看全部单据"
@@ -342,7 +337,7 @@ export default function HomeScreen() {
                     <TouchableOpacity
                       key={`${document.type}:${document.warehouse_id || 'none'}:${document.document_no}`}
                       style={[styles.recentRow, index > 0 && styles.rowDivider]}
-                      activeOpacity={0.74}
+                      activeOpacity={0.86}
                       onPress={() => handleRecentDocumentPress(document)}
                       accessibilityRole="button"
                       accessibilityLabel={`${label}单据 ${document.document_no}`}
@@ -367,7 +362,7 @@ export default function HomeScreen() {
               ) : (
                 <TouchableOpacity
                   style={styles.recentEmpty}
-                  activeOpacity={0.74}
+                  activeOpacity={0.86}
                   onPress={() => navigateToRoute('/document-management')}
                 >
                   <View style={styles.recentEmptyText}>

@@ -1,5 +1,7 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import { Keyboard, Modal, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Keyboard, Text, TextInput, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { AppFormField } from '@/components/AppFormField';
@@ -17,8 +19,10 @@ import {
 } from '@/utils/database';
 import { logger } from '@/utils/logger';
 import { createStyles } from './styles';
+import { MotionContent, MotionPresence } from '@/components/AppMotion';
 
 interface SupplierManagerProps {
+  visible?: boolean;
   embedded?: boolean;
   closeRef?: RefObject<(() => void) | null>;
   mode: 'manage' | 'select';
@@ -30,7 +34,7 @@ interface SupplierManagerProps {
 
 const nameKey = (name: string) => name.trim().toUpperCase();
 
-export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, embedded = false, closeRef }: SupplierManagerProps) {
+export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, embedded = false, closeRef, visible = true }: SupplierManagerProps) {
   const { theme } = useTheme();
   const styles = useMemo(() => createStyles(theme), [theme]);
   const alert = useCustomAlert();
@@ -44,6 +48,14 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
   const busyRef = useRef(false);
   const activeRef = useRef(true);
   const requestRef = useRef(0);
+  const [visibleMode, setVisibleMode] = useState(visible ? mode : null);
+  if (visibleMode !== (visible ? mode : null)) {
+    setVisibleMode(visible ? mode : null);
+    if (visible) {
+      setManaging(mode === 'manage'); setKeyword(''); setNewName('');
+      setLoading(true); setLoadFailed(false);
+    }
+  }
 
   const loadSuppliers = useCallback(() => {
     const request = ++requestRef.current;
@@ -67,13 +79,14 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
   };
 
   useEffect(() => {
+    if (!visible) return;
     activeRef.current = true;
     void loadSuppliers();
     return () => {
       activeRef.current = false;
       requestRef.current += 1;
     };
-  }, [loadSuppliers]);
+  }, [loadSuppliers, visible, mode]);
 
   const close = useCallback(() => {
     if (busyRef.current) return;
@@ -178,7 +191,7 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
               />
             }
           >
-            <KeyboardAwareFormFlatList
+            <MotionContent contentKey={managing} direction={managing ? 'forward' : 'back'} style={{ flex: 1 }}><KeyboardAwareFormFlatList
               style={styles.supplierList}
               data={loading || loadFailed ? [] : filteredSuppliers}
               keyExtractor={item => item.id}
@@ -236,7 +249,7 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
                     accessibilityRole="button"
                     accessibilityLabel={`选择供应商 ${item.name}`}
                     accessibilityState={{ selected: nameKey(value) === nameKey(item.name), disabled: managing || busy }}
-                    activeOpacity={0.65}
+                    activeOpacity={0.86}
                     disabled={managing || busy}
                     style={styles.supplierOptionContent}
                     onPress={() => selectSupplier(item.name, item.id)}
@@ -257,13 +270,14 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
                   {loadFailed ? <UiToolbarButton label="重新加载供应商" icon="refresh-cw" variant="secondary" onPress={() => { void refreshSuppliers(); }} /> : null}
                 </View>
               }
-            />
+            /></MotionContent>
           </AppModalCard>
         </View>
   );
   return (
     <>
-      {embedded ? content : <Modal visible transparent animationType="fade" onRequestClose={close}>{content}</Modal>}
+      {embedded ? <MotionPresence visible={visible} overlay style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 20 }}>{visible ? content : null}</MotionPresence>
+        : <Modal visible={visible} transparent animationType="fade" onRequestClose={close}>{content}</Modal>}
       {alert.AlertComponent}
     </>
   );

@@ -1,0 +1,76 @@
+diff --git a/build/web/useWebBarcodeScanner.js b/build/web/useWebBarcodeScanner.js
+index 4e5306697dc5cd79e487b1e8fae620f6fe6596df..9c2f317b0d785ad53649cbb32b9bcdcbe1390ff5 100644
+--- a/build/web/useWebBarcodeScanner.js
++++ b/build/web/useWebBarcodeScanner.js
+@@ -1,17 +1,20 @@
+ import * as React from 'react';
+ import * as WebBarcodeScanner from './WebBarcodeScanner';
+-function mapToViewCoordinates(result, videoWidth, viewHeight, height, width, isMirrored) {
+-    const scaleX = width / videoWidth;
+-    const scaleY = viewHeight / height;
++export function mapToViewCoordinates(result, videoWidth, videoHeight, viewWidth, viewHeight, isMirrored) {
++    // Match ExpoCamera.web's objectFit: cover, including the centered crop.
++    const scale = Math.max(viewWidth / videoWidth, viewHeight / videoHeight);
++    const offsetX = (viewWidth - videoWidth * scale) / 2;
++    const offsetY = (viewHeight - videoHeight * scale) / 2;
+     const mapPoint = (p) => {
+-        const x = isMirrored ? width - p.x * scaleX : p.x * scaleX;
+-        const y = p.y * scaleY;
++        const sourceX = p.x * scale + offsetX;
++        const x = isMirrored ? viewWidth - sourceX : sourceX;
++        const y = p.y * scale + offsetY;
+         return { x, y };
+     };
+     const origin = mapPoint(result.bounds.origin);
+     const size = {
+-        width: result.bounds.size.width * scaleX,
+-        height: result.bounds.size.height * scaleY,
++        width: result.bounds.size.width * scale,
++        height: result.bounds.size.height * scale,
+     };
+     if (isMirrored) {
+         origin.x -= size.width;
+diff --git a/src/web/useWebBarcodeScanner.ts b/src/web/useWebBarcodeScanner.ts
+index c258d738a32f58747cf1967f9e81ff85e7c202d9..c8adf529c19381ac60f621b4bc55891ac156c86a 100644
+--- a/src/web/useWebBarcodeScanner.ts
++++ b/src/web/useWebBarcodeScanner.ts
+@@ -3,27 +3,30 @@ import * as React from 'react';
+ import * as WebBarcodeScanner from './WebBarcodeScanner';
+ import type { BarcodeType, BarcodeScanningResult, MountErrorListener } from '../Camera.types';
+ 
+-function mapToViewCoordinates(
++export function mapToViewCoordinates(
+   result: BarcodeScanningResult,
+   videoWidth: number,
++  videoHeight: number,
++  viewWidth: number,
+   viewHeight: number,
+-  height: number,
+-  width: number,
+   isMirrored: boolean
+ ): BarcodeScanningResult {
+-  const scaleX = width / videoWidth;
+-  const scaleY = viewHeight / height;
++  // Match ExpoCamera.web's objectFit: cover, including the centered crop.
++  const scale = Math.max(viewWidth / videoWidth, viewHeight / videoHeight);
++  const offsetX = (viewWidth - videoWidth * scale) / 2;
++  const offsetY = (viewHeight - videoHeight * scale) / 2;
+ 
+   const mapPoint = (p: { x: number; y: number }) => {
+-    const x = isMirrored ? width - p.x * scaleX : p.x * scaleX;
+-    const y = p.y * scaleY;
++    const sourceX = p.x * scale + offsetX;
++    const x = isMirrored ? viewWidth - sourceX : sourceX;
++    const y = p.y * scale + offsetY;
+     return { x, y };
+   };
+ 
+   const origin = mapPoint(result.bounds.origin);
+   const size = {
+-    width: result.bounds.size.width * scaleX,
+-    height: result.bounds.size.height * scaleY,
++    width: result.bounds.size.width * scale,
++    height: result.bounds.size.height * scale,
+   };
+ 
+   if (isMirrored) {

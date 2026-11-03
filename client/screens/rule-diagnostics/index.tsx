@@ -1,5 +1,7 @@
+import { MotionCollapse } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FlatList, Keyboard, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { FlatList, Keyboard, Platform, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useFocusEffect, useNavigation } from 'expo-router';
 import type { NativeStackNavigationProp } from 'expo-router/native-stack';
 import type { ParamListBase } from 'expo-router/react-navigation';
@@ -10,6 +12,7 @@ import { AppSegmentedOptions } from '@/components/AppSegmentedOptions';
 import { UiPageHeader, UiToolbarButton } from '@/components/UiRedesign';
 import { RuleOptionPicker } from '@/screens/rules/RuleOptionPicker';
 import { useTheme } from '@/hooks/useTheme';
+import { useAppMotion } from '@/hooks/useAppMotion';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { BorderRadius, Spacing, Typography, type Theme } from '@/constants/theme';
 import {
@@ -30,6 +33,7 @@ const BINDING_LABELS = { exact: '精确绑定', generic: '通用版本绑定', n
 
 export default function RuleDiagnosticsScreen() {
   const { theme, isDark } = useTheme();
+  const reduced = useAppMotion();
   const styles = useMemo(() => createStyles(theme), [theme]);
   const router = useSafeRouter();
   const navigation = useNavigation<NativeStackNavigationProp<ParamListBase>>();
@@ -85,9 +89,10 @@ export default function RuleDiagnosticsScreen() {
           if (request === requestRef.current) pendingAnalysisRef.current = null;
           resolve();
         };
-        if (Platform.OS !== 'web' && waitingForEditorReturnRef.current) {
+        if (Platform.OS !== 'web' && waitingForEditorReturnRef.current && !reduced) {
           pendingAnalysisRef.current = { cancel: complete, afterTransition: complete };
         } else {
+          waitingForEditorReturnRef.current = false;
           const frame = requestAnimationFrame(complete);
           if (!completed) pendingAnalysisRef.current = { cancel: () => { cancelAnimationFrame(frame); complete(); } };
         }
@@ -121,7 +126,7 @@ export default function RuleDiagnosticsScreen() {
         setLoading(false);
       }
     }
-  }, []);
+  }, [reduced]);
 
   useFocusEffect(useCallback(() => {
     void load();
@@ -143,7 +148,7 @@ export default function RuleDiagnosticsScreen() {
 
   const editRule = (id: string) => {
     if (loadingRef.current || loadErrorRef.current) return;
-    waitingForEditorReturnRef.current = Platform.OS !== 'web';
+    waitingForEditorReturnRef.current = Platform.OS !== 'web' && !reduced;
     try {
       router.push('/rules', { editRuleId: id, returnTo: 'rule-diagnostics' });
     } catch (error) {
@@ -228,7 +233,7 @@ export default function RuleDiagnosticsScreen() {
               <TouchableOpacity accessibilityRole="button" accessibilityLabel="显示诊断隐藏字符" accessibilityState={{ expanded: showHidden }} onPress={() => setShowHidden(value => !value)} style={styles.smallAction}>
                 <Text style={styles.detail}>{showHidden ? '收起' : '显示'}隐藏字符（回车、换行、空格）</Text>
               </TouchableOpacity>
-              {showHidden && sample ? <Text selectable style={styles.raw}>{visualizeScanCharacters(sample)}</Text> : null}
+              {<MotionCollapse open={Boolean(showHidden && sample)}>{showHidden && sample ? <Text selectable style={styles.raw}>{visualizeScanCharacters(sample)}</Text> : null}</MotionCollapse>}
               {sampleError ? <Text accessibilityRole="alert" style={styles.problemText}>{sampleError}</Text> : null}
             </View>
 
@@ -264,7 +269,7 @@ export default function RuleDiagnosticsScreen() {
           </View>
         )}
       />
-      {rulePicker ? <RuleOptionPicker title="这张码应该属于哪条规则" value={expectedRuleId} options={[{ value: '', label: '不指定预期规则' }, ...snapshot.rules.map(rule => ({ value: rule.id, label: `${rule.name}${rule.isActive ? '' : '（已停用）'}` }))]} onClose={() => setRulePicker(false)} onSelect={value => { expectedRuleRef.current = value; setExpectedRuleId(value); setResult(null); setRulePicker(false); }} /> : null}
+      {<RuleOptionPicker title="这张码应该属于哪条规则" value={expectedRuleId} options={[{ value: '', label: '不指定预期规则' }, ...snapshot.rules.map(rule => ({ value: rule.id, label: `${rule.name}${rule.isActive ? '' : '（已停用）'}` }))]} onClose={() => setRulePicker(false)} onSelect={value => { expectedRuleRef.current = value; setExpectedRuleId(value); setResult(null); setRulePicker(false); }}  visible={Boolean(rulePicker)} />}
     </Screen>
   );
 }

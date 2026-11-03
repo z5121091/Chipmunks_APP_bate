@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -58,6 +58,9 @@ internal static class WindowTests
         {
             IntPtr handle = messageOwner.Handle;
             SynchronizationContext.SetSynchronizationContext(UiContext);
+            Run("ota-connection-inside-signing-tabs", OtaSigningTab);
+            Run("ota-only-apk-target", OtaOnlyApk);
+            Run("ota-publish-directly-in-main-window", OtaDirect);
             Run("idle-buttons-and-branded-layout", Idle);
             Run("running-stage-and-success-artifact", Success);
             Run("failed-next-task-clears-previous-artifact", FailureAfterSuccess);
@@ -220,6 +223,55 @@ internal static class WindowTests
         {
             window.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
             bitmap.Save(Path.Combine(root, name + ".png"), ImageFormat.Png);
+        }
+    }
+
+    private static void OtaSigningTab()
+    {
+        using (Fixture f = new Fixture("exit 0"))
+        using (var window = new SigningWindow(f.DirectoryPath)) {
+            var tabs = window.Controls.Find("apkPublishTabs", true).OfType<TabControl>().Single();
+            Assert(tabs.TabPages.Count == 2, "Signing and connection tabs missing.");
+            Assert(window.Text.Contains("构建工具设置"), "Settings title incorrect.");
+            tabs.SelectedIndex = 1; EnsureHandles(window); window.PerformLayout();
+            Assert(window.Controls.Find("testOtaConnection", true).Length == 1, "Connection test not integrated in signing settings.");
+            using (Bitmap image = new Bitmap(window.Width, window.Height)) {
+                window.DrawToBitmap(image, new Rectangle(Point.Empty, image.Size));
+                image.Save(Path.Combine(root, "ota-signing-connection.png"), ImageFormat.Png);
+            }
+        }
+    }
+
+    private static bool OwnVisible(Control control)
+    {
+        return (bool)typeof(Control).GetMethod("GetState", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(control, new object[] { 2 });
+    }
+    private static void OtaOnlyApk()
+    {
+        using (Fixture f = new Fixture("exit 0")) {
+            var publish = Find<Button>(f.Window, "publishOta");
+            Assert(Find<Button>(f.Window, "manageSigning").Text == "设置…", "Unified settings entry missing.");
+            Assert(publish.Text == "生成并发布热更新", "Publish action label incorrect.");
+            Assert(OwnVisible(publish), "APK publish action missing.");
+            f.Window.SelectTargetForTest(BuildTarget.SyncHelper);
+            Assert(!OwnVisible(publish) && !OwnVisible(Find<TextBox>(f.Window, "otaNotes").Parent), "Sync helper exposes hot-update actions.");
+            f.Window.SelectTargetForTest(BuildTarget.Apk);
+            Assert(OwnVisible(publish), "APK publish action did not return.");
+            Screenshot(f.Window, "ota-apk-main");
+        }
+    }
+    private static void OtaDirect()
+    {
+        using (Fixture f = new Fixture("exit 0")) {
+            string scripts = Path.Combine(f.DirectoryPath, "scripts"); Directory.CreateDirectory(scripts);
+            File.WriteAllText(Path.Combine(scripts, "publish-ota.ps1"), "param([string]$NotesFile)\r\nif(-not (Test-Path -LiteralPath $NotesFile)){exit 7}; [Console]::WriteLine('[4/5] Uploading fixture'); [Console]::WriteLine('PUBLISHED: 11111111-2222-3333-4444-555555555555'); exit 0", new UTF8Encoding(true));
+            typeof(BuildWindow).GetMethod("StartPublish", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(f.Window, null);
+            Assert(f.Window.TaskRunning && !Find<Button>(f.Window, "publishOta").Enabled, "Publish did not lock main-window actions.");
+            Finish(f);
+            Assert(f.Window.StatusTitle == "热更新发布成功", "Publish confirmation missing.");
+            Assert(f.Window.DisplayedLog.Contains("PUBLISHED:"), "Publish log did not reach main window.");
+            Assert(f.Window.DisplayedArtifact == null, "Publish exposed a stale APK artifact.");
+            Assert(!f.Window.Visible, "Publish unexpectedly opened main window.");
         }
     }
 

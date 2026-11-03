@@ -1,5 +1,7 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, Modal, ScrollView, useWindowDimensions } from 'react-native';
+import { View, Text, ScrollView, useWindowDimensions } from 'react-native';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { Spacing, BorderRadius, BorderWidth, Typography } from '@/constants/theme';
@@ -7,6 +9,8 @@ import { APP_MODAL_MAX_WIDTH, getAppModalWidth } from '@/constants/modal';
 import { withAlpha } from '@/utils/colors';
 import { AppPillToast, AppPillToastType } from './AppPillToast';
 import { feedbackCancel, feedbackConfirm, feedbackDeleted } from '@/utils/feedback';
+import { MotionSurface } from '@/components/AppMotion';
+import { getFeedbackDuration, type FeedbackTimingOptions } from '@/utils/feedbackTiming';
 
 export type AlertButtonType = {
   text: string;
@@ -38,6 +42,8 @@ export function CustomAlert({
   const modalWidth = getAppModalWidth(width);
   const shouldScrollMessage = Boolean(message && (message.includes('\n') || message.length > 96));
   const messageMaxHeight = Math.min(Math.max(height * 0.28, 96), 180);
+  const pressed = useRef(false);
+  useEffect(() => { pressed.current = false; }, [visible, title, buttons]);
 
   const getIconConfig = () => {
     switch (icon) {
@@ -77,15 +83,15 @@ export function CustomAlert({
   };
 
   const handleButtonPress = (button: AlertButtonType) => {
+    if (pressed.current || !visible) return;
+    pressed.current = true;
     if (button.style === 'cancel' || button.text === '取消') {
       void feedbackCancel();
     } else if (button.text === '确认' || button.text === '确定') {
       void feedbackConfirm();
     }
-    if (button.onPress) {
-      button.onPress();
-    }
     onClose();
+    button.onPress?.();
   };
 
   const iconConfig = getIconConfig();
@@ -104,7 +110,7 @@ export function CustomAlert({
         alignItems: 'center',
         padding: 20,
       }}>
-        <View style={{
+        <MotionSurface style={{
           width: modalWidth,
           maxWidth: APP_MODAL_MAX_WIDTH,
           borderRadius: BorderRadius.md,
@@ -198,7 +204,7 @@ export function CustomAlert({
                     borderColor: isCancel ? theme.border : 'transparent',
                   }}
                   onPress={() => handleButtonPress(button)}
-                  activeOpacity={0.7}
+                  activeOpacity={0.86}
                 >
                   <Text style={{
                     ...Typography.dialogAction,
@@ -210,7 +216,7 @@ export function CustomAlert({
               );
             })}
           </View>
-        </View>
+        </MotionSurface>
       </View>
     </Modal>
   );
@@ -224,7 +230,7 @@ export interface AlertConfig {
   icon?: AlertIconType;
 }
 
-export function useCustomAlert() {
+export function useCustomAlert({ duration, persistentErrors }: FeedbackTimingOptions = {}) {
   const [visible, setVisible] = useState(false);
   const [pill, setPill] = useState<{ text: string; type: AppPillToastType } | null>(null);
   const pillTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -238,15 +244,17 @@ export function useCustomAlert() {
     if (pillTimerRef.current) {
       clearTimeout(pillTimerRef.current);
     }
+    pillTimerRef.current = null;
 
     setPill({ text, type });
-    if (type !== 'error') {
+    const delay = getFeedbackDuration(type, { duration, persistentErrors });
+    if (delay !== null) {
       pillTimerRef.current = setTimeout(() => {
         setPill(null);
         pillTimerRef.current = null;
-      }, type === 'warning' ? 2400 : 2200);
+      }, delay);
     }
-  }, []);
+  }, [duration, persistentErrors]);
 
   useEffect(() => {
     return () => {
@@ -317,19 +325,11 @@ export function useCustomAlert() {
   }, [shouldUsePill, showPill]);
 
   const showError = useCallback((message: string) => {
-    if (shouldUsePill(message)) {
-      showPill(message, 'error');
-      return;
-    }
-
-    setConfig({
-      title: '错误',
-      message,
-      buttons: [{ text: '确定', style: 'destructive' }],
-      icon: 'error',
-    });
-    setVisible(true);
-  }, [shouldUsePill, showPill]);
+    // Long errors use the same wrapping, non-blocking feedback as short errors.
+    // Only an explicit showAlert/showConfirm opens a decision dialog.
+    setVisible(false);
+    showPill(message, 'error');
+  }, [showPill]);
 
   const showWarning = useCallback((message: string) => {
     if (shouldUsePill(message)) {
@@ -352,9 +352,8 @@ export function useCustomAlert() {
 
   // 直接渲染 AlertComponent，不再使用 useMemo 缓存
   // 因为 config.buttons.onPress 需要及时更新
-  const AlertComponent = visible || pill ? (
+  const AlertComponent = (
     <>
-      {visible ? (
         <CustomAlert
           visible={visible}
           title={config.title}
@@ -363,10 +362,9 @@ export function useCustomAlert() {
           icon={config.icon}
           onClose={close}
         />
-      ) : null}
-      {pill ? <AppPillToast text={pill.text} type={pill.type} /> : null}
+      <AppPillToast text={pill?.text || ''} type={pill?.type || 'success'} visible={Boolean(pill)} />
     </>
-  ) : null;
+  );
 
   return {
     visible,

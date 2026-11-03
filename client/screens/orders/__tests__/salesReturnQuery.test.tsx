@@ -1,5 +1,6 @@
 import TestRenderer, { act } from 'react-test-renderer';
-import { FlatList, Text, TouchableOpacity } from 'react-native';
+import { FlatList, Text } from 'react-native';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import OrdersScreen from '../index';
 import { getQueryOrder, getQueryMaterialsByOrder, getQueryFilteredOrders, type MaterialRecord } from '@/utils/database';
@@ -21,6 +22,9 @@ jest.mock('@/hooks/useTheme', () => {
 });
 jest.mock('../styles', () => ({ createStyles: () => ({}) }));
 jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
+jest.mock('@/components/CustomAlert', () => ({ useCustomAlert: () => ({ showConfirm: jest.fn(), showSuccess: jest.fn(), showError: jest.fn(), AlertComponent: null }) }));
+jest.mock('@/utils/outboundHistoryExport', () => ({ exportOutboundHistoryToComputer: jest.fn() }));
+jest.mock('@/utils/excel', () => ({ formatSyncErrorMessage: jest.fn() }));
 jest.mock('@/components/AnimatedCard', () => ({ AnimatedCard: 'Card' }));
 jest.mock('@/components/AppEmptyState', () => ({ AppEmptyState: 'Empty' }));
 jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon', FontAwesome6: 'Icon' }));
@@ -71,12 +75,12 @@ it('ignores a late warehouse A response after warehouse B has already loaded', a
     await act(async () => { root = TestRenderer.create(<OrdersScreen />); });
     await pressText(root, '仓库');
     await pressText(root, '仓库二');
-    expect(root.root.findByType(FlatList).props.data).toEqual([materialB]);
+    expect(root.root.findAllByType(FlatList).find(node => node.props.data.some((item: unknown) => item && typeof item === "object" && ("model" in item || "order_no" in item)))!.props.data).toEqual([expect.objectContaining({ model: 'MODEL-B', quantity: 2 })]);
     await act(async () => { lateOrder.resolve(orderA); lateMaterials.resolve([]); lateList.resolve([orderA]); });
-    expect(root.root.findByType(FlatList).props.data).toEqual([materialB]);
+    expect(root.root.findAllByType(FlatList).find(node => node.props.data.some((item: unknown) => item && typeof item === "object" && ("model" in item || "order_no" in item)))!.props.data).toEqual([expect.objectContaining({ model: 'MODEL-B', quantity: 2 })]);
     await pressText(root, '全部');
     await act(async () => { await jest.advanceTimersByTimeAsync(250); });
-    expect(root.root.findByType(FlatList).props.data).toEqual([orderB]);
+    expect(root.root.findAllByType(FlatList).find(node => node.props.data.some((item: unknown) => item && typeof item === "object" && ("model" in item || "order_no" in item)))!.props.data).toEqual([orderB]);
   } finally {
     if (root) await act(async () => { root.unmount(); });
     jest.useRealTimers();
@@ -130,17 +134,13 @@ it('queries independent returns as positive received records and opens their own
     expect(getQueryFilteredOrders).toHaveBeenCalled();
     expect(root.root.findAllByType(Text).map(node => node.props.children).flat().join(''))
       .toContain('销售退货 · 客户 B');
-    const list = root.root.findByType(FlatList);
-    expect(list.props.data).toEqual([record]);
-    let row!: TestRenderer.ReactTestRenderer;
-    await act(async () => { row = TestRenderer.create(list.props.renderItem({ item: record })); });
-    try {
-      expect(row.root.findAllByType(Text).map(node => node.props.children).flat().join('')).toContain('实收数量: 80');
-      await act(async () => { row.root.findByType(TouchableOpacity).props.onPress(); });
-      expect(mockPush).toHaveBeenCalledWith('/detail', { id: 'return-record-1' });
-    } finally {
-      await act(async () => { row.unmount(); });
-    }
+    expect(root.root.findAllByType(FlatList).find(node => node.props.data.some((item: unknown) => item && typeof item === "object" && ("model" in item || "order_no" in item)))!.props.data).toEqual([expect.objectContaining({ model: 'MODEL-1', quantity: 80 })]);
+    const batchButton = root.root.findAllByType(TouchableOpacity).find(node => node.props.accessibilityLabel?.startsWith('批次 LOT-1'));
+    expect(batchButton).toBeDefined();
+    await act(async () => { batchButton!.props.onPress(); });
+    expect(root.root.findAllByType(Text).map(node => node.props.children).flat().join('')).toContain('实收数量：80');
+    await pressText(root, '追溯码：TRACE-1');
+    expect(mockPush).toHaveBeenCalledWith('/detail', { id: 'return-record-1' });
   } finally {
     if (root) await act(async () => { root.unmount(); });
     jest.useRealTimers();

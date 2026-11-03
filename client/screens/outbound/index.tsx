@@ -1,5 +1,10 @@
+import { MotionChevron } from '@/components/AppMotion';
+import { MotionCollapse } from '@/components/AppMotion';
+import { MotionPresence } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
-import { View, Text, TouchableOpacity, FlatList, TextInput, Platform, Modal, ScrollView, BackHandler, type NativeSyntheticEvent, type TextInputSubmitEditingEventData } from 'react-native';
+import { View, Text, FlatList, TextInput, Platform, ScrollView, BackHandler, type NativeSyntheticEvent, type TextInputSubmitEditingEventData } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useConfirmedRouteExit } from '@/hooks/useConfirmedRouteExit';
 import { workDraftStorage as AsyncStorage } from '@/utils/workDraftIsolation';
@@ -611,7 +616,7 @@ export default function PDAScanScreen() {
   const { theme, isDark } = useTheme();
   const styles = useMemo(() => createStyles(theme), [theme]);
   const router = useSafeRouter();
-  const alert = useCustomAlert();
+  const alert = useCustomAlert({ persistentErrors: true });
   // 弹窗与路由 Hook 返回对象会随渲染更新；扫码回调通过 Ref 获取最新实例，避免高频扫码链路反复重建。
   const alertRef = useRef(alert);
   const routerRef = useRef(router);
@@ -845,7 +850,7 @@ export default function PDAScanScreen() {
   const expandedGroupsRef = useRef<Set<string>>(new Set());
 
   // Toast
-  const { showToast: notifyToast, ToastContainer } = useToast();
+  const { showToast: notifyToast, ToastContainer } = useToast({ persistentErrors: true });
   const showToast = useCallback((...args: Parameters<typeof notifyToast>) => {
     notifyToast(...args);
     if (args[1] === 'error') pausePendingScans();
@@ -1054,7 +1059,7 @@ export default function PDAScanScreen() {
       activeRulesRef.current = null;
       inventoryBindingsRef.current.clear();
       markErpVoucherUnverified();
-      const backSubscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      const backSubscription = Platform.OS === 'web' ? null : BackHandler.addEventListener('hardwareBackPress', () => {
         requestBackRef.current();
         return true;
       });
@@ -1118,7 +1123,7 @@ export default function PDAScanScreen() {
       };
       void init();
       return () => {
-        backSubscription.remove();
+        backSubscription?.remove();
         if (pageSessionRef.current !== sessionId) return;
         screenActiveRef.current = false;
         pageSessionRef.current += 1;
@@ -2822,7 +2827,7 @@ export default function PDAScanScreen() {
         <View style={styles.erpLineCard}>
           <TouchableOpacity
             style={styles.erpLineMain}
-            activeOpacity={0.76}
+            activeOpacity={0.86}
             onPress={() => toggleExpand(item.key)}
           >
             <View style={styles.erpLineContent}>
@@ -2853,14 +2858,10 @@ export default function PDAScanScreen() {
                 </Text>
               </View>
             </View>
-            <Feather
-              name={isExpanded ? 'chevron-up' : 'chevron-down'}
-              size={17}
-              color={theme.textMuted}
-            />
+            <MotionChevron expanded={Boolean(isExpanded)} collapsed="down" size={17} color={theme.textMuted} />
           </TouchableOpacity>
 
-          {isExpanded ? (
+          {<MotionCollapse open={Boolean(isExpanded)}>{isExpanded ? (
             <View style={styles.erpLineDetails}>
               {item.scannedItems.length > 0 ? (
                 item.scannedItems.map(renderErpLineDetail)
@@ -2868,7 +2869,7 @@ export default function PDAScanScreen() {
                 <Text style={styles.erpLineEmptyText}>暂无已扫明细</Text>
               )}
             </View>
-          ) : null}
+          ) : null}</MotionCollapse>}
         </View>
       );
     },
@@ -3614,8 +3615,7 @@ export default function PDAScanScreen() {
           )}
         </View>
 
-        {showLegacyReview ? (
-          <Modal transparent visible animationType="fade" onRequestClose={() => setShowLegacyReview(false)}>
+        {<Modal transparent visible={Boolean(showLegacyReview) && (true)} animationType="fade" onRequestClose={() => setShowLegacyReview(false)}>{showLegacyReview ? <>
             <View style={styles.modalOverlay}>
               <AppModalCard title="历史扫码待核对" subtitle="先核对原订单，再按当前规则恢复；不会自动补写"
                 size="list" stretchBody={false} onClose={() => setShowLegacyReview(false)}>
@@ -3655,11 +3655,9 @@ export default function PDAScanScreen() {
                 </ScrollView>
               </AppModalCard>
             </View>
-          </Modal>
-        ) : null}
+          </> : null}</Modal>}
 
-        {showPrintTasks ? (
-          <Modal transparent visible animationType="fade" onRequestClose={() => setShowPrintTasks(false)}>
+        {<Modal transparent visible={Boolean(showPrintTasks) && (true)} animationType="fade" onRequestClose={() => setShowPrintTasks(false)}>{showPrintTasks ? <>
             <View style={styles.modalOverlay}>
               <AppModalCard title="拆包标签任务" subtitle="任务回执由同步助手提供，请核对标签是否实际出纸"
                 size="list" stretchBody={false} onClose={() => setShowPrintTasks(false)}>
@@ -3696,11 +3694,10 @@ export default function PDAScanScreen() {
                 </ScrollView>
               </AppModalCard>
             </View>
-          </Modal>
-        ) : null}
+          </> : null}</Modal>}
 
         {/* 仓库选择器 */}
-        {showWarehousePicker && (
+        {<MotionPresence visible={Boolean(showWarehousePicker)} overlay style={{ position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, zIndex: 50 }}>{showWarehousePicker && (
           <View style={styles.pickerOverlay}>
             <View style={styles.pickerBox}>
               <Text style={styles.pickerTitle}>选择仓库</Text>
@@ -3711,7 +3708,7 @@ export default function PDAScanScreen() {
                     styles.pickerItem,
                     currentWarehouse?.id === wh.id && styles.pickerItemActive,
                   ]}
-                  activeOpacity={0.7}
+                  activeOpacity={0.86}
                   onPress={() => selectWarehouse(wh)}
                 >
                   <Text style={styles.pickerItemText}>{wh.name}</Text>
@@ -3728,7 +3725,7 @@ export default function PDAScanScreen() {
               </TouchableOpacity>
             </View>
           </View>
-        )}
+        )}</MotionPresence>}
 
         <Modal
           visible={!!pendingOutboundUnpack}

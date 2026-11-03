@@ -1,17 +1,7 @@
+import { MotionChevron } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import React, { useMemo } from 'react';
-import {
-  ActivityIndicator,
-  Platform,
-  StyleProp,
-  StyleSheet,
-  Switch,
-  Text,
-  TextInput,
-  TextInputProps,
-  TouchableOpacity,
-  View,
-  ViewStyle,
-} from 'react-native';
+import { ActivityIndicator, Platform, Pressable, StyleProp, StyleSheet, Text, TextInput, TextInputProps, View, ViewStyle } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AnimatedButton } from '@/components/AnimatedButton';
@@ -155,7 +145,7 @@ export function UiPageHeader({
     <View style={[styles.pageHeader, style]}>
       <TouchableOpacity
         style={styles.pageHeaderAction}
-        activeOpacity={0.72}
+        activeOpacity={0.86}
         onPress={onBack}
         accessibilityRole="button"
         accessibilityLabel={backLabel}
@@ -170,7 +160,7 @@ export function UiPageHeader({
       {rightIcon && onRightPress ? (
         <TouchableOpacity
           style={[styles.pageHeaderAction, (rightDisabled || rightLoading) && styles.itemDisabled]}
-          activeOpacity={0.72}
+          activeOpacity={0.86}
           disabled={rightDisabled || rightLoading}
           onPress={onRightPress}
           accessibilityRole="button"
@@ -211,6 +201,7 @@ export function UiListItem({
   const isSwitch = typeof switchValue === 'boolean' && onSwitchChange;
   const isDisabled = disabled || loading;
   const handlePress = () => {
+    if (isDisabled) return;
     if (isSwitch) {
       onSwitchChange(!switchValue);
       return;
@@ -218,14 +209,8 @@ export function UiListItem({
     onPress?.();
   };
 
-  return (
-    <AnimatedButton
-      style={[styles.item, compact && styles.itemCompact, isDisabled && styles.itemDisabled]}
-      onPress={handlePress}
-      disabled={isDisabled || (!onPress && !isSwitch)}
-      activeScale={0.985}
-      activeOpacity={0.9}
-    >
+  const content = (
+    <>
       <View
         style={[
           styles.iconBox,
@@ -257,25 +242,37 @@ export function UiListItem({
       </View>
 
       {isSwitch ? (
-        <Switch
-          value={switchValue}
-          onValueChange={onSwitchChange}
-          trackColor={{ false: theme.border, true: `${color}80` }}
-          thumbColor={switchValue ? color : theme.textMuted}
-        />
+        <View style={styles.switchHitArea} pointerEvents="none">
+          <View testID="ui-switch-track" style={[styles.switchTrack, {
+            backgroundColor: switchValue ? theme.success : theme.tagGray,
+            alignItems: switchValue ? 'flex-end' : 'flex-start',
+          }]}>
+            <View testID="ui-switch-thumb" style={[styles.switchThumb, {
+              backgroundColor: theme.white, shadowColor: theme.shadowColor,
+            }]} />
+          </View>
+        </View>
       ) : rightText ? (
         <Text style={[styles.rightText, { color }]} numberOfLines={1}>
           {rightText}
         </Text>
       ) : (
-        <Feather
-          name={expanded ? 'chevron-down' : 'chevron-right'}
-          size={16}
-          color={theme.textMuted}
-        />
+        <MotionChevron expanded={Boolean(expanded)} collapsed="right" size={16} color={theme.textMuted} />
       )}
-    </AnimatedButton>
+    </>
   );
+  const itemStyle = [styles.item, compact && styles.itemCompact, isDisabled && styles.itemDisabled];
+  // One switch target for both the row and the enlarged visual control. Avoid
+  // nesting a switch inside a button, which can dispatch the same tap twice.
+  if (isSwitch) return <Pressable style={itemStyle} onPress={handlePress} disabled={Boolean(isDisabled)}
+    accessibilityRole="switch" accessibilityLabel={title}
+    accessibilityState={{ checked: switchValue, disabled: Boolean(isDisabled) }}>
+    {content}
+  </Pressable>;
+  return <AnimatedButton style={itemStyle} onPress={handlePress}
+    disabled={isDisabled || !onPress} activeScale={0.985} activeOpacity={0.9}>
+    {content}
+  </AnimatedButton>;
 }
 
 export function UiToolbarButton({
@@ -337,7 +334,7 @@ export function UiToolbarButton({
       ]}
       onPress={onPress}
       disabled={disabled || loading}
-      activeScale={0.96}
+      activeScale={0.985}
       activeOpacity={0.9}
     >
       {loading ? (
@@ -519,6 +516,10 @@ const createStyles = (theme: Theme) =>
     itemDisabled: {
       opacity: 0.5,
     },
+    switchHitArea: { width: 64, height: 48, flexShrink: 0, alignItems: 'center', justifyContent: 'center' },
+    switchTrack: { width: 60, height: 34, borderRadius: 17, padding: 3, justifyContent: 'center' },
+    switchThumb: { width: 28, height: 28, borderRadius: 14,
+      shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.16, shadowRadius: 2, elevation: 1 },
     toolbarButton: {
       flexDirection: 'row',
       alignItems: 'center',

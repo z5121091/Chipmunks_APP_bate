@@ -904,3 +904,27 @@ it('persists partial receipts across restart, appends once and locks a fully com
   await expect(database.addInboundRecordsBatch([{ ...second, id: 'PARTIAL-THIRD', traceNo: 'PARTIAL-T3' }],
     { completionStatus: 'partial', expectedSavedIds: [first.id, second.id] })).rejects.toThrow('已入库完成');
 });
+
+
+it('isolates outbound history by warehouse across dates and excludes sales returns', async () => {
+  const a = { id: 'HISTORY-A', name: '历史仓库 A' };
+  const b = { id: 'HISTORY-B', name: '历史仓库 B' };
+  for (const [id, wh, date] of [['HISTORY-A-OLD', a, '2025-01-02'], ['HISTORY-A-NEW', a, '2026-10-31'], ['HISTORY-B-ONLY', b, '2026-10-31']] as const) {
+    await database.addMaterialWithOrder({ ...material, id, order_no: 'IO-' + id,
+      warehouse_id: wh.id, warehouse_name: wh.name, traceNo: id, scanned_at: date }, '历史客户', wh);
+  }
+  await database.saveSalesReturnWithOrder({ material: { ...returnMaterial('HISTORY-RETURN', 'HISTORY-RETURN-TRACE'),
+    warehouse_id: a.id, warehouse_name: a.name }, requiredQuantity: 100 });
+  expect((await database.getOutboundExportRows(a.id)).map(row => row.order_no).sort())
+    .toEqual(['IO-HISTORY-A-NEW', 'IO-HISTORY-A-OLD']);
+  expect((await database.getOutboundExportRows(b.id)).map(row => row.order_no))
+    .toEqual(['IO-HISTORY-B-ONLY']);
+});
+
+
+it('reads saved receipt accounts for compact metadata without guessing from warehouse names', async () => {
+  const row = { ...receipt, id: 'ACCOUNT-METADATA-A', inbound_no: 'ACCOUNT-METADATA', erp_account_key: 'shanghai-chipmunk' };
+  await database.addInboundRecordsBatch([row]);
+  expect((await database.getInboundDocumentSummaries()).find(item => item.inbound_no === row.inbound_no))
+    .toMatchObject({ erp_account_keys: 'shanghai-chipmunk' });
+});

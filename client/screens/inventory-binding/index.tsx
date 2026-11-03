@@ -1,13 +1,9 @@
+import { MotionChevron } from '@/components/AppMotion';
+import { MotionCollapse } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
 import { useState, useCallback, useMemo, useRef } from 'react';
-import {
-  View,
-  Text,
-  TouchableOpacity,
-  FlatList,
-  TextInput,
-  Modal,
-  Keyboard,
-} from 'react-native';
+import { View, Text, FlatList, TextInput, Keyboard } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
@@ -460,20 +456,16 @@ export default function InventoryBindingScreen() {
         <View style={styles.bindingCard}>
           <TouchableOpacity
             style={styles.bindingHeaderRow}
-            activeOpacity={0.75}
+            activeOpacity={0.86}
             onPress={() => toggleBindingExpanded(binding.id)}
           >
             <Text style={styles.bindingModel} numberOfLines={1} ellipsizeMode="tail">
               {binding.scan_model}
             </Text>
-            <Feather
-              name={isExpanded ? 'chevron-up' : 'chevron-down'}
-              size={16}
-              color={theme.textMuted}
-            />
+            <MotionChevron expanded={Boolean(isExpanded)} collapsed="down" size={16} color={theme.textMuted} />
           </TouchableOpacity>
 
-          {isExpanded ? (
+          {<MotionCollapse open={Boolean(isExpanded)}>{isExpanded ? (
             <View style={styles.bindingExpandedContent}>
               <View style={styles.bindingMetaRow}>
                 <Text style={styles.bindingMetaLabel}>存货编码</Text>
@@ -499,21 +491,21 @@ export default function InventoryBindingScreen() {
               <View style={styles.bindingFooter}>
                 <TouchableOpacity
                   style={styles.actionBtn}
-                  activeOpacity={0.75}
+                  activeOpacity={0.86}
                   onPress={() => handleOpenModal(binding)}
                 >
                   <Text style={styles.actionBtnText}>编辑</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={[styles.actionBtn, styles.actionBtnDanger]}
-                  activeOpacity={0.75}
+                  activeOpacity={0.86}
                   onPress={() => handleDelete(binding)}
                 >
                   <Text style={[styles.actionBtnText, styles.actionBtnTextDanger]}>删除</Text>
                 </TouchableOpacity>
               </View>
             </View>
-          ) : null}
+          ) : null}</MotionCollapse>}
         </View>
       );
     },
@@ -594,8 +586,8 @@ export default function InventoryBindingScreen() {
                       <>
                         <TouchableOpacity
                           style={styles.backButton}
-                          activeOpacity={0.7}
-                          onPress={() => router.back()}
+                          activeOpacity={0.86}
+                          onPress={() => router.back()} accessibilityLabel="返回上一页"
                         >
                           <Feather name="arrow-left" size={18} color={theme.textPrimary} />
                         </TouchableOpacity>
@@ -606,7 +598,7 @@ export default function InventoryBindingScreen() {
                         {searchInput ? (
                           <TouchableOpacity
                             style={styles.searchIconBtn}
-                            activeOpacity={0.7}
+                            activeOpacity={0.86}
                             onPress={() => {
                               void handleClearSearch();
                             }}
@@ -616,7 +608,7 @@ export default function InventoryBindingScreen() {
                         ) : null}
                         <TouchableOpacity
                           style={styles.searchSubmitPill}
-                          activeOpacity={0.75}
+                          activeOpacity={0.86}
                           onPress={() => {
                             void handleSearchSubmit();
                           }}
@@ -754,15 +746,15 @@ export default function InventoryBindingScreen() {
       </View>
 
       {/* 添加/编辑弹窗 */}
-      {modalVisible && <Modal
-        visible
+      {<Modal
+        visible={Boolean(modalVisible) && (true)}
         transparent
         animationType="fade"
         onRequestClose={() => {
           if (supplierModalMode) { supplierCloseRef.current?.(); return; }
           if (!saving) setModalVisible(false);
         }}
-      >
+      >{modalVisible ? <>
         <View style={[styles.modalOverlay, supplierModalMode ? { display: 'none' } : null]}>
           <AppModalCard
             title={editingBinding ? '编辑绑定' : '添加绑定'}
@@ -852,11 +844,10 @@ export default function InventoryBindingScreen() {
             </KeyboardAwareFormScrollView>
           </AppModalCard>
         </View>
-        {supplierModalMode ? (
-          <SupplierManager
+        {<SupplierManager
             embedded
             closeRef={supplierCloseRef}
-            mode={supplierModalMode}
+            mode={supplierModalMode || 'manage'}
             value={formData.supplier}
             onSelect={(supplier) => {
               setFormData(current => ({ ...current, supplier }));
@@ -864,9 +855,8 @@ export default function InventoryBindingScreen() {
             }}
             onDeleted={(supplier) => setFormData(current => normalizeBindingMatchKey(current.supplier) === normalizeBindingMatchKey(supplier) ? { ...current, supplier: '' } : current)}
             onClose={() => setSupplierModalMode(null)}
-          />
-        ) : null}
-      </Modal>}
+           visible={Boolean(supplierModalMode)} />}
+      </> : null}</Modal>}
 
       <Modal
         visible={dataToolsVisible}
@@ -916,9 +906,8 @@ export default function InventoryBindingScreen() {
         </View>
       </Modal>
 
-      {supplierModalMode && !modalVisible ? (
-        <SupplierManager
-          mode={supplierModalMode}
+      {<SupplierManager
+          mode={supplierModalMode || 'manage'}
           value={formData.supplier}
           onSelect={(supplier) => {
             setFormData(current => ({ ...current, supplier }));
@@ -926,8 +915,7 @@ export default function InventoryBindingScreen() {
           }}
           onDeleted={(supplier) => setFormData(current => normalizeBindingMatchKey(current.supplier) === normalizeBindingMatchKey(supplier) ? { ...current, supplier: '' } : current)}
           onClose={() => setSupplierModalMode(null)}
-        />
-      ) : null}
+         visible={Boolean(supplierModalMode && !modalVisible)} />}
 
       {/* 自定义弹窗 */}
       {alert.AlertComponent}

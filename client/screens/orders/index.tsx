@@ -1,13 +1,7 @@
-﻿import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
-import {
-  View,
-  Text,
-  TouchableOpacity,
-  TextInput,
-  Platform,
-  ActivityIndicator,
-  FlatList,
-} from 'react-native';
+import { MotionPresence } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+import { View, Text, TextInput, Platform, ActivityIndicator, FlatList } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from 'expo-router';
 import { Feather, FontAwesome6 } from '@expo/vector-icons';
@@ -15,6 +9,9 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '@/hooks/useTheme';
 import { useHardwareBack } from '@/hooks/useHardwareBack';
 import { Screen } from '@/components/Screen';
+import { useCustomAlert } from '@/components/CustomAlert';
+import { exportOutboundHistoryToComputer } from '@/utils/outboundHistoryExport';
+import { formatSyncErrorMessage } from '@/utils/excel';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { createStyles } from './styles';
 import { AnimatedCard } from '@/components/AnimatedCard';
@@ -32,7 +29,7 @@ import { safeJsonParseNullable } from '@/utils/json';
 import { STORAGE_KEYS } from '@/constants/config';
 import { formatDate } from '@/utils/time';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
-import { Spacing } from '@/constants/theme';
+import { groupOrderMaterials, type OrderMaterialGroup } from '@/utils/orderMaterialGroups';
 import { logger } from '@/utils/logger';
 
 // 搜索类型
@@ -50,6 +47,10 @@ export default function OrdersScreen() {
   const styles = useMemo(() => createStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
+  const alert = useCustomAlert();
+  const [exportingHistory, setExportingHistory] = useState(false);
+  const exportBusyRef = useRef(false);
+  const exportVisitRef = useRef(0);
   const params = useSafeSearchParams<{ orderNo?: string; materialId?: number }>();
 
   const [filteredOrders, setFilteredOrders] = useState<Order[]>([]);
@@ -69,8 +70,11 @@ export default function OrdersScreen() {
   const [currentOrderLoading, setCurrentOrderLoading] = useState(false);
 
   // 展开的订单
-  const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);
+  const [expandedOrderId, setExpandedOrderIdState] = useState<string | null>(null);
   const [expandedMaterials, setExpandedMaterials] = useState<MaterialRecord[]>([]);
+  const [expandedBatchKeys, setExpandedBatchKeys] = useState<Set<string>>(new Set());
+  const currentMaterialGroups = useMemo(() => groupOrderMaterials(currentOrderMaterials), [currentOrderMaterials]);
+  const expandedMaterialGroups = useMemo(() => groupOrderMaterials(expandedMaterials), [expandedMaterials]);
   const [expandedMaterialsLoadingId, setExpandedMaterialsLoadingId] = useState<string | null>(null);
   const expandedOrderIdRef = useRef<string | null>(null);
 
@@ -90,10 +94,11 @@ export default function OrdersScreen() {
     return true;
   }, [showWarehousePicker]));
 
-  // 同步 ref
-  useEffect(() => {
-    expandedOrderIdRef.current = expandedOrderId;
-  }, [expandedOrderId]);
+  const setExpandedOrderId = useCallback((id: string | null) => {
+    expandedOrderIdRef.current = id;
+    setExpandedOrderIdState(id);
+  }, []);
+  const showDetailError = alert.showError;
 
   const clearExpandedMaterialsTimer = useCallback(() => {
     if (expandedMaterialsTimerRef.current) {
@@ -118,6 +123,7 @@ export default function OrdersScreen() {
 
       return () => {
         screenActiveRef.current = false;
+        exportVisitRef.current += 1;
         warehouseLoadRequestRef.current += 1;
         currentOrderRequestRef.current += 1;
         searchRequestRef.current += 1;
@@ -126,6 +132,37 @@ export default function OrdersScreen() {
       };
     }, [clearExpandedMaterialsTimer])
   );
+
+  const handleExportHistory = () => {
+    if (exportBusyRef.current || !currentWarehouse) return;
+    const warehouse = { id: currentWarehouse.id, name: currentWarehouse.name };
+    const visit = exportVisitRef.current;
+    alert.showConfirm(
+      '导出历史',
+      `将导出「${warehouse.name}」的全部历史出库扫码记录到电脑，不受当前搜索和日期筛选影响。仅包含本机已保存的数据。`,
+      async () => {
+        if (!screenActiveRef.current || exportVisitRef.current !== visit || exportBusyRef.current) return;
+        exportBusyRef.current = true;
+        setExportingHistory(true);
+        try {
+          const result = await exportOutboundHistoryToComputer(warehouse);
+          if (screenActiveRef.current && exportVisitRef.current === visit) {
+            alert.showSuccess(`「${warehouse.name}」历史出库记录已导出到电脑，共 ${result.recordCount} 条\n文件：${result.fileName}`);
+          }
+        } catch (error) {
+          if (screenActiveRef.current && exportVisitRef.current === visit) {
+            const message = error instanceof Error ? error.message : '请检查电脑同步助手';
+            alert.showError(`「${warehouse.name}」导出失败：${formatSyncErrorMessage(message)}`);
+          }
+        } finally {
+          exportBusyRef.current = false;
+          setExportingHistory(false);
+        }
+      },
+      false,
+      '导出到电脑',
+    );
+  };
 
   // 加载仓库
   const loadWarehouses = useCallback(async (isCurrent: () => boolean): Promise<Warehouse | null> => {
@@ -274,8 +311,11 @@ export default function OrdersScreen() {
 
           setExpandedMaterials(materials);
         } catch (error) {
-          if (expandedMaterialsRequestRef.current === requestId) {
+          if (screenActiveRef.current && expandedMaterialsRequestRef.current === requestId && expandedOrderIdRef.current === order.id) {
             logger.error('加载订单物料失败:', error);
+            setExpandedOrderId(null);
+            setExpandedMaterialsLoadingId(null);
+            showDetailError('订单明细加载失败，请点击单据重试');
           }
         } finally {
           if (
@@ -298,7 +338,7 @@ export default function OrdersScreen() {
 
       await execute();
     },
-    [clearExpandedMaterialsTimer]
+    [clearExpandedMaterialsTimer, setExpandedOrderId, showDetailError]
   );
 
   const loadDataForWarehouse = useCallback(async (warehouseId?: string) => {
@@ -483,7 +523,7 @@ export default function OrdersScreen() {
 
       await loadDataForWarehouse(warehouse.id);
     },
-    [clearExpandedMaterialsTimer, currentWarehouse, loadDataForWarehouse]
+    [clearExpandedMaterialsTimer, currentWarehouse, loadDataForWarehouse, setExpandedOrderId]
   );
 
   const handleTimeFilterChange = useCallback((filter: TimeFilterType) => {
@@ -500,7 +540,7 @@ export default function OrdersScreen() {
       // （否则列表还是旧数据甚至为空，用户会以为没切成功）
       void loadDataForWarehouse(currentWarehouse?.id);
     }
-  }, [clearExpandedMaterialsTimer, currentWarehouse?.id, loadCurrentOrder, loadDataForWarehouse]);
+  }, [clearExpandedMaterialsTimer, currentWarehouse?.id, loadCurrentOrder, loadDataForWarehouse, setExpandedOrderId]);
 
   // 只在首次进入或目标单号变化时选择“当前”。从物料详情返回时保留查询视图。
   useEffect(() => {
@@ -516,7 +556,7 @@ export default function OrdersScreen() {
 
   // 点击订单 - 展开/收起显示物料列表
   const handleToggleOrder = async (order: Order) => {
-    if (expandedOrderId === order.id) {
+    if (expandedOrderIdRef.current === order.id) {
       expandedMaterialsRequestRef.current += 1;
       clearExpandedMaterialsTimer();
       setExpandedOrderId(null);
@@ -525,7 +565,7 @@ export default function OrdersScreen() {
     } else {
       setExpandedOrderId(order.id);
       setExpandedMaterials([]);
-      await loadExpandedMaterials(order, { warehouseId: currentWarehouse?.id, delay: 30 });
+      await loadExpandedMaterials(order, { warehouseId: currentWarehouse?.id });
     }
   };
 
@@ -534,27 +574,81 @@ export default function OrdersScreen() {
     router.push('/detail', { id: material.id });
   };
 
-  const renderMaterialRow = (material: MaterialRecord) => (
+  const renderMaterialRow = (material: MaterialRecord) => {
+    const traceNo = material.traceNo?.trim() || '-';
+    return (
       <View key={material.id} style={styles.materialItem}>
         <TouchableOpacity
-          style={styles.materialMainInfo}
-          activeOpacity={0.7}
+          style={styles.materialMainInfo} feedback="none"
+          accessibilityRole="button"
+          accessibilityLabel={`查看扫码记录，追溯码：${traceNo}`}
+          activeOpacity={0.86}
           onPress={() => handleViewMaterial(material)}
         >
-          <Text style={styles.materialModel} numberOfLines={1}>
-            {material.model || '未知型号'}
-          </Text>
-          <Text style={styles.materialDetails}>批次: {material.batch || '-'}</Text>
-          <Text style={styles.materialDetails}>{material.operation_type === 'sales_return' ? '实收数量' : '数量'}: {material.quantity || 0}</Text>
-          <Text style={styles.materialDate}>{formatDate(material.scanned_at)}</Text>
+          <View style={styles.materialScanRow}>
+            <Text style={styles.materialIdentity}>
+              {`追溯码：${traceNo}`}
+            </Text>
+            <Text style={styles.materialScanQuantity}>{material.operation_type === 'sales_return' ? '实收数量' : '数量'}：{material.quantity || 0}</Text>
+            <Feather name="chevron-right" size={14} color={theme.textMuted} />
+          </View>
         </TouchableOpacity>
 
       </View>
+    );
+  };
+
+  const renderMaterialField = (label: string, value: string, primary = false) => (
+    <View style={styles.materialFieldRow}>
+      <Text style={[styles.materialFieldLabel, primary && styles.materialModel]}>{label}：</Text>
+      <Text style={[styles.materialFieldValue, primary && styles.materialModel]}>{value || '-'}</Text>
+    </View>
+  );
+
+  const renderMaterialGroup = (group: OrderMaterialGroup) => (
+    <View key={group.key} style={styles.materialGroup}>
+      {renderMaterialField('型号', group.model, true)}
+      {renderMaterialField('编码', group.inventoryCode)}
+      {renderMaterialField('版本号', group.version)}
+      {renderMaterialField('封装', group.package)}
+      <View style={styles.materialSummaryRow}>
+        <Text style={styles.materialFieldLabel}>合计：</Text>
+        <Text style={[styles.materialDetails, { flexShrink: 1 }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>
+          {`${group.quantity.toLocaleString('zh-CN')} PCS`}
+        </Text>
+        <Text style={[styles.materialDetails, { marginLeft: 'auto', paddingLeft: 12, flexShrink: 1, textAlign: 'right' }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>
+          {`扫码记录：${group.recordCount} 条`}
+        </Text>
+      </View>
+      <View style={styles.batchRow}>
+        <Text style={styles.batchCell}>批次</Text><Text style={styles.batchCell}>生产日期</Text>
+        <Text style={styles.batchQuantity}>数量</Text><View style={{ width: 16 }} />
+      </View>
+      {group.batches.map(batch => {
+        const expanded = expandedBatchKeys.has(batch.key);
+        const match = searchType === 'batch' && !!searchText.trim() && batch.batch.toLowerCase().includes(searchText.trim().toLowerCase());
+        return <View key={batch.key}>
+          <TouchableOpacity feedback="none" style={[styles.batchRow, match && styles.batchMatch]} accessibilityRole="button"
+            accessibilityLabel={`批次 ${batch.batch || '未填写'}，生产日期 ${batch.productionDate || '未填写'}，数量 ${batch.quantity}，${expanded ? '收起' : '展开'}扫码记录`}
+            accessibilityState={{ expanded }} onPress={() => setExpandedBatchKeys(previous => {
+              const next = new Set(previous);
+              if (next.has(batch.key)) next.delete(batch.key); else next.add(batch.key);
+              return next;
+            })}>
+            <Text style={styles.batchCell}>{batch.batch || '未填写'}</Text>
+            <Text style={styles.batchCell}>{batch.productionDate || '未填写'}</Text>
+            <Text style={styles.batchQuantity}>{batch.quantity.toLocaleString('zh-CN')}</Text>
+            <Feather name={expanded ? "chevron-up" : "chevron-down"} size={16} color={theme.textSecondary} />
+          </TouchableOpacity>
+          <View>{expanded && batch.records.map(renderMaterialRow)}</View>
+        </View>;
+      })}
+    </View>
   );
 
   const renderOrderItem = ({ item: order }: { item: Order }) => (
       <View>
-        <AnimatedCard
+        <AnimatedCard disablePressAnimation
           onPress={() => handleToggleOrder(order)}
         >
           <View
@@ -562,11 +656,7 @@ export default function OrdersScreen() {
           >
             <View style={styles.orderHeader}>
               <View style={styles.orderHeaderLeft}>
-                <Feather
-                  name={expandedOrderId === order.id ? 'chevron-down' : 'chevron-right'}
-                  size={18}
-                  color={theme.textSecondary}
-                />
+                {expandedMaterialsLoadingId === order.id ? <ActivityIndicator size="small" color={theme.primary} /> : <Feather name={expandedOrderId === order.id ? "chevron-down" : "chevron-right"} size={18} color={theme.textSecondary} />}
                 <Text style={styles.orderNo} numberOfLines={1} ellipsizeMode="tail">
                   {order.order_no}
                 </Text>
@@ -590,24 +680,20 @@ export default function OrdersScreen() {
           </View>
         </AnimatedCard>
 
-        {expandedOrderId === order.id && (
-          <View style={styles.materialsList}>
-            {expandedMaterialsLoadingId === order.id ? (
-              <View style={styles.noMaterials}>
-                <ActivityIndicator size="small" color={theme.primary} />
-                <Text style={[styles.noMaterialsText, { marginTop: Spacing.xs }]}>
-                  正在加载本单物料...
-                </Text>
-              </View>
-            ) : expandedMaterials.length === 0 ? (
+        {<View>{expandedOrderId === order.id && expandedMaterialsLoadingId !== order.id && (
+          <View testID="order-expanded-details" style={styles.materialsList}>
+            {expandedMaterials.length === 0 ? (
               <View style={styles.noMaterials}>
                 <Text style={styles.noMaterialsText}>该订单暂无物料记录</Text>
               </View>
             ) : (
-              expandedMaterials.map(renderMaterialRow)
+              <>
+                {searchType === 'batch' && !!searchText.trim() && <Text style={styles.materialDetails}>显示本单全部批次，匹配批次已标记</Text>}
+                {expandedMaterialGroups.map(renderMaterialGroup)}
+              </>
             )}
           </View>
-        )}
+        )}</View>}
       </View>
   );
 
@@ -650,7 +736,7 @@ export default function OrdersScreen() {
     );
   };
 
-  const renderCurrentMaterialItem = ({ item }: { item: MaterialRecord }) => renderMaterialRow(item);
+  const renderCurrentMaterialItem = ({ item }: { item: OrderMaterialGroup }) => renderMaterialGroup(item);
 
   const renderCurrentEmpty = useCallback(() => {
     if (currentOrderLoading) {
@@ -676,7 +762,7 @@ export default function OrdersScreen() {
           />
           <TouchableOpacity
             style={styles.emptyActionBtn}
-            activeOpacity={0.8}
+            activeOpacity={0.86}
             onPress={() => router.push('/outbound')}
           >
             <Text style={styles.emptyActionText}>去扫码出库</Text>
@@ -696,7 +782,7 @@ export default function OrdersScreen() {
           />
           <TouchableOpacity
             style={styles.emptyActionBtn}
-            activeOpacity={0.8}
+            activeOpacity={0.86}
             onPress={() => router.push('/outbound')}
           >
             <Text style={styles.emptyActionText}>重新扫码</Text>
@@ -729,8 +815,8 @@ export default function OrdersScreen() {
         <View style={styles.header}>
           <TouchableOpacity
             style={styles.backButton}
-            activeOpacity={0.7}
-            onPress={() => router.back()}
+            activeOpacity={0.86}
+            onPress={() => router.back()} accessibilityLabel="返回上一页"
           >
             <Feather name="arrow-left" size={24} color={theme.textPrimary} />
           </TouchableOpacity>
@@ -766,81 +852,29 @@ export default function OrdersScreen() {
 
         {/* 仓库选择器 + 视图筛选 + 搜索类型 */}
         <View style={styles.filterCard}>
-          {/* 第一行：仓库 + 订单视图 */}
-          <View style={styles.filterRow}>
-            <TouchableOpacity
-              style={styles.warehouseBtn}
-              activeOpacity={0.7}
-              onPress={() => setShowWarehousePicker(true)}
-            >
-              <FontAwesome6 name="warehouse" size={14} color={theme.primary} />
-              <Text style={styles.warehouseBtnText}>{currentWarehouse?.name || '选择仓库'}</Text>
-              <FontAwesome6
-                name="chevron-down"
-                size={10}
-                color={theme.primary}
-                style={{ marginLeft: 4 }}
-              />
+          {/* 仓库、日期范围与低频导出入口同排；缩短仓库名称，不压缩点击高度。 */}
+          <View style={styles.toolbarRow}>
+            <TouchableOpacity style={styles.warehouseBtn} disabled={exportingHistory} activeOpacity={0.86}
+              accessibilityRole="button" accessibilityLabel={`选择仓库，当前${currentWarehouse?.name || '未选择'}`}
+              onPress={() => setShowWarehousePicker(true)}>
+              <View style={styles.warehouseArrowSpace} />
+              <Text style={styles.warehouseBtnText} numberOfLines={1}>{currentWarehouse?.name || '选择仓库'}</Text>
+              <Feather name="chevron-down" size={12} color={theme.primary} />
             </TouchableOpacity>
-
+            <View style={styles.timeSegments}>
+              {([{ key: 'current', label: '当前' }, { key: 'today', label: '当天' }, { key: 'all', label: '全部' }] as const).map(option => (
+                <TouchableOpacity key={option.key} accessibilityRole="button" accessibilityState={{ selected: timeFilter === option.key }}
+                  style={[styles.timeSegment, timeFilter === option.key && styles.timeSegmentActive]}
+                  onPress={() => handleTimeFilterChange(option.key)}>
+                  <Text style={[styles.timeSegmentText, timeFilter === option.key && styles.searchTypeTextActive]}>{option.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
             <TouchableOpacity
-              style={[styles.searchTypeBtn, timeFilter === 'current' && styles.searchTypeBtnActive]}
-              activeOpacity={0.7}
-              onPress={() => handleTimeFilterChange('current')}
-            >
-              <FontAwesome6
-                name="location-dot"
-                size={12}
-                color={timeFilter === 'current' ? theme.buttonPrimaryText : theme.textMuted}
-                style={styles.searchTypeBtnIcon}
-              />
-              <Text
-                style={[
-                  styles.searchTypeText,
-                  timeFilter === 'current' && styles.searchTypeTextActive,
-                ]}
-              >
-                当前
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.searchTypeBtn, timeFilter === 'today' && styles.searchTypeBtnActive]}
-              activeOpacity={0.7}
-              onPress={() => handleTimeFilterChange('today')}
-            >
-              <FontAwesome6
-                name="calendar-day"
-                size={12}
-                color={timeFilter === 'today' ? theme.buttonPrimaryText : theme.textMuted}
-                style={styles.searchTypeBtnIcon}
-              />
-              <Text
-                style={[
-                  styles.searchTypeText,
-                  timeFilter === 'today' && styles.searchTypeTextActive,
-                ]}
-              >
-                当天
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.searchTypeBtn, timeFilter === 'all' && styles.searchTypeBtnActive]}
-              activeOpacity={0.7}
-              onPress={() => handleTimeFilterChange('all')}
-            >
-              <FontAwesome6
-                name="calendar"
-                size={12}
-                color={timeFilter === 'all' ? theme.buttonPrimaryText : theme.textMuted}
-                style={styles.searchTypeBtnIcon}
-              />
-              <Text
-                style={[styles.searchTypeText, timeFilter === 'all' && styles.searchTypeTextActive]}
-              >
-                全部
-              </Text>
+              style={[styles.exportHistoryButton, (!currentWarehouse || exportingHistory) && styles.exportHistoryButtonDisabled]}
+              accessibilityRole="button" accessibilityLabel="导出当前仓库全部历史出库记录"
+              disabled={!currentWarehouse || exportingHistory} activeOpacity={0.86} onPress={handleExportHistory}>
+              <Text style={styles.exportHistoryText}>{exportingHistory ? '导出中' : '导出历史'}</Text>
             </TouchableOpacity>
           </View>
 
@@ -851,7 +885,7 @@ export default function OrdersScreen() {
                   styles.searchTypeBtn,
                   searchType === 'order' && styles.searchTypeBtnActive,
                 ]}
-                activeOpacity={0.7}
+                activeOpacity={0.86}
                 onPress={() => handleSearchTypeChange('order')}
               >
                 <FontAwesome6
@@ -875,7 +909,7 @@ export default function OrdersScreen() {
                   styles.searchTypeBtn,
                   searchType === 'customer' && styles.searchTypeBtnActive,
                 ]}
-                activeOpacity={0.7}
+                activeOpacity={0.86}
                 onPress={() => handleSearchTypeChange('customer')}
               >
                 <FontAwesome6
@@ -899,7 +933,7 @@ export default function OrdersScreen() {
                   styles.searchTypeBtn,
                   searchType === 'batch' && styles.searchTypeBtnActive,
                 ]}
-                activeOpacity={0.7}
+                activeOpacity={0.86}
                 onPress={() => handleSearchTypeChange('batch')}
               >
                 <FontAwesome6
@@ -938,11 +972,11 @@ export default function OrdersScreen() {
 
           {timeFilter === 'current' ? (
             <FlatList
-              data={currentOrder ? currentOrderMaterials : []}
-              keyExtractor={(item) => String(item.id)}
+              data={currentOrder ? currentMaterialGroups : []}
+              keyExtractor={(item) => item.key}
               renderItem={renderCurrentMaterialItem}
               ListHeaderComponent={currentOrder ? renderCurrentOrderCard : null}
-              extraData={`${currentOrder?.id || ''}-${currentOrderMaterials.length}-${currentOrderLoading}`}
+              extraData={[currentOrder, currentOrderLoading, expandedBatchKeys]}
               style={styles.ordersList}
               contentContainerStyle={[
                 styles.ordersListContent,
@@ -960,7 +994,7 @@ export default function OrdersScreen() {
               data={filteredOrders}
               keyExtractor={(item) => item.id}
               renderItem={renderOrderItem}
-              extraData={`${expandedOrderId}-${expandedMaterials.length}`}
+              extraData={[expandedOrderId, expandedMaterialGroups, expandedBatchKeys, searchText, searchType]}
               style={styles.ordersList}
               contentContainerStyle={[
                 styles.ordersListContent,
@@ -985,7 +1019,7 @@ export default function OrdersScreen() {
       </View>
 
       {/* 仓库选择器弹窗 */}
-      {showWarehousePicker && (
+      {<MotionPresence visible={Boolean(showWarehousePicker)} overlay style={{ position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, zIndex: 50 }}>{showWarehousePicker && (
         <View style={styles.pickerOverlay}>
           <View style={styles.pickerBox}>
             <Text style={styles.pickerTitle}>选择仓库</Text>
@@ -1000,7 +1034,7 @@ export default function OrdersScreen() {
                   styles.pickerItem,
                   currentWarehouse?.id === wh.id && styles.pickerItemActive,
                 ]}
-                activeOpacity={0.7}
+                activeOpacity={0.86}
                 onPress={() => handleWarehouseChange(wh)}
               >
                 <Text style={styles.pickerItemText}>{wh.name}</Text>
@@ -1012,14 +1046,15 @@ export default function OrdersScreen() {
             />
             <TouchableOpacity
               style={styles.pickerClose}
-              activeOpacity={0.7}
+              activeOpacity={0.86}
               onPress={() => setShowWarehousePicker(false)}
             >
               <Text style={styles.pickerCloseText}>关闭</Text>
             </TouchableOpacity>
           </View>
         </View>
-      )}
+      )}</MotionPresence>}
+      {alert.AlertComponent}
     </Screen>
   );
 }

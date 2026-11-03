@@ -1,5 +1,6 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useMemo, useState } from 'react';
-import { Keyboard, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Keyboard, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import {
   analyzeQRCodeRuleDetection,
@@ -140,7 +141,7 @@ export function RuleSamplePanel({ sample, onSampleChange, rule, rules, configura
         {!conflictingRuleNames.length && selectedOtherRule && <Text style={[Typography.caption, { color: theme.warning }]}>当前样本会优先使用“{selectedOtherRule.name}”，本规则不会处理该样本。</Text>}
         {isAutomaticallyDistinguished && <Text style={[Typography.caption, { color: theme.success }]}>已与 {otherMatchedRules.map(other => other.name).join('、')} 自动区分，扫码会优先使用本规则。</Text>}
       </>}
-      {(separatorPicker || mappingIndex !== null) && <RuleOptionPicker
+      {<RuleOptionPicker
         title={separatorPicker ? '确认分隔符' : `第${(mappingIndex ?? 0) + 1} / ${segmentCount}段`}
         detail={separatorPicker ? undefined : inspection?.parts[mappingIndex ?? 0]}
         value={separatorPicker ? rule.separator
@@ -167,7 +168,7 @@ export function RuleSamplePanel({ sample, onSampleChange, rule, rules, configura
             if (continuousMapping && mappingIndex + 1 < segmentCount) setMappingIndex(mappingIndex + 1);
             else closePicker();
           }
-        }} />}
+        }}  visible={Boolean((separatorPicker || mappingIndex !== null))} />}
     </View>
   );
 }

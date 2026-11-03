@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const motionTiming = require('../constants/motionTiming.json');
 const {
   withAppBuildGradle,
   withDangerousMod,
@@ -10,6 +11,27 @@ const {
 function replaceRequired(source, from, to) {
   if (!source.includes(from)) throw new Error(`Android template changed: missing ${from}`);
   return source.replace(from, to);
+}
+
+function writeMotionResources(androidRoot) {
+  const resourceRoot = path.join(androidRoot, 'app/src/main/res');
+  const animationRoot = path.join(resourceRoot, 'anim');
+  const valuesRoot = path.join(resourceRoot, 'values');
+  fs.mkdirSync(animationRoot, { recursive: true });
+  fs.mkdirSync(valuesRoot, { recursive: true });
+  fs.writeFileSync(path.join(valuesRoot, 'warehouse_motion.xml'),
+    `<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <integer name="warehouse_page_transition_ms">${motionTiming.page}</integer>\n</resources>\n`);
+  // Android native-stack ignores animationDuration. Override only the four
+  // resources used by slide_from_right/left, keeping their original geometry.
+  for (const [name, from, to] of [
+    ['rns_slide_in_from_right', '100%', '0%'],
+    ['rns_slide_in_from_left', '-100%', '0%'],
+    ['rns_slide_out_to_left', '0%', '-100%'],
+    ['rns_slide_out_to_right', '0%', '100%'],
+  ]) {
+    fs.writeFileSync(path.join(animationRoot, `${name}.xml`),
+      `<?xml version="1.0" encoding="utf-8"?>\n<translate xmlns:android="http://schemas.android.com/apk/res/android"\n    android:duration="@integer/warehouse_page_transition_ms"\n    android:fromXDelta="${from}"\n    android:toXDelta="${to}" />\n`);
+  }
 }
 
 module.exports = function withWarehouseAndroid(config) {
@@ -81,6 +103,7 @@ android {`);
   }]);
 
   return withDangerousMod(config, ['android', (config) => {
+    writeMotionResources(config.modRequest.platformProjectRoot);
     for (const [qualifier, light] of [['values', 'true'], ['values-night', 'false']]) {
       const directory = path.join(config.modRequest.platformProjectRoot, 'app/src/main/res', qualifier);
       fs.mkdirSync(directory, { recursive: true });
@@ -90,3 +113,5 @@ android {`);
     return config;
   }]);
 };
+
+module.exports.writeMotionResources = writeMotionResources;

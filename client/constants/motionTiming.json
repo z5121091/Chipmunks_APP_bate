@@ -1,0 +1,9 @@
+{
+  "pressIn": 70,
+  "pressOut": 110,
+  "content": 120,
+  "expand": 150,
+  "enter": 170,
+  "exit": 120,
+  "page": 220
+}

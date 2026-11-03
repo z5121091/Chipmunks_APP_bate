@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useMemo } from 'react';
 import { Animated, StyleProp, StyleSheet, Text, ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, BorderWidth, Spacing, Typography, withAlpha } from '@/constants/theme';
 import { rf } from '@/utils/responsive';
+import { useMotionPresence, useRetainedValue } from '@/components/AppMotion';
 
 export type AppPillToastType = 'success' | 'warning' | 'error' | 'info';
 
@@ -13,22 +14,16 @@ interface AppPillToastProps {
   type?: AppPillToastType;
   bottom?: number;
   style?: StyleProp<ViewStyle>;
+  visible?: boolean;
 }
 
-export function AppPillToast({ text, type = 'success', bottom, style }: AppPillToastProps) {
+export function AppPillToast({ text: inputText, type: inputType = 'success', bottom, style, visible = true }: AppPillToastProps) {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
-  const [anim] = useState(() => new Animated.Value(0));
-
-  useEffect(() => {
-    Animated.spring(anim, {
-      toValue: 1,
-      useNativeDriver: true,
-      damping: 18,
-      stiffness: 210,
-      mass: 0.9,
-    }).start();
-  }, [anim]);
+  const { present, progress: anim } = useMotionPresence(visible && Boolean(inputText));
+  const value = useMemo(() => ({ text: inputText, type: inputType }), [inputText, inputType]);
+  const { text, type } = useRetainedValue(visible && Boolean(inputText), value);
+  if (!present) return null;
 
   const color =
     type === 'error'

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
@@ -23,6 +23,8 @@ namespace Chipmunks.ApkBuilder
         private readonly Button restore;
         private readonly Button done;
         private bool busy;
+        private TabControl settingsTabs;
+        private OtaConnectionPanel connectionPanel;
 
         public static void ShowFor(IWin32Window owner, string repositoryPath)
         {
@@ -35,7 +37,7 @@ namespace Chipmunks.ApkBuilder
         {
             if (signingStore == null) throw new ArgumentNullException("signingStore");
             store = signingStore;
-            Text = "掌上仓库 · 发布签名";
+            Text = "掌上仓库 · 构建工具设置";
             Name = "SigningWindow";
             StartPosition = FormStartPosition.CenterParent;
             Font = new Font("Microsoft YaHei UI", 9F);
@@ -56,7 +58,7 @@ namespace Chipmunks.ApkBuilder
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 39));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
 
-            var title = Label("发布签名管理", 18F, Ink, true);
+            var title = Label("APK 签名与构建配置备份", 18F, Ink, true);
             title.AutoSize = false;
             var titlePanel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Margin = new Padding(0) };
             titlePanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 35));
@@ -81,12 +83,12 @@ namespace Chipmunks.ApkBuilder
             buttons.RowStyles.Add(new RowStyle(SizeType.Percent, 50)); buttons.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
             fromExisting = Button("导入原发布签名", false);
             fromFile = Button("选择签名文件", false);
-            export = Button("导出加密备份", true);
-            restore = Button("从备份恢复", false);
+            export = Button("导出构建配置备份", true);
+            restore = Button("恢复构建配置备份", false);
             buttons.Controls.Add(fromExisting, 0, 0); buttons.Controls.Add(fromFile, 1, 0); buttons.Controls.Add(export, 0, 1); buttons.Controls.Add(restore, 1, 1);
             layout.Controls.Add(buttons, 0, 2);
 
-            var note = Label("首次使用：点击“导入原发布签名”，将现有签名复制到本机加密存储。原文件和原配置会保留。\r\n\r\n换电脑：先导出加密备份，再到新电脑选择“从备份恢复”。请单独保管备份密码，工具无法找回。\r\n\r\n本机加密文件绑定当前 Windows 账户，不能直接复制到另一台电脑使用。\r\n\r\n此备份只包含发布签名，不包含项目源码或 NAS 配置。", 9F, Muted, false);
+            var note = Label("备份包含：APK 发布签名，以及本机已配置的热更新发布连接。\r\n\r\n换电脑：导出一份构建配置备份，在新电脑恢复，输入备份密码即可。无需分别备份。\r\n\r\n请单独保管备份密码，工具无法找回；项目源码和 NAS 配置需另外迁移。\r\n\r\n兼容旧版 .cwsign 签名备份。旧备份不含发布连接时，只恢复签名，保留本机现有连接。", 9F, Muted, false);
             note.Name = "SigningInstructions";
             note.TextAlign = ContentAlignment.TopLeft;
             note.Padding = new Padding(2, 9, 2, 0);
@@ -96,7 +98,16 @@ namespace Chipmunks.ApkBuilder
             done = Button("完成", true); done.Margin = new Padding(0, 4, 0, 0);
             done.Click += delegate { Close(); };
             layout.Controls.Add(done, 0, 5);
-            Controls.Add(layout);
+            settingsTabs = new TabControl { Dock = DockStyle.Fill, Name = "apkPublishTabs" };
+            var tabs = settingsTabs;
+            var signaturePage = new TabPage("APK 发布签名");
+            signaturePage.Controls.Add(layout);
+            var connectionPage = new TabPage("热更新发布连接");
+            connectionPanel = new OtaConnectionPanel { Dock = DockStyle.Top };
+            connectionPage.Controls.Add(connectionPanel);
+            connectionPanel.BusyChanged += delegate { settingsTabs.Enabled = !connectionPanel.IsBusy; };
+            tabs.TabPages.Add(signaturePage); tabs.TabPages.Add(connectionPage);
+            Controls.Add(tabs);
 
             fromExisting.Click += async delegate {
                 if (MessageBox.Show(this, "将原发布签名导入本机加密存储。原签名文件及原配置均会保留。", "导入发布签名", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
@@ -116,20 +127,20 @@ namespace Chipmunks.ApkBuilder
                 }
             };
             export.Click += async delegate {
-                using (var picker = new SaveFileDialog { Title = "保存加密签名备份", Filter = "加密签名备份 (*.cwsign)|*.cwsign", DefaultExt = "cwsign", AddExtension = true, OverwritePrompt = true, FileName = "掌上仓库-发布签名-" + DateTime.Now.ToString("yyyyMMdd", CultureInfo.InvariantCulture) + ".cwsign" })
+                using (var picker = new SaveFileDialog { Title = "保存构建配置备份", Filter = "加密构建配置备份 (*.cwbuild)|*.cwbuild", DefaultExt = "cwbuild", AddExtension = true, OverwritePrompt = true, FileName = "掌上仓库-构建配置-" + DateTime.Now.ToString("yyyyMMdd", CultureInfo.InvariantCulture) + ".cwbuild" })
                 {
                     if (picker.ShowDialog(this) != DialogResult.OK) return;
                     using (var prompt = new SigningSecretWindow(SigningSecretMode.BackupExport))
                     {
                         if (prompt.ShowDialog(this) != DialogResult.OK) return;
                         string password = prompt.Secret;
-                        try { await Run(delegate { store.ExportBackup(picker.FileName, password); }, "加密备份已保存。请单独保管备份密码。"); }
+                        try { await Run(delegate { store.ExportBackup(picker.FileName, password); }, "构建配置备份已保存。请单独保管备份密码。"); }
                         finally { password = null; prompt.ClearSecrets(); }
                     }
                 }
             };
             restore.Click += async delegate {
-                using (var picker = new OpenFileDialog { Title = "选择加密签名备份", Filter = "加密签名备份 (*.cwsign)|*.cwsign|所有文件 (*.*)|*.*", CheckFileExists = true, Multiselect = false })
+                using (var picker = new OpenFileDialog { Title = "选择构建配置备份", Filter = "构建配置及旧签名备份 (*.cwbuild;*.cwsign)|*.cwbuild;*.cwsign|所有文件 (*.*)|*.*", CheckFileExists = true, Multiselect = false })
                 {
                     if (picker.ShowDialog(this) != DialogResult.OK) return;
                     using (var prompt = new SigningSecretWindow(SigningSecretMode.BackupRestore))
@@ -148,13 +159,13 @@ namespace Chipmunks.ApkBuilder
                                 }
                                 await Task.Run(delegate { store.RestoreBackup(picker.FileName, password, confirmed); });
                                 return true;
-                            }, "发布签名已恢复，并已使用当前 Windows 账户重新加密。");
+                            }, "构建配置已恢复，签名和备份内的发布连接已使用当前 Windows 用户加密。");
                         }
                         finally { password = null; prompt.ClearSecrets(); }
                     }
                 }
             };
-            FormClosing += delegate(object sender, FormClosingEventArgs e) { if (busy) e.Cancel = true; };
+            FormClosing += delegate(object sender, FormClosingEventArgs e) { if (busy || connectionPanel.IsBusy) e.Cancel = true; };
             RefreshStatus();
         }
 
@@ -167,6 +178,7 @@ namespace Chipmunks.ApkBuilder
         {
             if (busy) return;
             busy = true;
+            settingsTabs.Enabled = false;
             fromExisting.Enabled = fromFile.Enabled = export.Enabled = restore.Enabled = done.Enabled = false;
             UseWaitCursor = true;
             result.Text = "正在校验并处理，请稍候…";
@@ -178,11 +190,12 @@ namespace Chipmunks.ApkBuilder
                 // SigningStore's public failures contain fixed descriptions, never raw crypto or file content.
                 MessageBox.Show(this, ex is InvalidOperationException ? ex.Message : "操作未完成，请检查文件与访问权限。现有签名未修改。", "签名处理失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
-            finally { busy = false; UseWaitCursor = false; fromExisting.Enabled = fromFile.Enabled = restore.Enabled = done.Enabled = true; RefreshStatus(); }
+            finally { busy = false; settingsTabs.Enabled = true; UseWaitCursor = false; fromExisting.Enabled = fromFile.Enabled = restore.Enabled = done.Enabled = true; RefreshStatus(); }
         }
 
         private void RefreshStatus()
         {
+            if (connectionPanel != null) connectionPanel.RefreshConfigurationStatus();
             SigningStatus status = store.GetStatus();
             state.Text = status.IsConfigured ? "已启用本机签名管理" : String.IsNullOrEmpty(status.ErrorMessage) ? "尚未导入发布签名" : "本机签名需要恢复";
             fingerprint.Text = status.IsConfigured ? "证书 SHA256：\r\n" + status.CertificateSha256 : status.ErrorMessage ?? "导入现有发布签名后，构建时会自动使用。";
@@ -190,6 +203,7 @@ namespace Chipmunks.ApkBuilder
             DateTimeOffset date;
             if (status.IsConfigured && DateTimeOffset.TryParse(status.ImportedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.None, out date)) imported.Text = "首次导入：" + date.ToLocalTime().ToString("yyyy/MM/dd HH:mm", CultureInfo.InvariantCulture);
             export.Enabled = status.IsConfigured && !busy;
+            if (status.IsConfigured) imported.Text += status.HasPublishConnection ? " · 备份将包含发布连接" : " · 尚未配置发布连接";
         }
 
         private static Label Label(string text, float size, Color color, bool bold) { var label = new Label { Text = text }; Configure(label, size, color, bold); return label; }

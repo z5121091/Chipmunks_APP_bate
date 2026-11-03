@@ -1,13 +1,8 @@
+import { MotionPresence } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {
-  ActivityIndicator,
-  FlatList,
-  RefreshControl,
-  Text,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+import { ActivityIndicator, FlatList, RefreshControl, Text, View } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather, FontAwesome6 } from '@expo/vector-icons';
@@ -15,6 +10,8 @@ import { AnimatedCard } from '@/components/AnimatedCard';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { AppPillToast, AppPillToastType } from '@/components/AppPillToast';
 import { Screen } from '@/components/Screen';
+import { DocumentMetadata } from '@/components/DocumentMetadata';
+import { ERP_ACCOUNTS } from '@/utils/erpAccounts';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
@@ -52,8 +49,9 @@ type DetailMap = Record<string, InboundRecord[]>;
 type NoticeType = AppPillToastType;
 type InboundDetailGroup = {
   key: string;
+  inventoryCode: string;
   model: string;
-  versions: string[];
+  version: string;
   records: InboundRecord[];
   totalQuantity: number;
 };
@@ -98,7 +96,14 @@ export default function InboundRecordsScreen() {
   const documentRequestRef = useRef(0);
   const [documents, setDocuments] = useState<InboundDocumentSummary[]>([]);
   const [detailsByKey, setDetailsByKey] = useState<DetailMap>({});
-  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
+  const [expandedKeys, setExpandedKeysState] = useState<Set<string>>(new Set());
+  const expandedKeysRef = useRef(new Set<string>());
+  const detailRequestsRef = useRef(new Map<string, number>());
+  const setExpandedKeys = useCallback((update: Set<string> | ((previous: Set<string>) => Set<string>)) => {
+    const next = typeof update === 'function' ? update(expandedKeysRef.current) : update;
+    expandedKeysRef.current = next;
+    setExpandedKeysState(next);
+  }, []);
   const [expandedDetailGroupKeys, setExpandedDetailGroupKeys] = useState<Set<string>>(new Set());
   const [loadingKeys, setLoadingKeys] = useState<Set<string>>(new Set());
   const [showWarehousePicker, setShowWarehousePicker] = useState(false);
@@ -191,6 +196,9 @@ export default function InboundRecordsScreen() {
     useCallback(() => {
       pageActiveRef.current = true;
       const sessionId = ++pageSessionRef.current;
+      // A request from the previous visit cannot finish this visit's expansion.
+      setExpandedKeys(previous => new Set([...previous].filter(key => !detailRequestsRef.current.has(key))));
+      detailRequestsRef.current.clear();
       setLoadingKeys(new Set());
       setSyncingKeys(new Set(syncingKeysRef.current));
       void Promise.all([loadWarehouses(), loadDocuments(selectedWarehouseId)]);
@@ -201,7 +209,7 @@ export default function InboundRecordsScreen() {
         pageSessionRef.current += 1;
         documentRequestRef.current += 1;
       };
-    }, [loadDocuments, loadWarehouses, selectedWarehouseId])
+    }, [loadDocuments, loadWarehouses, selectedWarehouseId, setExpandedKeys])
   );
 
   const handleRefresh = useCallback(async () => {
@@ -222,12 +230,12 @@ export default function InboundRecordsScreen() {
     setExpandedKeys(new Set());
     setExpandedDetailGroupKeys(new Set());
     setDetailsByKey({});
-  }, []);
+  }, [setExpandedKeys]);
 
   const toggleDocument = useCallback(async (item: InboundDocumentSummary) => {
     const ownsPage = capturePageOwner(selectedWarehouseRef.current);
     const key = getDocumentKey(item);
-    const isExpanded = expandedKeys.has(key);
+    const isExpanded = expandedKeysRef.current.has(key);
 
     if (isExpanded) {
       setExpandedKeys((prev) => {
@@ -244,21 +252,28 @@ export default function InboundRecordsScreen() {
       return;
     }
 
+    const session = pageSessionRef.current;
+    if (detailRequestsRef.current.get(key) === session) return;
+    detailRequestsRef.current.set(key, session);
     setLoadingKeys((prev) => new Set(prev).add(key));
     try {
       const records = await getInboundRecordsByNo(item.inbound_no, item.warehouse_id);
       if (!ownsPage()) return;
       setDetailsByKey((prev) => ({ ...prev, [key]: records }));
     } catch {
-      if (ownsPage()) showNotice('明细加载失败', 'error');
+      if (ownsPage() && expandedKeysRef.current.has(key)) {
+        setExpandedKeys(previous => { const next = new Set(previous); next.delete(key); return next; });
+        showNotice('明细加载失败，请点击单据重试', 'error');
+      }
     } finally {
+      if (ownsPage() && detailRequestsRef.current.get(key) === session) detailRequestsRef.current.delete(key);
       if (ownsPage()) setLoadingKeys((prev) => {
         const next = new Set(prev);
         next.delete(key);
         return next;
       });
     }
-  }, [capturePageOwner, detailsByKey, expandedKeys, showNotice]);
+  }, [capturePageOwner, detailsByKey, setExpandedKeys, showNotice]);
 
   const reloadAfterDelete = useCallback(async (
     documentKey?: string,
@@ -300,7 +315,7 @@ export default function InboundRecordsScreen() {
     if (!isCurrent()) return false;
     setDetailsByKey((prev) => ({ ...prev, [documentKey]: records }));
     return true;
-  }, [loadDocuments, selectedWarehouseId]);
+  }, [loadDocuments, selectedWarehouseId, setExpandedKeys]);
 
   const handleDeleteDocument = useCallback((item: InboundDocumentSummary) => {
     const key = getDocumentKey(item);
@@ -462,21 +477,20 @@ export default function InboundRecordsScreen() {
     deduplicateInboundRowsById(records).forEach((record) => {
       const model = normalizeInboundModel(record.scan_model) || '-';
       const version = normalizeInboundVersion(record.version);
-      const key = buildInboundModelKey(model);
+      const inventoryCode = record.inventory_code?.trim() || '';
+      const key = JSON.stringify([inventoryCode, buildInboundModelKey(model), version.toUpperCase()]);
       if (!groupMap.has(key)) {
         groupMap.set(key, {
           key,
+          inventoryCode,
           model,
-          versions: [],
+          version,
           records: [],
           totalQuantity: 0,
         });
       }
 
       const group = groupMap.get(key)!;
-      if (version && !group.versions.some((item) => item.toUpperCase() === version.toUpperCase())) {
-        group.versions.push(version);
-      }
       group.records.push(record);
       group.totalQuantity += Number(record.quantity || 0);
     });
@@ -487,6 +501,11 @@ export default function InboundRecordsScreen() {
       return bLatest.localeCompare(aLatest);
     });
   }, []);
+
+  // Expanding/collapsing must not regroup every cached document's scan rows.
+  const detailGroupsByKey = useMemo(() => Object.fromEntries(
+    Object.entries(detailsByKey).map(([key, records]) => [key, getDetailGroups(records)])
+  ), [detailsByKey, getDetailGroups]);
 
   const toggleDetailGroup = useCallback((key: string) => {
     setExpandedDetailGroupKeys((prev) => {
@@ -509,7 +528,7 @@ export default function InboundRecordsScreen() {
       <TouchableOpacity
         key={warehouse?.id || 'all'}
         style={[styles.pickerItem, active && styles.pickerItemActive]}
-        activeOpacity={0.72}
+        activeOpacity={0.86}
         onPress={() => handleWarehouseSelect(id)}
       >
         <View style={styles.pickerItemLeft}>
@@ -529,33 +548,30 @@ export default function InboundRecordsScreen() {
 
   const renderDetail = useCallback((
     record: InboundRecord,
-    document: InboundDocumentSummary,
-    index: number
+    document: InboundDocumentSummary
   ) => (
     <TouchableOpacity
       key={record.id}
       style={styles.detailRow}
-      activeOpacity={0.76}
+        feedback="none"
+      activeOpacity={0.86}
       onLongPress={() => handleDeleteRecord(record, document)}
     >
-      <View style={styles.detailIndex}>
-        <Text style={styles.detailIndexText}>{index + 1}</Text>
-      </View>
       <View style={styles.detailContent}>
-        <Text style={styles.detailTitle} numberOfLines={1}>
-          版本 {normalizeInboundVersion(record.version) || '-'} · 批次 {record.batch || '-'}
+        <Text style={styles.detailTitle}>
+          批次：{record.batch || '-'}
         </Text>
-        <Text style={styles.detailMeta} numberOfLines={1}>
-          存货编码 {record.inventory_code || '-'}
+        <Text style={styles.detailMeta}>
+          生产日期：{record.productionDate || '-'}
         </Text>
-        <Text style={styles.detailMeta} numberOfLines={1}>
-          生产日期 {record.productionDate || '-'}
+        <Text style={styles.detailMeta}>
+          追溯码：{record.traceNo?.trim() || '-'}
         </Text>
       </View>
       <View style={styles.detailQtyBox}>
         <View style={styles.detailQuantityRow}>
           <Text style={styles.detailQty}>{formatQuantity(record.quantity)}</Text>
-          <Text style={styles.detailQtyUnit}>PCS</Text>
+          <Text style={styles.detailQtyUnit}>/ PCS</Text>
         </View>
       </View>
     </TouchableOpacity>
@@ -573,15 +589,19 @@ export default function InboundRecordsScreen() {
       <View key={groupKey} style={styles.detailGroupCard}>
         <TouchableOpacity
           style={styles.detailGroupRow}
-          activeOpacity={0.76}
+          feedback="none"
+          activeOpacity={0.86}
           onPress={() => toggleDetailGroup(groupKey)}
         >
           <View style={styles.detailGroupContent}>
-            <Text style={styles.detailGroupTitle} numberOfLines={1}>
+            <Text style={styles.detailGroupTitle}>
+              存货编码：{group.inventoryCode || '-'}
+            </Text>
+            <Text style={styles.detailGroupMeta}>
               型号：{group.model}
             </Text>
-            <Text style={styles.detailGroupMeta} numberOfLines={1}>
-              版本：{group.versions.length > 0 ? group.versions.join('、') : '-'}
+            <Text style={styles.detailGroupMeta}>
+              版本号：{group.version || '-'}
             </Text>
             <Text style={styles.detailGroupCount}>{group.records.length} 条明细</Text>
           </View>
@@ -591,18 +611,14 @@ export default function InboundRecordsScreen() {
               <Text style={styles.detailQtyUnit}>PCS</Text>
             </View>
           </View>
-          <Feather
-            name={isExpanded ? 'chevron-up' : 'chevron-down'}
-            size={18}
-            color={theme.textSecondary}
-          />
+          <Feather name={isExpanded ? "chevron-up" : "chevron-down"} size={18} color={theme.textSecondary} />
         </TouchableOpacity>
 
-        {isExpanded ? (
+        {<View>{isExpanded ? (
           <View style={styles.detailGroupDetails}>
-            {group.records.map((record, index) => renderDetail(record, document, index))}
+            {group.records.map(record => renderDetail(record, document))}
           </View>
-        ) : null}
+        ) : null}</View>}
       </View>
     );
   }, [
@@ -616,10 +632,12 @@ export default function InboundRecordsScreen() {
   const renderDocument = useCallback(({ item }: { item: InboundDocumentSummary }) => {
     const key = getDocumentKey(item);
     const isExpanded = expandedKeys.has(key);
-    const details = detailsByKey[key] || [];
     const detailLoading = loadingKeys.has(key);
-    const detailGroups = getDetailGroups(details);
+    const detailGroups = detailGroupsByKey[key] || [];
     const syncMeta = getSyncStatusMeta(item.sync_status);
+    const accountLabel = item.erp_account_keys?.split(',').map(key =>
+      ERP_ACCOUNTS.find(account => account.key === key)?.name || '未知账套'
+    ).join('、') || '未记录账套';
     const syncing = syncingKeys.has(key);
     const syncActionLabel =
       syncing
@@ -629,7 +647,7 @@ export default function InboundRecordsScreen() {
           : '同步到电脑';
 
     return (
-      <AnimatedCard onPress={() => toggleDocument(item)} onLongPress={() => handleDeleteDocument(item)}>
+      <AnimatedCard disablePressAnimation onPress={() => toggleDocument(item)} onLongPress={() => handleDeleteDocument(item)}>
         <View style={styles.documentCard}>
           <View style={styles.documentHeader}>
             <View style={styles.documentIcon}>
@@ -639,6 +657,7 @@ export default function InboundRecordsScreen() {
               <View style={styles.documentTitleRow}>
                 <Text style={styles.documentNo} numberOfLines={1}>{item.inbound_no}</Text>
                 <TouchableOpacity
+                  feedback="none"
                   style={[
                     styles.syncInlineButton,
                     {
@@ -647,7 +666,7 @@ export default function InboundRecordsScreen() {
                     },
                     syncing && styles.syncInlineButtonDisabled,
                   ]}
-                  activeOpacity={0.72}
+                  activeOpacity={0.86}
                   disabled={syncing}
                   accessibilityRole="button"
                   accessibilityLabel={`${syncMeta.label}，${syncActionLabel}`}
@@ -666,23 +685,12 @@ export default function InboundRecordsScreen() {
                   </Text>
                 </TouchableOpacity>
               </View>
-              <Text style={[styles.documentMeta, { color: item.completion_status === 'partial' ? theme.primary : theme.success }]}>
-                {item.completion_status === 'partial' ? '部分入库 · 可继续扫码' : '已入库完成'}
-              </Text>
-              <Text style={[styles.documentMeta, { color: syncMeta.color }]}>
-                {syncMeta.label}
-              </Text>
-              <Text style={styles.documentMeta} numberOfLines={1}>
-                {item.in_date} · {item.warehouse_name}
-              </Text>
             </View>
-            <Feather
-              name={isExpanded ? 'chevron-up' : 'chevron-down'}
-              size={20}
-              color={theme.textSecondary}
-            />
+            {detailLoading ? <ActivityIndicator size="small" color={theme.primary} /> : <Feather name={isExpanded ? "chevron-up" : "chevron-down"} size={20} color={theme.textSecondary} />}
           </View>
 
+          <DocumentMetadata completion={item.completion_status === 'partial' ? '部分入库' : '已入库完成'}
+            syncLabel={syncMeta.label} syncColor={syncMeta.color} date={item.in_date} account={accountLabel} />
           <View style={styles.statsRow}>
             <View style={styles.statItem}>
               <Text style={styles.statValue}>{item.model_count}</Text>
@@ -700,30 +708,28 @@ export default function InboundRecordsScreen() {
             </View>
           </View>
 
-          {isExpanded ? (
-            <View style={styles.detailWrap}>
+          {<View>{isExpanded && !detailLoading ? (
+            <View testID="document-expanded-details" style={styles.detailWrap}>
+              {item.completion_status === 'partial' && <Text style={styles.detailHint}>可继续扫码</Text>}
               <View style={styles.detailHintRow}>
                 <Text style={styles.detailHint}>点型号展开明细，长按明细可删除</Text>
-                {detailLoading ? <ActivityIndicator size="small" color={theme.primary} /> : null}
               </View>
-              {detailLoading ? null : detailGroups.map((group) => renderDetailGroup(group, item, key))}
+              {detailGroups.map((group) => renderDetailGroup(group, item, key))}
             </View>
-          ) : null}
+          ) : null}</View>}
         </View>
       </AnimatedCard>
     );
   }, [
-    detailsByKey,
+    detailGroupsByKey,
     expandedKeys,
     handleDeleteDocument,
     handleResyncDocument,
-    getDetailGroups,
     getSyncStatusMeta,
     loadingKeys,
     renderDetailGroup,
     styles,
     theme.primary,
-    theme.success,
     theme.textSecondary,
     toggleDocument,
     syncingKeys,
@@ -740,8 +746,8 @@ export default function InboundRecordsScreen() {
         <View style={[styles.header, { paddingTop: insets.top + 10 }]}>
           <TouchableOpacity
             style={styles.backButton}
-            activeOpacity={0.72}
-            onPress={() => router.back()}
+            activeOpacity={0.86}
+            onPress={() => router.back()} accessibilityLabel="返回上一页"
           >
             <Feather name="arrow-left" size={20} color={theme.textPrimary} />
           </TouchableOpacity>
@@ -755,7 +761,7 @@ export default function InboundRecordsScreen() {
           <View style={styles.filterTitleRow}>
             <TouchableOpacity
               style={styles.warehouseSelectButton}
-              activeOpacity={0.72}
+              activeOpacity={0.86}
               onPress={() => setShowWarehousePicker(true)}
             >
               <View style={styles.warehouseIconBox}>
@@ -816,7 +822,7 @@ export default function InboundRecordsScreen() {
           removeClippedSubviews
         />
 
-        {showWarehousePicker ? (
+        {<MotionPresence visible={Boolean(showWarehousePicker)} overlay style={{ position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, zIndex: 50 }}>{showWarehousePicker ? (
           <View style={styles.pickerOverlay}>
             <View style={styles.pickerBox}>
               <Text style={styles.pickerTitle}>选择仓库</Text>
@@ -829,18 +835,16 @@ export default function InboundRecordsScreen() {
               />
               <TouchableOpacity
                 style={styles.pickerClose}
-                activeOpacity={0.72}
+                activeOpacity={0.86}
                 onPress={() => setShowWarehousePicker(false)}
               >
                 <Text style={styles.pickerCloseText}>关闭</Text>
               </TouchableOpacity>
             </View>
           </View>
-        ) : null}
+        ) : null}</MotionPresence>}
 
-        {notice ? (
-          <AppPillToast text={notice.text} type={notice.type} bottom={insets.bottom + 28} />
-        ) : null}
+        <AppPillToast text={notice?.text || ''} type={notice?.type || 'success'} visible={Boolean(notice)} bottom={insets.bottom + 28} />
       </View>
 
       {alert.AlertComponent}

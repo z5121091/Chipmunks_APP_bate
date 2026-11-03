@@ -9,6 +9,7 @@ import { analyzeRuleSample, diagnoseRuleConfiguration, type RuleSampleAnalysis }
 
 const mockPush = jest.fn();
 const mockBack = jest.fn();
+let mockReduced = false;
 let mockFocusEffect: (() => void | (() => void)) | undefined;
 let mockFocusCleanup: (() => void) | undefined;
 const mockTransitionListeners = new Set<(event: { data: { closing: boolean } }) => void>();
@@ -42,6 +43,7 @@ jest.mock('expo-router', () => ({
   },
 }));
 jest.mock('@/hooks/useTheme', () => ({ useTheme: () => ({ theme: {}, isDark: false }) }));
+jest.mock('@/hooks/useAppMotion', () => ({ useAppMotion: () => mockReduced }));
 jest.mock('@/hooks/useSafeRouter', () => ({ useSafeRouter: () => ({ push: mockPush, back: mockBack }), useSafeSearchParams: () => ({}) }));
 jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
 jest.mock('@/components/AppEmptyState', () => ({ AppEmptyState: 'Empty' }));
@@ -76,6 +78,7 @@ async function typeSample(value: string) {
 beforeEach(async () => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   jest.clearAllMocks();
+  mockReduced = false;
   mockNavigation.isFocused.mockReturnValue(true);
   jest.replaceProperty(Platform, 'OS', 'android');
   mockTransitionListeners.clear();
@@ -207,6 +210,23 @@ it('retains the sample and diagnostic selections while editing, then rechecks up
   expect(analyzeRuleSample).toHaveBeenLastCalledWith(originalSample, updatedRules, [], [], 'A');
   expect(rendered()).toContain('修改后的规则已重新验证');
   expect(rendered()).not.toContain('结构交叉风险');
+});
+
+it('rechecks on return without waiting for a native transition event when motion is reduced', async () => {
+  mockReduced = true;
+  await act(async () => { root.unmount(); root = TestRenderer.create(<RuleDiagnosticsScreen />); });
+  await settle();
+  await typeSample('MODEL/100');
+  await pressTool('编辑 A规则');
+  await act(async () => { mockFocusCleanup?.(); mockFocusCleanup = undefined; });
+  jest.mocked(analyzeRuleSample).mockClear();
+  await act(async () => {
+    const cleanup = mockFocusEffect?.();
+    mockFocusCleanup = typeof cleanup === 'function' ? cleanup : undefined;
+  });
+  await settle();
+  expect(analyzeRuleSample).toHaveBeenCalledWith('MODEL/100', rules, [], [], undefined);
+  expect(rendered()).toContain('本样本实际使用 A规则');
 });
 
 it('shows load failures and disables sample analysis until retry succeeds', async () => {

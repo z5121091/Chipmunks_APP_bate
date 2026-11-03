@@ -1,24 +1,28 @@
-import { Modal, ScrollView, Text, TouchableOpacity, View } from 'react-native';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
+import { ScrollView, Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
 import { AppModalHeader } from '@/components/AppModalHeader';
 import { Typography } from '@/constants/theme';
+import { MotionContent } from '@/components/AppMotion';
 
 export interface RuleChoice { value: string; label: string; disabled?: boolean }
 
-export function RuleOptionPicker({ title, options, value, onSelect, onClose, detail, onPrevious }: {
+export function RuleOptionPicker({ title, options, value, onSelect, onClose, detail, onPrevious, visible = true }: {
   title: string; options: RuleChoice[]; value?: string;
   onSelect: (value: string) => void; onClose: () => void;
   detail?: string; onPrevious?: () => void;
+  visible?: boolean;
 }) {
   const { theme, isDark } = useTheme();
   return (
-    <Modal visible animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
       <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'} safeAreaEdges={['top', 'bottom', 'left', 'right']} disableAutoScroll>
         <View style={{ flex: 1, padding: 16, width: '100%', maxWidth: 640, alignSelf: 'center' }}>
           <AppModalHeader title={title} onClose={onClose} />
-          <ScrollView key={title} keyboardShouldPersistTaps="handled">
+          <MotionContent contentKey={title} style={{ flex: 1 }}><ScrollView key={title} keyboardShouldPersistTaps="handled">
             {detail !== undefined && <Text selectable style={{ ...Typography.small, color: theme.textPrimary,
               padding: 12, marginBottom: 12, backgroundColor: theme.backgroundDefault, borderRadius: 8,
               borderWidth: 1, borderColor: theme.border }}>{detail || '【空字段】'}</Text>}
@@ -33,7 +37,7 @@ export function RuleOptionPicker({ title, options, value, onSelect, onClose, det
                 {option.value === value && <Feather name="check" size={18} color={theme.primary} />}
               </TouchableOpacity>
             ))}
-          </ScrollView>
+          </ScrollView></MotionContent>
           {onPrevious && <TouchableOpacity accessibilityRole="button" accessibilityLabel="上一段" onPress={onPrevious}
             style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center', gap: 8 }}>
             <Feather name="arrow-left" size={18} color={theme.primary} />

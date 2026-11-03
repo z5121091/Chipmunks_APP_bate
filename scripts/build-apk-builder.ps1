@@ -17,7 +17,7 @@ try {
     if (-not $compiler) {
         throw '找不到系统 .NET Framework C# 编译器。请在 Windows 10/11 启用 .NET Framework 4.x。'
     }
-    $sources = @('Program.cs', 'BuildWindow.cs', 'BuildRunner.cs', 'SigningStore.cs', 'SigningWindow.cs') | ForEach-Object {
+    $sources = @('Program.cs', 'BuildWindow.cs', 'BuildRunner.cs', 'SigningStore.cs', 'SigningWindow.cs', 'OtaConnectionPanel.cs', 'OtaConnection.cs') | ForEach-Object {
         $source = Join-Path $sourceDirectory $_
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "缺少构建工具源码：$_" }
         $source

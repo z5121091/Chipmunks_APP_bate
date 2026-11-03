@@ -1,11 +1,11 @@
 import TestRenderer, { act } from 'react-test-renderer';
-import { ActivityIndicator, ScrollView, Text, TouchableOpacity } from 'react-native';
+import { ActivityIndicator, ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { useTheme } from '@/hooks/useTheme';
 import { Colors, Typography } from '@/constants/theme';
 import { AppFormField } from '../AppFormField';
 import { AppPillToast } from '../AppPillToast';
 import { CustomAlert } from '../CustomAlert';
-import { UiPageHeader } from '../UiRedesign';
+import { UiListItem, UiPageHeader } from '../UiRedesign';
 
 jest.mock('@/hooks/useTheme', () => ({ useTheme: jest.fn() }));
 jest.mock('@/utils/feedback', () => ({
@@ -145,6 +145,41 @@ describe('shared UI visual contracts', () => {
       expect(refreshAction!.props.disabled).toBe(true);
       expect(refreshAction!.props.accessibilityState).toEqual({ disabled: true, busy: true });
       expect(root!.root.findAllByType(ActivityIndicator)).toHaveLength(1);
+    } finally {
+      if (root) await act(async () => { root!.unmount(); });
+    }
+  });
+
+  it('uses a larger green/gray switch with a white thumb and one accessible toggle action', async () => {
+    let root: TestRenderer.ReactTestRenderer | undefined;
+    const change = jest.fn();
+    const content = (checked: boolean, disabled = false) => <UiListItem
+      title="操作提示音" icon="radio" color={Colors.light.primary} compact
+      switchValue={checked} onSwitchChange={change} disabled={disabled} />;
+    const control = () => root!.root.findAll(node => node.props.accessibilityRole === 'switch' &&
+      typeof node.props.onPress === 'function').at(-1)!;
+    const track = () => StyleSheet.flatten(root!.root.findByProps({ testID: 'ui-switch-track' }).props.style);
+    const thumb = () => StyleSheet.flatten(root!.root.findByProps({ testID: 'ui-switch-thumb' }).props.style);
+    try {
+      await act(async () => { root = TestRenderer.create(content(false)); });
+      expect(track()).toMatchObject({ width: 60, height: 34, borderRadius: 17,
+        backgroundColor: Colors.light.tagGray, alignItems: 'flex-start' });
+      expect(thumb()).toMatchObject({ width: 28, height: 28, borderRadius: 14, backgroundColor: Colors.light.white });
+      expect(control().props.accessibilityState).toEqual({ checked: false, disabled: false });
+      await act(async () => { control().props.onPress(); });
+      expect(change).toHaveBeenCalledTimes(1);
+      expect(change).toHaveBeenLastCalledWith(true);
+      setTheme('dark');
+      await act(async () => { root!.update(content(true)); });
+      expect(track()).toMatchObject({ backgroundColor: Colors.dark.success, alignItems: 'flex-end' });
+      expect(thumb().backgroundColor).toBe(Colors.dark.white);
+      expect(control().props.accessibilityState.checked).toBe(true);
+      await act(async () => { control().props.onPress(); });
+      expect(change).toHaveBeenCalledTimes(2);
+      expect(change).toHaveBeenLastCalledWith(false);
+      await act(async () => { root!.update(content(true, true)); });
+      await act(async () => { control().props.onPress(); });
+      expect(change).toHaveBeenCalledTimes(2);
     } finally {
       if (root) await act(async () => { root!.unmount(); });
     }

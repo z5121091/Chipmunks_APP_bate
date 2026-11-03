@@ -13,7 +13,7 @@ using Microsoft.Win32.SafeHandles;
 
 namespace Chipmunks.ApkBuilder
 {
-    public enum BuildMode { Build, CheckEnvironment, PrepareEnvironment }
+    public enum BuildMode { Build, CheckEnvironment, PrepareEnvironment, PublishUpdate }
     public enum BuildTarget { Apk, SyncHelper }
     public enum BuildState { Idle, Running, Succeeded, Failed, Cancelled, NeedsAttention }
 
@@ -75,6 +75,8 @@ namespace Chipmunks.ApkBuilder
         private bool running;
         private bool disposed;
         private bool cancellationRequested;
+        private bool sawPublish;
+        private string publishNotesFile;
         private bool sawSuccess;
         private bool sawCheckSuccess;
         private bool sawPrepareSuccess;
@@ -135,6 +137,15 @@ namespace Chipmunks.ApkBuilder
             return StartAsync(mode, BuildTarget.Apk);
         }
 
+        public Task<BuildResult> StartPublishAsync(string notesFile)
+        {
+            lock (sync) {
+                if (running) throw new InvalidOperationException("当前任务尚未结束。");
+                publishNotesFile = Path.GetFullPath(notesFile);
+                return StartInternal(BuildMode.PublishUpdate, BuildTarget.Apk, false);
+            }
+        }
+
         public Task<BuildResult> StartAsync(BuildMode mode, BuildTarget target)
         {
             return StartInternal(mode, target, false);
@@ -154,12 +165,14 @@ namespace Chipmunks.ApkBuilder
         {
             if (!Enum.IsDefined(typeof(BuildMode), mode)) throw new ArgumentOutOfRangeException("mode");
             if (!Enum.IsDefined(typeof(BuildTarget), target)) throw new ArgumentOutOfRangeException("target");
+            if (mode == BuildMode.PublishUpdate && (target != BuildTarget.Apk || String.IsNullOrEmpty(publishNotesFile) || !File.Exists(publishNotesFile)))
+                throw new InvalidOperationException("热更新只能从 APK 目标使用有效更新说明发布。");
             lock (sync)
             {
                 if (disposed) throw new ObjectDisposedException("BuildRunner");
                 if (running) throw new InvalidOperationException("当前构建任务尚未结束。请等待完成或停止后再试。");
                 running = true;
-                cancellationRequested = sawSuccess = sawCheckSuccess = sawPrepareSuccess = false;
+                cancellationRequested = sawPublish = sawSuccess = sawCheckSuccess = sawPrepareSuccess = false;
                 apkPath = exeBuildId = exeSha256 = attentionCode = failureLine = logFailure = null;
                 displayLines.Clear();
                 snapshot = new BuildSnapshot { State = BuildState.Running, Mode = mode, Target = target, Stage = 0,
@@ -229,8 +242,8 @@ namespace Chipmunks.ApkBuilder
         private BuildResult Run(BuildMode mode, BuildTarget target, bool interactive)
         {
             BuildResult result = new BuildResult { State = BuildState.Failed, ExitCode = -1, Target = target };
-            string selectedScript = target == BuildTarget.Apk ? scriptPath : syncScriptPath;
-            string selectedLogDirectory = logDirectory ?? Path.Combine(repositoryPath, "logs", target == BuildTarget.Apk ? "android-build" : "sync-build", "gui");
+            string selectedScript = mode == BuildMode.PublishUpdate ? Path.Combine(repositoryPath, "scripts", "publish-ota.ps1") : target == BuildTarget.Apk ? scriptPath : syncScriptPath;
+            string selectedLogDirectory = logDirectory ?? Path.Combine(repositoryPath, "logs", mode == BuildMode.PublishUpdate ? "ota-publish" : target == BuildTarget.Apk ? "android-build" : "sync-build", "gui");
             string signingTaskId = Guid.NewGuid().ToString("N");
             Process process = null;
             JobObject job = null;
@@ -261,6 +274,7 @@ namespace Chipmunks.ApkBuilder
                 string gateName = @"Local\ChipmunksApkGate_" + Guid.NewGuid().ToString("N");
                 gate = new EventWaitHandle(false, EventResetMode.ManualReset, gateName);
                 string modeSwitch = mode == BuildMode.CheckEnvironment ? " -CheckOnly" : mode == BuildMode.PrepareEnvironment ? " -PrepareOnly" : String.Empty;
+                if (mode == BuildMode.PublishUpdate) modeSwitch = " -NotesFile '" + publishNotesFile.Replace("'", "''") + "'";
                 string command = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; " +
                     "$g=[System.Threading.EventWaitHandle]::OpenExisting('" + gateName + "'); if(-not $g.WaitOne(30000)){exit 91}; $g.Dispose(); " +
                     "& '" + selectedScript.Replace("'", "''") + "'" + modeSwitch + "; if($null -eq $LASTEXITCODE){exit 0}else{exit $LASTEXITCODE}";
@@ -414,6 +428,11 @@ namespace Chipmunks.ApkBuilder
                     return result;
                 }
                 if (result.ExitCode != 0) { result.ErrorMessage = failureLine ?? ("任务失败，退出码 " + result.ExitCode + "。请查看完整日志。"); return result; }
+                if (mode == BuildMode.PublishUpdate) {
+                    result.State = sawPublish ? BuildState.Succeeded : BuildState.Failed;
+                    result.ErrorMessage = sawPublish ? null : "未收到服务器确认发布成功，请查看日志。";
+                    return result;
+                }
                 if (mode == BuildMode.Build)
                 {
                     if (!sawSuccess) { result.ErrorMessage = "进程已退出，但没有构建成功标记。请查看日志，当前不认定为成功。"; return result; }
@@ -487,6 +506,7 @@ namespace Chipmunks.ApkBuilder
                     if (number <= (snapshot.Target == BuildTarget.Apk ? 5 : 4)) { snapshot.Stage = number; snapshot.StageText = stage.Groups[3].Value; }
                 }
                 string trimmed = line.Trim();
+                if (Regex.IsMatch(trimmed, @"^PUBLISHED: [a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$")) sawPublish = true;
                 if (trimmed == "BUILD SUCCEEDED") sawSuccess = true;
                 if (trimmed.StartsWith("CHECK PASSED:", StringComparison.Ordinal)) sawCheckSuccess = true;
                 if (trimmed == (snapshot.Target == BuildTarget.Apk ? "APK ENVIRONMENT READY. No APK build started." : "SYNC ENVIRONMENT READY. No EXE build started.")) sawPrepareSuccess = true;

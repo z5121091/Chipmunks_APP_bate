@@ -1,5 +1,6 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 
-import { View, Text, ScrollView, TouchableOpacity } from 'react-native';
+import { View, Text, ScrollView } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
@@ -27,7 +28,7 @@ export default function ChangelogScreen() {
         showsVerticalScrollIndicator={true}
       >
         <View style={styles.header}>
-          <TouchableOpacity style={styles.backButton} activeOpacity={0.7} onPress={() => router.back()}>
+          <TouchableOpacity style={styles.backButton} activeOpacity={0.86} onPress={() => router.back()} accessibilityLabel="返回上一页">
             <Feather name="arrow-left" size={24} color={theme.textPrimary} />
           </TouchableOpacity>
           <Text style={styles.title}>更新日志</Text>

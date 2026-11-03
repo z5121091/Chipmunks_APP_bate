@@ -1,5 +1,7 @@
-﻿import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { View, Text, TouchableOpacity, TextInput, Modal, Platform, FlatList, type NativeSyntheticEvent, type TextInputSubmitEditingEventData } from 'react-native';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { View, Text, TextInput, Platform, FlatList, type NativeSyntheticEvent, type TextInputSubmitEditingEventData } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { usePreventRemove } from 'expo-router/react-navigation';
 import { Feather } from '@expo/vector-icons';
@@ -176,8 +178,8 @@ export default function InventoryScreen() {
     [theme]
   );
   const router = useSafeRouter();
-  const { showToast, ToastContainer } = useToast();
-  const alert = useCustomAlert();
+  const { showToast, ToastContainer } = useToast({ persistentErrors: true });
+  const alert = useCustomAlert({ persistentErrors: true });
 
   const [selectedAccount, setSelectedAccount] = useState<ErpAccountConfig>(ERP_ACCOUNTS[0]);
   const selectedAccountRef = useRef<ErpAccountConfig>(ERP_ACCOUNTS[0]);
@@ -1359,7 +1361,7 @@ export default function InventoryScreen() {
         <TouchableOpacity
           key={record.id}
           style={styles.detailItem}
-          activeOpacity={0.7}
+          activeOpacity={0.86}
           onPress={() => openQuantityModal(record)}
           onLongPress={() => handleDeleteRecord(record)}
           delayLongPress={500}
@@ -1462,7 +1464,7 @@ export default function InventoryScreen() {
                   <TouchableOpacity
                     key={account.key}
                     style={[styles.typeBtn, active && styles.typeBtnActive]}
-                    activeOpacity={0.82}
+                    activeOpacity={0.86}
                     accessibilityRole="button"
                     accessibilityState={{ selected: active, disabled: saving || switchingAccount }}
                     disabled={!draftReady || saving || switchingAccount}
@@ -1633,7 +1635,7 @@ export default function InventoryScreen() {
           </View>
         </Modal>
 
-        {saveConfirmVisible && <Modal visible transparent animationType="fade" onRequestClose={closeSaveConfirmation}>
+        {<Modal visible={Boolean(saveConfirmVisible) && (true)} transparent animationType="fade" onRequestClose={closeSaveConfirmation}>{saveConfirmVisible ? <>
           <View style={quantityModalStyles.modalOverlay}>
             <AppModalCard title="完成盘点" subtitle={`${selectedAccount.name} · ${currentWarehouse.name}`} size="compact"
               onClose={closeSaveConfirmation}
@@ -1653,7 +1655,7 @@ export default function InventoryScreen() {
               </KeyboardAwareFormScrollView>
             </AppModalCard>
           </View>
-        </Modal>}
+        </> : null}</Modal>}
         {alert.AlertComponent}
         <ToastContainer />
       </View>

@@ -1,13 +1,8 @@
+import { MotionChevron } from '@/components/AppMotion';
+import { MotionCollapse } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import React from 'react';
-import {
-  Text,
-  TouchableOpacity,
-  View,
-  type StyleProp,
-  type TextStyle,
-  type ViewStyle,
-} from 'react-native';
-import { Feather } from '@expo/vector-icons';
+import { Text, View, type StyleProp, type TextStyle, type ViewStyle } from 'react-native';
 import {
   getRecordRenderSignature,
   type RecordRenderSignatureField,
@@ -74,11 +69,7 @@ function AggregatedRecordItemComponent<TRecord>({
   const content = (
     <View style={contentStyle}>
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-        <Feather
-          name={isExpanded ? 'chevron-down' : 'chevron-right'}
-          size={14}
-          color={chevronColor}
-        />
+        <MotionChevron expanded={Boolean(isExpanded)} collapsed="right" size={14} color={chevronColor} />
         <Text style={titleStyle}>{model}</Text>
       </View>
       <Text style={subtitleStyle}>版本: {version || '-'}</Text>
@@ -89,20 +80,16 @@ function AggregatedRecordItemComponent<TRecord>({
     <View style={containerStyle}>
       <TouchableOpacity
         style={rowStyle}
-        activeOpacity={0.7}
+        activeOpacity={0.86}
         onPress={toggleOnRowPress ? toggle : undefined}
       >
         {renderLeading?.(groupKey)}
         {toggleOnRowPress ? (
           content
         ) : (
-          <TouchableOpacity style={contentStyle} activeOpacity={0.7} onPress={toggle}>
+          <TouchableOpacity style={contentStyle} activeOpacity={0.86} onPress={toggle}>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-              <Feather
-                name={isExpanded ? 'chevron-down' : 'chevron-right'}
-                size={14}
-                color={chevronColor}
-              />
+              <MotionChevron expanded={Boolean(isExpanded)} collapsed="right" size={14} color={chevronColor} />
               <Text style={titleStyle}>{model}</Text>
             </View>
             <Text style={subtitleStyle}>版本: {version || '-'}</Text>
@@ -115,9 +102,9 @@ function AggregatedRecordItemComponent<TRecord>({
         )}
       </TouchableOpacity>
 
-      {isExpanded ? (
+      {<MotionCollapse open={Boolean(isExpanded)}>{isExpanded ? (
         <View style={detailsContainerStyle}>{records.map((record) => renderDetail(record))}</View>
-      ) : null}
+      ) : null}</MotionCollapse>}
     </View>
   );
 }

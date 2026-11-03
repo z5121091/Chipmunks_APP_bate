@@ -23,7 +23,8 @@
   },
   "pnpm": {
     "patchedDependencies": {
-      "expo-sqlite@57.0.3": "patches/expo-sqlite@57.0.3.patch"
+      "expo-sqlite@57.0.3": "patches/expo-sqlite@57.0.3.patch",
+      "expo-camera@57.0.6": "patches/expo-camera@57.0.6.patch"
     }
   }
 }

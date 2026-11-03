@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets, Edge } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
+import { AppModal } from '@/components/AppModal';
 import {
   KeyboardAwareScrollView,
   KeyboardAwareFlatList,
@@ -136,7 +137,7 @@ export const Screen = ({
       const element = el as ScreenElement;
       const t = element.type;
       // 弹窗内的滚动区域不属于页面主体。
-      if (t === Modal) return false;
+      if (t === Modal || t === AppModal) return false;
       const props = element.props as Record<string, unknown> | undefined;
       // 仅识别“垂直”滚动容器；横向滚动不视为页面已处理垂直滚动
       // eslint-disable-next-line react/prop-types

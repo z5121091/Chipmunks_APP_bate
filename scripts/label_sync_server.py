@@ -32,6 +32,7 @@ from openpyxl.styles import Font, Alignment, Border, Side
 
 try:
     from .sync_notifications import BusinessNotificationDispatcher
+    from .sync_connection_qr import ConnectionQrWindow
     from .sync_pairing_settings import PAIRING_ENV as SYNC_PAIRING_ENV, PairingSettingsWindow, hide_pairing_config, read_pairing_settings
     from .label_templates import (
         NATIVE_LABEL_COPIES,
@@ -44,6 +45,7 @@ try:
     )
 except ImportError:
     from sync_notifications import BusinessNotificationDispatcher
+    from sync_connection_qr import ConnectionQrWindow
     from sync_pairing_settings import PAIRING_ENV as SYNC_PAIRING_ENV, PairingSettingsWindow, hide_pairing_config, read_pairing_settings
     from label_templates import (
         NATIVE_LABEL_COPIES,
@@ -1665,6 +1667,10 @@ class TrayIcon:
             SYNC_CONFIG_FILE, self.on_pairing_saved,
             lambda message: self.notify('配对设置', message),
         )
+        self.connection_qr_window = ConnectionQrWindow(
+            SYNC_CONFIG_FILE, lambda: self.ip_address, SERVER_PORT,
+            lambda message: self.notify('连接二维码', message),
+        )
         
     def create_icon_image(self):
         """创建托盘图标"""
@@ -1714,6 +1720,9 @@ class TrayIcon:
         """打开设置窗口；仅点击确定后保存，不启动配置文件编辑器。"""
         self.pairing_window.show()
 
+    def open_connection_qr(self, *_args):
+        self.connection_qr_window.show()
+
     def on_pairing_saved(self, enabled):
         if self.icon:
             try:
@@ -1721,7 +1730,7 @@ class TrayIcon:
             except Exception:
                 log('配对设置已保存；托盘状态将在下次打开菜单时刷新。')
         self.notify('配对设置', (
-            '已开启配对保护，请在 APP 填写相同密钥并测试连接。'
+            '已开启配对保护，点击服务地址，在 APP 扫描最新连接二维码即可配对。'
             if enabled else '已关闭配对保护，APP 无需填写密钥即可连接。'
         ))
 
@@ -1813,6 +1822,7 @@ class TrayIcon:
         BUSINESS_NOTIFICATIONS.stop()
         self.address_monitor.stop()
         self.pairing_window.close()
+        self.connection_qr_window.close()
         if self.icon:
             self.icon.stop()
         cherrypy.engine.exit()
@@ -1833,7 +1843,7 @@ class TrayIcon:
                     lambda: self.set_autostart(not self.check_autostart()),
                 ),
                 pystray.Menu.SEPARATOR,
-                pystray.MenuItem(self.get_service_address_text, None, enabled=False),
+                pystray.MenuItem(self.get_service_address_text, self.open_connection_qr),
                 pystray.MenuItem(f"版本: {SYNC_EDITION} {SYNC_VERSION}", None, enabled=False),
                 pystray.MenuItem(f"同步目录: {DATA_ROOT}", None, enabled=False),
                 pystray.MenuItem(self.get_pairing_status_text, None, enabled=False),

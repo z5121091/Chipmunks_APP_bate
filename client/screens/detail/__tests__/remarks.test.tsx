@@ -15,7 +15,7 @@ jest.mock('expo-router', () => ({
   useFocusEffect: (callback: () => void) => require('react').useEffect(callback, [callback]),
 }));
 jest.mock('@/hooks/useTheme', () => {
-  const theme = {};
+  const theme = require('@/constants/theme').Colors.light;
   return { useTheme: () => ({ theme, isDark: false }) };
 });
 jest.mock('../styles', () => ({ createStyles: () => ({}) }));
@@ -185,6 +185,7 @@ it('edits only supplemental return notes once and reloads the automatic source r
   expect(updateSalesReturnNotes).toHaveBeenCalledTimes(1);
   expect(updateSalesReturnNotes).toHaveBeenCalledWith('return-1', '客户退回包装破损');
   expect(fullText()).toContain('销售退货；历史来源未知；客户退回包装破损');
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 220)); });
   expect(root!.root.findAllByType(AppModalCard)).toHaveLength(0);
 });
 

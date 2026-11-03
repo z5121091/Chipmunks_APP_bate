@@ -1,9 +1,12 @@
-import { useMemo, type ComponentProps } from 'react';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { useEffect, useMemo, useRef, useState, type ComponentProps } from 'react';
 import type { Tabs } from 'expo-router';
-import { StyleSheet, Text, TouchableOpacity, View, useWindowDimensions } from 'react-native';
+import { Animated, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { BorderRadius, BorderWidth, Typography } from '@/constants/theme';
 import { useTheme } from '@/hooks/useTheme';
+import { APP_MOTION } from '@/constants/motion';
+import { useAppMotion } from '@/hooks/useAppMotion';
 
 const ITEMS = [
   { name: 'index', label: '工作台', icon: 'home' },
@@ -15,6 +18,22 @@ const ITEMS = [
 export type WarehouseBottomNavigationProps = Parameters<
   NonNullable<ComponentProps<typeof Tabs>['tabBar']>
 >[0];
+
+function TabIndicator({ selected, color, style }: { selected: boolean; color: string; style: object }) {
+  const reduced = useAppMotion();
+  const [opacity] = useState(() => new Animated.Value(selected ? 1 : 0));
+  const previous = useRef(selected);
+  useEffect(() => {
+    if (reduced) { opacity.setValue(selected ? 1 : 0); previous.current = selected; return; }
+    if (previous.current === selected) return;
+    previous.current = selected;
+    const animation = Animated.timing(opacity, { toValue: selected ? 1 : 0, duration: reduced ? 0 : APP_MOTION.content,
+      easing: APP_MOTION.easing, useNativeDriver: true });
+    animation.start();
+    return () => animation.stop();
+  }, [selected, reduced, opacity]);
+  return <Animated.View pointerEvents="none" style={[style, { backgroundColor: color, opacity }]} />;
+}
 
 /** One persistent bar for the four main tabs; operation pages live outside it. */
 export function WarehouseBottomNavigation({ state, navigation, insets }: WarehouseBottomNavigationProps) {
@@ -64,7 +83,7 @@ export function WarehouseBottomNavigation({ state, navigation, insets }: Warehou
         const selected = state.routes[state.index]?.key === route.key;
         const color = selected ? theme.primary : theme.textMuted;
         return (
-          <TouchableOpacity key={route.key} style={styles.item} activeOpacity={0.78}
+          <TouchableOpacity key={route.key} style={styles.item} activeOpacity={0.86}
             onPress={() => {
               const event = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
               if (!selected && !event.defaultPrevented) navigation.navigate(route.name, route.params);
@@ -72,7 +91,7 @@ export function WarehouseBottomNavigation({ state, navigation, insets }: Warehou
             onLongPress={() => navigation.emit({ type: 'tabLongPress', target: route.key })}
             accessibilityRole="tab" accessibilityLabel={item.label}
             accessibilityState={{ selected }}>
-            <View style={[styles.indicator, { backgroundColor: selected ? theme.primary : 'transparent' }]} />
+            <TabIndicator style={styles.indicator} color={theme.primary} selected={selected} />
             <Feather name={item.icon} size={19} color={color} />
             <Text style={[styles.label, { color, fontWeight: selected ? '800' : '600' }]}>{item.label}</Text>
           </TouchableOpacity>

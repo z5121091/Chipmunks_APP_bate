@@ -1,5 +1,8 @@
+import { MotionSurface } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
 
-import { Modal, SafeAreaView, StyleSheet, Text, TouchableOpacity, View, useWindowDimensions } from 'react-native';
+import { SafeAreaView, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { rf, rs } from '@/utils/responsive';
 import { useTheme } from '@/hooks/useTheme';
@@ -38,7 +41,7 @@ export function WarehouseGuide({ visible, onSkip, onGoToSettings }: WarehouseGui
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onSkip}>
       <View style={[styles.overlay, { backgroundColor: theme.overlay }]}>
         <SafeAreaView style={[styles.container, { width: modalWidth }]}>
-          <View
+          <MotionSurface
             style={[
               styles.content,
               {
@@ -65,7 +68,7 @@ export function WarehouseGuide({ visible, onSkip, onGoToSettings }: WarehouseGui
                   },
                 ]}
                 onPress={onSkip}
-                activeOpacity={0.7}
+                activeOpacity={0.86}
               >
                 <Text style={[styles.skipButtonText, { color: theme.textSecondary }]}>
                   {'\u8df3\u8fc7\u5e76\u7ee7\u7eed'}
@@ -75,7 +78,7 @@ export function WarehouseGuide({ visible, onSkip, onGoToSettings }: WarehouseGui
               <TouchableOpacity
                 style={[styles.nextButton, { backgroundColor: theme.primary, shadowColor: theme.shadowColor }]}
                 onPress={onGoToSettings}
-                activeOpacity={0.7}
+                activeOpacity={0.86}
               >
                 <Text style={[styles.nextButtonText, { color: theme.buttonPrimaryText }]}>
                   {'\u53bb\u5efa\u4ed3\u5e93'}
@@ -97,7 +100,7 @@ export function WarehouseGuide({ visible, onSkip, onGoToSettings }: WarehouseGui
                 跳过后系统会自动创建“默认仓库”，后续可在仓库档案中修改名称和说明。
               </Text>
             </View>
-          </View>
+          </MotionSurface>
         </SafeAreaView>
       </View>
     </Modal>

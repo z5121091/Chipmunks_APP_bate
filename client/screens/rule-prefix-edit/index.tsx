@@ -1,12 +1,7 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
 import { useCallback, useMemo, useState } from 'react';
-import {
-  FlatList,
-  Modal,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+import { FlatList, Text, TextInput, View } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
@@ -198,7 +193,7 @@ export default function RulePrefixEditScreen() {
       return (
         <TouchableOpacity
           style={[styles.fieldCard, configured && styles.fieldCardConfigured]}
-          activeOpacity={0.78}
+          activeOpacity={0.86}
           onPress={() => handleOpenEditor(item)}
         >
           <View style={styles.fieldTopRow}>
@@ -331,7 +326,7 @@ export default function RulePrefixEditScreen() {
     <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
       <View style={[styles.container, { paddingTop: insets.top }]}>
         <View style={styles.header}>
-          <TouchableOpacity style={styles.backButton} activeOpacity={0.7} onPress={() => router.back()}>
+          <TouchableOpacity style={styles.backButton} activeOpacity={0.86} onPress={() => router.back()} accessibilityLabel="返回上一页">
             <Feather name="arrow-left" size={20} color={theme.textPrimary} />
           </TouchableOpacity>
           <Text style={styles.title}>编辑前缀</Text>
@@ -363,7 +358,7 @@ export default function RulePrefixEditScreen() {
           <View style={[styles.footer, { paddingBottom: Math.max(insets.bottom, 12) }]}>
             <TouchableOpacity
               style={styles.clearAllButton}
-              activeOpacity={0.72}
+              activeOpacity={0.86}
               onPress={handleClearAll}
               disabled={saving}
             >

@@ -15,8 +15,10 @@ export const createStyles = (theme: Theme) => {
       paddingBottom: 96,
     },
     header: {
+      flexDirection: 'row',
+      alignItems: 'center',
       marginBottom: Spacing.md,
-      padding: Spacing.lg,
+      padding: Spacing.sm,
       borderRadius: BorderRadius['2xl'],
       backgroundColor: theme.backgroundElevated,
       borderWidth: BorderWidth.normal,
@@ -28,11 +30,13 @@ export const createStyles = (theme: Theme) => {
       elevation: 5,
     },
     title: {
+      flexShrink: 1,
       fontSize: rf(24),
       fontWeight: '800',
       color: theme.textPrimary,
       letterSpacing: -0.6,
     },
+    headerBack: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center', marginRight: Spacing.sm },
     card: {
       backgroundColor: theme.backgroundElevated,
       borderRadius: BorderRadius.xl,

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -170,7 +170,7 @@ namespace Chipmunks.ApkBuilder
                 using (var form = new SigningWindow(store))
                 {
                     EnsureHandles(form); form.PerformLayout();
-                    Assert(form.Text.Contains("发布签名"), "signing window");
+                    Assert(form.Text.Contains("构建工具设置"), "settings window");
                     using (var bitmap = new Bitmap(form.Width, form.Height)) { form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(root, "signing-window.png")); }
                     form.Size = form.MinimumSize; form.PerformLayout();
                     Control[] notes = form.Controls.Find("SigningInstructions", true); Assert(notes.Length == 1, "instruction block exists");
@@ -180,6 +180,61 @@ namespace Chipmunks.ApkBuilder
                 }
                 foreach (SigningWindow.SigningSecretMode mode in Enum.GetValues(typeof(SigningWindow.SigningSecretMode)))
                 using (var prompt = new SigningWindow.SigningSecretWindow(mode)) { Assert(prompt.PasswordMasked, "password masked"); prompt.ClearSecrets(); }
+            });
+            var combined = new SigningStore(Path.Combine(root, "combined-source-project"), Path.Combine(root, "combined-source-store"));
+            combined.ImportPkcs12(keyA, FixturePassword, "release-test", FixturePassword);
+            const string TokenFixture = "fixture-publish-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            File.WriteAllBytes(combined.PublishTokenPath, ProtectedData.Protect(Encoding.UTF8.GetBytes(TokenFixture), null, DataProtectionScope.CurrentUser));
+            string combinedBackup = Path.Combine(root, "combined.cwbuild");
+            Test("one encrypted file contains signing and publishing connection", delegate {
+                combined.ExportBackup(combinedBackup, BackupPassword);
+                Assert(combined.InspectBackup(combinedBackup, BackupPassword).HasPublishConnection, "backup includes connection");
+                Assert(!Encoding.UTF8.GetString(File.ReadAllBytes(combinedBackup)).Contains(TokenFixture), "token is encrypted");
+            });
+            var combinedDestination = new SigningStore(Path.Combine(root, "combined-combinedDestination-project"), Path.Combine(root, "combined-combinedDestination-store"));
+            Test("portable combined restore recreates both combinedDestination stores", delegate {
+                combinedDestination.RestoreBackup(combinedBackup, BackupPassword);
+                Assert(combinedDestination.GetStatus().IsConfigured && combinedDestination.GetStatus().HasPublishConnection, "both configured");
+                byte[] tokenBytes = ProtectedData.Unprotect(File.ReadAllBytes(combinedDestination.PublishTokenPath), null, DataProtectionScope.CurrentUser);
+                Assert(Encoding.UTF8.GetString(tokenBytes) == TokenFixture, "restored token matches"); Array.Clear(tokenBytes, 0, tokenBytes.Length);
+            });
+            Test("wrong password preserves both signing and publishing files", delegate {
+                byte[] signingBefore = File.ReadAllBytes(combinedDestination.ManagedPath), tokenBefore = File.ReadAllBytes(combinedDestination.PublishTokenPath);
+                ExpectFailure(delegate { combinedDestination.RestoreBackup(combinedBackup, "wrong-backup-password"); });
+                Assert(Equal(signingBefore, File.ReadAllBytes(combinedDestination.ManagedPath)) && Equal(tokenBefore, File.ReadAllBytes(combinedDestination.PublishTokenPath)), "both preserved");
+            });
+            Test("legacy signing-only restore keeps existing publishing connection", delegate {
+                byte[] tokenBefore = File.ReadAllBytes(combinedDestination.PublishTokenPath);
+                combinedDestination.RestoreBackup(backup, BackupPassword);
+                Assert(Equal(tokenBefore, File.ReadAllBytes(combinedDestination.PublishTokenPath)), "legacy restore preserved token");
+            });
+            Test("pre-combined legacy payload restores without new optional fields", delegate {
+                byte[] plain = ProtectedData.Unprotect(File.ReadAllBytes(store.ManagedPath), Encoding.UTF8.GetBytes("Chipmunks.Build.Signing.v1"), DataProtectionScope.CurrentUser);
+                var legacyPayload = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(plain));
+                Array.Clear(plain, 0, plain.Length);
+                legacyPayload.Remove("buildBackupVersion"); legacyPayload.Remove("otaPublishToken"); legacyPayload.Remove("otaServerUrl");
+                byte[] legacyBytes = Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(legacyPayload));
+                byte[] legacyCipher = (byte[])typeof(SigningStore).GetMethod("EncryptBackup", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { legacyBytes, BackupPassword });
+                string legacyPath = Path.Combine(root, "pre-combined.cwsign"); File.WriteAllBytes(legacyPath, legacyCipher);
+                Array.Clear(legacyBytes, 0, legacyBytes.Length);
+                byte[] tokenBefore = File.ReadAllBytes(combinedDestination.PublishTokenPath);
+                combinedDestination.RestoreBackup(legacyPath, BackupPassword);
+                Assert(Equal(tokenBefore, File.ReadAllBytes(combinedDestination.PublishTokenPath)), "old payload keeps publishing config");
+            });
+            Test("connection write failure rolls signing back", delegate {
+                var blocked = new SigningStore(Path.Combine(root, "blocked-project"), Path.Combine(root, "blocked-store"));
+                blocked.ImportPkcs12(keyA, FixturePassword, "release-test", FixturePassword);
+                byte[] before = File.ReadAllBytes(blocked.ManagedPath);
+                Directory.CreateDirectory(blocked.PublishTokenPath);
+                ExpectFailure(delegate { blocked.RestoreBackup(combinedBackup, BackupPassword); });
+                Assert(Equal(before, File.ReadAllBytes(blocked.ManagedPath)), "signing rolled back");
+                Assert(Directory.Exists(blocked.PublishTokenPath), "blocking path untouched");
+            });
+            Test("damaged publishing configuration cannot silently produce incomplete backup", delegate {
+                File.WriteAllBytes(combined.PublishTokenPath, new byte[] { 1, 2, 3 });
+                string target = Path.Combine(root, "must-not-exist.cwbuild");
+                ExpectFailure(delegate { combined.ExportBackup(target, BackupPassword); });
+                Assert(!File.Exists(target), "incomplete backup not written");
             });
             int failures = 0;
             foreach (Dictionary<string, object> result in Results) if (!(bool)result["passed"]) failures++;

@@ -3,6 +3,7 @@ import { Spacing, BorderRadius, Theme, BorderWidth, Typography } from '@/constan
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
 import { rf } from '@/utils/responsive';
 import { withAlpha } from '@/utils/colors';
+import { UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 
 export const createStyles = (theme: Theme) => {
   const { width, height } = Dimensions.get('window');
@@ -37,7 +38,7 @@ export const createStyles = (theme: Theme) => {
       marginRight: Spacing.sm,
       width: 42,
       height: 42,
-      borderRadius: BorderRadius.full,
+      borderRadius: UI_REDESIGN_TOKENS.radius.control,
       justifyContent: 'center',
       alignItems: 'center',
       backgroundColor: theme.backgroundTertiary,
@@ -90,7 +91,7 @@ export const createStyles = (theme: Theme) => {
       gap: Spacing.xs,
     },
     filterCard: {
-      paddingHorizontal: Spacing.md,
+      paddingHorizontal: Spacing.sm,
       paddingTop: Spacing.sm,
       marginBottom: Spacing.sm,
       borderRadius: BorderRadius.xl,
@@ -98,23 +99,55 @@ export const createStyles = (theme: Theme) => {
       borderWidth: BorderWidth.normal,
       borderColor: theme.border,
     },
-    // 仓库选择器
+    // 三块都从零基准按比例分配，不能给日期/导出单独设置最小宽度：
+    // Android Yoga 会先保留这些宽度，再把剩余空间分配给仓库，导致只剩省略号。
     warehouseBtn: {
+      flexBasis: 0,
+      flexGrow: 3,
+      flexShrink: 1,
+      minWidth: 0,
       flexDirection: 'row',
       alignItems: 'center',
       paddingVertical: Spacing.xs + 1,
-      paddingHorizontal: Spacing.sm,
-      borderRadius: BorderRadius.full,
+      paddingHorizontal: 6,
+      borderRadius: UI_REDESIGN_TOKENS.radius.control,
       backgroundColor: theme.backgroundDefault,
       borderWidth: BorderWidth.normal,
       borderColor: theme.primary,
-      minHeight: 40,
+      minHeight: 44,
     },
     warehouseBtnText: {
+      flex: 1,
+      minWidth: 0,
       ...Typography.captionMedium,
       color: theme.primary,
-      marginLeft: Spacing.xs,
+      fontSize: rf(11),
+      textAlign: 'center',
     },
+    warehouseArrowSpace: { width: 12, flexShrink: 0 },
+    exportHistoryButton: {
+      flexBasis: 0,
+      flexGrow: 2.6,
+      flexShrink: 1,
+      minWidth: 0,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: Spacing.xs,
+      paddingHorizontal: 6,
+      minHeight: 44,
+      borderRadius: UI_REDESIGN_TOKENS.radius.control,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+      backgroundColor: theme.backgroundDefault,
+    },
+    exportHistoryButtonDisabled: { opacity: 0.5 },
+    exportHistoryText: { fontSize: rf(11), fontWeight: '600', color: theme.textSecondary },
+    toolbarRow: { flexDirection: 'row', alignItems: 'center', gap: 5, marginBottom: Spacing.sm },
+    timeSegments: { flexBasis: 0, flexGrow: 4.4, flexShrink: 1, minWidth: 0, flexDirection: 'row', borderRadius: UI_REDESIGN_TOKENS.radius.control, backgroundColor: theme.backgroundDefault },
+    timeSegment: { flex: 1, minHeight: 44, minWidth: 0, paddingHorizontal: 2, alignItems: 'center', justifyContent: 'center', borderRadius: UI_REDESIGN_TOKENS.radius.control },
+    timeSegmentActive: { backgroundColor: theme.primary },
+    timeSegmentText: { fontSize: rf(11), color: theme.textSecondary },
     // 搜索类型按钮（统一风格）
     searchTypeBtn: {
       flex: 1,
@@ -123,7 +156,7 @@ export const createStyles = (theme: Theme) => {
       justifyContent: 'center',
       paddingVertical: Spacing.xs + 1,
       paddingHorizontal: Spacing.xs,
-      borderRadius: BorderRadius.full,
+      borderRadius: UI_REDESIGN_TOKENS.radius.control,
       backgroundColor: theme.backgroundDefault,
       borderWidth: BorderWidth.normal,
       borderColor: theme.border,
@@ -257,15 +290,30 @@ export const createStyles = (theme: Theme) => {
     materialMainInfo: {
       flex: 1,
     },
+    materialScanRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+    materialIdentity: { flex: 1, minWidth: 0, fontSize: rf(11), color: theme.textPrimary },
+    materialScanQuantity: { flexShrink: 0, fontSize: rf(12), fontWeight: '600', color: theme.textPrimary },
+    materialGroup: { padding: Spacing.sm, marginBottom: Spacing.sm, backgroundColor: theme.backgroundElevated, borderRadius: BorderRadius.md, borderWidth: 1, borderColor: theme.border },
+    batchRow: { flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 44, paddingVertical: 8, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.border },
+    batchCell: { flex: 1, minWidth: 0, fontSize: rf(12), fontWeight: '700', color: theme.textPrimary },
+    batchQuantity: { flex: 0.8, textAlign: 'right', fontSize: rf(14), fontWeight: '700', color: theme.textPrimary },
+    batchMatch: { backgroundColor: withAlpha(theme.primary, 0.08) },
     materialModel: {
       fontSize: rf(12),
-      fontWeight: '600',
+      fontWeight: '700',
       color: theme.textPrimary,
+      textAlign: 'left',
       marginBottom: 1,
     },
+    materialFieldRow: { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 2 },
+    materialFieldLabel: { width: rf(56), fontSize: rf(11), fontWeight: '700', color: theme.textSecondary, textAlign: 'left' },
+    materialFieldValue: { flex: 1, minWidth: 0, fontSize: rf(11), fontWeight: '700', color: theme.textSecondary, textAlign: 'left' },
+    materialSummaryRow: { flexDirection: 'row', alignItems: 'baseline', marginBottom: 2 },
     materialDetails: {
       fontSize: rf(11),
+      fontWeight: '700',
       color: theme.textSecondary,
+      textAlign: 'left',
       marginBottom: 1,
     },
     materialDate: {
@@ -295,7 +343,7 @@ export const createStyles = (theme: Theme) => {
       marginTop: Spacing.sm,
       minHeight: 38,
       paddingHorizontal: Spacing.lg,
-      borderRadius: BorderRadius.md,
+      borderRadius: UI_REDESIGN_TOKENS.radius.control,
       backgroundColor: theme.primary,
       alignItems: 'center',
       justifyContent: 'center',

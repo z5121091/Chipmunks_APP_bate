@@ -1,16 +1,20 @@
 import TestRenderer, { act } from 'react-test-renderer';
-import { BackHandler, FlatList, Text, TextInput, TouchableOpacity } from 'react-native';
+import { BackHandler, FlatList, Text, TextInput } from 'react-native';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { exportOutboundHistoryToComputer } from '@/utils/outboundHistoryExport';
 import OrdersScreen from '../index';
 import InboundRecordsScreen from '@/screens/inbound-records';
 import InventoryRecordsScreen from '@/screens/inventory-records';
 import { getQueryFilteredOrders, getQueryMaterialsByOrder, getQueryOrder, type Order, type MaterialRecord } from '@/utils/database';
+import { MotionCollapse } from '@/components/AppMotion';
 
 type FocusEntry = { callback: () => void | (() => void); cleanup?: () => void };
 const mockFocusEntries = new Set<FocusEntry>();
 let mockFocused = true;
 const mockBack = jest.fn();
 const mockPush = jest.fn();
+const mockAlert = { showConfirm: jest.fn(), showSuccess: jest.fn(), showError: jest.fn(), AlertComponent: null };
 const mockParams: { orderNo?: string } = {};
 jest.mock('expo-router', () => ({
   useFocusEffect: (callback: FocusEntry['callback']) => require('react').useEffect(() => {
@@ -36,7 +40,8 @@ jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
 jest.mock('@/components/AnimatedCard', () => ({ AnimatedCard: 'Card' }));
 jest.mock('@/components/AppEmptyState', () => ({ AppEmptyState: 'Empty' }));
 jest.mock('@/components/AppPillToast', () => ({ AppPillToast: 'Notice' }));
-jest.mock('@/components/CustomAlert', () => ({ useCustomAlert: () => ({ showConfirm: jest.fn(), AlertComponent: null }) }));
+jest.mock('@/components/CustomAlert', () => ({ useCustomAlert: () => mockAlert }));
+jest.mock('@/utils/outboundHistoryExport', () => ({ exportOutboundHistoryToComputer: jest.fn() }));
 jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon', FontAwesome6: 'Icon' }));
 jest.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
@@ -66,6 +71,7 @@ jest.mock('@/utils/database', () => {
 const order = { id: 'order-A', order_no: 'ORDER-A', customer_name: '客户 A',
   created_at: '2026/10/18 10:00', warehouse_id: 'W1' } as Order;
 const material = { id: 'material-A', order_no: 'ORDER-A', model: 'MODEL-A', batch: 'LOT-A', quantity: 5,
+  traceNo: 'TRACE-A', productionDate: '2436',
   scanned_at: '2026/10/18 10:00', warehouse_id: 'W1' } as MaterialRecord;
 const textContent = (root: TestRenderer.ReactTestRenderer) => root.root.findAllByType(Text)
   .map(node => node.props.children).flat().join('');
@@ -90,6 +96,8 @@ const pressHardwareBack = async () => {
     const handled = Array.from(handlers).reverse().some(handler => handler());
     if (!handled) mockBack();
   });
+  // A closing picker is non-interactive immediately and remains visible briefly for its exit.
+  await act(async () => { jest.advanceTimersByTime(220); });
 };
 
 let root: TestRenderer.ReactTestRenderer | undefined;
@@ -161,9 +169,15 @@ it.each(['全部', '当天'])('keeps %s, search type, search text and expansion 
   try {
     await act(async () => { row = TestRenderer.create(orderList.props.renderItem({ item: order })); });
     await act(async () => { await row.root.findByType('Card').props.onPress(); });
-    await act(async () => { await jest.advanceTimersByTimeAsync(50); });
     await act(async () => { row.update(root!.root.findByType(FlatList).props.renderItem({ item: order })); });
-    await pressText(row, 'MODEL-A');
+    expect(row.root.findAllByType(MotionCollapse)).toHaveLength(0);
+    await act(async () => { row.update(root!.root.findByType(FlatList).props.renderItem({ item: order })); });
+    expect(row.root.findAllByProps({ testID: 'order-expanded-details' }).length).toBeGreaterThan(0);
+    await pressText(row, 'LOT-A');
+    await act(async () => { row.update(root!.root.findByType(FlatList).props.renderItem({ item: order })); });
+    expect(row.root.findAllByType(Text).filter(node => node.props.children === 'MODEL-A')).toHaveLength(1);
+    expect(row.root.findAllByType(Text).filter(node => node.props.children === '2436')).toHaveLength(1);
+    await pressText(row, '追溯码：TRACE-A');
     expect(mockPush).toHaveBeenCalledWith('/detail', { id: 'material-A' });
     await changeFocus(false);
     await changeFocus(true);
@@ -174,7 +188,62 @@ it.each(['全部', '当天'])('keeps %s, search type, search text and expansion 
     }));
     await act(async () => { row.update(root!.root.findByType(FlatList).props.renderItem({ item: order })); });
     expect(textContent(row)).toContain('MODEL-A');
+    expect(textContent(row)).toContain('追溯码：');
     expect(root!.root.findByType(FlatList).props.extraData).toContain(order.id);
+  } finally {
+    if (row) await act(async () => { row.unmount(); });
+  }
+});
+
+it.each([undefined, '  ', '-', ' TRACE-NEW '])('keeps the five material lines and displays trace %j without falling back to another identity', async traceNo => {
+  jest.mocked(getQueryMaterialsByOrder).mockResolvedValue([{
+    ...material, traceNo, sourceNo: 'BOX-DO-NOT-USE', inventory_code: 'CODE-A', version: 'V1', package: 'LQFP64',
+  }]);
+  await act(async () => { root = TestRenderer.create(<OrdersScreen />); });
+  await pressText(root!, '全部');
+  let row!: TestRenderer.ReactTestRenderer;
+  try {
+    const renderRow = () => root!.root.findByType(FlatList).props.renderItem({ item: order });
+    await act(async () => { row = TestRenderer.create(renderRow()); });
+    await act(async () => { await row.root.findByType('Card').props.onPress(); });
+    await act(async () => { row.update(renderRow()); });
+    const labels = row.root.findAllByType(Text).map(node => [node.props.children].flat().join(''));
+    const modelLine = labels.indexOf('型号：');
+    expect(labels.slice(modelLine, modelLine + 11)).toEqual([
+      '型号：', 'MODEL-A', '编码：', 'CODE-A', '版本号：', 'V1', '封装：', 'LQFP64', '合计：', '5 PCS', '扫码记录：1 条',
+    ]);
+    await pressText(row, 'LOT-A');
+    await act(async () => { row.update(renderRow()); });
+    const expectedTrace = traceNo?.trim() || '-';
+    expect(textContent(row)).toContain(`追溯码：${expectedTrace}`);
+    expect(textContent(row)).not.toContain('BOX-DO-NOT-USE');
+    expect(row.root.findAllByType(TouchableOpacity).some(node =>
+      node.props.accessibilityLabel === `查看扫码记录，追溯码：${expectedTrace}`)).toBe(true);
+    await pressText(row, `追溯码：${expectedTrace}`);
+    expect(mockPush).toHaveBeenCalledWith('/detail', { id: 'material-A' });
+  } finally {
+    if (row) await act(async () => { row.unmount(); });
+  }
+});
+
+it('retries an order read on the next click after failure, without a timer or animation', async () => {
+  await act(async () => { root = TestRenderer.create(<OrdersScreen />); });
+  await pressText(root!, '全部');
+  jest.mocked(getQueryMaterialsByOrder).mockClear().mockRejectedValueOnce(new Error('read failed')).mockResolvedValueOnce([material]);
+  let row!: TestRenderer.ReactTestRenderer;
+  try {
+    const renderRow = () => root!.root.findByType(FlatList).props.renderItem({ item: order });
+    await act(async () => { row = TestRenderer.create(renderRow()); });
+    await act(async () => { await row.root.findByType('Card').props.onPress(); });
+    await act(async () => { row.update(renderRow()); });
+    expect(mockAlert.showError).toHaveBeenCalledWith('订单明细加载失败，请点击单据重试');
+    expect(row.root.findAllByProps({ testID: 'order-expanded-details' })).toHaveLength(0);
+    await act(async () => { await row.root.findByType('Card').props.onPress(); });
+    await act(async () => { row.update(renderRow()); });
+    expect(getQueryMaterialsByOrder).toHaveBeenCalledTimes(2);
+    expect(textContent(row)).toContain('MODEL-A');
+    expect(row.root.findAllByType(MotionCollapse)).toHaveLength(0);
+    expect(row.root.findByType('Card').props.disablePressAnimation).toBe(true);
   } finally {
     if (row) await act(async () => { row.unmount(); });
   }
@@ -190,4 +259,53 @@ it('applies a different target order while mounted but does not reset the view f
   await act(async () => { root!.update(<OrdersScreen />); });
   expect(root!.root.findAllByType(TextInput)).toHaveLength(0);
   expect(getQueryOrder).toHaveBeenLastCalledWith('ORDER-B', 'W1');
+});
+
+
+it.each(['当前', '当天', '全部'])('exports the selected warehouse history independently of the %s view and search', async view => {
+  jest.mocked(exportOutboundHistoryToComputer).mockResolvedValue({ fileName: '仓库B.xlsx', recordCount: 8 });
+  await act(async () => { root = TestRenderer.create(<OrdersScreen />); });
+  await pressText(root!, '仓库 A');
+  await pressText(root!, '仓库 B');
+  await pressText(root!, view);
+  if (view !== '当前') {
+    await pressText(root!, '批次');
+    await act(async () => { root!.root.findByType(TextInput).props.onChangeText('FILTER-ONLY'); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(300); });
+  }
+  await pressText(root!, '导出历史');
+  expect(mockAlert.showConfirm).toHaveBeenLastCalledWith('导出历史', expect.stringContaining('仓库 B'), expect.any(Function), false, '导出到电脑');
+  expect(mockAlert.showConfirm.mock.calls.at(-1)?.[1]).toContain('不受当前搜索和日期筛选影响');
+  expect(exportOutboundHistoryToComputer).not.toHaveBeenCalled();
+  await act(async () => { await mockAlert.showConfirm.mock.calls.at(-1)![2](); });
+  expect(exportOutboundHistoryToComputer).toHaveBeenCalledTimes(1);
+  expect(exportOutboundHistoryToComputer).toHaveBeenCalledWith({ id: 'W2', name: '仓库 B' });
+  expect(mockAlert.showSuccess).toHaveBeenCalledWith(expect.stringContaining('仓库B.xlsx'));
+});
+
+it('keeps the confirmed warehouse snapshot and blocks repeated confirmation while exporting', async () => {
+  let finish!: (result: { fileName: string; recordCount: number }) => void;
+  jest.mocked(exportOutboundHistoryToComputer).mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+  await act(async () => { root = TestRenderer.create(<OrdersScreen />); });
+  await pressText(root!, '导出历史');
+  const confirm = mockAlert.showConfirm.mock.calls.at(-1)![2];
+  await pressText(root!, '仓库 A');
+  await pressText(root!, '仓库 B');
+  await act(async () => { void confirm(); void confirm(); });
+  expect(exportOutboundHistoryToComputer).toHaveBeenCalledTimes(1);
+  expect(exportOutboundHistoryToComputer).toHaveBeenCalledWith({ id: 'W1', name: '仓库 A' });
+  expect(textContent(root!)).toContain('导出中');
+  await act(async () => { finish({ fileName: 'A.xlsx', recordCount: 2 }); });
+  expect(textContent(root!)).toContain('导出历史');
+  expect(mockAlert.showSuccess).toHaveBeenCalledWith(expect.stringContaining('仓库 A'));
+});
+
+it('ignores confirmation from a previous page visit', async () => {
+  await act(async () => { root = TestRenderer.create(<OrdersScreen />); });
+  await pressText(root!, '导出历史');
+  const confirm = mockAlert.showConfirm.mock.calls.at(-1)![2];
+  await changeFocus(false);
+  await changeFocus(true);
+  await act(async () => { await confirm(); });
+  expect(exportOutboundHistoryToComputer).not.toHaveBeenCalled();
 });

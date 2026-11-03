@@ -1,14 +1,7 @@
+import { MotionContent } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useMemo, useRef, useState } from 'react';
-import {
-  ActivityIndicator,
-  FlatList,
-  Platform,
-  Text,
-  TouchableOpacity,
-  View,
-  type NativeSyntheticEvent,
-  type TextInputSubmitEditingEventData,
-} from 'react-native';
+import { ActivityIndicator, FlatList, Platform, Text, View, type NativeSyntheticEvent, type TextInputSubmitEditingEventData } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
@@ -307,7 +300,7 @@ export default function StockQueryScreen() {
         <TouchableOpacity
           key={account.key}
           style={[styles.accountButton, active && styles.accountButtonActive]}
-          activeOpacity={0.78}
+          activeOpacity={0.86}
           disabled={querying}
           onPress={() => {
             if (queryingRef.current) return;
@@ -420,7 +413,7 @@ export default function StockQueryScreen() {
           }}
         />
 
-        <View style={styles.resultSection}>
+        <MotionContent contentKey={querying ? 'loading' : errorMessage ? 'error' : lastQuery ? 'result' : 'empty'} direction="fade" style={{ flex: 1 }}><View style={styles.resultSection}>
           {lastQuery ? (
             <View style={styles.queryCard}>
               <View style={styles.queryMain}>
@@ -483,7 +476,7 @@ export default function StockQueryScreen() {
               }
             />
           )}
-        </View>
+        </View></MotionContent>
       </View>
     </Screen>
   );

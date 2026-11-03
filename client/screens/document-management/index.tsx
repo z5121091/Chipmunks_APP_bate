@@ -86,7 +86,7 @@ export default function DocumentManagementScreen() {
           {cards.map((card) => {
             const isPrimary = card.tone === 'primary';
             return (
-              <AnimatedCard key={card.id} onPress={() => handleCardPress(card)}>
+              <AnimatedCard key={card.id} disablePressAnimation onPress={() => handleCardPress(card)}>
                 <View style={[styles.card, isPrimary ? styles.cardPrimary : styles.cardMuted]}>
                   <View style={[styles.iconBox, isPrimary ? styles.iconBoxPrimary : styles.iconBoxMuted]}>
                     <Feather

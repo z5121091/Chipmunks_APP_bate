@@ -3,8 +3,9 @@
  * 统一的提示反馈组件
  */
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useMemo, useSyncExternalStore } from 'react';
 import { AppPillToast } from '@/components/AppPillToast';
+import { getFeedbackDuration, type FeedbackTimingOptions } from '@/utils/feedbackTiming';
 
 // 页面提示类型
 type ToastType = 'success' | 'warning' | 'error';
@@ -13,9 +14,7 @@ type ToastType = 'success' | 'warning' | 'error';
 // 页面内提示
 // ============================================================================
 
-interface ToastOptions {
-  duration?: number; // 显示时长，默认 500ms
-}
+type ToastOptions = FeedbackTimingOptions;
 
 interface UseToastReturn {
   showToast: (text: string, type?: ToastType) => void;
@@ -41,61 +40,34 @@ interface UseToastReturn {
  *   );
  * }
  */
+type ToastState = { text: string; type: ToastType } | null;
+function createToastStore() {
+  let value: ToastState = null;
+  const listeners = new Set<() => void>();
+  return { get: () => value, subscribe: (listener: () => void) => {
+    listeners.add(listener); return () => { listeners.delete(listener); };
+  }, set: (next: ToastState) => { value = next; listeners.forEach(listener => listener()); } };
+}
+
 export function useToast(options: ToastOptions = {}): UseToastReturn {
-  const { duration } = options;
-  const [toastState, setToastState] = useState<{
-    id: number;
-    text: string;
-    type: ToastType;
-  } | null>(null);
-  const toastIdRef = useRef(0);
+  const { duration, persistentErrors } = options;
+  const [store] = useState(createToastStore);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const hideToast = useCallback(() => {
-    setToastState(null);
-  }, []);
-
-  const showToast = useCallback((msg: string, toastType: ToastType = 'success') => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-    }
-
-    // 使用公共提示组件，保证扫码主流程与记录页的主题色、图标和深色模式一致。
-    setToastState({
-      id: ++toastIdRef.current,
-      text: msg,
-      type: toastType,
-    });
-
-    // 错误提示保留到下一条操作反馈到来，避免扫码设备来不及读完就消失。
-    // Toast 本身 pointerEvents=none，保持扫码和页面操作可继续；下一次扫码结果会自然替换它。
-    if (toastType !== 'error') {
-      const displayDuration = duration ?? (toastType === 'warning' ? 2400 : 2200);
-      timerRef.current = setTimeout(hideToast, displayDuration);
-    }
-  }, [duration, hideToast]);
-
-  // 组件卸载时清理
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-      }
-    };
-  }, []);
-
-  const ToastContainer: React.FC = useCallback(() => {
-    if (!toastState) return null;
-
-    return (
-      <AppPillToast
-        key={toastState.id}
-        text={toastState.text}
-        type={toastState.type}
-      />
-    );
-  }, [toastState]);
-
+  const showToast = useCallback((text: string, type: ToastType = 'success') => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = null;
+    store.set({ text, type });
+    const delay = getFeedbackDuration(type, { duration, persistentErrors });
+    if (delay !== null) timerRef.current = setTimeout(() => {
+      store.set(null);
+      timerRef.current = null;
+    }, delay);
+  }, [duration, persistentErrors, store]);
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+  const ToastContainer = useMemo(() => function ToastHost() {
+    const value = useSyncExternalStore(store.subscribe, store.get, store.get);
+    return <AppPillToast text={value?.text || ''} type={value?.type || 'success'} visible={Boolean(value)} />;
+  }, [store]);
   return { showToast, ToastContainer };
 }
 

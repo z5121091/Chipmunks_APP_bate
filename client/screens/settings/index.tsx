@@ -1,18 +1,11 @@
-﻿import { useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
+import { OtaUpdatePanel } from '@/screens/app-updates';
+import { UiPageHeader } from '@/components/UiRedesign';
+import { MotionCollapse } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
+import { useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {
-  View,
-  Text,
-  TouchableOpacity,
-  TextInput,
-  ActivityIndicator,
-  useWindowDimensions,
-  Platform,
-  Modal,
-  FlatList,
-  Linking,
-  InteractionManager,
-} from 'react-native';
+import { View, Text, useWindowDimensions, Platform, FlatList, Linking, InteractionManager } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useIsFocused } from 'expo-router/react-navigation';
 import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
@@ -20,15 +13,11 @@ import * as Updates from 'expo-updates';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
-import * as IntentLauncher from 'expo-intent-launcher';
 import { logger } from '@/utils/logger';
 import {
-  getOutboundExportRows,
   exportBackupData,
   importBackupData,
   getConfigStats,
-  getTodayExportCount,
-  incrementExportCount,
   importDatabaseFile,
   BackupData,
   isBackupDataShape,
@@ -60,49 +49,28 @@ import {
   SELF_UPDATE_ENABLED,
 } from '@/constants/version';
 import { setSoundEnabled as setSoundEnabledFn, initSoundSetting } from '@/utils/feedback';
-import { formatSyncErrorMessage, syncExcelToComputer, type ExcelSheet } from '@/utils/excel';
-import {
-  getWarehouseExportSegment,
-} from '@/utils/excelSchema';
-import { buildOutboundExportFileName, buildOutboundSheets } from '@/utils/outboundExport';
 import { safeJsonParseNullable } from '@/utils/json';
 import {
   getSyncConfigError,
-  normalizeSyncConfig,
 } from '@/utils/heartbeat';
 import {
   getSyncConnectionSnapshot,
   refreshSyncConnection,
-  saveSyncConnectionConfig,
   subscribeSyncConnection,
 } from '@/utils/syncConnection';
-import { NETWORK_CONFIG, SyncConfig, ConnectionStatus } from '@/constants/config';
+import { NETWORK_CONFIG, SyncConfig } from '@/constants/config';
 import { parseAuthFromUrl, base64Encode, compareVersions, getUpdateServer } from '@/utils/update';
-import { getDatabaseBackupDateString } from '@/utils/backupNaming';
+import * as IntentLauncher from 'expo-intent-launcher';
 import { useToast } from '@/utils/toast';
-import { scanQueue } from '@/utils/scanQueue';
 import {
   listIsolatedWorkDrafts, restoreIsolatedWorkDraft, type IsolatedWorkDraft,
 } from '@/utils/workDraftIsolation';
 import {
   createRealtimeDatabaseBackupFile,
   createRealtimeDatabaseBackupToNas,
-  getLastNasDatabaseBackupSuccess,
-  getNasDatabaseBackupSourceLabel,
-  type NasDatabaseBackupSuccess,
   uploadDatabaseBackupToNas,
 } from '@/utils/nasBackup';
-import {
-  getAutoNasBackupReasonLabel,
-  getAutoNasBackupStatus,
-  getAutoNasBackupStatusLabel,
-  getAutoNasBackupTriggerLabel,
-  getNativeAutoNasBackupReasonLabel,
-  getNativeAutoNasBackupStatus,
-  getNativeAutoNasBackupStatusLabel,
-  type AutoNasBackupStatus,
-  type NativeAutoNasBackupStatus,
-} from '@/utils/autoNasBackup';
+import { describeBackupDiagnostic, readBackupDiagnostic, type BackupDiagnostic } from '@/utils/backupDiagnostic';
 import { backendJsonRequest, buildErpProxyPath } from '@/utils/backendApi';
 import {
   ERP_ACCOUNTS,
@@ -112,12 +80,6 @@ import {
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 
 const FileSystem = FileSystemLegacy;
-
-type SyncTaskKey = 'outbound';
-const activeSyncTasks = new Set<SyncTaskKey>();
-
-const getErrorMessage = (error: unknown, fallback: string) =>
-  formatUserFacingErrorMessage(error, fallback);
 
 const isSyncConfig = (value: unknown): value is SyncConfig => {
   return (
@@ -131,7 +93,7 @@ const isSyncConfig = (value: unknown): value is SyncConfig => {
 
 const UPDATE_RETRY_DELAYS = [1000, 2000, 4000];
 
-type SettingsGroupId = 'system' | 'erp' | 'sync' | 'rules' | 'backup' | 'about';
+type SettingsGroupId = 'system' | 'erp' | 'rules' | 'backup' | 'about';
 
 type ErpConnectionStatus = 'idle' | 'checking' | 'connected' | 'warning' | 'error' | 'unavailable';
 
@@ -274,7 +236,7 @@ const getNextDatedFileName = async (
   }
 };
 
-export default function SettingsScreen() {
+export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: boolean }) {
   const { theme, isDark } = useTheme();
   const isFocused = useIsFocused();
   const router = useSafeRouter();
@@ -314,11 +276,7 @@ export default function SettingsScreen() {
   const [restoreLoading, setRestoreLoading] = useState(false);
   const [dbBackupLoading, setDbBackupLoading] = useState(false);
   const [dbRestoreLoading, setDbRestoreLoading] = useState(false);
-  const [lastNasBackupSuccess, setLastNasBackupSuccess] =
-    useState<NasDatabaseBackupSuccess | null>(null);
-  const [autoBackupStatus, setAutoBackupStatus] = useState<AutoNasBackupStatus | null>(null);
-  const [nativeAutoBackupStatus, setNativeAutoBackupStatus] =
-    useState<NativeAutoNasBackupStatus | null>(null);
+  const [backupDiagnostic, setBackupDiagnostic] = useState<BackupDiagnostic | null>(null);
   const [expandedSettingsGroup, setExpandedSettingsGroup] = useState<SettingsGroupId | null>(null);
   const [erpConnectionStates, setErpConnectionStates] = useState<
     Record<ErpAccountKey, ErpConnectionState>
@@ -342,29 +300,18 @@ export default function SettingsScreen() {
   const [restoringDraftArchive, setRestoringDraftArchive] = useState(false);
 
   // 电脑同步配置
-  const [syncConfig, setSyncConfig] = useState<SyncConfig>({ ip: '', port: '8080' });
-  const [testingSyncConfig, setTestingSyncConfig] = useState(false);
   const syncConnection = useSyncExternalStore(
     subscribeSyncConnection,
     getSyncConnectionSnapshot,
     getSyncConnectionSnapshot
   );
-  const normalizedSyncConfig = normalizeSyncConfig(syncConfig);
-  const matchesSavedSyncConfig =
-    syncConnection.config?.ip === normalizedSyncConfig.ip &&
-    syncConnection.config?.port === normalizedSyncConfig.port &&
-    (syncConnection.config?.pairingKey || '') === (normalizedSyncConfig.pairingKey || '');
-  const connectionStatus: ConnectionStatus = testingSyncConfig
-    ? 'testing'
-    : matchesSavedSyncConfig
-      ? syncConnection.status
-      : 'idle';
+  const connectionStatus = syncConnection.status;
+  const syncConfig = syncConnection.config || { ip: '', port: NETWORK_CONFIG.DEFAULT_PORT };
 
   // 声音开关
   const [soundEnabled, setSoundEnabled] = useState(true);
 
   // 各数据类型的同步状态
-  const [syncingOutbound, setSyncingOutbound] = useState(false);
 
   // 在线更新相关状态
   const [updateModalVisible, setUpdateModalVisible] = useState(false);
@@ -395,7 +342,6 @@ export default function SettingsScreen() {
     setSoundEnabledFn(nextSoundEnabled);
 
     if (!savedSyncConfig) {
-      setSyncConfig({ ip: '', port: NETWORK_CONFIG.DEFAULT_PORT });
       await refreshSyncConnection();
       return;
     }
@@ -406,7 +352,6 @@ export default function SettingsScreen() {
       isSyncConfig
     );
     if (!config || getSyncConfigError(config)) {
-      setSyncConfig({ ip: '', port: NETWORK_CONFIG.DEFAULT_PORT });
       await Promise.all([
         AsyncStorage.removeItem(STORAGE_KEYS.SYNC_CONFIG),
         AsyncStorage.removeItem(STORAGE_KEYS.CONNECTION_STATUS),
@@ -415,22 +360,12 @@ export default function SettingsScreen() {
       return;
     }
 
-    const normalizedConfig = normalizeSyncConfig(config);
-    setSyncConfig(normalizedConfig);
-
     // 检查真实服务状态；历史失败状态不阻止重连。
     await refreshSyncConnection();
   }, []);
 
   const loadAutoBackupStatus = useCallback(async () => {
-    const [status, nativeStatus, lastNasSuccess] = await Promise.all([
-      getAutoNasBackupStatus(),
-      getNativeAutoNasBackupStatus(),
-      getLastNasDatabaseBackupSuccess(),
-    ]);
-    setAutoBackupStatus(status);
-    setNativeAutoBackupStatus(nativeStatus);
-    setLastNasBackupSuccess(lastNasSuccess);
+    setBackupDiagnostic(await readBackupDiagnostic());
   }, []);
 
   const checkErpConnections = useCallback(
@@ -642,139 +577,6 @@ export default function SettingsScreen() {
       };
     }, [checkErpConnections, loadAutoBackupStatus, loadData, showSettingsLoadError])
   );
-
-  // IP变更
-  const handleIpChange = (text: string) => {
-    setSyncConfig((prev) => ({ ...prev, ip: text }));
-  };
-
-  // 端口变更
-  const handlePortChange = (text: string) => {
-    setSyncConfig((prev) => ({ ...prev, port: text.replace(/\D/g, '').slice(0, 5) }));
-  };
-
-  // 测试连接
-  const handleTestConnection = async () => {
-    const normalizedConfig = normalizeSyncConfig(syncConfig);
-    const configError = getSyncConfigError(normalizedConfig);
-    if (configError) {
-      alert.showWarning(configError);
-      return;
-    }
-
-    setSyncConfig(normalizedConfig);
-    setTestingSyncConfig(true);
-    try {
-      await saveSyncConnectionConfig(normalizedConfig);
-    } catch (error) {
-      logger.warn('[设置] 保存同步地址失败:', error);
-      alert.showError('同步地址保存失败，请重试');
-    } finally {
-      setTestingSyncConfig(false);
-    }
-  };
-
-  // 生成 Excel 并同步到电脑（支持多Sheet）
-  const syncToComputerMultiSheet = async (
-    sheets: ExcelSheet[],
-    endpoint: string,
-    setLoading: (loading: boolean) => void,
-    nameSuffix?: string,
-    exactFileName?: string
-  ): Promise<boolean> => {
-    const totalRows = sheets.reduce((sum, sheet) => sum + sheet.rows.length, 0);
-    if (totalRows === 0) {
-      alert.showWarning('暂无数据可同步');
-      return false;
-    }
-
-    setLoading(true);
-    try {
-      const result = await syncExcelToComputer(
-        sheets,
-        endpoint,
-        syncConfig,
-        nameSuffix,
-        (fileName) =>
-          alert.showSuccess(fileName ? `已同步到电脑\n文件：${fileName}` : '已同步到电脑'),
-        undefined,
-        exactFileName
-      );
-
-      if (!result.success && result.message) {
-        if (result.message.includes('暂无数据可同步')) {
-          alert.showWarning(result.message);
-          return false;
-        }
-
-        alert.showError(formatSyncErrorMessage(result.message));
-        return false;
-      }
-      return result.success;
-    } catch (error: unknown) {
-      alert.showError(
-        `同步失败：${formatSyncErrorMessage(getErrorMessage(error, ''), '请检查服务是否运行')}`
-      );
-      return false;
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // 同步出库单（扫码出库的物料信息）
-  const handleSyncOutbound = async () => {
-    if (activeSyncTasks.has('outbound')) {
-      return;
-    }
-
-    activeSyncTasks.add('outbound');
-    setSyncingOutbound(true);
-    try {
-      const outboundQueueStats = await scanQueue.flushPendingWrites({
-        timeoutMs: 15000,
-        retryFailed: true,
-      });
-      if (outboundQueueStats.failed > 0) {
-        alert.showError(
-          `仍有 ${outboundQueueStats.failed} 条出库扫码记录写入失败，请回到扫码出库页确认后再同步`
-        );
-        return;
-      }
-
-      const records = await getOutboundExportRows();
-
-      if (records.length === 0) {
-        alert.showWarning('暂无出库数据可同步');
-        return;
-      }
-
-      const todayCount = (await getTodayExportCount('outbound')) + 1;
-
-      const sheets = buildOutboundSheets(records);
-      const warehouseName = getWarehouseExportSegment(
-        records.map((record) => record.warehouse_name)
-      );
-      const exactFileName = buildOutboundExportFileName(warehouseName, todayCount);
-
-      const synced = await syncToComputerMultiSheet(
-        sheets,
-        '/outbound',
-        setSyncingOutbound,
-        undefined,
-        exactFileName
-      );
-      if (synced) {
-        await incrementExportCount('outbound');
-      }
-    } catch (error: unknown) {
-      alert.showError(
-        `同步失败：${formatSyncErrorMessage(getErrorMessage(error, ''), '请检查服务是否运行')}`
-      );
-    } finally {
-      activeSyncTasks.delete('outbound');
-      setSyncingOutbound(false);
-    }
-  };
 
   // ==================== 在线更新功能 ====================
 
@@ -1328,7 +1130,6 @@ export default function SettingsScreen() {
   };
 
   // 是否可以同步
-  const canSync = Boolean(syncConfig.ip) && connectionStatus === 'success';
   const syncTarget = syncConfig.ip
     ? `${syncConfig.ip}:${syncConfig.port || NETWORK_CONFIG.DEFAULT_PORT}`
     : '未配置';
@@ -1485,191 +1286,6 @@ export default function SettingsScreen() {
     []
   );
 
-  const openBatteryOptimizationSettings = useCallback(async () => {
-    if (Platform.OS !== 'android') {
-      await Linking.openSettings();
-      return;
-    }
-
-    try {
-      await IntentLauncher.startActivityAsync(
-        'android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS'
-      );
-    } catch (error) {
-      logger.warn('[设置] 打开电池优化设置失败，改为打开应用设置:', error);
-      await Linking.openSettings();
-    }
-  }, []);
-
-  const formatAutoBackupTime = useCallback((timeMs?: number) => {
-    if (!timeMs) {
-      return '暂无';
-    }
-    return formatDateTimeExport(new Date(timeMs).toISOString());
-  }, []);
-
-  const renderAutoBackupDiagnosticRow = useCallback(
-    (label: string, value: string, numberOfLines = 1, emphasizeError = false) => (
-      <View style={styles.autoBackupDiagnosticRow}>
-        <Text style={styles.autoBackupDiagnosticLabel}>{label}</Text>
-        <Text
-          style={[
-            styles.autoBackupDiagnosticValue,
-            emphasizeError && styles.autoBackupDiagnosticValueError,
-          ]}
-          numberOfLines={numberOfLines}
-        >
-          {value}
-        </Text>
-      </View>
-    ),
-    [styles]
-  );
-
-  const renderAutoBackupDiagnostic = useCallback(() => {
-    const today = getDatabaseBackupDateString();
-    const nativeSuccessAt =
-      nativeAutoBackupStatus?.status === 'success' ? nativeAutoBackupStatus.checkedAtMs : 0;
-    const latestSuccessAt = Math.max(lastNasBackupSuccess?.successAtMs ?? 0, nativeSuccessAt);
-    const latestSuccessDate = latestSuccessAt
-      ? getDatabaseBackupDateString(new Date(latestSuccessAt))
-      : null;
-    const hasNasSuccessToday = latestSuccessDate === today;
-    const hasFailure =
-      autoBackupStatus?.status === 'failed' || nativeAutoBackupStatus?.status === 'failed';
-    const statusLabel = hasNasSuccessToday
-      ? 'NAS已备份'
-      : hasFailure
-        ? '存在异常'
-        : lastNasBackupSuccess
-          ? '需备份'
-          : nativeAutoBackupStatus
-            ? getNativeAutoNasBackupStatusLabel(nativeAutoBackupStatus)
-            : getAutoNasBackupStatusLabel(autoBackupStatus);
-    const hasSuccess =
-      hasNasSuccessToday ||
-      autoBackupStatus?.status === 'success' ||
-      nativeAutoBackupStatus?.status === 'success';
-    const badgeStyle =
-      hasSuccess
-        ? styles.autoBackupDiagnosticBadgeSuccess
-        : hasFailure
-        ? styles.autoBackupDiagnosticBadgeError
-        : styles.autoBackupDiagnosticBadgeWarning;
-    const badgeTextStyle =
-      hasSuccess
-        ? styles.autoBackupDiagnosticBadgeTextSuccess
-        : hasFailure
-        ? styles.autoBackupDiagnosticBadgeTextError
-        : styles.autoBackupDiagnosticBadgeTextWarning;
-    const resultText =
-      autoBackupStatus?.status === 'failed'
-        ? autoBackupStatus.lastError || '未知错误'
-        : autoBackupStatus?.status === 'skipped'
-          ? getAutoNasBackupReasonLabel(autoBackupStatus.reason)
-          : autoBackupStatus?.status === 'success'
-            ? '最近一次自动备份已上传到 NAS'
-            : '暂无自动备份检查记录';
-    const successText = autoBackupStatus?.lastSuccessAt
-      ? `${formatAutoBackupTime(autoBackupStatus.lastSuccessAt)} · ${
-          autoBackupStatus.lastSuccessFileName || 'NAS 备份'
-        }`
-      : '暂无成功记录';
-    const latestNasSuccessText =
-      nativeSuccessAt > (lastNasBackupSuccess?.successAtMs ?? 0)
-        ? `${formatAutoBackupTime(nativeSuccessAt)} · ${getNasDatabaseBackupSourceLabel(
-            'native-workmanager'
-          )} · ${nativeAutoBackupStatus?.fileName || 'NAS 备份'}`
-        : lastNasBackupSuccess
-          ? `${formatAutoBackupTime(lastNasBackupSuccess.successAtMs)} · ${getNasDatabaseBackupSourceLabel(
-              lastNasBackupSuccess.source
-            )} · ${lastNasBackupSuccess.fileName}`
-          : '暂无 NAS 成功记录';
-    const nativeResultText =
-      nativeAutoBackupStatus?.status === 'failed'
-        ? nativeAutoBackupStatus.errorMessage || '未知错误'
-        : nativeAutoBackupStatus?.status === 'skipped'
-          ? getNativeAutoNasBackupReasonLabel(nativeAutoBackupStatus.reason)
-          : nativeAutoBackupStatus?.status === 'success'
-            ? '后台任务已上传数据库到 NAS'
-            : nativeAutoBackupStatus?.status === 'running'
-              ? '后台任务正在执行'
-              : '暂无后台任务记录';
-    const nativeSuccessText = nativeAutoBackupStatus?.fileName
-      ? `${formatAutoBackupTime(nativeAutoBackupStatus.checkedAtMs)} · ${
-          nativeAutoBackupStatus.fileName
-        }`
-      : nativeAutoBackupStatus?.lastSuccessAtMs
-        ? `${formatAutoBackupTime(nativeAutoBackupStatus.lastSuccessAtMs)} · 后台任务`
-        : '暂无后台成功记录';
-
-    return (
-      <View style={styles.autoBackupDiagnosticCard}>
-        <View style={styles.autoBackupDiagnosticHeader}>
-          <Text style={styles.autoBackupDiagnosticTitle}>NAS备份诊断</Text>
-          <View style={[styles.autoBackupDiagnosticBadge, badgeStyle]}>
-            <Text style={[styles.autoBackupDiagnosticBadgeText, badgeTextStyle]}>
-              {statusLabel}
-            </Text>
-          </View>
-        </View>
-        {renderAutoBackupDiagnosticRow('NAS最新', latestNasSuccessText, 2)}
-        {renderAutoBackupDiagnosticRow(
-          '前台检查',
-          formatAutoBackupTime(autoBackupStatus?.lastCheckedAt)
-        )}
-        {renderAutoBackupDiagnosticRow(
-          '前台来源',
-          getAutoNasBackupTriggerLabel(autoBackupStatus?.trigger)
-        )}
-        {renderAutoBackupDiagnosticRow(
-          '前台说明',
-          resultText,
-          2,
-          autoBackupStatus?.status === 'failed'
-        )}
-        {renderAutoBackupDiagnosticRow('前台成功', successText, 2)}
-        {renderAutoBackupDiagnosticRow('前台策略', '前台每 15 分钟刷新状态，Android 自动上传交给后台任务', 2)}
-        <View style={styles.autoBackupDiagnosticDivider} />
-        {renderAutoBackupDiagnosticRow('后台任务', getNativeAutoNasBackupStatusLabel(nativeAutoBackupStatus))}
-        {renderAutoBackupDiagnosticRow(
-          '后台时间',
-          formatAutoBackupTime(nativeAutoBackupStatus?.checkedAtMs)
-        )}
-        {renderAutoBackupDiagnosticRow(
-          '后台说明',
-          nativeResultText,
-          2,
-          nativeAutoBackupStatus?.status === 'failed'
-        )}
-        {renderAutoBackupDiagnosticRow('后台成功', nativeSuccessText, 2)}
-        {renderAutoBackupDiagnosticRow('后台策略', 'Android WorkManager 每 6 小时调度，锁屏后由系统执行', 2)}
-        <View style={styles.autoBackupProtectionBox}>
-          <Text style={styles.autoBackupProtectionTitle}>企业 PDA 后台保障</Text>
-          <Text style={styles.autoBackupProtectionText}>
-            建议把掌上仓库加入电池优化白名单，并允许后台网络，避免锁屏或省电策略延迟上传。
-          </Text>
-          {Platform.OS === 'android' && (
-            <AnimatedButton
-              style={styles.autoBackupProtectionButton}
-              activeOpacity={0.82}
-              onPress={openBatteryOptimizationSettings}
-            >
-              <Text style={styles.autoBackupProtectionButtonText}>打开电池优化设置</Text>
-            </AnimatedButton>
-          )}
-        </View>
-      </View>
-    );
-  }, [
-    autoBackupStatus,
-    formatAutoBackupTime,
-    lastNasBackupSuccess,
-    nativeAutoBackupStatus,
-    openBatteryOptimizationSettings,
-    renderAutoBackupDiagnosticRow,
-    styles,
-  ]);
 
   return (
     <Screen
@@ -1678,7 +1294,19 @@ export default function SettingsScreen() {
       safeAreaEdges={['top', 'left', 'right']}
       disableAutoScroll
     >
-      <KeyboardAwareFormScrollView
+      {updatesOnly ? <>
+        <UiPageHeader title="应用更新" onBack={() => router.back()} />
+        <KeyboardAwareFormScrollView contentContainerStyle={{ padding: 16 }}>
+          <View style={{ backgroundColor: theme.backgroundDefault, padding: 18, borderRadius: 16, marginBottom: 16 }}>
+            <Text style={{ color: theme.textPrimary, fontSize: 18, fontWeight: '700' }}>APK 版本</Text>
+            <Text style={{ color: theme.textSecondary, marginVertical: 10 }}>当前安装版本：{APP_VERSION}</Text>
+            {SELF_UPDATE_ENABLED && <AnimatedButton disabled={checkingUpdate || downloading} onPress={checkForUpdate} style={{ backgroundColor: theme.primary, padding: 14, borderRadius: 12, alignItems: 'center' }}>
+              <Text style={{ color: theme.buttonPrimaryText }}>{checkingUpdate ? '检查中…' : '检查 APK 更新'}</Text>
+            </AnimatedButton>}
+          </View>
+          <OtaUpdatePanel />
+        </KeyboardAwareFormScrollView>
+      </> :       <KeyboardAwareFormScrollView
         style={styles.container}
         contentContainerStyle={styles.scrollContent}
         bottomOffset={Spacing.xl}
@@ -1699,7 +1327,7 @@ export default function SettingsScreen() {
             onPress={() => toggleSettingsGroup('system')}
             expanded={expandedSettingsGroup === 'system'}
           />
-          {expandedSettingsGroup === 'system' && (
+          {<MotionCollapse open={Boolean(expandedSettingsGroup === 'system')}>{expandedSettingsGroup === 'system' && (
             <View style={styles.settingsGroupPanel}>
               {renderMenuCard('仓库档案', '维护仓库与默认仓库', 'box', theme.primary, () =>
                 router.push('/warehouse-management')
@@ -1723,7 +1351,7 @@ export default function SettingsScreen() {
                 toggleSound
               )}
             </View>
-          )}
+          )}</MotionCollapse>}
 
           <UiListItem
             title="ERP对接"
@@ -1733,7 +1361,7 @@ export default function SettingsScreen() {
             onPress={() => toggleSettingsGroup('erp')}
             expanded={expandedSettingsGroup === 'erp'}
           />
-          {expandedSettingsGroup === 'erp' && (
+          {<MotionCollapse open={Boolean(expandedSettingsGroup === 'erp')}>{expandedSettingsGroup === 'erp' && (
             <View style={styles.settingsGroupPanel}>
               {ERP_ACCOUNTS.map((account) => {
                 const connection = erpConnectionStates[account.key];
@@ -1761,143 +1389,16 @@ export default function SettingsScreen() {
                 Object.values(erpConnectionStates).some((item) => item.status === 'checking')
               )}
             </View>
-          )}
+          )}</MotionCollapse>}
 
           <UiListItem
             title="同步助手"
-            subtitle={syncAssistantStatus.title}
-            icon="refresh-cw"
+            subtitle="连接电脑，导出记录与打印标签"
+            icon="monitor"
             color={syncAssistantStatus.color}
-            onPress={() => toggleSettingsGroup('sync')}
-            expanded={expandedSettingsGroup === 'sync'}
+            rightText={connectionStatus === 'success' ? '已连接' : connectionStatus === 'testing' ? '检测中' : syncConfig.ip ? '未连接' : '未配置'}
+            onPress={() => router.push('/settings-tools', { section: 'sync' })}
           />
-          {expandedSettingsGroup === 'sync' && (
-            <View style={styles.settingsGroupPanel}>
-              <View style={styles.syncConfigCard}>
-                <View style={styles.syncAssistantHeader}>
-                  <View
-                    style={[
-                      styles.syncAssistantIcon,
-                      { backgroundColor: `${syncAssistantStatus.color}18` },
-                    ]}
-                  >
-                    {connectionStatus === 'testing' ? (
-                      <ActivityIndicator size="small" color={syncAssistantStatus.color} />
-                    ) : (
-                      <Feather
-                        name={syncAssistantStatus.icon}
-                        size={20}
-                        color={syncAssistantStatus.color}
-                      />
-                    )}
-                  </View>
-                  <View style={styles.syncAssistantInfo}>
-                    <Text style={styles.syncAssistantTitle}>{syncAssistantStatus.title}</Text>
-                    <Text style={styles.syncAssistantDesc}>{syncAssistantStatus.desc}</Text>
-                  </View>
-                </View>
-
-                <View style={styles.syncConfigRow}>
-                  <Text style={styles.syncConfigLabel}>电脑IP</Text>
-                  <TextInput
-                    style={styles.syncConfigInput}
-                    value={syncConfig.ip}
-                    onChangeText={handleIpChange}
-                    placeholder="例如 192.168.1.100"
-                    placeholderTextColor={theme.textMuted}
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                  />
-                </View>
-                <View style={styles.syncConfigRow}>
-                  <Text style={styles.syncConfigLabel}>端口</Text>
-                  <TextInput
-                    style={styles.syncConfigInput}
-                    value={syncConfig.port}
-                    onChangeText={handlePortChange}
-                    placeholder="默认: 8080"
-                    placeholderTextColor={theme.textMuted}
-                    keyboardType="numeric"
-                  />
-                </View>
-                <View style={styles.syncConfigRow}>
-                    <Text style={styles.syncConfigLabel}>配对密钥</Text>
-                    <TextInput
-                      style={styles.syncConfigInput}
-                      value={syncConfig.pairingKey || ''}
-                      onChangeText={pairingKey => setSyncConfig(previous => ({ ...previous, pairingKey }))}
-                      placeholder="选填，与电脑助手保持一致"
-                      placeholderTextColor={theme.textMuted}
-                      secureTextEntry
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                      maxLength={128}
-                    />
-                </View>
-                <View style={styles.syncConfigButtons}>
-                  <AnimatedButton
-                    containerStyle={styles.syncButtonWrap}
-                    style={[
-                      styles.syncButton,
-                      styles.syncButtonTest,
-                      connectionStatus === 'success' && styles.syncButtonSuccess,
-                      (connectionStatus === 'error' || connectionStatus === 'disconnected') &&
-                        styles.syncButtonError,
-                    ]}
-                    onPress={handleTestConnection}
-                    disabled={connectionStatus === 'testing'}
-                    activeScale={0.96}
-                    activeOpacity={0.9}
-                  >
-                    {connectionStatus === 'testing' ? (
-                      <ActivityIndicator size="small" color={theme.primary} />
-                    ) : (
-                      <Text
-                        style={[
-                          styles.syncButtonTestText,
-                          connectionStatus === 'success' && styles.syncButtonSuccessText,
-                          (connectionStatus === 'error' || connectionStatus === 'disconnected') &&
-                            styles.syncButtonErrorText,
-                        ]}
-                      >
-                        {connectionStatus === 'success'
-                          ? '已连接 ✓'
-                          : connectionStatus === 'disconnected'
-                            ? '重新检测'
-                            : connectionStatus === 'error'
-                              ? '重新检测'
-                              : '测试连接'}
-                      </Text>
-                    )}
-                  </AnimatedButton>
-                </View>
-                {connectionStatus === 'success' && (
-                  <Text style={styles.syncStatusHint}>连接成功，配置已自动保存</Text>
-                )}
-                {connectionStatus === 'disconnected' && (
-                  <Text style={styles.syncStatusHintError}>
-                    暂未连接，应用在前台时会自动重试；同步助手启动后可自动恢复
-                  </Text>
-                )}
-                {connectionStatus === 'error' && (
-                  <Text style={styles.syncStatusHintError}>请核对电脑地址、配对密钥和助手状态后重试</Text>
-                )}
-                {connectionStatus === 'idle' && !syncConfig.ip && (
-                  <Text style={styles.syncStatusHintIdle}>电脑端托盘菜单可查看服务地址</Text>
-                )}
-              </View>
-
-              {renderMenuCard(
-                '同步出库单',
-                '生成出库 Excel 到电脑同步文件夹',
-                'file-minus',
-                theme.primary,
-                handleSyncOutbound,
-                !canSync,
-                syncingOutbound
-              )}
-            </View>
-          )}
 
           <UiListItem
             title="扫码规则"
@@ -1907,7 +1408,7 @@ export default function SettingsScreen() {
             onPress={() => toggleSettingsGroup('rules')}
             expanded={expandedSettingsGroup === 'rules'}
           />
-          {expandedSettingsGroup === 'rules' && (
+          {<MotionCollapse open={Boolean(expandedSettingsGroup === 'rules')}>{expandedSettingsGroup === 'rules' && (
             <View style={styles.settingsGroupPanel}>
               {renderMenuCard(
                 '解析规则',
@@ -1937,7 +1438,7 @@ export default function SettingsScreen() {
                 router.push('/outbound-order-rules')
               )}
             </View>
-          )}
+          )}</MotionCollapse>}
 
           <UiListItem
             title="备份与恢复"
@@ -1947,7 +1448,7 @@ export default function SettingsScreen() {
             onPress={() => toggleSettingsGroup('backup')}
             expanded={expandedSettingsGroup === 'backup'}
           />
-          {expandedSettingsGroup === 'backup' && (
+          {<MotionCollapse open={Boolean(expandedSettingsGroup === 'backup')}>{expandedSettingsGroup === 'backup' && (
             <View style={styles.settingsGroupPanel}>
               {renderMenuCard(
                 '备份配置',
@@ -1985,7 +1486,6 @@ export default function SettingsScreen() {
                 false,
                 dbRestoreLoading
               )}
-              {renderAutoBackupDiagnostic()}
               {draftArchives.length > 0 && renderMenuCard(
                 '恢复前作业副本',
                 `${draftArchives.length} 份副本，核对后恢复未完成作业`,
@@ -1995,8 +1495,19 @@ export default function SettingsScreen() {
                   setDraftArchiveModalVisible(true);
                 }
               )}
+              {renderMenuCard(
+                'NAS 备份诊断', '', 'activity', theme.primary,
+                () => router.push('/settings-tools', { section: 'nas' }), false, false,
+                backupDiagnostic ? describeBackupDiagnostic(backupDiagnostic).label : '读取中'
+              )}
+              {renderMenuCard(
+                '电池优化与后台权限', '电池优化与后台运行设置', 'battery-charging', theme.primary,
+                () => router.push('/settings-tools', { section: 'background' })
+              )}
             </View>
-          )}
+          )}</MotionCollapse>}
+
+          <UiListItem title="应用更新" subtitle="检查 APK 版本与热更新" icon="download-cloud" color={theme.primary} onPress={() => router.push('/app-updates')} />
 
           <UiListItem
             title="关于掌上仓库"
@@ -2008,7 +1519,7 @@ export default function SettingsScreen() {
           />
         </UiListSection>
 
-        {expandedSettingsGroup === 'about' && (
+        {<MotionCollapse open={Boolean(expandedSettingsGroup === 'about')}>{expandedSettingsGroup === 'about' && (
           <View style={styles.aboutCard}>
             {/* App图标和名称 */}
             <View style={styles.aboutAppSection}>
@@ -2059,31 +1570,7 @@ export default function SettingsScreen() {
                 </View>
               </View>
 
-              {SELF_UPDATE_ENABLED && (
-                <AnimatedButton
-                  style={styles.aboutDetailRow}
-                  activeOpacity={0.7}
-                  disabled={checkingUpdate}
-                  onPress={checkForUpdate}
-                >
-                  <View style={styles.aboutDetailIconWrapper}>
-                    {checkingUpdate ? (
-                      <ActivityIndicator size="small" color={theme.success} />
-                    ) : (
-                      <Feather name="refresh-cw" size={rs(14)} color={theme.success} />
-                    )}
-                  </View>
-                  <Text style={styles.aboutDetailLabel} numberOfLines={1}>
-                    检查更新
-                  </Text>
-                  <View style={styles.aboutDetailRight}>
-                    <Text style={styles.aboutDetailValue} numberOfLines={1}>
-                      {checkingUpdate ? '检查中' : `当前 ${APP_VERSION}`}
-                    </Text>
-                    <Feather name="chevron-right" size={rs(12)} color={theme.textMuted} />
-                  </View>
-                </AnimatedButton>
-              )}
+
 
               <AnimatedButton
                 style={styles.aboutDetailRow}
@@ -2130,7 +1617,7 @@ export default function SettingsScreen() {
             <View style={styles.helpRow}>
               <TouchableOpacity
                 style={styles.helpEntry}
-                activeOpacity={0.7}
+                activeOpacity={0.86}
                 onPress={() => router.push('/help')}
               >
                 <Feather
@@ -2145,7 +1632,7 @@ export default function SettingsScreen() {
 
               <TouchableOpacity
                 style={styles.helpEntry}
-                activeOpacity={0.7}
+                activeOpacity={0.86}
                 onPress={() => router.push('/changelog')}
               >
                 <Feather
@@ -2159,11 +1646,11 @@ export default function SettingsScreen() {
               </TouchableOpacity>
             </View>
           </View>
-        )}
+        )}</MotionCollapse>}
 
         {/* 底部留白 */}
         <View style={{ height: Spacing['4xl'] }} />
-      </KeyboardAwareFormScrollView>
+      </KeyboardAwareFormScrollView>}
 
       {/* ==================== 在线更新模态框 ==================== */}
       <Modal visible={draftArchiveModalVisible && isFocused} transparent animationType="fade"

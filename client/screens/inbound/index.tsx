@@ -1,14 +1,8 @@
-﻿import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import {
-  View,
-  Text,
-  TouchableOpacity,
-  FlatList,
-  Platform,
-  BackHandler,
-  type NativeSyntheticEvent,
-  type TextInputSubmitEditingEventData,
-} from 'react-native';
+import { MotionChevron } from '@/components/AppMotion';
+import { MotionCollapse } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { View, Text, FlatList, Platform, BackHandler, type NativeSyntheticEvent, type TextInputSubmitEditingEventData } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { usePreventRemove } from 'expo-router/react-navigation';
 import { useTheme } from '@/hooks/useTheme';
@@ -45,7 +39,7 @@ import {
 import { isQRCode, recoverConfirmedScannerContent, shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
 import { parseQuantity } from '@/utils/quantity';
 
-import { Feather, FontAwesome6 } from '@expo/vector-icons';
+import { FontAwesome6 } from '@expo/vector-icons';
 import {
   feedbackSuccess,
   feedbackError,
@@ -205,7 +199,7 @@ const INBOUND_RECORD_SIGNATURE_FIELDS = [
 export default function InboundScreen() {
   const { theme, isDark } = useTheme();
   const styles = useMemo(() => createStyles(theme), [theme]);
-  const alert = useCustomAlert();
+  const alert = useCustomAlert({ persistentErrors: true });
   const router = useSafeRouter();
   // 弹窗与路由 Hook 返回对象会随渲染更新；扫码回调通过 Ref 获取最新实例，避免高频扫码链路反复重建。
   const alertRef = useRef(alert);
@@ -326,7 +320,7 @@ export default function InboundScreen() {
 
   // 已保存入库记录
   // Toast
-  const { showToast, ToastContainer } = useToast();
+  const { showToast, ToastContainer } = useToast({ persistentErrors: true });
 
   useEffect(() => {
     scanRecordsRef.current = scanRecords;
@@ -596,8 +590,8 @@ export default function InboundScreen() {
 
   usePreventRemove(saving || scanBusy || Boolean(inputValue.trim()), blockBackDuringWork);
   useFocusEffect(useCallback(() => {
-    const subscription = BackHandler.addEventListener('hardwareBackPress', blockBackDuringWork);
-    return () => subscription.remove();
+    const subscription = Platform.OS === 'web' ? null : BackHandler.addEventListener('hardwareBackPress', blockBackDuringWork);
+    return () => subscription?.remove();
   }, [blockBackDuringWork]));
 
   useEffect(() => {
@@ -1801,7 +1795,7 @@ export default function InboundScreen() {
       return (
         <TouchableOpacity
           style={styles.checkbox}
-          activeOpacity={0.7}
+          activeOpacity={0.86}
           onPress={() => toggleConfirm(key)}
         >
           <FontAwesome6
@@ -1893,7 +1887,7 @@ export default function InboundScreen() {
         <View style={styles.erpLineCard}>
           <TouchableOpacity
             style={styles.erpLineMain}
-            activeOpacity={0.76}
+            activeOpacity={0.86}
             onPress={() => toggleExpand(item.key)}
           >
             <View style={styles.erpLineContent}>
@@ -1919,20 +1913,16 @@ export default function InboundScreen() {
                 </Text>
               </View>
             </View>
-            <Feather
-              name={isExpanded ? 'chevron-up' : 'chevron-down'}
-              size={17}
-              color={theme.textMuted}
-            />
+            <MotionChevron expanded={Boolean(isExpanded)} collapsed="down" size={17} color={theme.textMuted} />
           </TouchableOpacity>
-          {isExpanded ? (
+          {<MotionCollapse open={Boolean(isExpanded)}>{isExpanded ? (
             <View style={styles.erpLineDetails}>
               {item.scannedRecords.length > 0 ? (
                 item.scannedRecords.map((record) => (
                   <TouchableOpacity
                     key={record.id}
                     style={styles.erpLineDetailItem}
-                    activeOpacity={0.76}
+                    activeOpacity={0.86}
                     onLongPress={() => handleDeleteRecord(record)}
                     delayLongPress={500}
                   >
@@ -1949,7 +1939,7 @@ export default function InboundScreen() {
                 <Text style={styles.erpLineEmptyText}>尚未扫描本物料</Text>
               )}
             </View>
-          ) : null}
+          ) : null}</MotionCollapse>}
         </View>
       );
     },

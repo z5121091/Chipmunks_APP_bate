@@ -1,4 +1,4 @@
-param([switch]$CheckOnly, [switch]$SyncOnly, [switch]$PrepareOnly, [switch]$NonInteractive)
+﻿param([switch]$CheckOnly, [switch]$SyncOnly, [switch]$PrepareOnly, [switch]$NonInteractive)
 
 $ErrorActionPreference = 'Stop'
 # A hidden GUI child has redirected streams and may have no console handle.
@@ -201,6 +201,7 @@ try {
         }
     }
 
+    Invoke-Checked 'node' @((Join-Path $repo 'scripts/ota-runtime.cjs'), '--prepare')
     Write-Host '[1/5] Synchronizing latest source into the dedicated build cache...'
     New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
     [IO.File]::WriteAllText($marker, 'chipmunks-android-build-v1')
@@ -297,6 +298,10 @@ try {
         if ($packagedAppConfig.extra.updateServerUrl -ne $releaseUpdateServer) {
             throw 'APK NAS authentication configuration is stale or missing. No APK will be delivered.'
         }
+        $builtOta = Get-Content (Join-Path $buildRoot 'client/ota-runtime.json') -Raw | ConvertFrom-Json
+        if ($packagedAppConfig.runtimeVersion -ne $builtOta.runtimeVersion -or -not $resources.Contains($builtOta.runtimeVersion)) {
+            throw 'APK hot-update runtime verification failed. No APK will be delivered.'
+        }
         $nativeNasConfigured = $false
         foreach ($dexEntry in $zip.Entries) {
             if ($dexEntry.FullName -notmatch '^classes\d*\.dex$') { continue }
@@ -340,6 +345,9 @@ try {
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash
     [IO.File]::WriteAllText("$destination.sha256", "$hash  $([IO.Path]::GetFileName($destination))`n")
     [IO.File]::WriteAllText((Join-Path $output "$stamp-verification.txt"), "$badging`n$($signature -join "`n")`nSHA256=$hash`n")
+    $otaBaseline = Get-Content (Join-Path $buildRoot 'client/ota-runtime.json') -Raw | ConvertFrom-Json
+    $otaBaseline | Add-Member -NotePropertyName version -NotePropertyValue $version.version
+    $otaBaseline | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $output 'ota-baseline.json')
     Write-Host "BUILD SUCCEEDED`nAPK: $destination`nSHA256: $hash`nLog: $logDir\$stamp.log" -ForegroundColor Green
 } catch {
     Write-Host ("BUILD FAILED: " + (Protect-BuildOutput $_.Exception.Message)) -ForegroundColor Red

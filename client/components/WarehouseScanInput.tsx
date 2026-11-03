@@ -1,16 +1,8 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { useOverlayActivity } from '@/hooks/useOverlayActivity';
 import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, type ComponentProps, type Ref } from 'react';
 import { useIsFocused } from 'expo-router/react-navigation';
-import {
-  ActivityIndicator,
-  AppState,
-  Platform,
-  StyleSheet,
-  TextInput,
-  TouchableOpacity,
-  View,
-  type TextInputProps,
-  type ViewProps,
-} from 'react-native';
+import { ActivityIndicator, AppState, Platform, StyleSheet, TextInput, View, type TextInputProps, type ViewProps } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { BorderRadius, BorderWidth, Spacing, Typography } from '@/constants/theme';
 import { useTheme } from '@/hooks/useTheme';
@@ -68,8 +60,9 @@ export function WarehouseScanInput({
   const scannerRef = useRef<TextInput>(null);
   const focusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFocused = useIsFocused();
+  const overlayActive = useOverlayActivity();
   const canEdit = (editable ?? true) && (!processing || acceptInputWhileProcessing);
-  const canFocus = isFocused && autoFocus && canEdit;
+  const canFocus = isFocused && autoFocus && canEdit && !overlayActive;
   const canFocusRef = useRef(false);
   const windowFocusedRef = useRef(true);
   // 原生 clear 与 JS 回调异步执行。按事件序号过滤旧快照，避免清空后被写回。
@@ -200,7 +193,7 @@ export function WarehouseScanInput({
           { backgroundColor: theme.primary },
           disabled && styles.actionButtonDisabled,
         ]}
-        activeOpacity={0.76}
+        activeOpacity={0.86}
         accessibilityRole="button"
         accessibilityLabel={actionLabel}
         accessibilityState={{ disabled, busy: actionLoading || processing }}

@@ -1,12 +1,7 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
 import { useState, useCallback } from 'react';
-import {
-  View,
-  Text,
-  TouchableOpacity,
-  ScrollView,
-  TextInput,
-  Modal,
-} from 'react-native';
+import { View, Text, ScrollView, TextInput } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
@@ -210,7 +205,7 @@ export default function WarehouseManagementScreen() {
       >
         {/* 头部 */}
         <View style={styles.header}>
-          <TouchableOpacity style={styles.backButton} activeOpacity={0.7} onPress={() => router.back()}>
+          <TouchableOpacity style={styles.backButton} activeOpacity={0.86} onPress={() => router.back()} accessibilityLabel="返回上一页">
             <Feather name="arrow-left" size={20} color={theme.textPrimary} />
           </TouchableOpacity>
           <View style={styles.headerContent}>

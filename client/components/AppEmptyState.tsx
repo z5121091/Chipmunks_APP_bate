@@ -11,6 +11,7 @@ import { Feather } from '@expo/vector-icons';
 import { BorderRadius, BorderWidth, Spacing, Typography } from '@/constants/theme';
 import { useTheme } from '@/hooks/useTheme';
 import { withAlpha } from '@/utils/colors';
+import { MotionContent } from '@/components/AppMotion';
 
 interface AppEmptyStateProps {
   icon?: keyof typeof Feather.glyphMap;
@@ -68,13 +69,13 @@ export function AppEmptyState({
 
   return (
     <View style={[styles.container, style]}>
-      <View style={styles.iconWrap}>
+      <MotionContent contentKey={loading} direction="fade" style={styles.iconWrap}>
         {loading ? (
           <ActivityIndicator size="small" color={theme.primary} />
         ) : (
           <Feather name={icon} size={iconSize} color={theme.primary} />
         )}
-      </View>
+      </MotionContent>
       <Text style={styles.title}>{title}</Text>
       {description ? <Text style={styles.description}>{description}</Text> : null}
     </View>

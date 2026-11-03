@@ -1,5 +1,6 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 
-import { Text, TouchableOpacity, View } from 'react-native';
+import { Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, BorderWidth, Spacing, Typography } from '@/constants/theme';
@@ -52,7 +53,7 @@ export function AppModalHeader({ title, subtitle, onClose }: AppModalHeaderProps
             borderWidth: BorderWidth.normal,
             borderColor: withAlpha(theme.textMuted, 0.12),
           }}
-          activeOpacity={0.75}
+          activeOpacity={0.86}
           accessibilityLabel="关闭"
           accessibilityRole="button"
           onPress={onClose}

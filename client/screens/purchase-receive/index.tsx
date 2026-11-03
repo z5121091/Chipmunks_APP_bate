@@ -1,15 +1,10 @@
+import { MotionContent } from '@/components/AppMotion';
+import { MotionChevron } from '@/components/AppMotion';
+import { MotionCollapse } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { cancelScanSubmit, scheduleScanSubmit } from '@/utils/scannerInput';
 import { useCallback, useMemo, useRef, useState } from 'react';
-import {
-  ActivityIndicator,
-  AppState,
-  FlatList,
-  Platform,
-  RefreshControl,
-  Text,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+import { ActivityIndicator, AppState, FlatList, Platform, RefreshControl, Text, View } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
@@ -637,7 +632,7 @@ export default function PurchaseReceiveScreen() {
         <View style={[styles.voucherCard, completed && styles.voucherCardCompleted]}>
           <TouchableOpacity
             style={styles.voucherHeader}
-            activeOpacity={0.76}
+            activeOpacity={0.86}
             disabled={completed}
             onPress={() => {
               void handleToggleItem(item);
@@ -664,11 +659,7 @@ export default function PurchaseReceiveScreen() {
             {completed ? (
               <Feather name="check-circle" size={20} color={theme.success} />
             ) : (
-              <Feather
-                name={expanded ? 'chevron-up' : 'chevron-down'}
-                size={19}
-                color={theme.textMuted}
-              />
+              <MotionChevron expanded={Boolean(expanded)} collapsed="down" size={19} color={theme.textMuted} />
             )}
           </TouchableOpacity>
 
@@ -677,7 +668,7 @@ export default function PurchaseReceiveScreen() {
               <Feather name="check" size={16} color={theme.success} />
               <Text style={styles.completedNoticeText}>本地已完成扫码，等待ERP审核</Text>
             </View>
-          ) : expanded ? (
+          ) : <MotionCollapse open={Boolean(expanded)}>{expanded ? (
             <View style={styles.detailSection}>
               {detailLoading ? (
                 <View style={styles.detailLoading}>
@@ -702,7 +693,7 @@ export default function PurchaseReceiveScreen() {
                   ))}
                   <TouchableOpacity
                     style={styles.startButton}
-                    activeOpacity={0.78}
+                    activeOpacity={0.86}
                     onPress={() => {
                       void handleStartScan(item);
                     }}
@@ -713,7 +704,7 @@ export default function PurchaseReceiveScreen() {
                 </>
               ) : null}
             </View>
-          ) : null}
+          ) : null}</MotionCollapse>}
         </View>
       );
     },
@@ -759,7 +750,7 @@ export default function PurchaseReceiveScreen() {
               <TouchableOpacity
                 key={account.key}
                 style={[styles.accountButton, active && styles.accountButtonActive]}
-                activeOpacity={0.78}
+                activeOpacity={0.86}
                 onPress={() => handleAccountPress(account)}
               >
                 <Text
@@ -815,7 +806,7 @@ export default function PurchaseReceiveScreen() {
               {completedItems.length > 0 ? ` · ${completedItems.length} 已入` : ''}
             </Text>
           </View>
-          {loading ? (
+          {<MotionContent contentKey={loading} direction="fade" style={{ flex: 1 }}>{loading ? (
             <View style={styles.loadingState}>
               <ActivityIndicator color={theme.primary} />
               <Text style={styles.loadingText}>正在读取ERP未审单据...</Text>
@@ -855,7 +846,7 @@ export default function PurchaseReceiveScreen() {
                 />
               }
             />
-          )}
+          )}</MotionContent>}
         </View>
       </View>
     </Screen>

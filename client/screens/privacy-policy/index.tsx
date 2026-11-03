@@ -1,14 +1,6 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { createElement, useEffect, useMemo, useState } from 'react';
-import {
-  ActivityIndicator,
-  AppState,
-  Linking,
-  Platform,
-  StyleSheet,
-  Text,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+import { ActivityIndicator, AppState, Linking, Platform, StyleSheet, Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { WebView } from 'react-native-webview';
@@ -56,7 +48,7 @@ export default function PrivacyPolicyScreen() {
       <Text style={styles.messageText}>请检查网络后重试</Text>
       <TouchableOpacity
         style={styles.retryButton}
-        activeOpacity={0.75}
+        activeOpacity={0.86}
         onPress={retry}
         accessibilityRole="button"
         accessibilityLabel="重新加载隐私政策"

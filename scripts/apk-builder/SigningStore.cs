@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -19,6 +19,7 @@ namespace Chipmunks.ApkBuilder
         public string ImportedAtUtc { get; internal set; }
         public string ErrorMessage { get; internal set; }
         public bool NeedsIdentityConfirmation { get; internal set; }
+        public bool HasPublishConnection { get; internal set; }
     }
 
     public sealed class SigningStore
@@ -32,9 +33,10 @@ namespace Chipmunks.ApkBuilder
         private readonly string repository;
         private readonly string mutexName;
         public string ManagedPath { get; private set; }
+        internal string PublishTokenPath { get; private set; }
 
         public SigningStore(string repositoryPath)
-            : this(repositoryPath, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ChipmunksBuildTools", "signing")) { }
+            : this(repositoryPath, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ChipmunksBuildTools", "signing")) { PublishTokenPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ChipmunksBuildTools", "ota", "publish-token.bin"); }
 
         // A separate root allows tests to remain completely independent of the user's signing store.
         internal SigningStore(string repositoryPath, string managedRoot)
@@ -43,12 +45,13 @@ namespace Chipmunks.ApkBuilder
             repository = Path.GetFullPath(repositoryPath).TrimEnd('\\');
             string identity = Hash(Encoding.UTF8.GetBytes(repository.ToUpperInvariant())).ToUpperInvariant();
             ManagedPath = Path.Combine(Path.GetFullPath(managedRoot), identity + ".dat");
+            PublishTokenPath = Path.Combine(Path.GetFullPath(managedRoot), "ota-publish-token.bin");
             mutexName = "Local\\Chipmunks.Signing." + Hash(Encoding.UTF8.GetBytes(ManagedPath.ToUpperInvariant()));
         }
 
         public SigningStatus GetStatus()
         {
-            var status = new SigningStatus { LegacyConfigurationAvailable = File.Exists(Path.Combine(repository, "android-build.local")) };
+            var status = new SigningStatus { HasPublishConnection = File.Exists(PublishTokenPath), LegacyConfigurationAvailable = File.Exists(Path.Combine(repository, "android-build.local")) };
             if (!File.Exists(ManagedPath)) return status;
             try
             {
@@ -92,12 +95,26 @@ namespace Chipmunks.ApkBuilder
         public void ExportBackup(string filePath, string backupPassword)
         {
             ValidatePassword(backupPassword);
-            if (!String.Equals(Path.GetExtension(filePath ?? ""), ".cwsign", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("备份文件必须使用 .cwsign 扩展名，不能覆盖原签名或配置文件。");
+            if (!String.Equals(Path.GetExtension(filePath ?? ""), ".cwsign", StringComparison.OrdinalIgnoreCase) && !String.Equals(Path.GetExtension(filePath ?? ""), ".cwbuild", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("备份文件必须使用 .cwbuild 或 .cwsign 扩展名，不能覆盖原签名或配置文件。");
             Change(delegate {
                 if (String.Equals(Path.GetFullPath(filePath), ManagedPath, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("备份文件不能覆盖本机托管签名。");
-                byte[] plain = Encode(ReadManaged());
+                Payload data = ReadManaged();
+                data.buildBackupVersion = 1;
+                if (File.Exists(PublishTokenPath)) {
+                    byte[] tokenCipher = ReadLimited(PublishTokenPath, 65536, "发布连接配置");
+                    byte[] tokenPlain = null;
+                    try {
+                        tokenPlain = ProtectedData.Unprotect(tokenCipher, null, DataProtectionScope.CurrentUser);
+                        data.otaPublishToken = Encoding.UTF8.GetString(tokenPlain);
+                        data.otaServerUrl = "https://erp.chipmunks.fun/app-updates";
+                    } catch { throw new InvalidOperationException("本机发布连接无法解密，请先检查发布连接设置后再备份。"); }
+                    finally { Array.Clear(tokenCipher, 0, tokenCipher.Length); if (tokenPlain != null) Array.Clear(tokenPlain, 0, tokenPlain.Length); }
+                }
+                ValidateConnection(data);
+                byte[] plain = Encode(data);
+                data.otaPublishToken = null;
                 byte[] encrypted = null;
                 try { encrypted = EncryptBackup(plain, backupPassword); AtomicWrite(filePath, encrypted); }
                 finally { Array.Clear(plain, 0, plain.Length); if (encrypted != null) Array.Clear(encrypted, 0, encrypted.Length); }
@@ -137,8 +154,9 @@ namespace Chipmunks.ApkBuilder
                     if (CheckRecoveryIdentity(data) && !confirmUnverifiedIdentity)
                         throw new InvalidOperationException("本机旧签名已损坏，且原签名配置不可读取。请先查看备份证书指纹，并明确确认后恢复。");
                     // Keep the historical import date from the authenticated backup.
-                    SaveManaged(data);
-                    return Status(data);
+                    SaveRestoredConfiguration(data);
+                    var restored = Status(data); restored.HasPublishConnection = File.Exists(PublishTokenPath);
+                    return restored;
                 }
                 finally { Array.Clear(encrypted, 0, encrypted.Length); if (plain != null) Array.Clear(plain, 0, plain.Length); }
             });
@@ -146,7 +164,7 @@ namespace Chipmunks.ApkBuilder
 
         private static SigningStatus Status(Payload data)
         {
-            return new SigningStatus { IsConfigured = true, CertificateSha256 = data.certificateSha256, ImportedAtUtc = data.importedAtUtc };
+            return new SigningStatus { IsConfigured = true, CertificateSha256 = data.certificateSha256, ImportedAtUtc = data.importedAtUtc, HasPublishConnection = !String.IsNullOrEmpty(data.otaPublishToken) };
         }
 
         private T Change<T>(Func<T> action)
@@ -249,8 +267,44 @@ namespace Chipmunks.ApkBuilder
             finally { Array.Clear(plain, 0, plain.Length); if (cipher != null) Array.Clear(cipher, 0, cipher.Length); }
         }
 
+        private static void ValidateConnection(Payload data)
+        {
+            if (data.buildBackupVersion.HasValue && data.buildBackupVersion != 1)
+                throw new InvalidOperationException("此构建配置备份版本暂不支持，请使用新版工具。");
+            if (data.otaPublishToken != null &&
+                (data.otaServerUrl != "https://erp.chipmunks.fun/app-updates" ||
+                 !System.Text.RegularExpressions.Regex.IsMatch(data.otaPublishToken, @"\A[A-Za-z0-9_-]{32,512}\z")))
+                throw new InvalidOperationException("备份中的发布连接格式不正确，现有配置未修改。");
+        }
+
+        private void SaveRestoredConfiguration(Payload data)
+        {
+            if (String.IsNullOrEmpty(data.otaPublishToken)) { SaveManaged(data); return; }
+            byte[] token = Encoding.UTF8.GetBytes(data.otaPublishToken);
+            byte[] tokenCipher = null, oldSigning = null, oldToken = null;
+            bool changedSigning = false, changedToken = false;
+            try {
+                tokenCipher = ProtectedData.Protect(token, null, DataProtectionScope.CurrentUser);
+                oldSigning = File.Exists(ManagedPath) ? ReadLimited(ManagedPath, MaxBackupBytes, "原签名配置") : null;
+                oldToken = File.Exists(PublishTokenPath) ? ReadLimited(PublishTokenPath, 65536, "原发布配置") : null;
+                data.otaPublishToken = null; data.otaServerUrl = null; data.buildBackupVersion = null;
+                SaveManaged(data); changedSigning = true;
+                AtomicWrite(PublishTokenPath, tokenCipher); changedToken = true;
+            } catch {
+                try {
+                    if (changedToken) { if (oldToken != null) AtomicWrite(PublishTokenPath, oldToken); else File.Delete(PublishTokenPath); }
+                    if (changedSigning) { if (oldSigning != null) AtomicWrite(ManagedPath, oldSigning); else File.Delete(ManagedPath); }
+                } catch { throw new InvalidOperationException("恢复过程中磁盘写入或回退失败，请保留备份文件并检查签名与发布连接状态。"); }
+                throw new InvalidOperationException("恢复未完成，原有配置已保留，请检查文件访问权限。");
+            } finally {
+                Array.Clear(token, 0, token.Length);
+                foreach (byte[] bytes in new[] { tokenCipher, oldSigning, oldToken }) if (bytes != null) Array.Clear(bytes, 0, bytes.Length);
+            }
+        }
+
         private static void Validate(Payload data, bool setFingerprint)
         {
+            if (data != null) ValidateConnection(data);
             if (data == null || data.schemaVersion != 1 || (data.storeExtension != ".p12" && data.storeExtension != ".pfx") ||
                 String.IsNullOrWhiteSpace(data.keyAlias) || data.keyAlias.Length > 200 || HasControl(data.keyAlias) ||
                 String.IsNullOrWhiteSpace(data.storePassword) || String.IsNullOrWhiteSpace(data.keyPassword) || data.storePassword.Length > 1024 || data.keyPassword.Length > 1024 ||
@@ -420,6 +474,9 @@ namespace Chipmunks.ApkBuilder
 
         internal sealed class Payload
         {
+            public int? buildBackupVersion { get; set; }
+            public string otaPublishToken { get; set; }
+            public string otaServerUrl { get; set; }
             public int schemaVersion { get; set; }
             public string storeBase64 { get; set; }
             public string storeExtension { get; set; }

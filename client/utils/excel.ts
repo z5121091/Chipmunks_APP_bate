@@ -1,3 +1,4 @@
+import { beginOtaSensitiveOperation } from '@/utils/otaSafety';
 /**
  * Excel 导出工具
  *
@@ -289,8 +290,8 @@ export const syncExcelToComputer = async (
     const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
 
     const controller = new AbortController();
+    const finishOtaOperation = beginOtaSensitiveOperation();
     const timeoutId = setTimeout(() => controller.abort(), EXPORT_CONFIG.TIMEOUT);
-
     try {
       const response = await fetch(url, {
         method: 'POST',
@@ -380,6 +381,7 @@ export const syncExcelToComputer = async (
         return { success: false, message: msg };
       }
     } finally {
+      finishOtaOperation();
       clearTimeout(timeoutId);
     }
   } catch (error: unknown) {

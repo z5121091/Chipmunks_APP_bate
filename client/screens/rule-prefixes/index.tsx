@@ -1,5 +1,6 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useState } from 'react';
-import { FlatList, Text, TouchableOpacity, View } from 'react-native';
+import { FlatList, Text, View } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
@@ -71,7 +72,7 @@ export default function RulePrefixesScreen() {
       return (
         <TouchableOpacity
           style={styles.ruleCard}
-          activeOpacity={0.72}
+          activeOpacity={0.86}
           onPress={() => router.push('/rule-prefix-edit', { ruleId: item.id })}
         >
           <View style={styles.ruleHeader}>
@@ -140,8 +141,8 @@ export default function RulePrefixesScreen() {
         <View style={styles.header}>
           <TouchableOpacity
             style={styles.backButton}
-            activeOpacity={0.7}
-            onPress={() => router.back()}
+            activeOpacity={0.86}
+            onPress={() => router.back()} accessibilityLabel="返回上一页"
           >
             <Feather name="arrow-left" size={20} color={theme.textPrimary} />
           </TouchableOpacity>

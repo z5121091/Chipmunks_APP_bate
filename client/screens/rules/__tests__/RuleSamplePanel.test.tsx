@@ -63,7 +63,7 @@ it('confirms the separator then assigns every segment continuously without using
     if (index) expect(picker().props.options.find((option: { value: string }) => option.value === 'model').disabled).toBe(true);
     await choose(fields[index]);
   }
-  expect(root.root.findAllByType(RuleOptionPicker)).toHaveLength(0);
+  expect(root.root.findAllByType(RuleOptionPicker).filter(node => node.props.visible !== false)).toHaveLength(0);
   expect(latest().fieldOrder.slice(0, 8)).toEqual(fields.slice(0, 8));
   expect(latest().fieldOrder.slice(8).every(isIgnoredRuleField)).toBe(true);
   expect(parseWithRule(sample, latest()).standardFields).toMatchObject({ model: 'MODEL', batch: 'LOT', quantity: '100', sourceNo: 'BOX' });
@@ -82,7 +82,7 @@ it('supports backtracking, dismissing mid-flow, and editing the second or third 
   await act(async () => { picker().props.onClose(); });
   await press('设置第2段字段');
   await choose('batch');
-  expect(root.root.findAllByType(RuleOptionPicker)).toHaveLength(0);
+  expect(root.root.findAllByType(RuleOptionPicker).filter(node => node.props.visible !== false)).toHaveLength(0);
   await press('设置第3段字段');
   await choose('quantity');
   expect(latest().fieldOrder).toEqual(['model', 'batch', 'quantity']);
@@ -111,7 +111,7 @@ it('does not offer a non-responsive mapping dialog when a terminator removes the
   await act(async () => { root = TestRenderer.create(<Harness sample="MODEL;END" initial={{ ...base, terminator: ';END' }} />); });
   await press('拆分并逐段分配');
   await choose(';');
-  expect(root.root.findAllByType(RuleOptionPicker)).toHaveLength(0);
+  expect(root.root.findAllByType(RuleOptionPicker).filter(node => node.props.visible !== false)).toHaveLength(0);
   expect(button('设置第1段字段').props.disabled).toBe(true);
 });
 

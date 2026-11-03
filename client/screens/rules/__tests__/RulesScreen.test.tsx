@@ -298,7 +298,8 @@ it('keeps the rule draft while choosing a supplier and can clear the formal asso
   await input('规则名称', '草稿名称');
   await act(async () => { sample().props.onSampleChange('MODEL/100'); sample().props.onAssign(0, 'model', 2); });
   await press('选择规则供应商');
-  expect(root.root.findByType(Modal).props.visible).toBe(false);
+  // Keep the editor beneath the supplier surface so returning never flashes the rule list.
+  expect(root.root.findByType(Modal).props.visible).toBe(true);
   await act(async () => { root.root.findByType(SupplierManager).props.onSelect('极海科技', 'supplier-apm'); });
   expect(sample().props.sample).toBe('MODEL/100');
   expect(sample().props.rule).toMatchObject({ name: '草稿名称', supplierName: '极海科技', supplierId: 'supplier-apm' });
@@ -324,6 +325,7 @@ it('opens a diagnosis-linked rule once, keeps legacy supplier notes unassociated
   expect(sample().props.rule).toMatchObject({ supplierId: '', supplierName: '旧备注' });
   await act(async () => { await root.root.findByType(AppModalActions).props.onPrimaryPress(); });
   expect(database.updateRule).toHaveBeenCalledWith(legacy.id, expect.objectContaining({ supplierId: '', supplierName: '旧备注' }));
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 220)); });
   expect(root.root.findAllByType(Modal)).toHaveLength(0);
   expect(mockRouter.back).not.toHaveBeenCalled();
 });
@@ -717,6 +719,7 @@ it.each([26, 260])('mounts only the first visible batch with %i configured rules
   expect(root.root.findAllByType(Swipeable)).toHaveLength(8);
   expect(list.props.getItemLayout).toBeUndefined();
   expect(root.root.findAllByType(GestureDetector)).toHaveLength(0);
+  await act(async () => { jest.advanceTimersByTime(220); });
   expect(root.root.findAllByType(RuleSamplePanel)).toHaveLength(0);
 });
 
@@ -729,6 +732,7 @@ it('does not repaint rule swipe controls while opening or typing in the editor',
   await input('规则名称', 'New rule');
   expect(swipeRender).not.toHaveBeenCalled();
   await act(async () => { root.root.findByType(AppModalActions).props.onSecondaryPress(); });
+  await act(async () => { jest.advanceTimersByTime(220); });
   expect(root.root.findAllByType(RuleSamplePanel)).toHaveLength(0);
   expect(swipeRender).not.toHaveBeenCalled();
 });

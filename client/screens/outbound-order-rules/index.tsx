@@ -1,5 +1,7 @@
+import { MotionContent } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { FlatList, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { FlatList, Text, TextInput, View } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
@@ -267,7 +269,7 @@ export default function OutboundOrderRulesScreen() {
         <TouchableOpacity
           accessibilityLabel={`编辑 ${item.name} 的出库单号规则`}
           style={[styles.warehouseCard, configured && styles.warehouseCardConfigured]}
-          activeOpacity={0.78}
+          activeOpacity={0.86}
           onPress={() => openWarehouseEditor(item)}
         >
           <View style={styles.warehouseTopRow}>
@@ -323,13 +325,13 @@ export default function OutboundOrderRulesScreen() {
 
   if (activeWarehouse) {
     return (
-      <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
+      <MotionContent contentKey={activeWarehouse ? 'editor' : 'list'} direction="fade" style={{ flex: 1 }}><Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
         <View style={[styles.editorScreen, { paddingTop: insets.top }]}>
           <View style={styles.header}>
             <TouchableOpacity
               accessibilityLabel="返回仓库规则列表"
               style={styles.backButton}
-              activeOpacity={0.7}
+              activeOpacity={0.86}
               onPress={closeWarehouseEditor}
             >
               <Feather name="arrow-left" size={20} color={theme.textPrimary} />
@@ -389,18 +391,18 @@ export default function OutboundOrderRulesScreen() {
           </KeyboardAwareFormScrollView>
         </View>
         {alert.AlertComponent}
-      </Screen>
+      </Screen></MotionContent>
     );
   }
 
   return (
-    <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
+    <MotionContent contentKey={activeWarehouse ? 'editor' : 'list'} direction="fade" style={{ flex: 1 }}><Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
       <View style={[styles.container, { paddingTop: insets.top }]}>
         <View style={styles.header}>
           <TouchableOpacity
             accessibilityLabel="返回设置"
             style={styles.backButton}
-            activeOpacity={0.7}
+            activeOpacity={0.86}
             onPress={() => router.back()}
           >
             <Feather name="arrow-left" size={20} color={theme.textPrimary} />
@@ -433,6 +435,6 @@ export default function OutboundOrderRulesScreen() {
         />
       </View>
       {alert.AlertComponent}
-    </Screen>
+    </Screen></MotionContent>
   );
 }

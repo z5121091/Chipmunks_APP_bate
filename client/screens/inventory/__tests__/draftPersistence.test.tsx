@@ -134,6 +134,7 @@ it('blocks header, hardware and native route removal throughout ERP, DB, draft c
   jest.mocked(syncExcelToComputer).mockReturnValueOnce(sync.promise);
   jest.mocked(updateInventoryCheckDocumentSyncStatus).mockReturnValueOnce(status.promise);
   await confirmSave();
+  await act(async () => { await jest.advanceTimersByTimeAsync(220); });
   expect(root.root.findAllByType('ModalCard' as never).some(card => card.props.title === '完成盘点')).toBe(false);
   await expectNavigationBlocked();
   await act(async () => { reconciliation.resolve(result); });

@@ -54,6 +54,8 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
     "slug": slugAppName,
     "version": versionConfig.version,
     "orientation": "portrait",
+    runtimeVersion: require('./ota-runtime.json').runtimeVersion,
+    updates: { url: 'https://erp.chipmunks.fun/app-updates/manifest', checkAutomatically: 'NEVER', fallbackToCacheTimeout: 0 },
     "icon": "./assets/images/icon.png",
     "scheme": "chipmunkswarehouse",
     "userInterfaceStyle": "automatic",
@@ -69,6 +71,7 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
         "android.permission.INTERNET",
         "android.permission.ACCESS_NETWORK_STATE",
         "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CAMERA",
         ...(selfUpdateEnabled ? ["android.permission.REQUEST_INSTALL_PACKAGES"] : [])
       ],
       "blockedPermissions": [
@@ -76,7 +79,6 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
-        "android.permission.CAMERA",
         "android.permission.MODIFY_AUDIO_SETTINGS",
         "android.permission.READ_MEDIA_AUDIO",
         "android.permission.READ_MEDIA_IMAGES",
@@ -92,6 +94,7 @@ export default function appConfig({ config }: ConfigContext): ExpoConfig {
       "output": "single"
     },
     "plugins": [
+      ["expo-camera", { cameraPermission: "允许掌上仓库扫描电脑连接二维码", recordAudioAndroid: false, barcodeScannerEnabled: true }],
       process.env.EXPO_PUBLIC_BACKEND_BASE_URL ? [
         "expo-router",
         {

@@ -1,5 +1,6 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 
-import { StyleProp, Text, TouchableOpacity, View, ViewStyle } from 'react-native';
+import { StyleProp, Text, View, ViewStyle } from 'react-native';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, BorderWidth, Spacing, Typography } from '@/constants/theme';
 import { MIN_TOUCH_TARGET } from '@/utils/responsive';
@@ -73,7 +74,7 @@ export function AppModalActions({
             paddingHorizontal: Spacing.md,
             opacity: secondaryDisabled ? 0.55 : 1,
           }}
-          activeOpacity={0.8}
+          activeOpacity={0.86}
           accessibilityRole="button"
           accessibilityState={{ disabled: secondaryDisabled }}
           disabled={secondaryDisabled}
@@ -104,7 +105,7 @@ export function AppModalActions({
           shadowRadius: 10,
           elevation: primaryDisabled ? 0 : 2,
         }}
-        activeOpacity={0.82}
+        activeOpacity={0.86}
         accessibilityRole="button"
         accessibilityState={{ disabled: primaryDisabled }}
         disabled={primaryDisabled}

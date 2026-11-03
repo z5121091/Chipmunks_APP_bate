@@ -1,5 +1,6 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 
-import { Text, TouchableOpacity, View } from 'react-native';
+import { Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderWidth, Spacing, Typography } from '@/constants/theme';
@@ -29,7 +30,7 @@ export function AppToggleRow({ title, description, checked, onPress }: AppToggle
         borderWidth: BorderWidth.normal,
         borderColor: theme.border,
       }}
-      activeOpacity={0.82}
+      activeOpacity={0.86}
       accessibilityRole="checkbox"
       accessibilityState={{ checked }}
       onPress={onPress}

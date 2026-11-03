@@ -1,21 +1,9 @@
+import { MotionContent } from '@/components/AppMotion';
+import { APP_MOTION } from '@/constants/motion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { AppModal as Modal } from '@/components/AppModal';
 import { useState, useCallback, useRef, useMemo, useEffect, type ElementRef } from 'react';
-import {
-  View,
-  Text,
-  TouchableOpacity,
-  FlatList,
-  ActivityIndicator,
-  TextInput,
-  Modal,
-  AppState,
-  Keyboard,
-  ScrollView,
-  Platform,
-  UIManager,
-  findNodeHandle,
-  type NativeScrollEvent,
-  type NativeSyntheticEvent,
-} from 'react-native';
+import { View, Text, FlatList, ActivityIndicator, TextInput, AppState, Keyboard, ScrollView, Platform, UIManager, findNodeHandle, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from 'expo-router';
 import { usePreventRemove } from 'expo-router/react-navigation';
@@ -95,7 +83,8 @@ const EDITOR_SECTIONS = {
   conditions: '识别条件',
 };
 
-const SORT_LAYOUT_TRANSITION = LinearTransition.springify().damping(140).stiffness(1600).mass(4);
+const SORT_LAYOUT_TRANSITION = LinearTransition.springify().damping(APP_MOTION.sortLayout.damping)
+  .stiffness(APP_MOTION.sortLayout.stiffness).mass(APP_MOTION.sortLayout.mass);
 const SORT_ROW_GAP = Spacing.sm;
 const INITIAL_RULE_BATCH = 8;
 const renderRuleSeparator = () => <View style={{ height: SORT_ROW_GAP }} />;
@@ -873,7 +862,7 @@ export default function RulesScreen() {
       dragY.value = 0;
       draggingIdRef.current = id;
       setDraggingId(id);
-      dragScale.value = withSpring(1.04, { damping: 20, stiffness: 240, mass: 0.8 });
+      dragScale.value = withSpring(1.02, APP_MOTION.sortSpring);
       if (!listLayoutRef.current) {
         measureListLayout();
       }
@@ -954,8 +943,8 @@ export default function RulesScreen() {
     stopAutoScroll();
     draggingIdRef.current = null;
     const session = dragSessionRef.current;
-    dragScale.value = withSpring(1, { damping: 20, stiffness: 240, mass: 0.8 });
-    dragY.value = withSpring(0, { damping: 20, stiffness: 220, mass: 0.8 }, (finished) => {
+    dragScale.value = withSpring(1, APP_MOTION.sortSpring);
+    dragY.value = withSpring(0, APP_MOTION.sortReturnSpring, (finished) => {
       if (finished) {
         runOnJS(clearDragState)(session);
       }
@@ -1167,7 +1156,7 @@ export default function RulesScreen() {
           accessibilityRole="button"
           accessibilityLabel={`删除条件${index + 1}`}
           style={styles.fieldAction}
-          activeOpacity={0.7}
+          activeOpacity={0.86}
           onPress={() => setMatchConditions(previous => previous.filter((_, itemIndex) => itemIndex !== index))}
         >
           <Feather name="trash-2" size={17} color={theme.error} />
@@ -1226,7 +1215,7 @@ export default function RulesScreen() {
           </View>
         </View>
 
-        <KeyboardAwareFormScrollView
+        <MotionContent contentKey={editorSection} direction={editorSection === 'main' ? 'back' : 'forward'} style={{ flex: 1 }}><KeyboardAwareFormScrollView
           key={editorSection}
           style={styles.ruleEditorBody}
           contentContainerStyle={styles.ruleEditorBodyContent}
@@ -1370,7 +1359,7 @@ export default function RulesScreen() {
                       styles.separatorBtn,
                       ruleSeparator === sep && styles.separatorBtnActive,
                     ]}
-                    activeOpacity={0.7}
+                    activeOpacity={0.86}
                     onPress={() => {
                       setRuleSeparator(sep);
                       setCustomSeparator('');
@@ -1393,7 +1382,7 @@ export default function RulesScreen() {
                     styles.separatorBtn,
                     ruleSeparator === 'custom' && styles.separatorBtnActive,
                   ]}
-                  activeOpacity={0.7}
+                  activeOpacity={0.86}
                   onPress={() => {
                     setRuleSeparator('custom');
                     setCustomLeftBracket('');
@@ -1414,7 +1403,7 @@ export default function RulesScreen() {
                     styles.separatorBtn,
                     ruleSeparator === 'special' && styles.separatorBtnActive,
                   ]}
-                  activeOpacity={0.7}
+                  activeOpacity={0.86}
                   onPress={() => {
                     setRuleSeparator('special');
                     setCustomSeparator('');
@@ -1543,7 +1532,7 @@ export default function RulesScreen() {
                             styles.separatorBtn,
                             ruleTerminator === value && styles.separatorBtnActive,
                           ]}
-                          activeOpacity={0.7}
+                          activeOpacity={0.86}
                           onPress={() => setRuleTerminator(value)}
                         >
                           <Text
@@ -1573,7 +1562,7 @@ export default function RulesScreen() {
                       styles.fieldBtn,
                       selectedFields.includes(field) && styles.fieldBtnActive,
                     ]}
-                    activeOpacity={0.7}
+                    activeOpacity={0.86}
                     onPress={() => toggleField(field)}
                   >
                     <Text
@@ -1742,7 +1731,7 @@ export default function RulesScreen() {
                           style={styles.fieldSelectBtn}
                           accessibilityRole="button"
                           accessibilityLabel="选择条件字段"
-                          activeOpacity={0.7}
+                          activeOpacity={0.86}
                           onPress={() => setConditionPicker('field')}
                         >
                           <Text style={styles.fieldSelectText} numberOfLines={1}>
@@ -1780,7 +1769,7 @@ export default function RulesScreen() {
                           style={styles.addConditionBtn}
                           accessibilityRole="button"
                           accessibilityLabel="添加识别条件"
-                          activeOpacity={0.7}
+                          activeOpacity={0.86}
                           onPress={handleAddMatchCondition}
                         >
                           <Feather name="plus" size={20} color={theme.buttonPrimaryText} />
@@ -1794,11 +1783,10 @@ export default function RulesScreen() {
               </View>
             </>
           )}
-        </KeyboardAwareFormScrollView>
+        </KeyboardAwareFormScrollView></MotionContent>
 
-        {conditionPicker && (
-          <RuleOptionPicker
-            title={CONDITION_PICKER_TITLES[conditionPicker]}
+        {<RuleOptionPicker
+            title={CONDITION_PICKER_TITLES[conditionPicker || 'logic']}
             value={conditionPickerValue()}
             options={conditionPickerOptions()}
             onClose={() => setConditionPicker(null)}
@@ -1809,8 +1797,7 @@ export default function RulesScreen() {
               else if (conditionPicker === 'operator') setNewConditionOperator(value as ConditionOperator);
               setConditionPicker(null);
             }}
-          />
-        )}
+           visible={Boolean(conditionPicker)} />}
 
         <View style={[styles.ruleEditorFooter, { paddingBottom: Math.max(insets.bottom, 16) }]}>
           {editorSection === 'main' ? (
@@ -1838,8 +1825,7 @@ export default function RulesScreen() {
       </View>
     </Screen>
   ) : null;
-  const supplierPickerContent = supplierPickerVisible && (
-        <SupplierManager
+  const supplierPickerContent = <SupplierManager
           mode="select"
           value={supplierId ? supplierName : ''}
           onSelect={(name, id) => {
@@ -1849,8 +1835,7 @@ export default function RulesScreen() {
           }}
           onDeleted={() => undefined}
           onClose={() => setSupplierPickerVisible(false)}
-        />
-      );
+         visible={Boolean(supplierPickerVisible)} />;
 
   // Diagnosis opens an editor page, so only the stack performs its enter/exit transition.
   // The ordinary settings list retains its existing native Modal editor.
@@ -1886,7 +1871,7 @@ export default function RulesScreen() {
               accessibilityRole="button"
               accessibilityLabel="取消排序"
               style={[styles.headerAction, sortSaving && styles.actionDisabled]}
-              activeOpacity={0.7}
+              activeOpacity={0.86}
               onPress={cancelSort}
               disabled={sortSaving}
               accessibilityState={{ disabled: sortSaving }}
@@ -1896,8 +1881,8 @@ export default function RulesScreen() {
           ) : (
             <TouchableOpacity
               style={styles.backButton}
-              activeOpacity={0.7}
-              onPress={() => router.back()}
+              activeOpacity={0.86}
+              onPress={() => router.back()} accessibilityLabel="返回上一页"
             >
               <Feather name="arrow-left" size={20} color={theme.textPrimary} />
             </TouchableOpacity>
@@ -1910,7 +1895,7 @@ export default function RulesScreen() {
               accessibilityRole="button"
               accessibilityLabel="完成排序"
               style={[styles.addButton, (sortSaving || draggingId !== null) && styles.actionDisabled]}
-              activeOpacity={0.9}
+              activeOpacity={0.86}
               onPress={confirmSort}
               disabled={sortSaving || draggingId !== null}
               accessibilityState={{ disabled: sortSaving || draggingId !== null, busy: sortSaving }}
@@ -1922,7 +1907,7 @@ export default function RulesScreen() {
               accessibilityRole="button"
               accessibilityLabel="新增解析规则"
               style={styles.addButton}
-              activeOpacity={0.9}
+              activeOpacity={0.86}
               onPress={handleAddRule}
             >
               <Feather name="plus" size={18} color={theme.buttonPrimaryText} />
@@ -2001,14 +1986,14 @@ export default function RulesScreen() {
       </View>
 
       {/* 普通规则列表仍使用原有编辑弹窗。 */}
-      {modalVisible && <Modal
-        visible={!supplierPickerVisible}
+      {<Modal
+        visible={Boolean(modalVisible)}
         animationType="slide"
         presentationStyle="fullScreen"
         onRequestClose={closeEditor}
-      >
+      >{modalVisible ? <>
         {editorContent}
-      </Modal>}
+      </> : null}</Modal>}
 
       {supplierPickerContent}
 

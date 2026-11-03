@@ -125,23 +125,23 @@ async function openSupplierSelection() {
 }
 
 it('opens supplier maintenance from the toolbar without a material form', async () => {
-  expect(root.root.findAllByType(SupplierManager)).toHaveLength(0);
+  expect(root.root.findAllByType(SupplierManager).filter(node => node.props.visible !== false)).toHaveLength(0);
   await pressTool('维护供应商');
-  expect(root.root.findByType(SupplierManager).props.mode).toBe('manage');
+  expect(root.root.findAllByType(SupplierManager).find(node => node.props.visible !== false)!.props.mode).toBe('manage');
   expect(root.root.findAllByType(AppFormField)).toHaveLength(0);
-  await act(async () => { root.root.findByType(SupplierManager).props.onClose(); });
-  expect(root.root.findAllByType(SupplierManager)).toHaveLength(0);
+  await act(async () => { root.root.findAllByType(SupplierManager).find(node => node.props.visible !== false)!.props.onClose(); });
+  expect(root.root.findAllByType(SupplierManager).filter(node => node.props.visible !== false)).toHaveLength(0);
 });
 
 it('keeps typed model and code when selecting or cancelling a supplier and saves the selected name', async () => {
   await pressTool('新增');
   await fillBinding();
   await openSupplierSelection();
-  expect(root.root.findByType(SupplierManager).props.mode).toBe('select');
-  await act(async () => { root.root.findByType(SupplierManager).props.onClose(); });
+  expect(root.root.findAllByType(SupplierManager).find(node => node.props.visible !== false)!.props.mode).toBe('select');
+  await act(async () => { root.root.findAllByType(SupplierManager).find(node => node.props.visible !== false)!.props.onClose(); });
   expect(root.root.findAllByType(AppFormField)[0].findByType(TextInput).props.value).toBe('NEW-MODEL');
   await openSupplierSelection();
-  await act(async () => { root.root.findByType(SupplierManager).props.onSelect('新供应商'); });
+  await act(async () => { root.root.findAllByType(SupplierManager).find(node => node.props.visible !== false)!.props.onSelect('新供应商'); });
   await act(async () => { root.root.findByType(AppModalActions).props.onPrimaryPress(); });
   expect(database.addInventoryBinding).toHaveBeenCalledWith({
     scan_model: 'NEW-MODEL', inventory_code: 'NEW-CODE', version: '', supplier: '新供应商', description: '',

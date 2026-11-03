@@ -1,6 +1,10 @@
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { UiPageHeader } from '@/components/UiRedesign';
+import { AppModal as Modal } from '@/components/AppModal';
 import { useState, useCallback, useRef } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, Platform, Modal, TextInput } from 'react-native';
+import { View, Text, ScrollView, Platform, TextInput } from 'react-native';
 import { useFocusEffect } from 'expo-router';
+import { Feather } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/hooks/useTheme';
@@ -267,6 +271,7 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
   if (loading) {
     return (
       <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
+        <UiPageHeader title="记录详情" onBack={handleBack} />
         <View style={styles.loadingContainer}>
           <Text style={styles.loadingText}>加载中...</Text>
         </View>
@@ -280,7 +285,7 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
       <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
         <View style={styles.errorContainer}>
           <Text style={styles.errorText}>{error || '记录不存在'}</Text>
-          <TouchableOpacity style={styles.backButton} activeOpacity={0.7} onPress={handleBack}>
+          <TouchableOpacity style={styles.backButton} activeOpacity={0.86} onPress={handleBack} accessibilityLabel="返回上一页">
             <Text style={styles.backButtonText}>返回</Text>
           </TouchableOpacity>
         </View>
@@ -296,6 +301,9 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
       >
         {/* 头部 */}
         <View style={styles.header}>
+          <TouchableOpacity style={styles.headerBack} accessibilityRole="button" accessibilityLabel="返回上一页" onPress={handleBack}>
+            <Feather name="arrow-left" size={22} color={theme.textPrimary} />
+          </TouchableOpacity>
           <Text style={styles.title}>{record.operation_type === 'sales_return' ? '退货记录详情' : '记录详情'}</Text>
         </View>
         
@@ -387,7 +395,7 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
           </Text>
           
           {/* 解析诊断信息 */}
-          {record.raw_content && (
+          {Boolean(record.raw_content) && (
             <View style={{ marginTop: Spacing.sm }}>
               <Text style={[styles.cardTitle, { fontSize: rf(13), marginBottom: 8 }]}>
                 字段拆分结果：
@@ -473,7 +481,7 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
           )}
           
           {/* 规则信息 */}
-          {(record.rule_name || ruleName) && (
+          {Boolean(record.rule_name || ruleName) && (
             <View style={{ marginTop: Spacing.sm }}>
               <Text style={[styles.cardTitle, { fontSize: rf(13) }]}>
                 使用规则: {record.rule_name || ruleName}
@@ -484,11 +492,11 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
         
         {/* 操作按钮 */}
         <View style={styles.actionsContainer}>
-          <TouchableOpacity style={styles.button} activeOpacity={0.7} onPress={handleCopy}>
+          <TouchableOpacity style={styles.button} activeOpacity={0.86} onPress={handleCopy}>
             <Text style={styles.buttonText}>复制内容</Text>
           </TouchableOpacity>
           {record.operation_type === 'sales_return' ? (
-            <TouchableOpacity style={styles.secondaryButton} activeOpacity={0.7} onPress={() => {
+            <TouchableOpacity style={styles.secondaryButton} activeOpacity={0.86} onPress={() => {
               setNotesDraft(record.user_notes || '');
               setNotesSaveError(null);
               setNotesEditorVisible(true);
@@ -497,16 +505,15 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
             </TouchableOpacity>
           ) : null}
           
-          <TouchableOpacity style={styles.secondaryButton} activeOpacity={0.7} onPress={handleBack}>
+          <TouchableOpacity style={styles.secondaryButton} activeOpacity={0.86} onPress={handleBack} accessibilityLabel="返回上一页">
             <Text style={styles.secondaryButtonText}>返回</Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
 
-      {notesEditorVisible ? (
-        <Modal transparent visible animationType="fade" onRequestClose={() => {
+      {<Modal transparent visible={Boolean(notesEditorVisible) && (true)} animationType="fade" onRequestClose={() => {
           if (!notesSaving) setNotesEditorVisible(false);
-        }}>
+        }}>{notesEditorVisible ? <>
           <View style={styles.modalOverlay}>
             <AppModalCard title="补充退货备注" size="form"
               onClose={notesSaving ? undefined : () => setNotesEditorVisible(false)}
@@ -524,8 +531,7 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
               </KeyboardAwareFormScrollView>
             </AppModalCard>
           </View>
-        </Modal>
-      ) : null}
+        </> : null}</Modal>}
       
       {/* 自定义弹窗 */}
       {alert.AlertComponent}

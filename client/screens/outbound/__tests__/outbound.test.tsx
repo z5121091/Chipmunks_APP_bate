@@ -2281,6 +2281,7 @@ describe('outbound back navigation', () => {
       if (source === 'hardware') expect(getBackListener()()).toBe(true);
       else root.root.findByType(UiPageHeader).props.onBack();
     });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     expect(root.root.findAllByType(Text).some(text => text.props.children === '选择仓库')).toBe(false);
     expect(summaryValue('order')).toBe(no);
     expect(await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT)).toBe(previousDraft);

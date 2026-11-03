@@ -1,22 +1,19 @@
+import { OtaStartup } from '@/components/OtaStartup';
+import { MotionContent } from '@/components/AppMotion';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import '../global.css';
 import { useCallback, useEffect, useState } from 'react';
 import { Stack } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
-import {
-  ActivityIndicator,
-  AppState,
-  StyleSheet,
-  Text,
-  TouchableOpacity,
-  View,
-  type AppStateStatus,
-} from 'react-native';
+import { ActivityIndicator, AppState, StyleSheet, Text, View, type AppStateStatus } from 'react-native';
 import {
   checkpointDatabaseToDisk,
   ensureDatabaseConnectionReady,
   initDatabase,
 } from '@/utils/database';
 import { Provider } from '@/components/Provider';
+import { APP_MOTION } from '@/constants/motion';
+import { useAppMotion } from '@/hooks/useAppMotion';
 import { BorderRadius, Spacing, Typography } from '@/constants/theme';
 import { logger } from '@/utils/logger';
 import {
@@ -32,7 +29,7 @@ import {
 } from '@/utils/autoNasBackup';
 import { setSyncConnectionActive } from '@/utils/syncConnection';
 
-SplashScreen.setOptions({ duration: 200, fade: true });
+SplashScreen.setOptions({ duration: APP_MOTION.enter, fade: true });
 
 void SplashScreen.preventAutoHideAsync().catch((error) => {
   logger.warn('[App] prevent splash auto hide failed:', error);
@@ -57,6 +54,8 @@ const STACK_ROUTES = [
   'outbound-order-rules',
   'inventory-binding',
   'detail',
+  'settings-tools',
+  'app-updates',
   'help',
   'changelog',
   'privacy-policy',
@@ -84,7 +83,7 @@ function DatabaseGateScreen({
   const { theme } = useTheme();
 
   return (
-    <View style={[databaseGateStyles.container, { backgroundColor: theme.backgroundRoot }]}>
+    <MotionContent contentKey={databaseInitializing} direction="fade" style={[databaseGateStyles.container, { backgroundColor: theme.backgroundRoot }]}>
       {databaseInitializing ? (
         <View style={databaseGateStyles.centerContent}>
           <ActivityIndicator size="large" color={theme.primary} />
@@ -101,7 +100,7 @@ function DatabaseGateScreen({
             {getErrorMessage(databaseInitError)}
           </Text>
           <TouchableOpacity
-            activeOpacity={0.85}
+            activeOpacity={0.86}
             onPress={onRetryInitializeDatabase}
             style={[databaseGateStyles.retryButton, { backgroundColor: theme.primary }]}
           >
@@ -111,7 +110,7 @@ function DatabaseGateScreen({
           </TouchableOpacity>
         </View>
       )}
-    </View>
+    </MotionContent>
   );
 }
 
@@ -153,6 +152,15 @@ const databaseGateStyles = StyleSheet.create({
     fontWeight: '700',
   },
 });
+
+function AppNavigator() {
+  const reduced = useAppMotion();
+  const { theme } = useTheme();
+  return <Stack screenOptions={{ headerShown: false, animation: reduced ? 'none' : 'slide_from_right',
+    animationDuration: APP_MOTION.page, contentStyle: { backgroundColor: theme.backgroundRoot } }}>
+    {STACK_ROUTES.map(routeName => <Stack.Screen key={routeName} name={routeName} />)}
+  </Stack>;
+}
 
 export default function RootLayout() {
   const [databaseReady, setDatabaseReady] = useState(false);
@@ -314,11 +322,8 @@ export default function RootLayout() {
 
   return (
     <Provider>
-      <Stack screenOptions={{ headerShown: false }}>
-        {STACK_ROUTES.map((routeName) => (
-          <Stack.Screen key={routeName} name={routeName} />
-        ))}
-      </Stack>
+      <AppNavigator />
+      <OtaStartup />
     </Provider>
   );
 }

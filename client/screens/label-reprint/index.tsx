@@ -1,5 +1,6 @@
+import { AppModal as Modal } from '@/components/AppModal';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Keyboard, KeyboardAvoidingView, Modal, Platform, ScrollView, Text, View, useWindowDimensions } from 'react-native';
+import { Keyboard, KeyboardAvoidingView, Platform, ScrollView, Text, View, useWindowDimensions } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
@@ -438,8 +439,7 @@ export default function LabelReprintScreen() {
           )}
         </ScrollView>
       </View>
-      {correctionTask ? (
-        <Modal transparent visible animationType="fade" onRequestClose={closeQuantityCorrection}>
+      {<Modal transparent visible={Boolean(correctionTask) && (true)} animationType="fade" onRequestClose={closeQuantityCorrection}>{correctionTask ? <>
           <KeyboardAvoidingView style={[styles.modalOverlay, taskOverlayPadding]}
             behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
             <View style={styles.modalViewport} testID="label-quantity-viewport"
@@ -480,10 +480,8 @@ export default function LabelReprintScreen() {
               </AppModalCard>
             </View>
           </KeyboardAvoidingView>
-        </Modal>
-      ) : null}
-      {showTasks && !notice ? (
-        <Modal transparent visible animationType="fade" onRequestClose={closeTasks}>
+        </> : null}</Modal>}
+      {<Modal transparent visible={Boolean(showTasks && !notice) && (true)} animationType="fade" onRequestClose={closeTasks}>{showTasks && !notice ? <>
           <KeyboardAvoidingView style={[styles.modalOverlay, taskOverlayPadding]}
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
             <View style={styles.modalViewport} testID="label-reprint-task-viewport"
@@ -504,8 +502,7 @@ export default function LabelReprintScreen() {
               </AppModalCard>
             </View>
           </KeyboardAvoidingView>
-        </Modal>
-      ) : null}
+        </> : null}</Modal>}
       <CustomAlert visible={Boolean(notice)} title={notice?.title || ''} message={notice?.message}
         icon="warning" buttons={noticeButtons} onClose={closeNotice} />
     </Screen>

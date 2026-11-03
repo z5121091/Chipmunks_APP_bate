@@ -1,3 +1,4 @@
+import { beginOtaSensitiveOperation } from '@/utils/otaSafety';
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 
 const normalizeBaseUrl = (value?: string): string => {
@@ -173,6 +174,7 @@ export const backendJsonRequest = async <T>(
     timeoutMs = DEFAULT_BACKEND_TIMEOUT_MS,
   } = options;
   const url = buildBackendUrl(path, options);
+  const finishOtaOperation = beginOtaSensitiveOperation();
   const requestController = new AbortController();
   const abortFromCaller = () => requestController.abort();
   const timeoutId =
@@ -226,6 +228,7 @@ export const backendJsonRequest = async <T>(
         : error;
     throw new BackendNetworkError(url, requestError);
   } finally {
+    finishOtaOperation();
     if (timeoutId) {
       clearTimeout(timeoutId);
     }

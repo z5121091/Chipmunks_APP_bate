@@ -4,7 +4,9 @@ import { syncExcelToComputer } from '@/utils/excel';
 import { buildInboundSheets, buildInboundExportFileNameFromNo } from '@/utils/inboundExport';
 import { buildInventorySheets, buildInventoryExportFileNameFromNo } from '@/utils/inventoryExport';
 import TestRenderer, { act } from 'react-test-renderer';
-import { FlatList, Text, TouchableOpacity } from 'react-native';
+import { ActivityIndicator, FlatList, Text } from 'react-native';
+import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
+import { MotionCollapse } from '@/components/AppMotion';
 import InboundRecordsScreen from '../index';
 import InventoryRecordsScreen from '@/screens/inventory-records';
 import {
@@ -69,7 +71,8 @@ const deferred = <T,>() => {
 const document = (suffix: string) => ({
   inbound_no: `II-${suffix}`, check_no: `PD-${suffix}`, warehouse_id: suffix === 'B' ? 'W2' : 'W1',
   warehouse_name: `仓库 ${suffix}`, erp_account_key: suffix === 'B' ? 'wuxi-duneng' : 'shanghai-chipmunk',
-  erp_account_name: `账套 ${suffix}`, created_at: '2026/10/15 15:00', in_date: '2026-10-15',
+  erp_account_name: `账套 ${suffix}`, erp_account_keys: suffix === 'B' ? 'wuxi-duneng' : 'shanghai-chipmunk',
+  completion_status: 'partial' as const, created_at: '2026/10/15 15:00', in_date: '2026-10-15',
   record_count: 1, model_count: 1, total_quantity: 40, whole_count: 1, partial_count: 0,
   sync_status: 'pending' as const,
 });
@@ -119,6 +122,132 @@ describe.each(variants)('$name document request ownership', variant => {
   };
   afterEach(async () => { if (root) await act(async () => { root.unmount(); }); });
 
+  it('shows loading in the header and expands the document only after details arrive', async () => {
+    await mount();
+    const pending = deferred<never[]>();
+    jest.mocked(variant.read).mockImplementationOnce(() => pending.promise);
+    let row!: TestRenderer.ReactTestRenderer;
+    try {
+      await act(async () => { row = TestRenderer.create(list(root).props.renderItem({ item: document('A') })); });
+      await act(async () => { void row.root.findByType('Card').props.onPress(); });
+      await act(async () => { row.update(list(root).props.renderItem({ item: document('A') })); });
+      expect(row.root.findByType('Card').props.disablePressAnimation).toBe(true);
+      expect(row.root.findAllByType(MotionCollapse)).toHaveLength(0);
+      expect(row.root.findAllByProps({ testID: 'document-expanded-details' })).toHaveLength(0);
+      expect(row.root.findAllByType(ActivityIndicator)).toHaveLength(1);
+      await act(async () => { pending.resolve([]); });
+      await act(async () => { row.update(list(root).props.renderItem({ item: document('A') })); });
+      expect(row.root.findAllByProps({ testID: 'document-expanded-details' }).length).toBeGreaterThan(0);
+      expect(row.root.findAllByType(ActivityIndicator)).toHaveLength(0);
+    } finally {
+      if (row) await act(async () => { row.unmount(); });
+    }
+  });
+
+  it('shows the account only in the summary after expanding the document', async () => {
+    await mount();
+    let row!: TestRenderer.ReactTestRenderer;
+    try {
+      await act(async () => { row = TestRenderer.create(list(root).props.renderItem({ item: document('A') })); });
+      await act(async () => { row.root.findByType('Card').props.onPress(); });
+      await act(async () => { row.update(list(root).props.renderItem({ item: document('A') })); });
+      const labels = row.root.findAllByType(Text).map(node => node.props.children).flat().join('');
+      expect(labels.match(/账套 A/g)).toHaveLength(1);
+      expect(labels).not.toContain('账套：');
+      expect(labels).toContain('点型号展开明细');
+      if (variant.name === 'inbound') expect(labels).toContain('可继续扫码');
+    } finally {
+      if (row) await act(async () => { row.unmount(); });
+    }
+  });
+
+  it('separates inventory codes, models and versions while keeping record quantities and trace details', async () => {
+    const record = (id: string, quantity: number, actual: number, extra: Partial<InboundRecord & InventoryCheckRecord> = {}) => ({
+      id, inventory_code: 'INV-A', scan_model: 'MODEL-A', version: 'V1', quantity, actual_quantity: actual,
+      batch: 'BATCH-A', productionDate: '2528', traceNo: 'TRACE-A', created_at: '2026/10/15 15:00', ...extra,
+    } as InboundRecord & InventoryCheckRecord);
+    jest.mocked(variant.read).mockResolvedValueOnce([
+      record('R1', 10, 7), record('R2', 20, 0, { traceNo: '  ' }),
+      record('R3', 30, 25, { version: 'V2' }),
+      record('R4', 40, 35, { inventory_code: 'INV-B' }),
+      record('R5', 50, 45, { version: '' }),
+      record('R6', 60, 55, { scan_model: 'MODEL-B' }),
+    ]);
+    await mount();
+    let row!: TestRenderer.ReactTestRenderer;
+    const labels = (node: TestRenderer.ReactTestInstance) => node.findAllByType(Text)
+      .map(label => [label.props.children].flat().join(''));
+    const groups = () => row.root.findAllByType(TouchableOpacity)
+      .filter(node => labels(node).some(label => label.startsWith('型号：')));
+    try {
+      await act(async () => { row = TestRenderer.create(list(root).props.renderItem({ item: document('A') })); });
+      await act(async () => { row.root.findByType('Card').props.onPress(); });
+      await act(async () => { row.update(list(root).props.renderItem({ item: document('A') })); });
+      expect(groups()).toHaveLength(5);
+      const sameVersion = groups().find(node => {
+        const text = labels(node);
+        return text.includes('存货编码：INV-A') && text.includes('型号：MODEL-A') && text.includes('版本号：V1');
+      })!;
+      expect(labels(sameVersion).slice(0, 4)).toEqual(['存货编码：INV-A', '型号：MODEL-A', '版本号：V1', '2 条明细']);
+      expect(labels(sameVersion)[4]).toBe(variant.name === 'inventory' ? '7' : '30');
+      expect(groups().some(node => labels(node).includes('版本号：-'))).toBe(true);
+      await act(async () => { sameVersion.props.onPress(); });
+      await act(async () => { row.update(list(root).props.renderItem({ item: document('A') })); });
+      const details = row.root.findAllByType(TouchableOpacity).filter(node => Boolean(node.props.onLongPress));
+      expect(details).toHaveLength(2);
+      expect(labels(details[0])).toEqual([
+        '批次：BATCH-A', '生产日期：2528', '追溯码：TRACE-A',
+        variant.name === 'inventory' ? '实盘 7' : '10', '/ PCS',
+      ]);
+      expect(labels(details[1])).toEqual([
+        '批次：BATCH-A', '生产日期：2528', '追溯码：-',
+        variant.name === 'inventory' ? '实盘 0' : '20', '/ PCS',
+      ]);
+    } finally {
+      if (row) await act(async () => { row.unmount(); });
+    }
+  });
+
+  it('handles three rapid taps without duplicate reads or waiting for animation callbacks', async () => {
+    await mount();
+    const pending = deferred<never[]>();
+    jest.mocked(variant.read).mockClear().mockImplementationOnce(() => pending.promise);
+    let row!: TestRenderer.ReactTestRenderer;
+    try {
+      await act(async () => { row = TestRenderer.create(list(root).props.renderItem({ item: document('A') })); });
+      const press = row.root.findByType('Card').props.onPress;
+      await act(async () => { void press(); void press(); void press(); });
+      expect(variant.read).toHaveBeenCalledTimes(1);
+      await act(async () => { pending.resolve([]); });
+      await act(async () => { row.update(list(root).props.renderItem({ item: document('A') })); });
+      expect(row.root.findAllByProps({ testID: 'document-expanded-details' }).length).toBeGreaterThan(0);
+      expect(row.root.findAllByType(MotionCollapse)).toHaveLength(0);
+      await act(async () => { await row.root.findByType('Card').props.onPress(); });
+      await act(async () => { row.update(list(root).props.renderItem({ item: document('A') })); });
+      expect(row.root.findAllByProps({ testID: 'document-expanded-details' })).toHaveLength(0);
+    } finally {
+      if (row) await act(async () => { row.unmount(); });
+    }
+  });
+
+  it('allows a single click to retry after a failed detail read', async () => {
+    await mount();
+    jest.mocked(variant.read).mockClear().mockRejectedValueOnce(new Error('read failed')).mockResolvedValueOnce([]);
+    let row!: TestRenderer.ReactTestRenderer;
+    try {
+      await act(async () => { row = TestRenderer.create(list(root).props.renderItem({ item: document('A') })); });
+      await act(async () => { await row.root.findByType('Card').props.onPress(); });
+      await act(async () => { row.update(list(root).props.renderItem({ item: document('A') })); });
+      expect(row.root.findAllByProps({ testID: 'document-expanded-details' })).toHaveLength(0);
+      await act(async () => { await row.root.findByType('Card').props.onPress(); });
+      await act(async () => { row.update(list(root).props.renderItem({ item: document('A') })); });
+      expect(variant.read).toHaveBeenCalledTimes(2);
+      expect(row.root.findAllByProps({ testID: 'document-expanded-details' }).length).toBeGreaterThan(0);
+    } finally {
+      if (row) await act(async () => { row.unmount(); });
+    }
+  });
+
   it('ignores a late manual refresh from A and leaves the newer B refresh running', async () => {
     await mount();
     await changeScope(root, variant.all, variant.scopeA);
@@ -149,7 +278,7 @@ describe.each(variants)('$name document request ownership', variant => {
     await changeScope(root, variant.scopeA, variant.scopeB);
     await act(async () => { lateA.reject(new Error('late A failed')); });
     expect(list(root).props.data).toEqual([document('B')]);
-    expect(root.root.findAllByType('Notice')).toHaveLength(0);
+    expect(root.root.findAllByType('Notice').filter(node => node.props.visible !== false)).toHaveLength(0);
   });
 
   it('keeps the newest refresh when the same scope completes out of order', async () => {
@@ -188,7 +317,7 @@ describe.each(variants)('$name document request ownership', variant => {
     await changeScope(root, variant.scopeA, variant.scopeB);
     await act(async () => { deletedScope.resolve([]); });
     expect(list(root).props.data).toEqual([document('B')]);
-    expect(root.root.findAllByType('Notice')).toHaveLength(0);
+    expect(root.root.findAllByType('Notice').filter(node => node.props.visible !== false)).toHaveLength(0);
   });
 });
 
@@ -268,7 +397,7 @@ describe.each(variants)('$name repeat document sync', variant => {
     jest.mocked(variant.update).mockRejectedValueOnce(new Error('status write failed'));
     await pressSync();
     expect(button().props.disabled).toBe(false);
-    expect(root.root.findAllByType('Notice').length).toBeGreaterThan(0);
+    expect(root.root.findAllByType('Notice').filter(node => node.props.visible !== false).length).toBeGreaterThan(0);
     await pressSync();
     expect(syncExcelToComputer).toHaveBeenCalledTimes(2);
   });
