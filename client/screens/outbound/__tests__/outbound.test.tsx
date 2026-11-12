@@ -17,6 +17,7 @@ import { DEFAULT_OUTBOUND_ORDER_RULE } from '@/utils/outboundOrderRule';
 import { OUTBOUND_VERIFICATION_TTL_MS } from '@/utils/outboundProgress';
 import { scanQueue, QueueItemStatus, type QueueItem } from '@/utils/scanQueue';
 import { loadUnpackPrintTasks, submitUnpackPrintTask } from '@/utils/unpackPrintTasks';
+import { buildInternalLabel, internalLabelPackageKey, type InternalLabelPackage } from '@/utils/internalLabelCode';
 
 let mockScreenFocused = true;
 const mockRouter = { back: jest.fn(), push: jest.fn() };
@@ -91,7 +92,9 @@ jest.mock('@/utils/erpSaleDispatch', () => ({
 jest.mock('@/utils/database', () => ({
   initDatabase: jest.fn(), upsertOrder: jest.fn(), getOrder: jest.fn(),
   getAllWarehouses: jest.fn(), getDefaultWarehouse: jest.fn(), getMaterialsByOrder: jest.fn(),
+  findOutboundOrderWarehouseConflict: jest.fn(),
   getInventoryCodeByModel: jest.fn(), getInventoryBindingMatchByModel: jest.fn(),
+  requireActiveInternalLabel: jest.fn(), getInternalLabelSpecifications: jest.fn(),
   getInventorySupplierById: jest.fn(), getInventoryBindingByCode: jest.fn(),
   checkMaterialExists: jest.fn(), addMaterialWithOrder: jest.fn(), getMaterialById: jest.fn(),
   getSalesReturnsByOrder: jest.fn(), getSalesReturnById: jest.fn(), saveSalesReturnWithOrder: jest.fn(), deleteSalesReturn: jest.fn(),
@@ -148,6 +151,11 @@ const historical = (quantity = 100): database.MaterialRecord => ({
   scanned_at: new Date().toISOString(), operation_type: 'outbound', raw_content: 'QR',
 });
 
+const internalPackage = (packageId = 'P6Z9H8J4K3R2'): InternalLabelPackage => ({
+  packageId, quantity: 100, revision: 1, inventoryCode: 'A', inventoryName: '内部零件',
+  specification: 'Ｍodel A', accountKey: 'shanghai-chipmunk', warehouseName: '无锡总仓', warehouseCode: '001',
+});
+
 beforeEach(async () => {
   jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
@@ -168,6 +176,7 @@ beforeEach(async () => {
   jest.mocked(database.getAllWarehouses).mockResolvedValue([warehouse, shanghaiWarehouse]);
   jest.mocked(database.getDefaultWarehouse).mockResolvedValue(warehouse);
   jest.mocked(database.getMaterialsByOrder).mockReset().mockResolvedValue([]);
+  jest.mocked(database.findOutboundOrderWarehouseConflict).mockReset().mockResolvedValue(null);
   jest.mocked(database.getSalesReturnsByOrder).mockReset().mockResolvedValue([]);
   jest.mocked(database.getSalesReturnById).mockReset().mockResolvedValue(null);
   jest.mocked(database.deleteSalesReturn).mockReset().mockResolvedValue(undefined);
@@ -186,6 +195,8 @@ beforeEach(async () => {
   jest.mocked(database.getInventorySupplierById).mockReset();
   jest.mocked(database.getInventoryBindingByCode).mockReset();
   jest.mocked(database.getInventoryBindingMatchByModel).mockReset().mockResolvedValue({ inventoryCode: 'A', matchKind: 'exact' });
+  jest.mocked(database.requireActiveInternalLabel).mockReset();
+  jest.mocked(database.getInternalLabelSpecifications).mockReset().mockResolvedValue(new Map());
   jest.mocked(database.getMaterialById).mockReset().mockResolvedValue(null);
   jest.mocked(database.checkMaterialExists).mockResolvedValue({ material: null, isUnpacked: false, canRescan: false });
   jest.mocked(database.addMaterialWithOrder).mockReset().mockImplementation(async () => `item-${jest.mocked(database.addMaterialWithOrder).mock.calls.length}`);
@@ -198,6 +209,209 @@ beforeEach(async () => {
 afterEach(async () => {
   await act(async () => { root.unmount(); });
   jest.useRealTimers();
+});
+
+describe('unsupported order formats and legacy local history', () => {
+  it('rejects a custom format without clearing the current verified ERP order', async () => {
+    await act(async () => { root.unmount(); });
+    await AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_ORDER_RULE, JSON.stringify({
+      ...DEFAULT_OUTBOUND_ORDER_RULE, sample: 'CUSTOM-2000-01-01-01', prefix: 'CUSTOM',
+    }));
+    await act(async () => { root = TestRenderer.create(<PDAScanScreen />); });
+    await tick();
+    await scan(no);
+    const savedDraft = await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT);
+    await scan('CUSTOM-2026-09-06-01');
+
+    expect(useToast().showToast).toHaveBeenCalledWith('出库单未匹配到ERP账套，请检查单号规则', 'error');
+    expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(1);
+    expect(summaryValue('order')).toBe(no);
+    expect(await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT)).toBe(savedDraft);
+    await scan('Model A/100');
+    expect(database.addMaterialWithOrder).toHaveBeenCalledTimes(1);
+    expect(database.addMaterialWithOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ order_no: no, warehouse_id: warehouse.id }), expect.anything(), expect.anything(),
+    );
+    expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not create an unverified custom-format order with no active work', async () => {
+    await act(async () => { root.unmount(); });
+    await AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_ORDER_RULE, JSON.stringify({
+      ...DEFAULT_OUTBOUND_ORDER_RULE, sample: 'CUSTOM-2000-01-01-01', prefix: 'CUSTOM',
+    }));
+    await act(async () => { root = TestRenderer.create(<PDAScanScreen />); });
+    await tick();
+    await scan('CUSTOM-2026-09-06-01');
+    expect(fetchSaleDispatchVoucher).not.toHaveBeenCalled();
+    expect(database.upsertOrder).not.toHaveBeenCalled();
+    expect(database.addMaterialWithOrder).not.toHaveBeenCalled();
+    expect(await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT)).toBeNull();
+    expect(useToast().showToast).toHaveBeenCalledWith('出库单未匹配到ERP账套，请检查单号规则', 'error');
+  });
+
+  it('does not transfer already queued materials from a rejected custom order to the verified ERP order', async () => {
+    await act(async () => { root.unmount(); });
+    await AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_ORDER_RULE, JSON.stringify({
+      ...DEFAULT_OUTBOUND_ORDER_RULE, sample: 'CUSTOM-2000-01-01-01', prefix: 'CUSTOM',
+    }));
+    await act(async () => { root = TestRenderer.create(<PDAScanScreen />); });
+    await tick();
+    let finishLoad!: (loaded: ReturnType<typeof voucher>) => void;
+    jest.mocked(fetchSaleDispatchVoucher).mockImplementationOnce(() => new Promise(resolve => { finishLoad = resolve; }));
+    await scan(no);
+    await scan('CUSTOM-2026-09-06-01');
+    await scan('Model A/200');
+    expect(database.addMaterialWithOrder).not.toHaveBeenCalled();
+    await act(async () => { finishLoad(voucher()); });
+    await tick();
+    await tick();
+
+    expect(database.addMaterialWithOrder).not.toHaveBeenCalled();
+    expect(useCustomAlert().showAlert).toHaveBeenCalledWith(
+      '待处理扫码已暂停', expect.stringContaining('还有 1 条扫码尚未保存'), expect.any(Array), 'warning',
+    );
+    // Releasing the existing pause must revalidate the queued item against its
+    // originally accepted order, rather than silently assigning it to the old one.
+    await pressAlertButton('待处理扫码已暂停', '继续处理');
+    expect(useToast().showToast).toHaveBeenCalledWith(
+      '处理失败：这笔待处理扫码属于 CUSTOM-2026-09-06-01，请先加载该订单再继续', 'error',
+    );
+    expect(database.addMaterialWithOrder).not.toHaveBeenCalled();
+    expect(summaryValue('order')).toBe(no);
+  });
+
+  it('restores existing non-ERP local history from its recorded warehouse without routing it to an ERP account', async () => {
+    await act(async () => { root.unmount(); });
+    const legacyOrderNo = 'LOCAL-2025-01';
+    await AsyncStorage.setItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT, JSON.stringify({
+      orderNo: legacyOrderNo, customerName: '历史客户', warehouseId: warehouse.id,
+      warehouseName: warehouse.name, updatedAt: new Date().toISOString(),
+    }));
+    jest.mocked(database.getMaterialsByOrder).mockImplementation(async (orderNo, warehouseId) =>
+      orderNo === legacyOrderNo && (!warehouseId || warehouseId === shanghaiWarehouse.id)
+        ? [{ ...historical(), order_no: legacyOrderNo, warehouse_id: shanghaiWarehouse.id, warehouse_name: shanghaiWarehouse.name }]
+        : []);
+    await act(async () => { root = TestRenderer.create(<PDAScanScreen />); });
+    await tick();
+
+    expect(database.getMaterialsByOrder).toHaveBeenCalledWith(legacyOrderNo, warehouse.id);
+    expect(database.getMaterialsByOrder).toHaveBeenCalledWith(legacyOrderNo);
+    expect(fetchSaleDispatchVoucher).not.toHaveBeenCalled();
+    expect(summaryValue('order')).toBe(legacyOrderNo);
+    expect(root.root.findByType(FlatList).props.data[0].totalQuantity).toBe(100);
+    expect(JSON.parse((await AsyncStorage.getItem(STORAGE_KEYS.GLOBAL_WAREHOUSE))!).id).toBe(shanghaiWarehouse.id);
+    expect(JSON.parse((await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT))!).warehouseId).toBe(shanghaiWarehouse.id);
+  });
+});
+
+describe('outbound internal package labels', () => {
+  it('shows the complete registered specification on expansion while saving the original item data', async () => {
+    const specification = '川土微,CA-IS2062VW,集成隔离电源,CAN隔离器,独立逻辑电源,封装:SOIC16-WB';
+    const pkg = { ...internalPackage(), specification, accountKey: voucher().accountKey };
+    jest.mocked(database.requireActiveInternalLabel).mockResolvedValueOnce(pkg);
+    await scan(no);
+    await scan(buildInternalLabel(pkg));
+
+    expect(database.addMaterialWithOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ model: pkg.inventoryName, inventory_code: pkg.inventoryCode }), expect.anything(), expect.anything(),
+    );
+    const renderCard = () => {
+      const list = root.root.findByType(FlatList);
+      return list.props.renderItem({ item: list.props.data[0] });
+    };
+    let card!: TestRenderer.ReactTestRenderer;
+    await act(async () => { card = TestRenderer.create(renderCard()); });
+    try {
+      const title = () => card.root.findAllByType(Text).find(node => node.props.children === specification);
+      expect(title()?.props).toMatchObject({ numberOfLines: 2, ellipsizeMode: 'tail' });
+      await act(async () => { card.root.findAll(node => Boolean(node.props.onPress))[0].props.onPress(); });
+      await act(async () => { card.update(renderCard()); });
+      expect(title()).toBeDefined();
+      expect(title()?.props.numberOfLines).toBeUndefined();
+    } finally {
+      await act(async () => { card.unmount(); });
+    }
+  });
+
+  it('matches the ERP code without a binding and distinguishes equal-quantity packages by their registered ID', async () => {
+    const first = internalPackage();
+    const second = internalPackage('P6Z9H8J4K3R3');
+    const firstCode = buildInternalLabel(first);
+    const secondCode = buildInternalLabel(second);
+    jest.mocked(database.requireActiveInternalLabel).mockImplementation(async code => code === firstCode ? first : second);
+    await scan(no);
+    await scan(firstCode);
+    await scan(secondCode);
+    jest.mocked(database.checkMaterialExists).mockResolvedValueOnce({
+      material: { ...historical(), package_key: internalLabelPackageKey(first.packageId) },
+      isUnpacked: false, canRescan: false,
+    });
+    await scan(firstCode);
+
+    expect(database.detectRule).not.toHaveBeenCalled();
+    expect(database.getInventoryBindingMatchByModel).not.toHaveBeenCalled();
+    expect(database.checkMaterialExists).toHaveBeenCalledWith(
+      no, first.inventoryName, '', undefined, undefined, '100', undefined, internalLabelPackageKey(first.packageId),
+    );
+    expect(database.addMaterialWithOrder).toHaveBeenCalledTimes(2);
+    expect(jest.mocked(database.addMaterialWithOrder).mock.calls.map(([material]) => material.package_key))
+      .toEqual([first, second].map(pkg => internalLabelPackageKey(pkg.packageId)));
+    expect(root.root.findByType(FlatList).props.data[0].scannedQuantity).toBe(200);
+  });
+
+  it('stops a replaced code or a cross-account specification mismatch before saving', async () => {
+    const pkg = internalPackage();
+    jest.mocked(database.requireActiveInternalLabel)
+      .mockRejectedValueOnce(new Error('该内部标签版本已失效'))
+      .mockResolvedValueOnce({ ...pkg, specification: '不同规格' });
+    await scan(no);
+    await scan(buildInternalLabel(pkg));
+    expect(useToast().showToast).toHaveBeenCalledWith(expect.stringContaining('该内部标签版本已失效'), 'error');
+    await scan(buildInternalLabel(pkg));
+    expect(useToast().showToast).toHaveBeenCalledWith(expect.stringContaining('跨账套无法核对内部标签 A 的规格'), 'error');
+    expect(database.addMaterialWithOrder).not.toHaveBeenCalled();
+  });
+
+  it('hands the registered internal package and exact split quantities to the unpack transaction', async () => {
+    const pkg = { ...internalPackage(), quantity: 477 };
+    const code = buildInternalLabel(pkg);
+    jest.mocked(database.requireActiveInternalLabel).mockResolvedValueOnce(pkg);
+    jest.mocked(fetchSaleDispatchVoucher).mockResolvedValueOnce(voucher(200));
+    jest.mocked(database.saveUnpackOperation).mockResolvedValueOnce({
+      pairId: 'internal-split', shippedRecord: { new_quantity: '200' }, remainingRecord: { new_quantity: '277' },
+    } as Awaited<ReturnType<typeof database.saveUnpackOperation>>);
+    await scan(no);
+    await scan(code);
+    expect(feedbackUnpackRequired).toHaveBeenCalledTimes(1);
+    await act(async () => { await root.root.findByType(AppModalCard).props.footer.props.onPrimaryPress(); });
+
+    expect(database.saveUnpackOperation).toHaveBeenCalledWith(expect.objectContaining({
+      material: expect.objectContaining({ package_key: internalLabelPackageKey(pkg.packageId), raw_content: code }),
+      shippedQuantity: 200, remainingQuantity: 277, newTraceNo: '',
+    }));
+    expect(database.addMaterialWithOrder).not.toHaveBeenCalled();
+    expect(feedbackOutboundOrderComplete).toHaveBeenCalledWith(true);
+  });
+
+  it('recovers the vendor label after a confirmed internal scanner frame before any vendor rules are cached', async () => {
+    const pkg = internalPackage();
+    const code = buildInternalLabel(pkg);
+    const vendorRule: database.QRCodeRule = {
+      id: 'vendor', name: 'Vendor', description: '', separator: '/',
+      fieldOrder: ['model', 'quantity'], isActive: true, created_at: '', updated_at: '',
+    };
+    jest.mocked(database.getActiveRules).mockResolvedValue([vendorRule]);
+    jest.mocked(database.requireActiveInternalLabel).mockResolvedValueOnce(pkg);
+    await scan(no);
+    await scan(code);
+    expect(database.getActiveRules).not.toHaveBeenCalled();
+    await scan(`${code}Model A/100`);
+
+    expect(database.requireActiveInternalLabel).toHaveBeenCalledTimes(1);
+    expect(database.detectRule).toHaveBeenCalledWith('Model A/100', [vendorRule]);
+    expect(database.addMaterialWithOrder).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('outbound rule supplier validation', () => {
@@ -655,6 +869,78 @@ it('keeps material accepted after a queued order attached to that order when the
   );
   expect(root.root.findByType(FlatList).props.data[0].scannedQuantity).toBe(100);
   expect(feedbackError).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['IO-2026-09-06-01', '苏州仓库'],
+  [no, 'B仓'],
+])('opens %s in the actual archived ERP warehouse and announces %s', async (orderNo, warehouseName) => {
+  await act(async () => { root.unmount(); });
+  const actualWarehouse = { ...warehouse, id: 'W-A', name: warehouseName, is_default: false };
+  jest.mocked(database.getAllWarehouses).mockResolvedValue([warehouse, shanghaiWarehouse, actualWarehouse]);
+  jest.mocked(fetchSaleDispatchVoucher).mockResolvedValue({ ...voucher(3000, orderNo), warehouseName: ` ${warehouseName} ` });
+  await act(async () => { root = TestRenderer.create(<PDAScanScreen />); });
+  await tick();
+
+  await scan(orderNo);
+
+  expect(database.getMaterialsByOrder).toHaveBeenCalledWith(orderNo, actualWarehouse.id);
+  expect(database.upsertOrder).toHaveBeenCalledWith(orderNo, 'Demo customer', {
+    id: actualWarehouse.id, name: actualWarehouse.name,
+  });
+  expect(database.findOutboundOrderWarehouseConflict).toHaveBeenCalledWith(
+    orderNo, actualWarehouse.id, getErpAccountByOutboundOrderNo(orderNo)?.key,
+  );
+  await scan(orderNo);
+  expect(jest.mocked(feedbackOutboundOrderReady).mock.calls).toEqual([
+    ['loaded', warehouseName], ['current', warehouseName],
+  ]);
+});
+
+it.each([
+  ['IO-2026-09-06-01', warehouse.name],
+  [no, shanghaiWarehouse.name],
+])('uses the standard order speech for %s in either preset warehouse (%s)', async (orderNo, warehouseName) => {
+  jest.mocked(fetchSaleDispatchVoucher).mockResolvedValue({ ...voucher(3000, orderNo), warehouseName });
+
+  await scan(orderNo);
+
+  expect(jest.mocked(feedbackOutboundOrderReady).mock.calls).toEqual([['loaded']]);
+});
+
+it.each([
+  ['尚未登记', '仓库「尚未登记」未在仓库档案登记'],
+  ['', `ERP 未返回单据 ${no} 的仓库`],
+])('blocks an unresolvable actual warehouse without falling back (%s)', async (warehouseName, reason) => {
+  jest.mocked(fetchSaleDispatchVoucher).mockResolvedValue({ ...voucher(), warehouseName });
+
+  await scan(no);
+
+  expect(useToast().showToast).toHaveBeenCalledWith(expect.stringContaining(reason), 'error');
+  expect(database.upsertOrder).not.toHaveBeenCalled();
+  expect(database.getMaterialsByOrder).not.toHaveBeenCalled();
+  expect(feedbackOutboundOrderReady).not.toHaveBeenCalled();
+});
+
+it('keeps existing scans in the old warehouse when refreshing an ERP order that was moved', async () => {
+  jest.mocked(database.getMaterialsByOrder).mockResolvedValue([historical(100)]);
+  await scan(no);
+  jest.mocked(database.upsertOrder).mockClear();
+  jest.mocked(database.getMaterialsByOrder).mockClear();
+  jest.mocked(fetchSaleDispatchVoucher).mockResolvedValue({ ...voucher(), warehouseName: shanghaiWarehouse.name });
+  jest.mocked(database.findOutboundOrderWarehouseConflict).mockResolvedValue({
+    warehouse_id: warehouse.id, warehouse_name: warehouse.name,
+  });
+
+  await tick(OUTBOUND_VERIFICATION_TTL_MS + 1);
+  await scan(no);
+
+  expect(useToast().showToast).toHaveBeenCalledWith(expect.stringContaining(
+    `在「${warehouse.name}」已有扫码记录，ERP 当前仓库为「${shanghaiWarehouse.name}」`,
+  ), 'error');
+  expect(database.upsertOrder).not.toHaveBeenCalled();
+  expect(database.getMaterialsByOrder).not.toHaveBeenCalled();
+  expect(root.root.findByType(FlatList).props.data[0].scannedQuantity).toBe(100);
 });
 
 it('keeps the selected warehouse ID when ERP names also match another local warehouse', async () => {
@@ -1556,6 +1842,24 @@ describe('material scanner completion boundaries', () => {
     jest.mocked(feedbackError).mockClear();
   });
 
+  it('releases a finished scan immediately so the next package does not wait in the old 170ms idle gap', async () => {
+    const input = () => root.root.findByType(WarehouseScanInput).props;
+    await act(async () => {
+      input().onChangeText(full);
+      input().onSubmitEditing({ nativeEvent: { text: full } });
+    });
+    expect(database.addMaterialWithOrder).toHaveBeenCalledTimes(1);
+    await tick(0);
+    expect(input().processing).toBe(false);
+    await tick(10);
+    await act(async () => {
+      input().onChangeText('Model A/LOT-2/100');
+      input().onSubmitEditing({ nativeEvent: { text: 'Model A/LOT-2/100' } });
+    });
+    expect(database.addMaterialWithOrder).toHaveBeenCalledTimes(2);
+    expect(feedbackSuccess).toHaveBeenCalledTimes(2);
+  });
+
   it('does not consume a Geehy label while the final box field is still arriving', async () => {
     const geehy = { ...rule, id: 'geehy', fieldOrder: [
       'model', 'batch', 'package', 'version', 'quantity', 'productionDate', 'traceNo', 'sourceNo',
@@ -1585,6 +1889,42 @@ describe('material scanner completion boundaries', () => {
     expect(jest.mocked(database.detectRule).mock.calls.map(([raw]) => raw)).toEqual([code(10), code(11), code(12)]);
     expect(jest.mocked(database.addMaterialWithOrder).mock.calls.map(([item]) => [item.model, item.sourceNo]))
       .toEqual(Array.from({ length: 3 }, () => ['APM32F103RBT6', 'OPGD144429023']));
+    expect(feedbackNotBound).not.toHaveBeenCalled();
+  });
+
+  it('immediately consumes a Geehy Enter once its final change agrees, without reviving cumulative prefixes or late Enters', async () => {
+    const geehy = { ...rule, id: 'geehy', fieldOrder: [
+      'model', 'batch', 'package', 'version', 'quantity', 'productionDate', 'traceNo', 'sourceNo',
+    ] };
+    jest.mocked(database.getActiveRules).mockResolvedValue([geehy]);
+    jest.mocked(database.detectRule).mockImplementation(async raw =>
+      database.inspectQRCodeRule(raw, geehy).matched ? geehy : null);
+    jest.mocked(database.parseWithRule).mockImplementation(jest.requireActual('@/utils/database').parseWithRule);
+    jest.mocked(database.getInventoryBindingMatchByModel).mockImplementation(async model =>
+      ({ inventoryCode: model === 'APM32F103RBT6' ? 'A' : null, matchKind: 'exact' }));
+    const code = (suffix: number) => `APM32F103RBT6/NYORY/LQFP64/801204300041/960/2436/BT7124009010023-${suffix}/OPGD144429023`;
+    const input = () => root.root.findByType(WarehouseScanInput).props;
+    let nativePrefix = '';
+    for (const suffix of [10, 11, 12]) {
+      const raw = code(suffix);
+      await act(async () => {
+        input().onChangeText(nativePrefix + raw.slice(0, -7));
+        input().onSubmitEditing({ nativeEvent: { text: nativePrefix + raw } });
+      });
+      await tick(20);
+      expect(database.addMaterialWithOrder).toHaveBeenCalledTimes(suffix - 10);
+      await act(async () => { input().onChangeText(nativePrefix + raw); });
+      await tick(0);
+      expect(input().value).toBe('');
+      expect(database.addMaterialWithOrder).toHaveBeenCalledTimes(suffix - 9);
+      await act(async () => { input().onSubmitEditing({ nativeEvent: { text: nativePrefix + raw } }); });
+      await tick(0);
+      expect(database.addMaterialWithOrder).toHaveBeenCalledTimes(suffix - 9);
+      nativePrefix += raw;
+    }
+    expect(jest.mocked(database.detectRule).mock.calls.map(([raw]) => raw)).toEqual([code(10), code(11), code(12)]);
+    expect(jest.mocked(database.addMaterialWithOrder).mock.calls.map(([item]) => [item.model, item.sourceNo, item.traceNo]))
+      .toEqual([10, 11, 12].map(suffix => ['APM32F103RBT6', 'OPGD144429023', `BT7124009010023-${suffix}`]));
     expect(feedbackNotBound).not.toHaveBeenCalled();
   });
 
@@ -1788,9 +2128,7 @@ describe('material scanner completion boundaries', () => {
     await tick(100);
     expect(database.detectRule).not.toHaveBeenCalled();
     await act(async () => { input().onChangeText(full); });
-    await tick(149);
-    expect(database.detectRule).not.toHaveBeenCalled();
-    await tick(1);
+    // The complete Enter frame now agrees with JS; no extra 150ms merge wait.
     expect(database.detectRule).toHaveBeenCalledWith(full, [rule]);
     expect(database.addMaterialWithOrder).toHaveBeenCalledTimes(1);
     await act(async () => { input().onSubmitEditing({ nativeEvent: { text: full } }); });

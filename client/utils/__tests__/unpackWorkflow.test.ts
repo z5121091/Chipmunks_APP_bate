@@ -1,6 +1,8 @@
-import { getSupplierForInventoryBinding, type UnpackRecord } from '../database';
+import { getSupplierForInventoryBinding, requireActiveInternalLabel, type UnpackRecord } from '../database';
 import { syncExcelToComputer } from '../excel';
 import { submitUnpackRecordsToComputer, syncUnpackRecordsToComputer } from '../unpackWorkflow';
+import { buildInternalLabel, internalLabelPackageKey } from '../internalLabelCode';
+import { buildUnpackLabelSheet } from '../labelExport';
 
 jest.mock('@react-native-async-storage/async-storage', () => ({
   __esModule: true,
@@ -9,6 +11,7 @@ jest.mock('@react-native-async-storage/async-storage', () => ({
 jest.mock('../database', () => ({
   getNextUnpackIndex: jest.fn(),
   getSupplierForInventoryBinding: jest.fn(),
+  requireActiveInternalLabel: jest.fn(),
 }));
 jest.mock('../excel', () => ({
   syncExcelToComputer: jest.fn(),
@@ -61,9 +64,57 @@ describe('unpack native submission response', () => {
     expect(await submitUnpackRecordsToComputer(records, config)).toMatchObject({ status: 'skipped', message: '供应商不适用' });
   });
 
+  it('stops a split retry before the helper if a registered child code is now obsolete', async () => {
+    const parentPackageId = 'PARENT00000001';
+    const labels = ['CHILDSHIP00001', 'CHILDLEFT00001'].map((packageId, index) => ({
+      inventoryCode: 'INV-1', inventoryName: '隔离芯片', specification: 'SOIC16-WB',
+      accountKey: 'shanghai-chipmunk' as const, warehouseName: '无锡总仓', warehouseCode: '001',
+      packageId, parentPackageId, quantity: index + 1, revision: 1,
+    }));
+    const internalRecords = records.map((record, index) => ({ ...record,
+      package_key: internalLabelPackageKey(labels[index].packageId), parent_package_key: internalLabelPackageKey(parentPackageId),
+      source_qr: buildInternalLabel(labels[index]),
+    }));
+    jest.mocked(requireActiveInternalLabel).mockResolvedValueOnce(labels[0]).mockRejectedValueOnce(new Error('内部标签版本已失效'));
+    await expect(submitUnpackRecordsToComputer(internalRecords, config, { retryConfirmed: true })).rejects.toThrow('版本已失效');
+    expect(syncExcelToComputer).not.toHaveBeenCalled();
+
+    jest.mocked(requireActiveInternalLabel).mockResolvedValueOnce(labels[0]).mockResolvedValueOnce(labels[1]);
+    await expect(submitUnpackRecordsToComputer(internalRecords, config, { retryConfirmed: true })).resolves.toMatchObject({ status: 'submitted' });
+    expect(syncExcelToComputer).toHaveBeenCalledTimes(1);
+    expect(getSupplierForInventoryBinding).not.toHaveBeenCalled();
+  });
+
   it('rejects a mismatched response ID', async () => {
     jest.mocked(syncExcelToComputer).mockResolvedValue({ success: true, nativePrint: true, nativePrintJobId: 'other-pair' });
     await expect(submitUnpackRecordsToComputer(records, config)).rejects.toThrow('任务标识不一致');
+  });
+
+  it('submits only the positive shipped label for a full box split, preserving the saved pair ID', async () => {
+    const shipped = { ...records[0], label_type: 'shipped', new_quantity: '2000', package_supplier: '苏州东微半导体股份有限公司' } as UnpackRecord;
+    const remaining = { ...records[1], label_type: 'remaining', new_quantity: '0' } as UnpackRecord;
+    await submitUnpackRecordsToComputer([shipped, remaining], config);
+    expect(buildUnpackLabelSheet).toHaveBeenCalledWith([
+      expect.objectContaining({ id: shipped.id, new_quantity: '2000', supplier: shipped.package_supplier }),
+    ], '标签数据');
+    expect(getSupplierForInventoryBinding).not.toHaveBeenCalled();
+    expect(jest.mocked(syncExcelToComputer).mock.calls[0][7]?.queryParams?.print_job_id).toBe('pair-1');
+  });
+
+  it('does not require a nonexistent internal child QR for a zero remainder', async () => {
+    const label = { inventoryCode: 'INV-1', inventoryName: '隔离芯片', specification: 'SOIC16-WB',
+      accountKey: 'shanghai-chipmunk' as const, warehouseName: '无锡总仓', warehouseCode: '001',
+      packageId: 'FULLSHIP000001', parentPackageId: 'PARENT00000001', quantity: 2000, revision: 1 };
+    const parentKey = internalLabelPackageKey(label.parentPackageId);
+    const shipped = { ...records[0], label_type: 'shipped', new_quantity: '2000',
+      package_key: internalLabelPackageKey(label.packageId), parent_package_key: parentKey,
+      source_qr: buildInternalLabel(label) } as UnpackRecord;
+    const remaining = { ...records[1], label_type: 'remaining', new_quantity: '0', parent_package_key: parentKey } as UnpackRecord;
+    jest.mocked(requireActiveInternalLabel).mockResolvedValueOnce(label);
+    await expect(submitUnpackRecordsToComputer([shipped, remaining], config)).resolves.toMatchObject({ status: 'submitted' });
+    expect(requireActiveInternalLabel).toHaveBeenCalledTimes(1);
+    expect(requireActiveInternalLabel).toHaveBeenCalledWith(shipped.source_qr);
+    expect(buildUnpackLabelSheet).toHaveBeenCalledWith([shipped], '标签数据');
   });
 
   it('requires a consistent single pair ID and confirmed native outcome', async () => {

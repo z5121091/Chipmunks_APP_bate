@@ -15,6 +15,7 @@ import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
 import { useHardwareBack } from '@/hooks/useHardwareBack';
+import { useDocumentTarget } from '@/hooks/useDocumentTarget';
 import { feedbackDeleted } from '@/utils/feedback';
 import {
   deleteInventoryCheckDocument,
@@ -22,6 +23,7 @@ import {
   DocumentSyncStatus,
   getInventoryCheckDocumentSummaries,
   getInventoryCheckRecordsByNo,
+  getInternalLabelSpecifications,
   InventoryCheckDocumentSummary,
   InventoryCheckRecord,
   updateInventoryCheckDocumentSyncStatus,
@@ -39,6 +41,7 @@ import {
 } from '@/utils/inventoryExport';
 import { STORAGE_KEYS, type SyncConfig } from '@/constants/config';
 import { safeJsonParseNullable } from '@/utils/json';
+import { isInternalLabelPackageKey } from '@/utils/internalLabelCode';
 import { createStyles } from './styles';
 
 type DetailMap = Record<string, InventoryCheckRecord[]>;
@@ -98,6 +101,7 @@ export default function InventoryRecordsScreen() {
   const pageSessionRef = useRef(0);
   const documentRequestRef = useRef(0);
   const [documents, setDocuments] = useState<InventoryCheckDocumentSummary[]>([]);
+  const [documentsLoaded, setDocumentsLoaded] = useState(false);
   const [detailsByKey, setDetailsByKey] = useState<DetailMap>({});
   const [expandedKeys, setExpandedKeysState] = useState<Set<string>>(new Set());
   const expandedKeysRef = useRef(new Set<string>());
@@ -164,6 +168,7 @@ export default function InventoryRecordsScreen() {
     if (!ownsPage()) return null;
     const requestId = ++documentRequestRef.current;
     const isCurrent = () => ownsPage() && documentRequestRef.current === requestId;
+    setDocumentsLoaded(false);
     if (!silent) {
       setRefreshing(asRefresh);
       setLoading(!asRefresh);
@@ -173,6 +178,7 @@ export default function InventoryRecordsScreen() {
       const rows = await getInventoryCheckDocumentSummaries(undefined, accountKey || undefined);
       if (!isCurrent()) return null;
       setDocuments(rows);
+      setDocumentsLoaded(true);
       return { rows, isCurrent };
     } catch {
       if (isCurrent()) showNotice('盘点记录加载失败', 'error');
@@ -208,19 +214,6 @@ export default function InventoryRecordsScreen() {
   const handleRefresh = useCallback(async () => {
     await loadDocuments(selectedAccountKey, true);
   }, [loadDocuments, selectedAccountKey]);
-
-  const handleAccountSelect = useCallback((accountKey: ErpAccountKey | null) => {
-    if (selectedAccountRef.current !== accountKey) {
-      selectedAccountRef.current = accountKey;
-      pageSessionRef.current += 1;
-      documentRequestRef.current += 1;
-    }
-    setSelectedAccountKey(accountKey);
-    setShowAccountPicker(false);
-    setExpandedKeys(new Set());
-    setExpandedDetailGroupKeys(new Set());
-    setDetailsByKey({});
-  }, [setExpandedKeys]);
 
   const toggleDocument = useCallback(async (item: InventoryCheckDocumentSummary) => {
     const ownsPage = capturePageOwner(selectedAccountRef.current);
@@ -264,6 +257,29 @@ export default function InventoryRecordsScreen() {
       });
     }
   }, [capturePageOwner, detailsByKey, setExpandedKeys, showNotice]);
+
+  const { clearTarget, visibleDocuments } = useDocumentTarget({
+    documents, ready: documentsLoaded, getKey: getDocumentKey,
+    isActive: () => pageActiveRef.current,
+    openDocument: item => {
+      if (!expandedKeysRef.current.has(getDocumentKey(item))) void toggleDocument(item);
+    },
+    onMissing: () => showNotice('该盘点单已删除或不存在，已显示现有记录', 'warning'),
+  });
+
+  const handleAccountSelect = useCallback((accountKey: ErpAccountKey | null) => {
+    clearTarget();
+    if (selectedAccountRef.current !== accountKey) {
+      selectedAccountRef.current = accountKey;
+      pageSessionRef.current += 1;
+      documentRequestRef.current += 1;
+    }
+    setSelectedAccountKey(accountKey);
+    setShowAccountPicker(false);
+    setExpandedKeys(new Set());
+    setExpandedDetailGroupKeys(new Set());
+    setDetailsByKey({});
+  }, [clearTarget, setExpandedKeys]);
 
   const reloadAfterDelete = useCallback(async (
     documentKey?: string,
@@ -403,6 +419,9 @@ export default function InventoryRecordsScreen() {
           showNotice('该盘点单没有可同步明细', 'warning');
           return;
         }
+        const packageKeys = records.map((record) => record.package_key).filter(isInternalLabelPackageKey);
+        const specifications = packageKeys.length ? await getInternalLabelSpecifications(packageKeys) : undefined;
+        if (!ownsPage()) return;
 
         const fileName = buildInventoryExportFileNameFromNo(
           item.warehouse_name,
@@ -411,6 +430,7 @@ export default function InventoryRecordsScreen() {
         );
         const exportRecords: InventoryExportRecord[] = records.map((record) => ({
           ...record,
+          internalSpecification: record.package_key ? specifications?.get(record.package_key) : undefined,
           account_name: record.erp_account_name || item.erp_account_name || '',
         }));
         const result = await syncExcelToComputer(
@@ -420,7 +440,8 @@ export default function InventoryRecordsScreen() {
           undefined,
           undefined,
           undefined,
-          fileName
+          fileName,
+          { warehouse: { id: item.warehouse_id, name: item.warehouse_name } },
         );
 
         try {
@@ -781,7 +802,7 @@ export default function InventoryRecordsScreen() {
         </View>
 
         <FlatList
-          data={documents}
+          data={visibleDocuments}
           keyExtractor={keyExtractor}
           renderItem={renderDocument}
           contentContainerStyle={[

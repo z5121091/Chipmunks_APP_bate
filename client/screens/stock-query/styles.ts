@@ -105,6 +105,10 @@ export const createStyles = (theme: Theme) => {
       color: theme.textPrimary,
       fontWeight: '800',
     },
+    queryTime: {
+      ...Typography.tiny,
+      color: theme.textMuted,
+    },
     queryBadge: {
       minHeight: 28,
       paddingHorizontal: 10,

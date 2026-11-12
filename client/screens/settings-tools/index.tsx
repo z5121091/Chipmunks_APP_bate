@@ -151,7 +151,7 @@ export default function SettingsToolsScreen() {
       }}><Feather name="arrow-left" size={22} color={theme.textPrimary} /></TouchableOpacity>
       <Text style={[styles.title, textStyle]}>{title}</Text>
     </View>
-    <KeyboardAwareFormScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" bottomOffset={Spacing.xl}>
+    <KeyboardAwareFormScrollView contentContainerStyle={[styles.content, mode === 'nas' && styles.nasContent]} keyboardShouldPersistTaps="handled" bottomOffset={Spacing.xl}>
       {!!error && <Text accessibilityRole="alert" style={[styles.paragraph, { color: theme.error }]}>{error}</Text>}
       {mode === 'sync' && <View style={[styles.connectionCard, { backgroundColor: theme.backgroundElevated, borderColor: theme.border }]}>
         <View style={[styles.connectionHeading, { borderBottomColor: theme.border }]}>
@@ -212,9 +212,14 @@ export default function SettingsToolsScreen() {
             <Text style={[styles.label, textStyle]}>{details ? '收起详细诊断' : '查看详细诊断'}</Text>
             <MotionChevron expanded={Boolean(details)} collapsed="down" size={18} color={theme.textSecondary} />
           </TouchableOpacity>
-          {<MotionCollapse open={Boolean(details)}>{details && diagnostic.rows.map(([label, value]) => <View key={label} style={[styles.diagnosticRow, { borderBottomColor: theme.border }]}>
-            <Text style={[styles.label, mutedStyle]}>{label}</Text><Text selectable style={[styles.value, textStyle]}>{value}</Text>
-          </View>)}</MotionCollapse>}
+          <MotionCollapse open={details} style={[styles.diagnosticCard, { backgroundColor: theme.backgroundElevated, borderColor: theme.border }]}>
+            {diagnostic.rows.map(([label, value], index) => (
+              <View key={label} style={[styles.diagnosticRow, index > 0 && { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.border }]}>
+                <Text style={[styles.diagnosticLabel, mutedStyle]}>{label}</Text>
+                <Text selectable style={[styles.diagnosticValue, textStyle]}>{value}</Text>
+              </View>
+            ))}
+          </MotionCollapse>
         </>}
         <ActionButton label={busy ? '刷新中…' : '刷新状态'} onPress={() => void refresh()} disabled={busy} />
       </>}
@@ -241,6 +246,7 @@ const styles = StyleSheet.create({
   back: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center', marginRight: 8 },
   title: { ...Typography.h4, flexShrink: 1 },
   content: { padding: Spacing.md, paddingBottom: 40, width: '100%', maxWidth: 640, alignSelf: 'center' },
+  nasContent: { maxWidth: 448, minWidth: 0 },
   status: { ...Typography.h4, marginBottom: 8 },
   paragraph: { ...Typography.small, lineHeight: 22, marginBottom: 16 },
   connectionCard: { borderWidth: 1, borderRadius: BorderRadius.xl, padding: 16 },
@@ -254,6 +260,8 @@ const styles = StyleSheet.create({
   button: { minHeight: 48, borderRadius: BorderRadius.md, padding: 12, alignItems: 'center', justifyContent: 'center', marginVertical: 12 },
   buttonText: { ...Typography.smallMedium },
   disclosure: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', borderWidth: 1, borderRadius: BorderRadius.md, padding: 12, minHeight: 48 },
-  diagnosticRow: { paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth },
-  value: { ...Typography.small, lineHeight: 22, marginTop: 4 },
+  diagnosticCard: { marginTop: Spacing.xs, paddingHorizontal: Spacing.sm, borderWidth: 1, borderRadius: BorderRadius.md },
+  diagnosticRow: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.sm, paddingVertical: Spacing.xs },
+  diagnosticLabel: { ...Typography.captionMedium, width: '35%', maxWidth: 88, minWidth: 0 },
+  diagnosticValue: { ...Typography.caption, flex: 1, minWidth: 0, lineHeight: 18 },
 });

@@ -2,6 +2,8 @@ import TestRenderer, { act } from 'react-test-renderer';
 import { ActivityIndicator, AppState, TextInput, TouchableOpacity, type AppStateStatus } from 'react-native';
 import { useIsFocused } from 'expo-router/react-navigation';
 import { WarehouseScanInput, type WarehouseScanInputHandle, type WarehouseScanInputProps } from '../WarehouseScanInput';
+import { useOverlayPresence } from '@/hooks/useOverlayActivity';
+import { GEEHY_SCAN_SAMPLES } from '@/utils/testFixtures/geehyScans';
 
 jest.mock('expo-router/react-navigation', () => ({ useIsFocused: jest.fn() }));
 jest.mock('@/hooks/useTheme', () => ({ useTheme: () => ({ theme: {} }) }));
@@ -10,6 +12,136 @@ jest.mock('react-native', () => Object.create(jest.requireActual('react-native')
   TextInput: { value: 'Input' },
   Platform: { value: { ...jest.requireActual('react-native').Platform, OS: 'android' } },
 }));
+
+it('discards buffered native boundaries on an explicit account or session reset', async () => {
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  jest.mocked(useIsFocused).mockReturnValue(true);
+  const inputRef = { current: null as WarehouseScanInputHandle | null };
+  const submit = jest.fn();
+  let root: TestRenderer.ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      root = TestRenderer.create(<WarehouseScanInput inputRef={inputRef} autoFocus={false}
+        actionLabel="Scan" onActionPress={jest.fn()} onChangeText={jest.fn()} onSubmitEditing={submit} />,
+      { createNodeMock: node => node.type === TextInput ? { clear: jest.fn(), isFocused: () => false } : null });
+    });
+    const input = () => root!.root.findByType(TextInput).props;
+    const [previous, sample] = GEEHY_SCAN_SAMPLES;
+    await act(async () => {
+      input().onChange({ nativeEvent: { text: previous.raw.slice(0, -8), eventCount: 1 } });
+      input().onChangeText(previous.raw.slice(0, -8));
+      input().onSubmitEditing({ nativeEvent: { text: previous.raw } });
+      input().onSubmitEditing({ nativeEvent: { text: sample.raw } });
+    });
+    submit.mockClear();
+    await act(async () => { inputRef.current!.clear({ discardPendingSubmits: true }); });
+    await act(async () => {
+      input().onChange({ nativeEvent: { text: sample.raw, eventCount: 2 } });
+      input().onChangeText(sample.raw);
+    });
+    expect(submit).not.toHaveBeenCalled();
+    // A new scan of the same label in the new account can still submit normally.
+    await act(async () => { input().onSubmitEditing({ nativeEvent: { text: sample.raw } }); });
+    expect(submit).toHaveBeenCalledTimes(1);
+  } finally {
+    if (root) await act(async () => root!.unmount());
+  }
+});
+
+it('retains an early native Submit until its full change arrives for 30 distinct Geehy packs', async () => {
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  jest.mocked(useIsFocused).mockReturnValue(true);
+  const inputRef = { current: null as WarehouseScanInputHandle | null };
+  const saved: string[] = [];
+  let pending = '';
+  let root: TestRenderer.ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      root = TestRenderer.create(<WarehouseScanInput inputRef={inputRef} autoFocus={false}
+        actionLabel="Scan" onActionPress={jest.fn()}
+        onChangeText={text => { pending = text; }}
+        onSubmitEditing={event => {
+          if (!pending || pending !== event.nativeEvent.text) return;
+          saved.push(pending); pending = ''; inputRef.current!.clear();
+        }} />, { createNodeMock: node => node.type === TextInput ? { clear: jest.fn(), isFocused: () => false } : null });
+    });
+    let count = 0;
+    for (const sample of GEEHY_SCAN_SAMPLES) {
+      const input = () => root!.root.findByType(TextInput).props;
+      await act(async () => { input().onSubmitEditing({ nativeEvent: { text: sample.raw } }); });
+      await act(async () => {
+        input().onChange({ nativeEvent: { text: sample.raw, eventCount: ++count } });
+        input().onChangeText(sample.raw);
+      });
+      expect(pending).toBe('');
+      expect(saved.at(-1)).toBe(sample.raw);
+      // A second native Enter for this consumed frame cannot create another save.
+      await act(async () => { input().onSubmitEditing({ nativeEvent: { text: sample.raw } }); });
+    }
+    expect(saved).toEqual(GEEHY_SCAN_SAMPLES.map(sample => sample.raw));
+  } finally {
+    if (root) await act(async () => root!.unmount());
+  }
+});
+
+it.each(['partial', 'two-ahead', 'change-clears'] as const)('keeps native boundaries safe when %s events arrive out of order', async mode => {
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  jest.mocked(useIsFocused).mockReturnValue(true);
+  const inputRef = { current: null as WarehouseScanInputHandle | null };
+  let current = '';
+  const saved: string[] = [];
+  const persist = () => { saved.push(current); current = ''; inputRef.current!.clear(); };
+  let root: TestRenderer.ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      root = TestRenderer.create(<WarehouseScanInput inputRef={inputRef} autoFocus={false}
+        actionLabel="Scan" onActionPress={jest.fn()}
+        onChangeText={text => { current = text; if (mode === 'change-clears') persist(); }}
+        onSubmitEditing={event => { if (current && current === event.nativeEvent.text) persist(); }} />,
+      { createNodeMock: node => node.type === TextInput ? { clear: jest.fn(), isFocused: () => false } : null });
+    });
+    const [a, b] = GEEHY_SCAN_SAMPLES;
+    const input = () => root!.root.findByType(TextInput).props;
+    let count = 0;
+    const change = async (text: string) => act(async () => {
+      input().onChange({ nativeEvent: { text, eventCount: ++count } });
+      input().onChangeText(text);
+    });
+    if (mode === 'partial') await change(a.raw.slice(0, -8));
+    await act(async () => { input().onSubmitEditing({ nativeEvent: { text: a.raw } }); });
+    if (mode === 'two-ahead') await act(async () => { input().onSubmitEditing({ nativeEvent: { text: b.raw } }); });
+    await change(a.raw);
+    expect(saved).toEqual([a.raw]);
+    if (mode === 'two-ahead') {
+      await change(b.raw);
+      expect(saved).toEqual([a.raw, b.raw]);
+    } else if (mode === 'partial') {
+      await change(b.raw.slice(0, 7));
+      // The previous Enter must not turn the second pack's prefix into a frame.
+      await act(async () => { input().onSubmitEditing({ nativeEvent: { text: a.raw } }); });
+      expect(saved).toEqual([a.raw]);
+      await change(b.raw);
+      await act(async () => { input().onSubmitEditing({ nativeEvent: { text: b.raw } }); });
+      expect(saved).toEqual([a.raw, b.raw]);
+      // Separate no-trace/identical physical packs still have fresh native events.
+      await change(b.raw);
+      await act(async () => { input().onSubmitEditing({ nativeEvent: { text: b.raw } }); });
+      expect(saved).toEqual([a.raw, b.raw, b.raw]);
+      // The next identical physical pack can also deliver Submit before change.
+      await act(async () => { input().onSubmitEditing({ nativeEvent: { text: b.raw } }); });
+      // Re-delivery of the consumed event is still stale, even with a candidate Submit.
+      await act(async () => {
+        input().onChange({ nativeEvent: { text: b.raw, eventCount: count } });
+        input().onChangeText(b.raw);
+      });
+      expect(saved).toHaveLength(3);
+      await change(b.raw);
+      expect(saved).toEqual([a.raw, b.raw, b.raw, b.raw]);
+    }
+  } finally {
+    if (root) await act(async () => root!.unmount());
+  }
+});
 
 it('rejects native snapshots from a consumed scan without dropping a fresh identical package', async () => {
   jest.useFakeTimers();
@@ -220,6 +352,84 @@ it('coalesces repeated focus requests, keeps the caret on repeated scans, and pa
     await render();
     await tick();
     expect(focus).toHaveBeenCalledTimes(5);
+  } finally {
+    if (root) await act(async () => { root!.unmount(); });
+    subscription.mockRestore();
+    AppState.currentState = originalState;
+    jest.useRealTimers();
+  }
+});
+
+it('hands scanner focus to a shown modal while the page scanner remains blocked', async () => {
+  jest.useFakeTimers();
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  jest.mocked(useIsFocused).mockReturnValue(true);
+  const originalState = AppState.currentState;
+  AppState.currentState = 'active';
+  const subscription = jest.spyOn(AppState, 'addEventListener').mockImplementation(() => ({ remove: jest.fn() }));
+  const reprintFocus = jest.fn();
+  const stockCodeFocus = jest.fn();
+  const action = jest.fn();
+  let root: TestRenderer.ReactTestRenderer | undefined;
+
+  function ScannerPair({ dialogOpen, dialogShown }: { dialogOpen: boolean; dialogShown: boolean }) {
+    useOverlayPresence(dialogOpen);
+    return <>
+      <WarehouseScanInput accessibilityLabel="Reprint" actionLabel="Reprint" onActionPress={action} />
+      {dialogOpen && <WarehouseScanInput accessibilityLabel="Stock code" actionLabel="Lookup" onActionPress={action}
+        focusInModal autoFocus={dialogShown} />}
+    </>;
+  }
+
+  const render = async (dialogOpen: boolean, dialogShown = false) => {
+    await act(async () => {
+      const element = <ScannerPair dialogOpen={dialogOpen} dialogShown={dialogShown} />;
+      if (root) root.update(element);
+      else root = TestRenderer.create(element, { createNodeMock: node => node.type === TextInput ? {
+        focus: node.props.accessibilityLabel === 'Reprint' ? reprintFocus : stockCodeFocus,
+        isFocused: () => false,
+      } : null });
+    });
+  };
+  const emit = async (type: 'blur' | 'change', state: AppStateStatus) => {
+    await act(async () => {
+      for (const [event, handler] of subscription.mock.calls) {
+        if (event === type) handler(state);
+      }
+    });
+  };
+  const tick = async () => { await act(async () => { jest.advanceTimersByTime(200); }); };
+
+  try {
+    await render(false);
+    await tick();
+    expect(reprintFocus).toHaveBeenCalledTimes(1);
+    reprintFocus.mockClear();
+
+    await render(true);
+    await emit('blur', 'active');
+    await tick();
+    expect(reprintFocus).not.toHaveBeenCalled();
+    expect(stockCodeFocus).not.toHaveBeenCalled();
+
+    await render(true, true);
+    await tick();
+    expect(stockCodeFocus).toHaveBeenCalledTimes(1);
+    expect(reprintFocus).not.toHaveBeenCalled();
+    stockCodeFocus.mockClear();
+
+    jest.mocked(useIsFocused).mockReturnValue(false);
+    await render(true, true);
+    await emit('change', 'active');
+    await tick();
+    expect(stockCodeFocus).not.toHaveBeenCalled();
+
+    AppState.currentState = 'background';
+    jest.mocked(useIsFocused).mockReturnValue(true);
+    await render(true, true);
+    await tick();
+    expect(stockCodeFocus).not.toHaveBeenCalled();
+    expect(reprintFocus).not.toHaveBeenCalled();
   } finally {
     if (root) await act(async () => { root!.unmount(); });
     subscription.mockRestore();

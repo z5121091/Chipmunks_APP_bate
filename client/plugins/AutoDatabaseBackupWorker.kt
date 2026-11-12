@@ -332,7 +332,7 @@ class AutoDatabaseBackupWorker(
     // database snapshot/upload/status steps must still run one at a time.
     if (!backupInProgress.compareAndSet(false, true)) {
       Log.i(TAG, "Another database backup is running; retry this work later")
-      return Result.retry()
+      return retryWithinLimit()
     }
     return try {
       val today = AutoDatabaseBackupScheduler.todayBeijing()
@@ -422,10 +422,20 @@ class AutoDatabaseBackupWorker(
         "workmanager",
         errorMessage = error.message ?: "Unknown error"
       )
-      Result.retry()
+      retryWithinLimit()
     } finally {
       backupInProgress.set(false)
     }
+  }
+
+  private fun retryWithinLimit(): Result {
+    if (runAttemptCount < MAX_RETRY_COUNT) {
+      return Result.retry()
+    }
+    // Only finish this execution. Periodic work, the daily alarm and app startup
+    // remain scheduled, so NAS recovery can trigger a fresh backup later.
+    Log.w(TAG, "Auto database backup retry limit reached for this execution")
+    return Result.failure()
   }
 
   private fun hasBusinessData(databaseFile: File): Boolean {
@@ -433,10 +443,13 @@ class AutoDatabaseBackupWorker(
     val businessTables = listOf(
       "出库单",
       "出库明细",
-      "入库记录",
-      "盘点记录",
       "拆包记录",
-      "销售退货记录"
+      "内部标签包装",
+      "销售退货记录",
+      "物料绑定",
+      "物料绑定版本",
+      "入库记录",
+      "盘点记录"
     )
 
     SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
@@ -670,6 +683,7 @@ class AutoDatabaseBackupWorker(
 
   companion object {
     private const val TAG = "AutoDbBackup"
+    private const val MAX_RETRY_COUNT = 3
     private val DEFAULT_UPDATE_SERVER = BuildConfig.UPDATE_SERVER_URL
     private val backupInProgress = AtomicBoolean(false)
   }

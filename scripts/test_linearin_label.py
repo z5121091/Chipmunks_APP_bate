@@ -104,13 +104,14 @@ class LinearinLabelTest(unittest.TestCase):
                 self.assertIn((112, 230, quantity, False), captured['text'])
                 self.assertEqual(record, before)
 
-    def test_reprint_preserves_cr_lf_crlf_and_optional_terminal_line_break(self):
-        for separator in ('\r', '\n', '\r\n'):
-            for terminal in ('', separator):
-                raw = SAMPLE_QR.replace('\r', separator) + terminal
-                with self.subTest(separator=repr(separator), terminal=repr(terminal)):
-                    _commands, captured = capture_label(make_record(), source_qr=raw)
-                    self.assertEqual(captured['payload'].encode('ascii'), raw.encode('ascii'))
+    def test_reprint_preserves_line_break_variants_and_comma_separator(self):
+        cases = [(separator, terminal) for separator in ('\r', '\n', '\r\n')
+                 for terminal in ('', separator)] + [(',', '')]
+        for separator, terminal in cases:
+            raw = SAMPLE_QR.replace('\r', separator) + terminal
+            with self.subTest(separator=repr(separator), terminal=repr(terminal)):
+                _commands, captured = capture_label(make_record(), source_qr=raw)
+                self.assertEqual(captured['payload'].encode('ascii'), raw.encode('ascii'))
 
     def test_numeric_quantity_equivalence_preserves_original_quantity_spelling_on_reprint(self):
         raw = SAMPLE_QR.replace('QTY:4000\r', 'QTY:04000\r')
@@ -134,25 +135,27 @@ class LinearinLabelTest(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, name):
                 capture_label(make_record(**{key: '3999' if key == 'quantity' else 'OTHER'}), SAMPLE_QR)
 
-    def test_wrong_prefix_or_swapped_line_reports_expected_position_without_echoing_raw(self):
+    def test_wrong_prefix_or_swapped_field_reports_expected_position_without_echoing_raw(self):
         for index, prefix in enumerate(PREFIXES):
             lines = SAMPLE_QR.split('\r')
             lines[index] = 'SECRET:' + lines[index][len(prefix):]
             with self.subTest(index=index), self.assertRaisesRegex(
-                ValueError, rf'第{index + 1}行应以{re.escape(prefix)}开头',
+                ValueError, rf'^先积原始二维码第{index + 1}个字段应以{re.escape(prefix)}开头，请核对该字段和解析规则$',
             ) as error:
                 capture_label(make_record(), '\r'.join(lines))
             self.assertNotIn('SECRET', str(error.exception))
             self.assertEqual(server.get_safe_reprint_template_error(error.exception), str(error.exception))
         lines = SAMPLE_QR.split('\r')
         lines[3], lines[4] = lines[4], lines[3]
-        with self.assertRaisesRegex(ValueError, '第4行应以D/C:开头'):
+        with self.assertRaisesRegex(ValueError, '^先积原始二维码第4个字段应以D/C:开头，请核对该字段和解析规则$'):
             capture_label(make_record(), '\r'.join(lines))
 
     def test_missing_extra_and_literal_backslash_lines_are_rejected(self):
         for raw in (SAMPLE_QR.rsplit('\r', 1)[0], SAMPLE_QR + '\rEXTRA:1',
                     SAMPLE_QR.replace('\r', '\\'), SAMPLE_QR.replace('\r', '\r\r')):
-            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, '六个字段'):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                ValueError, '^先积原始二维码须包含完整的六个字段（支持换行或逗号分隔）$',
+            ):
                 capture_label(make_record(), raw)
 
     def test_invalid_quantities_and_missing_model_stop_before_building_qr(self):
@@ -229,7 +232,7 @@ class LinearinLabelTest(unittest.TestCase):
                     self.assertIsNone(crop.crop(bounds).getbbox())
 
     def test_diagnostics_remain_specific_and_missing_logo_names_the_new_resource(self):
-        for error in (ValueError('先积原始二维码须包含完整的六行字段'),
+        for error in (ValueError('先积原始二维码须包含完整的六个字段（支持换行或逗号分隔）'),
                       ValueError('先积标签缺少型号'), ValueError('先积标签数量须为有效的正整数'),
                       ValueError('先积原始二维码版本号与解析结果不一致，请核对该字段和解析规则')):
             self.assertEqual(server.get_safe_reprint_template_error(error), str(error))
@@ -250,7 +253,7 @@ class LinearinLabelTest(unittest.TestCase):
             ))
             self.assertFalse(receipt['success'])
             self.assertEqual(receipt['code'], 'INVALID_LABEL_CONTENT')
-            self.assertIn('第5行应以LOT:开头', receipt['message'])
+            self.assertEqual(receipt['message'], '先积原始二维码第5个字段应以LOT:开头，请核对该字段和解析规则')
             self.assertNotIn('SECRET', repr(receipt))
             self.assertNotIn(raw, repr(server.EPHEMERAL_REPRINT_JOBS))
             spool.assert_not_called()

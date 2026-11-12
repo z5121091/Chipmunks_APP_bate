@@ -9,6 +9,7 @@ import {
 import { migrateLegacyRuleFields } from './legacyRuleFields';
 import { parseQuantity } from './quantity';
 import { stripRuleTerminator } from './ruleTerminator';
+import { bindingMatchesVersion, getBindingVersions } from './bindingVersions';
 
 export interface RuleDiagnosticIssue {
   id: string;
@@ -266,9 +267,8 @@ export const analyzeRuleSample = (
     const fields = parseWithRule(content, rule).standardFields;
     const modelKey = key(fields.model);
     const matchingModels = modelKey ? bindingsByModel.get(modelKey) ?? [] : [];
-    const version = key(fields.version);
-    const exact = matchingModels.filter(binding => key(binding.version) === version);
-    const generic = matchingModels.filter(binding => !key(binding.version));
+    const exact = matchingModels.filter(binding => bindingMatchesVersion(binding, fields.version));
+    const generic = matchingModels.filter(binding => getBindingVersions(binding).length === 0);
     const rows = exact.length ? exact : generic;
     const binding = inspection.matched && rows.length === 1 ? rows[0] : null;
     const bindingMatch: RuleSampleCandidate['bindingMatch'] = !inspection.matched || !rows.length ? 'none'

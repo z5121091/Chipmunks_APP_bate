@@ -324,6 +324,29 @@ export const createStyles = (theme: Theme) => {
       borderColor: theme.border,
       minHeight: 44,
     },
+    versionInputs: {
+      gap: Spacing.xs,
+    },
+    versionInputRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.xs,
+    },
+    versionInput: {
+      flex: 1,
+      minWidth: 0,
+    },
+    versionAction: {
+      width: 44,
+      height: 44,
+      flexShrink: 0,
+      borderRadius: BorderRadius.lg,
+      borderWidth: BorderWidth.normal,
+      borderColor: theme.border,
+      backgroundColor: theme.backgroundTertiary,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
     supplierPicker: {
       flexDirection: 'row',
       alignItems: 'center',

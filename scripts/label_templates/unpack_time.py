@@ -1,24 +1,12 @@
 import datetime
-import os
-from functools import lru_cache
 
 from .common import (
     NATIVE_LABEL_FONT_SIZE_PIXELS,
     NATIVE_LABEL_WIDTH_DOTS,
     build_native_text_bitmap,
     get_excel_cell_text,
+    get_native_chinese_font as get_unpack_time_font,
 )
-
-
-@lru_cache(maxsize=32)
-def get_unpack_time_font(bold=False, size_pixels=NATIVE_LABEL_FONT_SIZE_PIXELS):
-    from PIL import ImageFont
-
-    windows_root = os.environ.get('WINDIR') or os.environ.get('SystemRoot') or 'C:/Windows'
-    font_path = os.path.join(windows_root, 'Fonts', 'msyhbd.ttc' if bold else 'msyh.ttc')
-    if not os.path.isfile(font_path):
-        raise RuntimeError('未找到微软雅黑字体，无法打印中文拆包时间标签')
-    return ImageFont.truetype(font_path, size_pixels)
 
 
 def format_unpack_time(value):

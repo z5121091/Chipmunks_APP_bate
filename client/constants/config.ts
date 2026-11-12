@@ -17,8 +17,10 @@ export const STORAGE_KEYS = {
   OUTBOUND_ORDER_RULE: '@settings_outbound_order_rule',
   OUTBOUND_WAREHOUSE_ORDER_RULES: '@settings_outbound_warehouse_order_rules',
 
-  // 当前仓库选择（盘点、出库、单据管理共享）
+  // 当前仓库选择（盘点、出库等作业共享）
   GLOBAL_WAREHOUSE: '@global_current_warehouse',
+  // 出库订单查询独立保存，不改变扫码作业的仓库。
+  ORDERS_WAREHOUSE: '@orders_current_warehouse',
 
   // 扫码出库作业草稿和兼容旧版草稿的暂存键
   OUTBOUND_WORK_DRAFT: '@outbound_work_draft',

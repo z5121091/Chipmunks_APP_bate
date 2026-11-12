@@ -151,11 +151,12 @@ export const createStyles = (theme: Theme) => {
     // 搜索类型按钮（统一风格）
     searchTypeBtn: {
       flex: 1,
+      minWidth: 0,
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'center',
       paddingVertical: Spacing.xs + 1,
-      paddingHorizontal: Spacing.xs,
+      paddingHorizontal: isCompactScreen ? 4 : Spacing.xs,
       borderRadius: UI_REDESIGN_TOKENS.radius.control,
       backgroundColor: theme.backgroundDefault,
       borderWidth: BorderWidth.normal,
@@ -172,6 +173,7 @@ export const createStyles = (theme: Theme) => {
     searchTypeText: {
       ...Typography.captionMedium,
       color: theme.textSecondary,
+      flexShrink: 1,
     },
     searchTypeTextActive: {
       color: theme.buttonPrimaryText,
@@ -225,6 +227,8 @@ export const createStyles = (theme: Theme) => {
     orderNo: {
       ...Typography.smallMedium,
       color: theme.textPrimary,
+    },
+    orderNoTarget: {
       flex: 1,
       marginRight: Spacing.xs,
     },
@@ -297,7 +301,6 @@ export const createStyles = (theme: Theme) => {
     batchRow: { flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 44, paddingVertical: 8, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.border },
     batchCell: { flex: 1, minWidth: 0, fontSize: rf(12), fontWeight: '700', color: theme.textPrimary },
     batchQuantity: { flex: 0.8, textAlign: 'right', fontSize: rf(14), fontWeight: '700', color: theme.textPrimary },
-    batchMatch: { backgroundColor: withAlpha(theme.primary, 0.08) },
     materialModel: {
       fontSize: rf(12),
       fontWeight: '700',

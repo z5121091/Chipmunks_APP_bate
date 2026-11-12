@@ -66,11 +66,11 @@ describe('feedback speech scheduling', () => {
 
     expect(Speech.stop).not.toHaveBeenCalled();
     expect(Speech.speak).toHaveBeenCalledWith(
-      '扫码成功',
+      '成功',
       expect.objectContaining({
         language: 'zh-CN',
         pitch: 1,
-        rate: 1,
+        rate: 1.3,
       })
     );
 
@@ -84,6 +84,7 @@ describe('feedback speech scheduling', () => {
       '开始入库',
       expect.objectContaining({
         language: 'zh-CN',
+        rate: 1,
       })
     );
     expect(
@@ -104,6 +105,7 @@ describe('feedback speech scheduling', () => {
     expect(jest.mocked(Speech.speak).mock.calls.map(([text]) => text)).toEqual([
       '查询成功', '查询成功', '未绑定', '查询失败', '已清空', '清空失败',
     ]);
+    expect(jest.mocked(Speech.speak).mock.calls.map(([, options]) => options?.rate)).toEqual([1, 1, 1, 1, 1, 1]);
   });
 
   it('announces every unpack stage without stopping or deduplicating scan feedback', async () => {
@@ -113,7 +115,7 @@ describe('feedback speech scheduling', () => {
     await feedbackUnpackRequired();
     await feedbackUnpackComplete();
     expect(jest.mocked(Speech.speak).mock.calls.map(([text]) => text)).toEqual([
-      '扫码成功', '需要拆包', '拆包完成', '需要拆包', '拆包完成',
+      '成功', '需要拆包', '拆包完成', '需要拆包', '拆包完成',
     ]);
     expect(Speech.stop).not.toHaveBeenCalled();
   });
@@ -159,6 +161,16 @@ describe('feedback speech scheduling', () => {
     expect(Speech.stop).toHaveBeenCalledTimes(2);
   });
 
+  it('speaks the order status and archive warehouse as a single utterance', async () => {
+    await feedbackOutboundOrderReady('loaded', '苏州仓库');
+    await feedbackOutboundOrderReady('switched', 'B仓');
+    await feedbackSalesReturnOrderReady('complete', 'B仓');
+
+    expect(jest.mocked(Speech.speak).mock.calls.map(([text]) => text)).toEqual([
+      '订单已载入，苏州仓库', '切换订单，B仓', '本单退货已收齐，B仓',
+    ]);
+  });
+
   it('uses dedicated return messages and announces a completed save only once', async () => {
     await feedbackSalesReturnOrderReady('loaded');
     await feedbackSalesReturnOrderReady('switched');
@@ -168,8 +180,9 @@ describe('feedback speech scheduling', () => {
     await feedbackSalesReturnSaved(true);
     expect(jest.mocked(Speech.speak).mock.calls.map(([text]) => text)).toEqual([
       '销售退货单已载入', '切换退货单', '当前退货单，请继续扫码', '本单退货已收齐',
-      '退货扫码成功', '本单退货已收齐',
+      '成功', '本单退货已收齐',
     ]);
+    expect(jest.mocked(Speech.speak).mock.calls.map(([, options]) => options?.rate)).toEqual([1, 1, 1, 1, 1.3, 1]);
     expect(Speech.stop).toHaveBeenCalledTimes(5);
   });
 
@@ -282,7 +295,7 @@ describe('feedback with delayed native operations', () => {
     expect(speech.stop).toHaveBeenCalledTimes(3);
   });
 
-  it('clears queued native successes when a later scan fails', async () => {
+  it('bounds queued successes and clears the pending success when a later scan fails', async () => {
     const nativeQueue: string[] = [];
     jest.mocked(speech.speak).mockImplementation((text, options) => {
       nativeQueue.push(text);
@@ -292,15 +305,197 @@ describe('feedback with delayed native operations', () => {
 
     const first = feedback.feedbackSuccess();
     const second = feedback.feedbackSuccess();
-    await jest.runAllTimersAsync();
+    await jest.advanceTimersByTimeAsync(3000);
     await Promise.all([first, second]);
-    expect(nativeQueue).toEqual(['扫码成功', '扫码成功']);
+    expect(nativeQueue).toEqual(['成功']);
 
     const error = feedback.feedbackError('保存失败，请重扫');
     await jest.runAllTimersAsync();
     await error;
     expect(nativeQueue).toEqual(['保存失败，请重扫']);
   });
+
+  it('coalesces a fast batch into one active and one pending success while vibrating for every saved pack', async () => {
+    const done: (() => void)[] = [];
+    jest.mocked(speech.speak).mockImplementation((_text, options) => {
+      options?.onStart?.();
+      done.push(() => options?.onDone?.());
+    });
+    const saves = Array.from({ length: 40 }, (_, index) => index % 2
+      ? feedback.feedbackSalesReturnSaved(false) : feedback.feedbackSuccess());
+    await jest.advanceTimersByTimeAsync(200);
+    expect(speech.speak).toHaveBeenCalledTimes(1);
+    expect(jest.mocked(haptics.notificationAsync).mock.calls.length +
+      jest.mocked(haptics.performAndroidHapticsAsync).mock.calls.length).toBe(40);
+    expect(speech.stop).not.toHaveBeenCalled();
+
+    // The caller's wait can expire while the native playback slot remains occupied.
+    await jest.advanceTimersByTimeAsync(3000);
+    await Promise.all(saves);
+    expect(speech.speak).toHaveBeenCalledTimes(1);
+
+    done[0]();
+    await jest.advanceTimersByTimeAsync(200);
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+    done[1]();
+    await jest.runAllTimersAsync();
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+    expect(speech.stop).not.toHaveBeenCalled();
+    expect(jest.mocked(speech.speak).mock.calls.map(([text, options]) => [text, options?.rate]))
+      .toEqual([['成功', 1.3], ['成功', 1.3]]);
+  });
+
+  it('recovers a missing native completion after stopping the old playback and ignores its late callbacks', async () => {
+    const stop = deferred<void>();
+    const callbacks: Parameters<typeof speech.speak>[1][] = [];
+    jest.mocked(speech.stop).mockReturnValueOnce(stop.promise);
+    jest.mocked(speech.speak).mockImplementation((_text, options) => {
+      options?.onStart?.();
+      callbacks.push(options);
+    });
+
+    void feedback.feedbackSuccess();
+    void feedback.feedbackSuccess();
+    await jest.advanceTimersByTimeAsync(4900);
+    expect(speech.speak).toHaveBeenCalledTimes(1);
+    expect(speech.stop).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(600);
+    expect(speech.stop).toHaveBeenCalledTimes(1);
+    expect(speech.speak).toHaveBeenCalledTimes(1);
+
+    stop.resolve(undefined);
+    await jest.advanceTimersByTimeAsync(500);
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+    void feedback.feedbackSuccess();
+    callbacks[0]?.onDone?.();
+    callbacks[0]?.onStopped?.();
+    await jest.advanceTimersByTimeAsync(500);
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+    callbacks[1]?.onDone?.();
+    await jest.advanceTimersByTimeAsync(500);
+    expect(speech.speak).toHaveBeenCalledTimes(3);
+    callbacks[2]?.onDone?.();
+    await jest.advanceTimersByTimeAsync(5500);
+    expect(speech.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('reserves a playback slot during slow warmup instead of submitting every saved pack afterward', async () => {
+    const voices = deferred<Speech.Voice[]>();
+    const done: (() => void)[] = [];
+    jest.mocked(speech.getAvailableVoicesAsync).mockImplementationOnce(() => voices.promise);
+    jest.mocked(speech.speak).mockImplementation((_text, options) => {
+      options?.onStart?.();
+      done.push(() => options?.onDone?.());
+    });
+    const saves = Array.from({ length: 20 }, () => feedback.feedbackSuccess());
+    await jest.advanceTimersByTimeAsync(8000);
+    await Promise.all(saves);
+    expect(speech.speak).not.toHaveBeenCalled();
+    voices.resolve([]);
+    await jest.advanceTimersByTimeAsync(200);
+    expect(speech.speak).toHaveBeenCalledTimes(1);
+    done[0]();
+    await jest.advanceTimersByTimeAsync(200);
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+    done[1]();
+  });
+
+  it('waits for an already-playing order completion before stopping a stalled success', async () => {
+    const recoveryStop = deferred<void>();
+    jest.mocked(speech.stop).mockResolvedValueOnce(undefined).mockReturnValueOnce(recoveryStop.promise);
+    const callbacks: Parameters<typeof speech.speak>[1][] = [];
+    jest.mocked(speech.speak).mockImplementation((_text, options) => {
+      options?.onStart?.();
+      callbacks.push(options);
+    });
+    void feedback.feedbackOutboundOrderComplete();
+    await jest.advanceTimersByTimeAsync(500);
+    expect(speech.stop).toHaveBeenCalledTimes(1);
+    void feedback.feedbackSuccess();
+    void feedback.feedbackSuccess();
+    void feedback.feedbackOutboundOrderReady('loaded');
+    await jest.advanceTimersByTimeAsync(5500);
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+    expect(speech.stop).toHaveBeenCalledTimes(1);
+
+    callbacks[0]?.onDone?.();
+    await jest.advanceTimersByTimeAsync(500);
+    expect(speech.stop).toHaveBeenCalledTimes(2);
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+    recoveryStop.resolve(undefined);
+    await jest.advanceTimersByTimeAsync(500);
+    expect(jest.mocked(speech.speak).mock.calls.slice(2).map(([text]) => text).sort())
+      .toEqual(['成功', '订单已载入'].sort());
+    callbacks[2]?.onDone?.();
+    callbacks[3]?.onDone?.();
+  });
+
+  it('clears pending scan speech on a native submission failure and accepts a later fresh success', async () => {
+    jest.mocked(speech.speak).mockImplementationOnce(() => { throw new Error('TTS unavailable'); });
+    const saves = Array.from({ length: 10 }, () => feedback.feedbackSuccess());
+    await jest.advanceTimersByTimeAsync(3000);
+    await Promise.all(saves);
+    expect(speech.speak).toHaveBeenCalledTimes(1);
+    expect(speech.stop).toHaveBeenCalledTimes(1);
+    const fresh = feedback.feedbackSuccess();
+    await jest.runAllTimersAsync();
+    await fresh;
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['done', 'stopped', 'error'] as const)('releases the scan slot on native %s and ignores a repeated old callback', async outcome => {
+    const end: (() => void)[] = [];
+    jest.mocked(speech.speak).mockImplementation((_text, options) => {
+      options?.onStart?.();
+      end.push(() => {
+        if (outcome === 'done') options?.onDone?.();
+        else if (outcome === 'stopped') options?.onStopped?.();
+        else options?.onError?.(new Error('native TTS error'));
+      });
+    });
+    void feedback.feedbackSuccess();
+    void feedback.feedbackSuccess();
+    await jest.advanceTimersByTimeAsync(200);
+    end[0]();
+    await jest.advanceTimersByTimeAsync(500);
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+    void feedback.feedbackSuccess();
+    end[0]();
+    await jest.advanceTimersByTimeAsync(500);
+    expect(speech.speak).toHaveBeenCalledTimes(2);
+    end[1]();
+    await jest.advanceTimersByTimeAsync(500);
+    expect(speech.speak).toHaveBeenCalledTimes(3);
+    end[2]();
+  });
+
+  it.each(['error', 'warning', 'complete', 'order', 'sound-off', 'inactive', 'cleanup'] as const)(
+    'discards old active and pending successes on %s without reviving them on late native callbacks',
+    async outcome => {
+      const done: (() => void)[] = [];
+      jest.mocked(speech.speak).mockImplementation((_text, options) => {
+        options?.onStart?.();
+        done.push(() => options?.onDone?.());
+      });
+      const oldSaves = [feedback.feedbackSuccess(), feedback.feedbackSuccess(), feedback.feedbackSuccess()];
+      await jest.advanceTimersByTimeAsync(200);
+      const replacement = outcome === 'error' ? feedback.feedbackError('保存失败，请重扫')
+        : outcome === 'warning' ? feedback.feedbackWarning('请先核对')
+        : outcome === 'complete' ? feedback.feedbackOutboundOrderComplete()
+        : outcome === 'order' ? feedback.feedbackOutboundOrderReady('switched')
+        : outcome === 'inactive' ? feedback.pauseFeedbackForAppInactive()
+        : outcome === 'cleanup' ? feedback.cleanupSounds()
+        : feedback.setSoundEnabled(false);
+      await jest.advanceTimersByTimeAsync(3000);
+      await Promise.all([...oldSaves, replacement]);
+      expect(speech.stop).toHaveBeenCalledTimes(1);
+      done[0]();
+      done[0]();
+      await jest.advanceTimersByTimeAsync(500);
+      expect(jest.mocked(speech.speak).mock.calls.filter(([text]) => text === '成功')).toHaveLength(1);
+      done.slice(1).forEach(finish => finish());
+    }
+  );
 
   it('announces a new event even when it has the same wording as the current priority speech', async () => {
     jest.mocked(speech.speak).mockImplementation((_text, options) => { options?.onStart?.(); });

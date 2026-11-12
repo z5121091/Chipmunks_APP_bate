@@ -5,8 +5,15 @@ import { UiListItem } from '@/components/UiRedesign';
 import { MotionCollapse } from '@/components/AppMotion';
 
 // Keep the actual settings groups and shared disclosure/button components.
-// Native storage, network checks and navigation are outside this regression.
-jest.mock('expo-router', () => ({ useFocusEffect: jest.fn() }));
+// Stub navigation without starting native storage and network checks.
+let mockBlurListener: (() => void) | undefined;
+const mockNavigation = {
+  addListener: (event: string, listener: () => void) => {
+    if (event === 'blur') mockBlurListener = listener;
+    return () => { mockBlurListener = undefined; };
+  },
+};
+jest.mock('expo-router', () => ({ useFocusEffect: jest.fn(), useNavigation: () => mockNavigation }));
 jest.mock('expo-router/react-navigation', () => ({ useIsFocused: () => true }));
 const mockPush = jest.fn();
 jest.mock('@/hooks/useSafeRouter', () => ({ useSafeRouter: () => ({ push: mockPush }) }));
@@ -75,4 +82,23 @@ it('opens every settings group immediately, including after repeated cross-group
   expect(textVisible('物料绑定')).toBe(true);
   await act(async () => { press('物料绑定'); });
   expect(mockPush).toHaveBeenCalledWith('/inventory-binding');
+});
+
+it('closes the expanded group when a retained settings screen loses navigation focus', async () => {
+  await act(async () => { root = TestRenderer.create(<SettingsScreen />); });
+  await act(async () => { press('作业与物料'); });
+  expect(textVisible('物料绑定')).toBe(true);
+
+  await act(async () => { root!.update(<SettingsScreen />); });
+  expect(item('作业与物料').props.expanded).toBe(true);
+
+  await act(async () => { press('物料绑定'); });
+  expect(mockBlurListener).toBeDefined();
+  await act(async () => { mockBlurListener!(); });
+  await act(async () => { root!.update(<SettingsScreen />); });
+
+  expect(root!.root.findAllByType(MotionCollapse).every(node => !node.props.open)).toBe(true);
+  expect(textVisible('物料绑定')).toBe(false);
+  await act(async () => { press('作业与物料'); });
+  expect(textVisible('物料绑定')).toBe(true);
 });

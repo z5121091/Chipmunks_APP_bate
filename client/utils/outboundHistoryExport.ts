@@ -35,7 +35,7 @@ export async function exportOutboundHistoryToComputer(warehouse: Pick<Warehouse,
     const fileName = buildOutboundExportFileName(warehouse.name, sequence);
     const result = await syncExcelToComputer(
       buildOutboundSheets(records), '/outbound', normalizeSyncConfig(config),
-      undefined, undefined, undefined, fileName,
+      undefined, undefined, undefined, fileName, { warehouse },
     );
     if (!result.success) throw new Error(result.message || '导出失败，请检查电脑同步助手');
     try {

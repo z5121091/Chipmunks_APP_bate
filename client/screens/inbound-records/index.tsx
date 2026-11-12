@@ -16,6 +16,7 @@ import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
 import { useHardwareBack } from '@/hooks/useHardwareBack';
+import { useDocumentTarget } from '@/hooks/useDocumentTarget';
 import { feedbackDeleted } from '@/utils/feedback';
 import {
   deleteInboundDocument,
@@ -95,6 +96,7 @@ export default function InboundRecordsScreen() {
   const pageSessionRef = useRef(0);
   const documentRequestRef = useRef(0);
   const [documents, setDocuments] = useState<InboundDocumentSummary[]>([]);
+  const [documentsLoaded, setDocumentsLoaded] = useState(false);
   const [detailsByKey, setDetailsByKey] = useState<DetailMap>({});
   const [expandedKeys, setExpandedKeysState] = useState<Set<string>>(new Set());
   const expandedKeysRef = useRef(new Set<string>());
@@ -161,6 +163,7 @@ export default function InboundRecordsScreen() {
     if (!ownsPage()) return null;
     const requestId = ++documentRequestRef.current;
     const isCurrent = () => ownsPage() && documentRequestRef.current === requestId;
+    setDocumentsLoaded(false);
     if (!silent) {
       setRefreshing(asRefresh);
       setLoading(!asRefresh);
@@ -170,6 +173,7 @@ export default function InboundRecordsScreen() {
       const rows = await getInboundDocumentSummaries(warehouseId || undefined);
       if (!isCurrent()) return null;
       setDocuments(rows);
+      setDocumentsLoaded(true);
       return { rows, isCurrent };
     } catch {
       if (isCurrent()) showNotice('入库记录加载失败', 'error');
@@ -219,19 +223,6 @@ export default function InboundRecordsScreen() {
     ]);
   }, [loadDocuments, loadWarehouses, selectedWarehouseId]);
 
-  const handleWarehouseSelect = useCallback((warehouseId: string | null) => {
-    if (selectedWarehouseRef.current !== warehouseId) {
-      selectedWarehouseRef.current = warehouseId;
-      pageSessionRef.current += 1;
-      documentRequestRef.current += 1;
-    }
-    setSelectedWarehouseId(warehouseId);
-    setShowWarehousePicker(false);
-    setExpandedKeys(new Set());
-    setExpandedDetailGroupKeys(new Set());
-    setDetailsByKey({});
-  }, [setExpandedKeys]);
-
   const toggleDocument = useCallback(async (item: InboundDocumentSummary) => {
     const ownsPage = capturePageOwner(selectedWarehouseRef.current);
     const key = getDocumentKey(item);
@@ -274,6 +265,29 @@ export default function InboundRecordsScreen() {
       });
     }
   }, [capturePageOwner, detailsByKey, setExpandedKeys, showNotice]);
+
+  const { clearTarget, visibleDocuments } = useDocumentTarget({
+    documents, ready: documentsLoaded, getKey: getDocumentKey,
+    isActive: () => pageActiveRef.current,
+    openDocument: item => {
+      if (!expandedKeysRef.current.has(getDocumentKey(item))) void toggleDocument(item);
+    },
+    onMissing: () => showNotice('该入库单已删除或不存在，已显示现有记录', 'warning'),
+  });
+
+  const handleWarehouseSelect = useCallback((warehouseId: string | null) => {
+    clearTarget();
+    if (selectedWarehouseRef.current !== warehouseId) {
+      selectedWarehouseRef.current = warehouseId;
+      pageSessionRef.current += 1;
+      documentRequestRef.current += 1;
+    }
+    setSelectedWarehouseId(warehouseId);
+    setShowWarehousePicker(false);
+    setExpandedKeys(new Set());
+    setExpandedDetailGroupKeys(new Set());
+    setDetailsByKey({});
+  }, [clearTarget, setExpandedKeys]);
 
   const reloadAfterDelete = useCallback(async (
     documentKey?: string,
@@ -423,7 +437,8 @@ export default function InboundRecordsScreen() {
           undefined,
           undefined,
           undefined,
-          fileName
+          fileName,
+          { warehouse: { id: item.warehouse_id, name: item.warehouse_name } },
         );
 
         try {
@@ -788,7 +803,7 @@ export default function InboundRecordsScreen() {
         </View>
 
         <FlatList
-          data={documents}
+          data={visibleDocuments}
           keyExtractor={keyExtractor}
           renderItem={renderDocument}
           contentContainerStyle={[

@@ -2,6 +2,10 @@ import TestRenderer, { act } from 'react-test-renderer';
 import { Animated, Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { AppModalCard } from '@/components/AppModalCard';
 import { Spacing } from '@/constants/theme';
+import {
+  activateInternalLabelCorrection, createInternalLabelTasks, findExistingInternalLabelPackage,
+  loadInternalLabelTasks, queryInternalLabelStock, type InternalLabelStock,
+} from '@/utils/internalLabels';
 import LabelReprintScreen from '../index';
 import {
   applyLabelQuantityCorrection, getLabelCorrectionTraceNo, IgnoredLabelReprintScan,
@@ -34,6 +38,12 @@ jest.mock('@/utils/labelReprint', () => ({
   parseLabelCorrectionQuantity: jest.fn(), getLabelCorrectionTraceNo: jest.fn(), applyLabelQuantityCorrection: jest.fn(),
   LabelReprintValidationError: class extends Error { title = '无法补打'; },
   IgnoredLabelReprintScan: class extends Error {},
+  getLabelPrintCopies: (job: { printedCopies?: number; status: string; internalAction?: string }) => job.printedCopies ?? (job.status === 'submitted' ? 2 : job.internalAction === 'create' ? 1 : 2),
+}));
+jest.mock('@/utils/internalLabels', () => ({
+  activateInternalLabelCorrection: jest.fn(), cancelInternalLabelCorrection: jest.fn(),
+  createInternalLabelTasks: jest.fn(), findExistingInternalLabelPackage: jest.fn(),
+  loadInternalLabelTasks: jest.fn(), queryInternalLabelStock: jest.fn(),
 }));
 
 const task = (id: string, overrides: Partial<LabelReprintTask> = {}): LabelReprintTask => ({
@@ -61,8 +71,10 @@ describe('label reprint page visit', () => {
     jest.clearAllMocks();
     windowDimensionsSpy = jest.spyOn(require('react-native'), 'useWindowDimensions')
       .mockReturnValue({ width: 320, height: 480, scale: 1, fontScale: 1 });
+    jest.mocked(loadInternalLabelTasks).mockResolvedValue([]);
+    jest.mocked(findExistingInternalLabelPackage).mockResolvedValue(false);
     jest.mocked(prepareLabelReprint).mockImplementation(async (raw) => task(raw.trim()));
-    jest.mocked(submitLabelReprint).mockImplementation(async (prepared) => ({ ...prepared, status: 'submitted' }));
+    jest.mocked(submitLabelReprint).mockImplementation(async (prepared) => ({ ...prepared, status: 'submitted', printedCopies: prepared.internalAction === 'create' ? 1 : 2 }));
     jest.mocked(parseLabelCorrectionQuantity).mockImplementation((raw) => {
       const value = Number(raw);
       if (!/^\d+$/.test(raw.trim()) || !Number.isSafeInteger(value) || value <= 0) throw new Error('请输入大于 0 的整数');
@@ -86,7 +98,9 @@ describe('label reprint page visit', () => {
     windowDimensionsSpy.mockRestore();
     jest.useRealTimers();
   });
-  const scanner = () => root.root.findByType('Scanner' as unknown as React.ElementType);
+  const scanners = () => root.root.findAllByType('Scanner' as unknown as React.ElementType);
+  const scanner = () => scanners().find(({ props }) => props.actionLabel === '补打标签' || props.actionLabel === '扫描标签')!;
+  const stockScanner = () => scanners().find(({ props }) => props.accessibilityLabel === '存货编码')!;
   const buttons = (label: string) => root.root.findAllByType('Button' as unknown as React.ElementType)
     .filter((node) => node.props.label === label);
   const text = () => root.root.findAllByType(Text).map((node) => node.props.children).flat().join('');
@@ -99,6 +113,143 @@ describe('label reprint page visit', () => {
     await act(async () => { buttons('修改数量')[0].props.onPress(); });
     await scan(raw);
   };
+
+  it('gives the visible internal label dialog exclusive scanner ownership and restores label reprinting on close', async () => {
+    const code = 'IC.00000226.00';
+    jest.mocked(queryInternalLabelStock).mockResolvedValueOnce([]);
+    expect(scanner().props.autoFocus).toBe(true);
+    expect(scanner().props.editable).toBe(true);
+
+    await act(async () => { scanner().props.onChangeText('UNSUBMITTED-BACKGROUND-CODE'); });
+    await act(async () => { buttons('新建内部标签')[0].props.onPress(); });
+    expect(scanner().props.autoFocus).toBe(false);
+    expect(scanner().props.editable).toBe(false);
+    expect(scanner().props.value).toBe('');
+    expect(stockScanner().props.autoFocus).toBe(false);
+
+    await act(async () => { root.root.findByType(Modal).props.onShow(); });
+    expect(stockScanner().props.autoFocus).toBe(true);
+    expect(stockScanner().props.showSoftInputOnFocus).toBe(false);
+    expect(stockScanner().props.actionLabel).toBe('查询 ERP 现存量');
+    await scan('BACKGROUND-SCAN-DURING-DIALOG');
+    await act(async () => { stockScanner().props.onChangeText(code); });
+    await act(async () => { stockScanner().props.onSubmitEditing({ nativeEvent: { text: code } }); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
+    expect(queryInternalLabelStock).toHaveBeenCalledTimes(1);
+    expect(queryInternalLabelStock).toHaveBeenCalledWith('shanghai-chipmunk', code);
+    expect(prepareLabelReprint).not.toHaveBeenCalled();
+    expect(submitLabelReprint).not.toHaveBeenCalled();
+
+    await act(async () => { buttons('取消')[0].props.onPress(); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
+    expect(stockScanner()).toBeUndefined();
+    expect(scanner().props.autoFocus).toBe(true);
+    expect(scanner().props.editable).toBe(true);
+    await scan('NEXT-LABEL');
+    expect(prepareLabelReprint).toHaveBeenCalledTimes(1);
+    expect(prepareLabelReprint).toHaveBeenCalledWith('NEXT-LABEL');
+
+    await act(async () => { buttons('新建内部标签')[0].props.onPress(); });
+    expect(stockScanner().props.value).toBe('');
+  });
+
+  it('uses the main warehouse directly and prints one task per real package after the allocation balances', async () => {
+    const stock: InternalLabelStock = { accountKey: 'shanghai-chipmunk', warehouseCode: '001', warehouseName: '无锡总仓',
+      inventoryCode: 'RES.01120042.00', inventoryName: '贴片电阻', specification: '12KΩ,±1%,0402', quantity: 477 };
+    jest.mocked(queryInternalLabelStock).mockResolvedValue([stock]);
+    const created = [200, 200, 77].map((quantity, index) => task(`PACKAGE-${index}`, {
+      quantity, internalPackageId: `P${index}`, internalAction: 'create',
+    }));
+    jest.mocked(createInternalLabelTasks).mockResolvedValue(created);
+    await act(async () => { buttons('新建内部标签')[0].props.onPress(); });
+    expect(scanner().props.editable).toBe(false);
+    await act(async () => { root.root.findByType(Modal).props.onShow(); });
+    const input = (label: string) => root.root.findAllByType('Input' as unknown as React.ElementType)
+      .find((node) => node.props.accessibilityLabel === label)!;
+    await act(async () => { stockScanner().props.onChangeText(stock.inventoryCode); });
+    await act(async () => { stockScanner().props.onSubmitEditing({ nativeEvent: { text: stock.inventoryCode } }); });
+    expect(queryInternalLabelStock).toHaveBeenCalledWith('shanghai-chipmunk', stock.inventoryCode);
+    expect(buttons('无锡总仓')).toHaveLength(0);
+    expect(text()).toContain('实际仓库：无锡总仓');
+    expect(text()).toContain('ERP 现存量：477');
+    expect(buttons('确认打印')[0].props.disabled).toBe(false);
+    await act(async () => { buttons('按包分配')[0].props.onPress(); });
+    expect(stockScanner().props.autoFocus).toBe(false);
+    await act(async () => { stockScanner().props.onPressIn(); });
+    expect(stockScanner().props.showSoftInputOnFocus).toBe(true);
+    await act(async () => { input('第 1 包数量').props.onFocus(); });
+    expect(stockScanner().props.autoFocus).toBe(false);
+    await act(async () => { input('第 1 包数量').props.onChangeText('200'); });
+    expect(text()).toContain('待分配 277');
+    expect(buttons('确认打印')[0].props.disabled).toBe(true);
+    await act(async () => { buttons('添加一包')[0].props.onPress(); });
+    expect(buttons('移除')[0].props.icon).toBeUndefined();
+    expect(StyleSheet.flatten(buttons('移除')[0].props.style)).toMatchObject({ width: 'auto', minWidth: 0, height: 32 });
+    await act(async () => { input('第 2 包数量').props.onChangeText('200'); });
+    await act(async () => { buttons('添加一包')[0].props.onPress(); });
+    await act(async () => { input('第 3 包数量').props.onChangeText('77'); });
+    expect(text()).toContain('共打印 3 张');
+    await act(async () => { buttons('确认打印')[0].props.onPress(); });
+    expect(createInternalLabelTasks).toHaveBeenCalledWith(stock, [200, 200, 77], { allowExistingStock: false });
+    expect(jest.mocked(submitLabelReprint).mock.calls.map(([job]) => job.id)).toEqual(created.map((job) => job.id));
+    expect(text()).toContain('已提交 3 包、3 张标签');
+    expect(root.root.findByType(AppModalCard).props.title).toBe('补打标签任务');
+  });
+
+  it('passes an existing-stock override only after the separate explicit confirmation', async () => {
+    const stock: InternalLabelStock = { accountKey: 'shanghai-chipmunk', warehouseCode: '001', warehouseName: '无锡总仓',
+      inventoryCode: 'RES.01120042.00', inventoryName: '贴片电阻', specification: '0402', quantity: 100 };
+    jest.mocked(queryInternalLabelStock).mockResolvedValueOnce([stock]);
+    jest.mocked(findExistingInternalLabelPackage).mockResolvedValueOnce(true);
+    jest.mocked(createInternalLabelTasks).mockResolvedValueOnce([]);
+    await act(async () => { buttons('新建内部标签')[0].props.onPress(); });
+    await act(async () => { root.root.findByType(Modal).props.onShow(); });
+    await act(async () => { stockScanner().props.onSubmitEditing({ nativeEvent: { text: stock.inventoryCode } }); });
+    await act(async () => { buttons('确认打印')[0].props.onPress(); });
+    expect(createInternalLabelTasks).not.toHaveBeenCalled();
+    await act(async () => { buttons('确认另建并打印')[0].props.onPress(); });
+    expect(createInternalLabelTasks).toHaveBeenCalledWith(stock, [100], { allowExistingStock: true });
+  });
+
+  it('does not choose the first row or print when a main-warehouse lookup is ambiguous', async () => {
+    const stock: InternalLabelStock = { accountKey: 'shanghai-chipmunk', warehouseCode: '001', warehouseName: '无锡总仓',
+      inventoryCode: 'RES.01120042.00', inventoryName: '贴片电阻', specification: '12KΩ,±1%,0402', quantity: 477 };
+    jest.mocked(queryInternalLabelStock).mockResolvedValue([stock, { ...stock, warehouseCode: 'DUPLICATE' }]);
+    await act(async () => { buttons('新建内部标签')[0].props.onPress(); });
+    await act(async () => { root.root.findByType(Modal).props.onShow(); });
+    await act(async () => { stockScanner().props.onSubmitEditing({ nativeEvent: { text: stock.inventoryCode } }); });
+    expect(text()).toContain('ERP 主仓现存量不唯一');
+    expect(buttons('确认打印')[0].props.disabled).toBe(true);
+    expect(createInternalLabelTasks).not.toHaveBeenCalled();
+  });
+
+  it('shows the actual old two-copy receipt and explains a legacy create retry did not print again', async () => {
+    const legacy = task('OLD-CREATE', { internalPackageId: 'OLDPACKAGE001', internalAction: 'create' });
+    jest.mocked(prepareLabelReprint).mockResolvedValueOnce(legacy);
+    jest.mocked(submitLabelReprint).mockResolvedValueOnce({ ...legacy, status: 'submitted', printedCopies: 2,
+      lastMessage: '该旧任务此前已按两张提交，本次未重复打印，请核对已有标签' });
+    await scan('OLD-CREATE');
+    expect(text()).toContain('本次未重复打印');
+    expect(text()).toContain('2 张');
+    expect(submitLabelReprint).toHaveBeenCalledTimes(1);
+  });
+
+  it('activates an internal correction only after the user confirms physical replacement', async () => {
+    const original = task('HLS', { internalPackageId: 'P001' });
+    const replacement = task('HLS-2', { internalPackageId: 'P001', internalAction: 'correction', quantity: 123 });
+    jest.mocked(prepareLabelReprint).mockResolvedValueOnce(original);
+    jest.mocked(applyLabelQuantityCorrection).mockResolvedValueOnce(replacement);
+    await openQuantityDialog('HLS');
+    await act(async () => { quantityInput().props.onChangeText('123'); });
+    await act(async () => { buttons('确认打印')[0].props.onPress(); });
+    expect(text()).toContain('待确认换贴');
+    expect(activateInternalLabelCorrection).not.toHaveBeenCalled();
+    await act(async () => { buttons('确认换贴')[0].props.onPress(); });
+    const alert = root.root.findByType('Alert' as unknown as React.ElementType);
+    await act(async () => { alert.props.buttons.find((button: { text: string }) => button.text === '已换贴，启用新版').onPress(); });
+    expect(activateInternalLabelCorrection).toHaveBeenCalledWith(expect.objectContaining({ id: replacement.id, status: 'submitted' }));
+    expect(text()).toContain('已换贴，新标签已启用');
+  });
 
   it('waits for quantity confirmation, prints a larger positive integer, then returns to ordinary reprint', async () => {
     await openQuantityDialog();
@@ -178,12 +329,12 @@ describe('label reprint page visit', () => {
 
   it('constrains the real animated button wrappers for the header and quantity modal on a small PDA', async () => {
     const ActualUiToolbarButton = jest.requireActual('@/components/UiRedesign').UiToolbarButton;
-    const assertRealButtonBounds = async (props: Record<string, unknown>) => {
+    const assertRealButtonBounds = async (props: Record<string, unknown>, flex = 1) => {
       let rendered!: TestRenderer.ReactTestRenderer;
       await act(async () => { rendered = TestRenderer.create(<ActualUiToolbarButton {...props} />); });
       try {
         expect(StyleSheet.flatten(rendered.root.findByType(Animated.View).props.style))
-          .toMatchObject({ flex: 1, flexBasis: 0, minWidth: 0 });
+          .toMatchObject({ flex, flexBasis: 0, minWidth: 0 });
         const touchStyle = StyleSheet.flatten(rendered.root.findByType(TouchableOpacity).props.style);
         expect(touchStyle).toMatchObject({ width: '100%', minWidth: 0, justifyContent: 'center' });
         expect(touchStyle.flex).toBeUndefined();
@@ -193,8 +344,11 @@ describe('label reprint page visit', () => {
     };
     const headerActions = buttons('修改数量')[0].parent!;
     expect(StyleSheet.flatten(headerActions.props.style))
-      .toMatchObject({ flexDirection: 'row', width: 200, maxWidth: '100%', flexShrink: 0 });
+      .toMatchObject({ flexDirection: 'row' });
+    expect(StyleSheet.flatten(headerActions.props.style).width).toBeUndefined();
     expect(StyleSheet.flatten(headerActions.props.style).flexWrap).not.toBe('wrap');
+    expect(headerActions.children).toEqual([buttons('新建内部标签')[0], buttons('修改数量')[0], buttons('打印任务')[0]]);
+    await assertRealButtonBounds(buttons('新建内部标签')[0].props, 1.25);
     await assertRealButtonBounds(buttons('修改数量')[0].props);
     await assertRealButtonBounds(buttons('打印任务')[0].props);
     await act(async () => { buttons('修改数量')[0].props.onPress(); });
@@ -222,6 +376,20 @@ describe('label reprint page visit', () => {
     expect(root.root.findByType(AppModalCard).props.style.height).toBe(240);
   });
 
+  it('sizes the next label form independently of the keyboard-reduced correction viewport', async () => {
+    await openQuantityDialog();
+    const viewport = root.root.findByProps({ testID: 'label-quantity-viewport' });
+    await act(async () => { viewport.props.onLayout({ nativeEvent: { layout: { height: 240 } } }); });
+    expect(root.root.findByType(AppModalCard).props.style.height).toBe(240);
+
+    await act(async () => { buttons('取消')[0].props.onPress(); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(220); });
+    await act(async () => { buttons('新建内部标签')[0].props.onPress(); });
+    const newLabelCard = root.root.findByType(AppModalCard);
+    expect(newLabelCard.props.title).toBe('新建内部标签');
+    expect(newLabelCard.props.style.height).toBeCloseTo(393.6);
+  });
+
   it('consumes one input only once across stability timer and Enter, and allows a deliberate rescan', async () => {
     const raw = ' CH334U,250,TRACE-1 ';
     await act(async () => { scanner().props.onChangeText(raw); });
@@ -234,6 +402,36 @@ describe('label reprint page visit', () => {
     await scan(raw);
     expect(prepareLabelReprint).toHaveBeenCalledTimes(2);
     expect(submitLabelReprint).toHaveBeenCalledTimes(2);
+  });
+
+  it('merges an early native Enter with the final HLS change before requesting one print', async () => {
+    const raw = 'HLS~#~IC.00000226.00~#~10~#~EXAMPLEPKG001~#~1';
+    const submit = () => scanner().props.onSubmitEditing({ nativeEvent: { text: raw } });
+    await act(async () => { scanner().props.onChangeText(raw.slice(0, -2)); });
+    await act(async () => { submit(); });
+    expect(prepareLabelReprint).not.toHaveBeenCalled();
+    await act(async () => { scanner().props.onChangeText(raw); });
+    await act(async () => { submit(); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(150); });
+
+    expect(prepareLabelReprint).toHaveBeenCalledTimes(1);
+    expect(prepareLabelReprint).toHaveBeenCalledWith(raw);
+    expect(submitLabelReprint).toHaveBeenCalledTimes(1);
+    expect(scanner().props.value).toBe('');
+  });
+
+  it('separates two HLS labels if native change coalesces them after the first Enter', async () => {
+    const first = 'HLS~#~IC.00000226.00~#~10~#~EXAMPLEPKG001~#~1';
+    const second = 'HLS~#~IC.00000226.00~#~15~#~EXAMPLEPKG002~#~1';
+    await act(async () => { scanner().props.onChangeText(first.slice(0, -2)); });
+    await act(async () => { scanner().props.onSubmitEditing({ nativeEvent: { text: first } }); });
+    await act(async () => { scanner().props.onChangeText(first + second); });
+    await act(async () => { scanner().props.onSubmitEditing({ nativeEvent: { text: first + second } }); });
+    await act(async () => { await jest.advanceTimersByTimeAsync(150); });
+
+    expect(jest.mocked(prepareLabelReprint).mock.calls).toEqual([[first], [second]]);
+    expect(submitLabelReprint).toHaveBeenCalledTimes(2);
+    expect(scanner().props.value).toBe('');
   });
 
   it.each(['\r\n', '\n'])('keeps embedded %j in a streamed QR intact until the final Enter and does not submit a partial line', async ending => {

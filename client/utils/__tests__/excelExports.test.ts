@@ -1,9 +1,13 @@
 import { getErpAccountByOutboundOrderNo } from '../erpAccounts';
+import * as XLSX from 'xlsx';
+import { generateExcelBase64 } from '../excel';
 import { EXCEL_HEADERS } from '../excelSchema';
 import { buildInboundSheets } from '../inboundExport';
 import { buildInventorySheets } from '../inventoryExport';
 import { buildUnpackLabelSheet } from '../labelExport';
 import { buildOutboundSheets } from '../outboundExport';
+
+jest.mock('../syncConnection', () => ({ reportSyncConnectionResult: jest.fn() }));
 
 const getCell = (
   headers: string[],
@@ -12,6 +16,41 @@ const getCell = (
 ) => row[headers.indexOf(header)];
 
 describe('business Excel schemas', () => {
+  it('keeps the full internal label specification in fixed-width model cells', () => {
+    const specification = '川土微,CA-IS2062VW,集成隔离电源,CAN隔离器,独立逻辑电源,封装:SOIC16-WB';
+    const inventoryCode = 'IC.00000226.00';
+    const [outbound] = buildOutboundSheets([{ inventory_code: inventoryCode, model: specification, quantity: 4 }]);
+    const [summary, detail] = buildInventorySheets([
+      { inventory_code: inventoryCode, scan_model: '普通型号', check_type: 'whole', quantity: 2 },
+      { inventory_code: inventoryCode, scan_model: '隔离芯片', internalSpecification: specification, check_type: 'whole', quantity: 4 },
+    ]);
+    expect(summary.rows).toHaveLength(1);
+    expect(getCell(summary.headers, summary.rows[0], EXCEL_HEADERS.actualQuantity)).toBe(6);
+    expect(getCell(detail.headers, detail.rows[0], EXCEL_HEADERS.model)).toBe('普通型号');
+
+    const workbook = XLSX.read(generateExcelBase64([outbound, summary, detail]), { type: 'base64', cellStyles: true });
+    for (const [sheet, row] of [[outbound, 1], [summary, 1], [detail, 2]] as const) {
+      const modelColumn = sheet.headers.indexOf(EXCEL_HEADERS.model);
+      const worksheet = workbook.Sheets[sheet.name];
+      expect(worksheet[XLSX.utils.encode_cell({ r: row, c: modelColumn })].v).toBe(specification);
+      expect(worksheet['!cols']?.[modelColumn]?.wch).toBe(24);
+    }
+  });
+
+  it('exports only actual scanned versions from all three document types', () => {
+    const record = {
+      inventory_code: 'CODE', scan_model: 'MODEL', model: 'MODEL', warehouse_name: '仓库A',
+      version: 'V2', versions: ['V1', 'V2', 'V3'], quantity: 4,
+    };
+    const [, inbound] = buildInboundSheets([record]);
+    const [outbound] = buildOutboundSheets([{ ...record, quantity: '4' }]);
+    const [, inventory] = buildInventorySheets([{ ...record, check_type: 'whole' }]);
+    for (const sheet of [inbound, outbound, inventory]) {
+      expect(sheet.headers.filter(header => header.startsWith('版本号'))).toEqual(['版本号']);
+      expect(getCell(sheet.headers, sheet.rows[0], EXCEL_HEADERS.version)).toBe('V2');
+    }
+  });
+
   it('keeps inbound detail fields and aggregates quantities by material identity', () => {
     const sheets = buildInboundSheets([
       {
@@ -32,15 +71,16 @@ describe('business Excel schemas', () => {
       },
     ]);
 
-    const detail = sheets[0];
+    expect(sheets.map(sheet => sheet.name)).toEqual(['型号汇总', '入库明细']);
+    const [summary, detail] = sheets;
     expect(getCell(detail.headers, detail.rows[0], EXCEL_HEADERS.inboundNo)).toBe(
       'II-2026-07-26-001'
     );
     expect(getCell(detail.headers, detail.rows[0], EXCEL_HEADERS.inventoryCode)).toBe(
       'IC.00000537.01'
     );
-    expect(sheets[1].rows).toHaveLength(1);
-    expect(getCell(sheets[1].headers, sheets[1].rows[0], EXCEL_HEADERS.totalQuantity)).toBe(500);
+    expect(summary.rows).toHaveLength(1);
+    expect(getCell(summary.headers, summary.rows[0], EXCEL_HEADERS.totalQuantity)).toBe(500);
   });
 
   it('writes outbound account, voucher and quantity into the monthly sheet', () => {
@@ -117,20 +157,21 @@ describe('business Excel schemas', () => {
       },
     ]);
 
-    expect(sheets.map((sheet) => sheet.name)).toEqual(['盘点明细', '盘点差异']);
-    expect(sheets[0].rows).toHaveLength(2);
-    expect(getCell(sheets[0].headers, sheets[0].rows[0], EXCEL_HEADERS.account)).toBe(
+    expect(sheets.map((sheet) => sheet.name)).toEqual(['盘点差异', '盘点明细']);
+    const [summary, detail] = sheets;
+    expect(detail.rows).toHaveLength(2);
+    expect(getCell(detail.headers, detail.rows[0], EXCEL_HEADERS.account)).toBe(
       '无锡笃能'
     );
-    expect(sheets[1].rows).toHaveLength(1);
-    expect(getCell(sheets[1].headers, sheets[1].rows[0], EXCEL_HEADERS.actualQuantity)).toBe(
+    expect(summary.rows).toHaveLength(1);
+    expect(getCell(summary.headers, summary.rows[0], EXCEL_HEADERS.actualQuantity)).toBe(
       4800
     );
-    expect(getCell(sheets[1].headers, sheets[1].rows[0], EXCEL_HEADERS.erpQuantity)).toBe(
+    expect(getCell(summary.headers, summary.rows[0], EXCEL_HEADERS.erpQuantity)).toBe(
       4500
     );
     expect(
-      getCell(sheets[1].headers, sheets[1].rows[0], EXCEL_HEADERS.differenceQuantity)
+      getCell(summary.headers, summary.rows[0], EXCEL_HEADERS.differenceQuantity)
     ).toBe(300);
   });
 });

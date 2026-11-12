@@ -52,6 +52,11 @@ export const buildInboundSheets = (records: InboundExportRecord[]): ExcelSheet[]
   });
 
   return [
+    {
+      name: '型号汇总',
+      headers: buildMaterialSummaryHeaders(EXCEL_HEADERS.totalQuantity),
+      rows: buildMaterialSummaryRows(summaryMap.values()),
+    },
     buildExcelSheet(
       '入库明细',
       [
@@ -68,10 +73,5 @@ export const buildInboundSheets = (records: InboundExportRecord[]): ExcelSheet[]
       ],
       records
     ),
-    {
-      name: '型号汇总',
-      headers: buildMaterialSummaryHeaders(EXCEL_HEADERS.totalQuantity),
-      rows: buildMaterialSummaryRows(summaryMap.values()),
-    },
   ];
 };

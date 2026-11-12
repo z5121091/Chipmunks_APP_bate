@@ -2,7 +2,7 @@ import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { UiPageHeader } from '@/components/UiRedesign';
 import { AppModal as Modal } from '@/components/AppModal';
 import { useState, useCallback, useRef } from 'react';
-import { View, Text, ScrollView, Platform, TextInput } from 'react-native';
+import { View, Text, ScrollView, TextInput } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
@@ -30,6 +30,7 @@ import { useCustomAlert } from '@/components/CustomAlert';
 import { rf } from '@/utils/responsive';
 import { Spacing } from '@/constants/theme';
 import { logger } from '@/utils/logger';
+import { packageFieldValue } from '@/utils/packageRecognition';
 
 const selectRecordRemarks = (history: MaterialRemarkDTO[], orderNo: string): MaterialRemarkDTO[] => {
   const seenPairs = new Set<string>();
@@ -233,7 +234,17 @@ export default function DetailScreen() {
     }
   };
 
-  // 复制内容
+  const copyText = async (text: string, successMessage: string) => {
+    const sessionId = detailSessionRef.current;
+    try {
+      if (!(await Clipboard.setStringAsync(text))) throw new Error('剪贴板写入失败');
+      if (detailSessionRef.current === sessionId) alert.showSuccess(successMessage);
+    } catch (copyError) {
+      logger.error('复制内容失败:', copyError);
+      if (detailSessionRef.current === sessionId) alert.showError('复制失败，请稍后重试');
+    }
+  };
+
   const handleCopy = async () => {
     if (!record) return;
     
@@ -248,18 +259,31 @@ export default function DetailScreen() {
 箱号: ${record.sourceNo || '-'}
 扫描时间: ${formatDateTime(record.scanned_at)}
 ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw_content}`;
-    
-    try {
-      if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        await Clipboard.setStringAsync(text);
-      }
-      alert.showSuccess('内容已复制到剪贴板');
-    } catch (copyError) {
-      logger.error('复制内容失败:', copyError);
-      alert.showError('复制失败，请稍后重试');
-    }
+
+    await copyText(text, '内容已复制到剪贴板');
+  };
+
+  const renderCopyableField = (label: '订单号' | '退货单号' | '客户名称' | '批次' | '追溯码', value?: string | null, stacked = false) => {
+    const text = packageFieldValue(value);
+    const rowStyle = stacked ? styles.fieldColumn : styles.fieldRow;
+    const content = (
+      <>
+        <Text style={styles.fieldLabel}>{label}</Text>
+        <Text style={stacked ? styles.fieldValueLong : styles.fieldValue}>{text || '-'}</Text>
+      </>
+    );
+    return text ? (
+      <TouchableOpacity
+        style={rowStyle}
+        feedback="none"
+        accessibilityRole="button"
+        accessibilityLabel={`${label}，${text}`}
+        accessibilityHint="长按复制"
+        onLongPress={() => copyText(text, `${label}已复制`)}
+      >
+        {content}
+      </TouchableOpacity>
+    ) : <View style={rowStyle}>{content}</View>;
   };
   
   // 返回
@@ -311,16 +335,8 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
         <View style={styles.card}>
           <Text style={styles.cardTitle}>基本信息</Text>
           
-          {/* 订单号单独一行，支持换行 */}
-          <View style={styles.fieldColumn}>
-            <Text style={styles.fieldLabel}>{record.operation_type === 'sales_return' ? '退货单号' : '订单号'}</Text>
-            <Text style={styles.fieldValueLong}>{record.order_no}</Text>
-          </View>
-          
-          <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>客户名称</Text>
-            <Text style={styles.fieldValue}>{customerName || '-'}</Text>
-          </View>
+          {renderCopyableField(record.operation_type === 'sales_return' ? '退货单号' : '订单号', record.order_no, true)}
+          {renderCopyableField('客户名称', customerName)}
           
           <View style={styles.fieldRow}>
             <Text style={styles.fieldLabel}>扫描时间</Text>
@@ -349,10 +365,7 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
             </Text>
           </View>
           
-          <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>批次</Text>
-            <Text style={styles.fieldValue}>{record.batch || '-'}</Text>
-          </View>
+          {renderCopyableField('批次', record.batch)}
           
           <View style={styles.fieldRow}>
             <Text style={styles.fieldLabel}>封装</Text>
@@ -376,10 +389,7 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
             <Text style={styles.fieldValue}>{record.productionDate || '-'}</Text>
           </View>
           
-          <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>追踪码</Text>
-            <Text style={styles.fieldValue}>{record.traceNo || '-'}</Text>
-          </View>
+          {renderCopyableField('追溯码', record.traceNo)}
           
           <View style={[styles.fieldRow, styles.fieldRowLast]}>
             <Text style={styles.fieldLabel}>箱号</Text>

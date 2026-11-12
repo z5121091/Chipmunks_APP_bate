@@ -63,6 +63,8 @@ internal static class WindowTests
             Run("ota-publish-directly-in-main-window", OtaDirect);
             Run("idle-buttons-and-branded-layout", Idle);
             Run("running-stage-and-success-artifact", Success);
+            Run("verified-success-with-log-warning-keeps-artifact-and-history", SuccessWithLogWarning);
+            Run("failed-build-with-log-warning-keeps-error-priority", FailureWithLogWarning);
             Run("failed-next-task-clears-previous-artifact", FailureAfterSuccess);
             Run("sdk-attention-exposes-prepare-and-no-artifact", Attention);
             Run("selected-log-copy-does-not-block-worker", SelectedLog);
@@ -77,6 +79,10 @@ internal static class WindowTests
             Run("target-switch-clears-result-and-builds-exe", SyncTarget);
             Run("running-task-locks-target-and-signing-manager", TargetLock);
             Run("signing-manager-callback-and-no-cmd-control", SigningEntry);
+            Run("preview-third-target-and-maintenance-entrypoints", PreviewTarget);
+            Run("maintenance-dialogs-load-and-fit", MaintenanceDialogs);
+            Run("storage-virtual-list-filter-numeric-sort-and-selection", StorageList);
+            Run("cancel-before-background-launch-does-not-run", CancelBeforeLaunch);
             if (selectedTest == null) RealProjectIdlePreview();
         }
         File.WriteAllText(Path.Combine(root, selectedTest == null ? "results.json" : "results.selected.json"), new JavaScriptSerializer().Serialize(new {
@@ -102,6 +108,85 @@ internal static class WindowTests
 
     private static void Assert(bool value, string message) { if (!value) throw new Exception(message); }
     private static string Quote(string value) { return "'" + value.Replace("'", "''") + "'"; }
+    private static void PreviewTarget()
+    {
+        using (Fixture f = new Fixture("exit 0")) {
+            Assert(Find<Button>(f.Window, "changeAssessment").Enabled, "Assessment entry missing.");
+            Assert(Find<Button>(f.Window, "taskHistory").Enabled, "Task history entry missing.");
+            Assert(Find<Button>(f.Window, "storageManager").Enabled, "Storage entry missing.");
+            var target = Find<ComboBox>(f.Window, "buildTarget");
+            Assert(target.Items.Count == 3, "Preview target missing."); target.SelectedIndex = 2;
+            Assert(Find<Button>(f.Window, "startBuild").Text == "启动预览", "Preview start label missing.");
+            Assert(!Find<Button>(f.Window, "publishOta").Visible, "OTA leaked into preview.");
+            Assert(!Find<Button>(f.Window, "cancelBuild").Enabled, "Idle preview stop enabled.");
+            Assert(!f.Runner.IsRunning && !f.Window.TaskRunning, "Preview selection started build.");
+            f.Window.TickForTest();
+            target.SelectedIndex = 0;
+            Assert(Find<Button>(f.Window, "startBuild").Text == "开始构建", "APK target did not restore.");
+        }
+    }
+    private static void CancelBeforeLaunch()
+    {
+        using (Fixture f = new Fixture("[Threading.Thread]::Sleep(1000); " + SuccessScript)) {
+            f.Start(BuildMode.Build); f.Window.StopTask(); Finish(f);
+            Assert(!File.Exists(f.Apk) && !f.Runner.IsRunning, "Cancelled queued task still generated an artifact.");
+            Assert(f.Window.StatusTitle == "任务已停止", "Cancelled queued task did not settle.");
+        }
+    }
+    private static void MaintenanceDialogs()
+    {
+        using (Fixture f = new Fixture("exit 0")) {
+            foreach (string mode in new[] { "assessment", "history", "storage" }) {
+                using (var dialog = new BuildToolsWindow(f.DirectoryPath, mode)) {
+                    EnsureHandles(dialog);
+                    var load = (System.Threading.Tasks.Task)typeof(BuildToolsWindow).GetMethod("LoadContent", BindingFlags.NonPublic | BindingFlags.Instance).Invoke(dialog, null);
+                    Stopwatch watch = Stopwatch.StartNew();
+                    while (!load.IsCompleted && watch.ElapsedMilliseconds < 10000) { PumpEvents(); Thread.Sleep(10); }
+                    Assert(load.IsCompleted && !load.IsFaulted, "Maintenance content failed to load.");
+                    dialog.Size = dialog.MinimumSize; dialog.PerformLayout();
+                    foreach (Button button in Descendants(dialog).OfType<Button>())
+                        Assert(button.Right <= button.Parent.ClientSize.Width && button.Bottom <= button.Parent.ClientSize.Height, "Maintenance button clipped: " + button.Text);
+                    Screenshot(dialog, "maintenance-" + mode);
+                }
+            }
+        }
+    }
+    private static void StorageList()
+    {
+        using (Fixture f = new Fixture("exit 0"))
+        using (var dialog = new BuildToolsWindow(f.DirectoryPath, "storage")) {
+            EnsureHandles(dialog);
+            var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+            var models = (List<BuildStorageItem>)typeof(BuildToolsWindow).GetField("storageItems", flags).GetValue(dialog);
+            string large = Path.Combine(f.DirectoryPath, "large"), small = Path.Combine(f.DirectoryPath, "small"), protectedPath = Path.Combine(f.DirectoryPath, "protected");
+            models.Add(new BuildStorageItem { Path = protectedPath, Kind = "APK", Bytes = 999999, CanDelete = false, SizeKnown = true });
+            models.Add(new BuildStorageItem { Path = small, Kind = "日志", Bytes = 9, CanDelete = true, SizeKnown = true });
+            models.Add(new BuildStorageItem { Path = large, Kind = "APK", Bytes = 20000, CanDelete = true, SizeKnown = true });
+            models.Add(new BuildStorageItem { Path = Path.Combine(f.DirectoryPath, "pending"), Kind = "缓存", IsDirectory = true, CanDelete = true });
+            var apply = typeof(BuildToolsWindow).GetMethod("ApplyStorageView", flags);
+            apply.Invoke(dialog, null);
+            var table = Descendants(dialog).OfType<DataGridView>().Single();
+            Assert(table.VirtualMode && table.RowCount == 3, "Storage does not default to virtual clearable-only rows.");
+            Assert(Convert.ToString(table.Rows[0].Cells["Path"].Value) == large, "Default numeric size sort incorrect.");
+            Assert(Convert.ToString(table.Rows[2].Cells["Size"].Value) == "待统计", "Unknown size displayed as zero.");
+            table.Rows[1].Cells["selected"].Value = true;
+            var selected = (HashSet<string>)typeof(BuildToolsWindow).GetField("checkedPaths", flags).GetValue(dialog);
+            Assert(selected.Contains(small), "Virtual checkbox does not preserve its path.");
+            dialog.Controls.Find("storageSort", true).OfType<ComboBox>().Single().SelectedIndex = 1;
+            Assert(Convert.ToString(table.Rows[0].Cells["Path"].Value) == small && Convert.ToBoolean(table.Rows[0].Cells["selected"].Value), "Sorting lost selection or sorted formatted sizes as text.");
+            dialog.Controls.Find("onlyClearable", true).OfType<CheckBox>().Single().Checked = false;
+            Assert(table.RowCount == 4 && Convert.ToString(table.Rows[3].Cells["Path"].Value) == protectedPath, "Protected rows mixed with clearable items.");
+            table.Rows[3].Cells["selected"].Value = true;
+            Assert(!selected.Contains(protectedPath), "Protected virtual checkbox was selectable.");
+            var selectAll = dialog.Controls.Find("selectClearable", true).OfType<Button>().Single();
+            typeof(Button).GetMethod("OnClick", flags).Invoke(selectAll, new object[] { EventArgs.Empty });
+            Assert(selected.Count == 3 && !selected.Contains(protectedPath), "Bulk selection included protected items.");
+            var clearAll = dialog.Controls.Find("clearStorageSelection", true).OfType<Button>().Single();
+            typeof(Button).GetMethod("OnClick", flags).Invoke(clearAll, new object[] { EventArgs.Empty });
+            Assert(selected.Count == 0, "Clear selection left hidden paths selected.");
+            Screenshot(dialog, "storage-sorted-list");
+        }
+    }
     private const string SuccessScript = "[IO.File]::WriteAllBytes(__APK__, [byte[]](1,2,3,4)); [Console]::WriteLine('BUILD SUCCEEDED'); [Console]::WriteLine('APK: ' + __APK__); exit 0";
 
     private sealed class Fixture : IDisposable
@@ -112,7 +197,7 @@ internal static class WindowTests
         public readonly BuildRunner Runner;
         public readonly BuildWindow Window;
 
-        public Fixture(string script)
+        public Fixture(string script, Func<WaitHandle, int, bool> waitForOutputEnd = null)
         {
             DirectoryPath = Path.Combine(root, "隔离 UI 空格 ' " + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(DirectoryPath);
@@ -123,7 +208,8 @@ internal static class WindowTests
             Apk = Path.Combine(DirectoryPath, "测试安装包.apk");
             SetScript(script);
             Runner = new BuildRunner(new BuildRunnerOptions {
-                RepositoryPath = DirectoryPath, ScriptPath = Script, SyncScriptPath = Script, LogDirectory = Path.Combine(DirectoryPath, "logs")
+                RepositoryPath = DirectoryPath, ScriptPath = Script, SyncScriptPath = Script, LogDirectory = Path.Combine(DirectoryPath, "logs"),
+                WaitForOutputEnd = waitForOutputEnd
             });
             Window = new BuildWindow(DirectoryPath, Runner, false);
             EnsureHandles(Window);
@@ -215,7 +301,7 @@ internal static class WindowTests
         }).OrderBy(delegate(Label label) { return label.Text[0]; }).ToArray();
     }
 
-    private static void Screenshot(BuildWindow window, string name)
+    private static void Screenshot(Form window, string name)
     {
         window.PerformLayout();
         EnsureHandles(window);
@@ -319,6 +405,53 @@ internal static class WindowTests
         }
     }
 
+    private static void SuccessWithLogWarning()
+    {
+        bool injectTimeout = true;
+        // Fault injection waits for fixture output before withholding its EOF
+        // acknowledgement. No persistent external process or timing race is used.
+        Func<WaitHandle, int, bool> wait = delegate(WaitHandle signal, int timeout) {
+            bool ended = signal.WaitOne(timeout);
+            Assert(ended, "Fixture output did not drain before fault injection.");
+            return !injectTimeout;
+        };
+        string script = SuccessScript.Replace("exit 0", "[Console]::WriteLine('SHA256: '+(Get-FileHash -LiteralPath __APK__ -Algorithm SHA256).Hash.ToLowerInvariant()); exit 0");
+        using (Fixture f = new Fixture(script, wait)) {
+            f.Start(BuildMode.Build); Finish(f);
+            Assert(f.Window.StatusTitle == "构建成功" && f.Window.DisplayedApk == f.Apk, "Warning converted verified success into a failed result.");
+            Assert(f.Window.StatusDetail.Contains("日志收尾异常") && Find<Label>(f.Window, "buildResult").Text.Contains("提示："), "Success warning is not visible.");
+            Assert(Find<Label>(f.Window, "buildResult").Text.Contains(Path.GetFileName(f.Apk)), "Warning summary lost the delivered artifact name.");
+            Assert(Find<Button>(f.Window, "openApk").Enabled && Find<Button>(f.Window, "openLog").Enabled &&
+                !Find<Button>(f.Window, "copyError").Enabled, "Warning success lost artifact/log actions or exposed failure action.");
+            Assert(Descendants(f.Window).OfType<ProgressBar>().Single().Value == 100 &&
+                Stages(f.Window).All(delegate(Label label) { return label.ForeColor == Good; }), "Warning success did not retain completed progress.");
+            var history = BuildHistory.Load(f.DirectoryPath);
+            Assert(history.Count == 1 && history[0].State == "成功" && history[0].ArtifactPath == f.Apk &&
+                history[0].Summary.Contains("日志"), "Warning history lost its success classification, artifact, or warning summary.");
+            Screenshot(f.Window, "success-log-warning");
+
+            injectTimeout = false;
+            f.SetScript("[Console]::WriteLine('CHECK PASSED: fixture'); exit 0");
+            f.Start(BuildMode.CheckEnvironment); Finish(f);
+            Assert(f.Window.StatusTitle == "环境检查通过" && !f.Window.StatusDetail.Contains("日志收尾异常"), "Next task retained the old warning.");
+            Assert(BuildHistory.Load(f.DirectoryPath)[0].Summary == "任务已完成", "Old warning leaked into the next history entry.");
+        }
+    }
+
+    private static void FailureWithLogWarning()
+    {
+        using (Fixture f = new Fixture("[Console]::WriteLine('BUILD FAILED: fixture 编译错误'); exit 7",
+            delegate(WaitHandle signal, int timeout) { Assert(signal.WaitOne(timeout), "Fixture output did not drain."); return false; })) {
+            f.Start(BuildMode.Build); Finish(f);
+            Assert(f.Window.StatusTitle == "任务未完成" && f.Window.StatusDetail.Contains("fixture 编译错误"), "Log warning concealed the actual failure.");
+            Assert(!Find<Button>(f.Window, "openApk").Enabled && Find<Button>(f.Window, "copyError").Enabled,
+                "Failed build with warning exposed an artifact or disabled its error action.");
+            var history = BuildHistory.Load(f.DirectoryPath);
+            Assert(history.Count == 1 && history[0].State == "未完成" && history[0].Summary.Contains("fixture 编译错误"),
+                "Failure history was replaced by a warning success summary.");
+        }
+    }
+
     private static void FailureAfterSuccess()
     {
         using (Fixture f = new Fixture(SuccessScript))
@@ -375,6 +508,9 @@ internal static class WindowTests
             Assert(f.Window.IsInBackground && !f.Window.Visible, "Continue-in-background did not hide the window.");
             Stopwatch watch = Stopwatch.StartNew();
             // No DoEvents, UI timer, or TickForTest while the real worker produces all output.
+            // Snapshotting now starts asynchronously too. Wait for the background
+            // worker to enter its first state without pumping the UI continuation.
+            while (f.Runner.GetSnapshot().State == BuildState.Idle && watch.ElapsedMilliseconds < 15000) Thread.Sleep(25);
             while (f.Runner.IsRunning && watch.ElapsedMilliseconds < 15000) Thread.Sleep(25);
             Assert(!f.Runner.IsRunning && f.Runner.GetSnapshot().State == BuildState.Succeeded,
                 "Background worker depended on UI polling.");

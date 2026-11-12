@@ -2,7 +2,7 @@ import { MotionChevron } from '@/components/AppMotion';
 import { MotionCollapse } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import React from 'react';
-import { Text, View, type StyleProp, type TextStyle, type ViewStyle } from 'react-native';
+import { StyleSheet, Text, View, type StyleProp, type TextStyle, type ViewStyle } from 'react-native';
 import {
   getRecordRenderSignature,
   type RecordRenderSignatureField,
@@ -11,6 +11,7 @@ import {
 type AggregatedRecordItemProps<TRecord> = {
   groupKey: string;
   model: string;
+  titleNumberOfLines?: number;
   version?: string;
   totalQuantity: number;
   records: readonly TRecord[];
@@ -46,6 +47,7 @@ const areCompareValuesEqual = (
 function AggregatedRecordItemComponent<TRecord>({
   groupKey,
   model,
+  titleNumberOfLines,
   version,
   totalQuantity,
   records,
@@ -66,11 +68,16 @@ function AggregatedRecordItemComponent<TRecord>({
 }: AggregatedRecordItemProps<TRecord>) {
   const toggle = () => onToggle(groupKey);
 
+  const title = (
+    <Text style={[titleStyle, titleNumberOfLines !== undefined && styles.boundedTitle]}
+      numberOfLines={titleNumberOfLines} ellipsizeMode="tail">{model}</Text>
+  );
+
   const content = (
     <View style={contentStyle}>
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
         <MotionChevron expanded={Boolean(isExpanded)} collapsed="right" size={14} color={chevronColor} />
-        <Text style={titleStyle}>{model}</Text>
+        {title}
       </View>
       <Text style={subtitleStyle}>版本: {version || '-'}</Text>
     </View>
@@ -90,7 +97,7 @@ function AggregatedRecordItemComponent<TRecord>({
           <TouchableOpacity style={contentStyle} activeOpacity={0.86} onPress={toggle}>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
               <MotionChevron expanded={Boolean(isExpanded)} collapsed="right" size={14} color={chevronColor} />
-              <Text style={titleStyle}>{model}</Text>
+              {title}
             </View>
             <Text style={subtitleStyle}>版本: {version || '-'}</Text>
           </TouchableOpacity>
@@ -114,6 +121,7 @@ export const AggregatedRecordItem = React.memo(
   (previous, next) =>
     previous.groupKey === next.groupKey &&
     previous.model === next.model &&
+    previous.titleNumberOfLines === next.titleNumberOfLines &&
     previous.version === next.version &&
     previous.totalQuantity === next.totalQuantity &&
     previous.isExpanded === next.isExpanded &&
@@ -127,3 +135,5 @@ export const AggregatedRecordItem = React.memo(
     getRecordRenderSignature(previous.records, previous.recordSignatureFields) ===
       getRecordRenderSignature(next.records, next.recordSignatureFields)
 ) as typeof AggregatedRecordItemComponent;
+
+const styles = StyleSheet.create({ boundedTitle: { flexShrink: 1, minWidth: 0 } });

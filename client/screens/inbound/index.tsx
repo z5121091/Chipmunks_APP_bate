@@ -30,6 +30,10 @@ import {
   detectRule,
   getActiveRules,
   parseWithRule,
+  FIELD_LABELS,
+  assertPackageIsNotSplit,
+  checkInboundPackageExists,
+  matchesLegacyPackage,
   QRCodeRuleConflictError,
   getInventoryCodeByModel,
   generateId,
@@ -37,6 +41,7 @@ import {
   getInboundRecordsByNo,
 } from '@/utils/database';
 import { isQRCode, recoverConfirmedScannerContent, shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
+import { buildPackageKey, packageFieldValue } from '@/utils/packageRecognition';
 import { parseQuantity } from '@/utils/quantity';
 
 import { FontAwesome6 } from '@expo/vector-icons';
@@ -119,6 +124,7 @@ interface ScanRecord {
   productionDate?: string;
   traceNo?: string;
   sourceNo?: string;
+  package_key?: string;
   // 占位字段解析值（仅用于兼容和排查，不展示、不导出）
   customFields?: Record<string, string>;
   // 是否已确认
@@ -131,7 +137,8 @@ const savedRecordToScan = (record: InboundRecord): ScanRecord => ({
   batch: record.batch || '', quantity: record.quantity, scanTime: record.created_at,
   rawContent: record.rawContent || '', version: record.version, package: record.package,
   productionDate: record.productionDate, traceNo: record.traceNo, sourceNo: record.sourceNo,
-  ruleId: record.rule_id, ruleName: record.rule_name, customFields: record.customFields, saved: true,
+  ruleId: record.rule_id, ruleName: record.rule_name, customFields: record.customFields,
+  package_key: record.package_key || undefined, saved: true,
 });
 
 type InboundAggregatedRecord = {
@@ -877,6 +884,7 @@ export default function InboundScreen() {
         productionDate?: string;
         traceNo?: string;
         sourceNo?: string;
+  package_key?: string;
         customFields?: Record<string, string>;
         ruleId?: string;
         ruleName?: string;
@@ -926,7 +934,8 @@ export default function InboundScreen() {
               package: standardFields.package || '',
               version: standardFields.version || '',
               productionDate: standardFields.productionDate || '',
-              traceNo: standardFields.traceNo || '',
+              traceNo: packageFieldValue(standardFields.traceNo),
+              package_key: buildPackageKey(rule, standardFields, FIELD_LABELS),
               sourceNo: standardFields.sourceNo || '',
               customFields: customFields || {},
               ruleId: rule.id,
@@ -1065,20 +1074,19 @@ export default function InboundScreen() {
           }
         }
 
-        // 检查是否重复扫描（只检测追溯码，因为箱号可能重复）
-        let isDuplicate = false;
-
-        // 无追溯码的相同标签继续允许逐次扫描，不按二维码内容去重。
         const traceNo = parsedRecord.traceNo?.trim() || '';
-        if (traceNo) {
-          const existing = [...savedInboundRecordsRef.current, ...scanRecordsRef.current].find((r) => r.traceNo?.trim() === traceNo);
-          if (existing) {
-            isDuplicate = true;
-          }
-        }
+        const packageKey = parsedRecord.package_key;
+        const currentRecords = [...savedInboundRecordsRef.current, ...scanRecordsRef.current];
+        if (packageKey) await assertPackageIsNotSplit(packageKey);
+        const isDuplicate = packageKey
+          ? currentRecords.some(record => record.package_key === packageKey ||
+            (!record.package_key && selectedRule && 'ruleId' in record && record.ruleId === selectedRule.id &&
+              matchesLegacyPackage(packageKey, selectedRule, record.rawContent))) || await checkInboundPackageExists(packageKey)
+          : traceNo && currentRecords.some(record => record.traceNo?.trim() === traceNo);
+        if (!isSessionActive(sessionId)) return;
 
         if (isDuplicate) {
-          showToast('已扫过此追溯码', 'warning');
+          showToast(packageKey ? '此包装已入库或已扫过' : '已扫过此追溯码', 'warning');
           feedbackDuplicate();
           return;
         }
@@ -1100,6 +1108,7 @@ export default function InboundScreen() {
           version: normalizedVersion || undefined,
           productionDate: parsedRecord.productionDate || undefined,
           traceNo: traceNo || undefined,
+          package_key: packageKey,
           sourceNo: parsedRecord.sourceNo || undefined,
           // 占位字段解析值
           customFields: parsedRecord.customFields,
@@ -1211,7 +1220,7 @@ export default function InboundScreen() {
     void processScan(code, confirmedNativePrefix);
   }, [processScan]);
 
-  // 完整物料保持150ms自动提交；已确认前包与后包分别接收。
+  // 真实文本与原生回车一致时立即提交；无结束事件时保留静默收尾保护。
   const handleInputChange = useCallback((incomingText: string, alreadyNormalized = false) => {
     if (!draftReadyRef.current || saveInProgressRef.current) return;
     const native = alreadyNormalized
@@ -1238,6 +1247,10 @@ export default function InboundScreen() {
     liveInputValueRef.current = text;
     setInputValue(text);
     if (!text) return;
+    if (!alreadyNormalized && pendingNativeSubmitTextRef.current === text) {
+      flushScannerInput(text);
+      return;
+    }
 
     const sessionId = sessionIdRef.current;
     const isCurrent = () => isSessionActive(sessionId)
@@ -1279,7 +1292,7 @@ export default function InboundScreen() {
 
   const syncInboundSnapshot = async (
     records: InboundExportRecord[],
-    warehouseName: string,
+    warehouse: Pick<Warehouse, 'id' | 'name'>,
     inboundNo: string
   ): Promise<{ success: boolean; skipped: boolean; fileName?: string; message?: string }> => {
     const savedSyncConfig = await AsyncStorage.getItem(STORAGE_KEYS.SYNC_CONFIG);
@@ -1291,7 +1304,7 @@ export default function InboundScreen() {
       return { success: false, skipped: true };
     }
 
-    const fileName = buildInboundExportFileNameFromNo(warehouseName, inboundNo);
+    const fileName = buildInboundExportFileNameFromNo(warehouse.name, inboundNo);
     const result = await syncExcelToComputer(
       buildInboundSheets(records),
       '/inbound',
@@ -1299,7 +1312,8 @@ export default function InboundScreen() {
       undefined,
       undefined,
       undefined,
-      fileName
+      fileName,
+      { warehouse },
     );
 
     return {
@@ -1430,6 +1444,7 @@ export default function InboundScreen() {
           version: record.version || '',
           productionDate: record.productionDate || '',
           traceNo: record.traceNo || '',
+          package_key: record.package_key,
           sourceNo: record.sourceNo || '',
           customFields: record.customFields,
           rule_id: record.ruleId,
@@ -1470,7 +1485,7 @@ export default function InboundScreen() {
         message: '电脑同步失败，请稍后重试',
       };
       try {
-        syncResult = await syncInboundSnapshot(exportRecords, currentWarehouse.name, inboundNo);
+        syncResult = await syncInboundSnapshot(exportRecords, currentWarehouse, inboundNo);
       } catch (syncError) {
         logger.warn('[handleSaveInbound] 入库已保存，但同步流程异常:', syncError);
         syncResult = {

@@ -266,6 +266,33 @@ describe('real sample diagnosis', () => {
     expect(result.supplierStatus).toBe('unknown');
   });
 
+  it('recognizes every complete configured version and preserves the scanned version in the sample', () => {
+    const rules = [rule('a', { fieldOrder: ['model', 'version', 'quantity'], supplierId: 'supplier-b' })];
+    const shared = binding('shared', { version: 'V1', versions: ['V1', 'V2'], supplier: '厂家乙' });
+    const records = [binding(), shared];
+
+    for (const version of ['v1', 'v2']) {
+      const result = analyzeRuleSample(`SF1234/${version}/100`, rules, records, suppliers).candidates[0];
+      expect(result.bindingMatch).toBe('exact');
+      expect(result.binding?.id).toBe('shared');
+      expect(result.supplierStatus).toBe('consistent');
+      expect(result.fields.version).toBe(version);
+    }
+    const fallback = analyzeRuleSample('SF1234/V10/100', rules, records, suppliers).candidates[0];
+    expect(fallback.bindingMatch).toBe('generic');
+    expect(fallback.binding?.id).toBe('binding-a');
+    const missing = analyzeRuleSample('SF1234/V10/100', rules, [shared], suppliers).candidates[0];
+    expect(missing.bindingMatch).toBe('none');
+    expect(shared.versions).toEqual(['V1', 'V2']);
+  });
+
+  it('keeps a multi-version binding ineligible for a QR with no version', () => {
+    const result = analyzeRuleSample(sample, [rule('a', { supplierId: 'supplier-a' })],
+      [binding('multi', { version: 'V1', versions: ['V1', '', 'V2'] })], suppliers).candidates[0];
+    expect(result.bindingMatch).toBe('none');
+    expect(result.binding).toBeNull();
+  });
+
   it('does not match a legacy empty model binding when the sample model is absent', () => {
     const result = analyzeRuleSample('LOT/100', [rule('a', {
       supplierId: 'supplier-a', fieldOrder: ['batch', 'quantity'],

@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from scripts import label_sync_server as server
 from scripts import label_templates
-from scripts.label_templates import apm, boya, dongwei, linearin, rongpai, union, wch
+from scripts.label_templates import apm, boya, dongwei, linearin, renmao, rongpai, union, wch
 from scripts.test_label_code128 import decode_manual_content
 
 
@@ -31,6 +31,7 @@ def fixture(key):
         'dongwei': '苏州东微半导体股份有限公司',
         'linearin': '上海先积集成电路有限公司',
         'rongpai': '荣湃半导体(上海)有限公司',
+        'renmao': '广东仁懋电子有限公司',
     }
     record = dict(
         supplier=suppliers[key], model='APM32F103RBT6', batch='NYORY',
@@ -75,6 +76,11 @@ def fixture(key):
                       source_no='', trace_no='')
         raw = ('P/N:LTA8292XS8/R8\rPKG:SOIC-8L\rQTY:4000\r'
                'D/C:J-L14\rLOT:231012PJ\rDATE:17-04-2023')
+    elif key == 'renmao':
+        record.update(model='MOT3114G', version='810411G01000101', package='PDFN5*6',
+                      batch='ZYA.C', quantity='5000', production_date='20261022',
+                      source_no='0005', trace_no='')
+        raw = 'B 810411G01000101 MOT3114G PDFN5*6 ZYA.C 5000 20261022 0005'
     else:
         record.update(model='Pai8485E-W1R', batch='A552588.1', production_date='2528HE',
                       trace_no='2507260140109-1', version='LEVEL2',
@@ -93,6 +99,8 @@ def quantity_token(key, quantity):
         return f'QTY:{quantity}\r'
     if key == 'wch':
         return f',{quantity},'
+    if key == 'renmao':
+        return f' {quantity} '
     if key in ('union', 'dongwei', 'rongpai'):
         return f';{quantity};'
     return f'/{quantity}/'
@@ -116,9 +124,9 @@ def corrected_record(key, quantity, suffix=2):
 
 
 MODULES = {'geehy': apm, 'leadcore': apm, 'boya': boya, 'union': union,
-           'wch': wch, 'dongwei': dongwei, 'linearin': linearin, 'rongpai': rongpai}
+           'wch': wch, 'dongwei': dongwei, 'linearin': linearin, 'rongpai': rongpai, 'renmao': renmao}
 BARCODE_COUNTS = {'geehy': 8, 'leadcore': 8, 'boya': 0, 'union': 7,
-                  'wch': 0, 'dongwei': 0, 'linearin': 0, 'rongpai': 5}
+                  'wch': 0, 'dongwei': 0, 'linearin': 0, 'rongpai': 5, 'renmao': 5}
 
 
 class CorrectedReprintCompatibilityTest(unittest.TestCase):
@@ -162,7 +170,7 @@ class CorrectedReprintCompatibilityTest(unittest.TestCase):
         self.assertEqual(qr.call_args.args[0], record['source_qr'])
         self.assertIn(b'BITMAP 0,0,100,400,0,', commands)
         displayed = [item[2] for item in text.call_args.args[0]]
-        self.assertIn(record['quantity'], displayed)
+        self.assertIn(record['quantity'] + (' PCS' if key == 'renmao' else ''), displayed)
         self.assertIn(record['model'], displayed)
         if record['trace_no']:
             self.assertIn(record['trace_no'], displayed)
@@ -230,6 +238,9 @@ class CorrectedReprintCompatibilityTest(unittest.TestCase):
 
     def test_linearin_lower_and_higher_quantities(self):
         self.assert_supplier_corrections('linearin')
+
+    def test_renmao_lower_and_higher_quantities_without_a_trace(self):
+        self.assert_supplier_corrections('renmao')
 
     def test_linearin_prefixes_and_line_endings_survive_quantity_correction(self):
         expected_lines = [

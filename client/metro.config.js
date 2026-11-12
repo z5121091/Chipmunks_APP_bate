@@ -14,9 +14,23 @@ if (process.env.EXPO_NO_METRO_WORKSPACE_ROOT === '1') {
 
 // 安全地获取 Expo 的默认排除列表
 const existingBlockList = [].concat(config.resolver.blockList || []);
+const managedPreview = Boolean(process.env.CHIPMUNKS_WEB_PREVIEW_SESSION);
+// The browser preview does not consume Express or native project sources. Keep
+// their dependency trees out of the initial watcher crawl on Windows.
+const previewOnlyFolders = managedPreview ? ['server', 'client/android', 'client/ios'] : [];
+if (managedPreview) {
+  const serverRoot = path.resolve(__dirname, '../server').toLowerCase();
+  config.watchFolders = (config.watchFolders || []).filter((folder) => path.resolve(folder).toLowerCase() !== serverRoot);
+}
+const previewGeneratedFolders = ['output', 'logs', 'dist', 'scripts/.sync-build-temp', 'scripts/dist', ...previewOnlyFolders].map((folder) => {
+  const absolute = path.resolve(__dirname, '..', folder);
+  const escaped = absolute.split(/[\\/]/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[\\\\/]');
+  return new RegExp(`^${escaped}(?:[\\\\/].*)?$`);
+});
 
 config.resolver.blockList = [
   ...existingBlockList,
+  ...previewGeneratedFolders,
   /.*\/\.expo\/.*/, // Expo 的缓存和构建产物目录
 
   // 1. 原生代码 (Java/C++/Objective-C)
@@ -120,6 +134,8 @@ config.server = {
   enhanceMiddleware: (metroMiddleware, metroServer) => {
     return connect()
       .use((req, res, next) => {
+        const previewSession = process.env.CHIPMUNKS_WEB_PREVIEW_SESSION;
+        if (previewSession) res.setHeader('X-Chipmunks-Preview-Session', previewSession);
         if (shouldProxyToBackend(req.url)) {
           logMetroProxy(`[Metro Proxy] Forwarding ${req.method} ${req.url}`);
 

@@ -17,6 +17,7 @@ export interface QueueItemParsedPayload {
   quantity: string;
   traceNo?: string;
   sourceNo?: string;
+  package_key?: string;
   package?: string;
   version?: string;
   productionDate?: string;

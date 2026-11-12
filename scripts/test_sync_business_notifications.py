@@ -366,6 +366,8 @@ class BusinessNotificationWiringTest(unittest.TestCase):
         tray.running = True
         tray.address_monitor = Mock()
         tray.pairing_window = Mock()
+        tray.connection_qr_window = Mock()
+        tray.log_window = Mock()
         tray.icon = Mock()
         order = []
         self.dispatcher.stop.side_effect = lambda: order.append('notifications')

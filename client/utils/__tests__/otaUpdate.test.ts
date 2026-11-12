@@ -5,11 +5,13 @@ import { beginOtaSensitiveOperation, lockForOtaApply } from '../otaSafety';
 
 jest.mock('@react-native-async-storage/async-storage', () => jest.requireActual('@react-native-async-storage/async-storage/jest/async-storage-mock'));
 jest.mock('expo-updates', () => ({
-  isEnabled: true, isEmbeddedLaunch: false, updateId: 'release-1', manifest: { extra: { warehouseUpdate: { notes: 'fix' } } },
+  isEnabled: true, isEmbeddedLaunch: false, updateId: 'release-1', createdAt: null,
+  manifest: { extra: { warehouseUpdate: { notes: 'fix' } } },
   checkForUpdateAsync: jest.fn(), fetchUpdateAsync: jest.fn(), reloadAsync: jest.fn(),
 }));
 
 beforeEach(async () => { jest.clearAllMocks(); await AsyncStorage.clear(); });
+afterEach(() => { jest.restoreAllMocks(); });
 
 test('only a running update is recorded and notified once', async () => {
   expect(await recordRunningUpdate()).toMatchObject({ id: 'release-1', notes: 'fix' });
@@ -62,6 +64,26 @@ test('same update returned by server is not fetched again', async () => {
   jest.mocked(Updates.checkForUpdateAsync).mockResolvedValue({ isAvailable: true, manifest: { id: 'release-1' } } as never);
   expect(await downloadOtaUpdate()).toBe('latest');
   expect(Updates.fetchUpdateAsync).not.toHaveBeenCalled();
+});
+test.each(['2026-11-09T15:23:19Z', '2026-11-09T15:35:30Z'])('embedded APK skips a remote update at %s with empty app storage', async createdAt => {
+  jest.replaceProperty(Updates, 'isEmbeddedLaunch', true);
+  jest.replaceProperty(Updates, 'updateId', 'fresh-embedded-apk');
+  jest.replaceProperty(Updates, 'createdAt', new Date('2026-11-09T15:35:30Z'));
+  jest.mocked(Updates.checkForUpdateAsync).mockResolvedValue({ isAvailable: true, manifest: { id: 'old-ota', createdAt } } as never);
+  expect(await downloadOtaUpdate()).toBe('latest');
+  expect(Updates.fetchUpdateAsync).not.toHaveBeenCalled();
+  expect(getPendingOtaUpdate({ isUpdatePending: true, downloadedUpdate: { updateId: 'old-ota', createdAt: new Date(createdAt) } })).toBeNull();
+  expect(await AsyncStorage.getAllKeys()).toEqual([]);
+});
+test('embedded APK can still fetch and offer a later update', async () => {
+  const createdAt = '2026-11-10T00:00:00Z';
+  jest.replaceProperty(Updates, 'isEmbeddedLaunch', true);
+  jest.replaceProperty(Updates, 'updateId', 'fresh-embedded-apk');
+  jest.replaceProperty(Updates, 'createdAt', new Date('2026-11-09T15:35:30Z'));
+  jest.mocked(Updates.checkForUpdateAsync).mockResolvedValue({ isAvailable: true, manifest: { id: 'new-ota', createdAt } } as never);
+  expect(await downloadOtaUpdate()).toBe('downloaded');
+  expect(Updates.fetchUpdateAsync).toHaveBeenCalledTimes(1);
+  expect(getPendingOtaUpdate({ isUpdatePending: true, downloadedUpdate: { updateId: 'new-ota', createdAt: new Date(createdAt) } })?.updateId).toBe('new-ota');
 });
 test('reminders are claimed once per version, including concurrent checks', async () => {
   expect(await Promise.all([claimOtaNotice('ready', 'id-1'), claimOtaNotice('ready', 'id-1')])).toEqual([true, false]);

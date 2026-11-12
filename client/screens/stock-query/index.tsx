@@ -19,22 +19,25 @@ import {
   fetchCurrentStockByInventoryCode,
   type CurrentStockRow,
 } from '@/utils/erpCurrentStock';
-import { detectRule, getActiveRules, getInventoryCodeByModel, initDatabase, parseWithRule, type QRCodeRule } from '@/utils/database';
+import { detectRule, getActiveRules, getInventoryCodeByModel, initDatabase, parseWithRule, requireActiveInternalLabel, type QRCodeRule } from '@/utils/database';
+import { assertInternalLabelStockMatches, isInternalLabelInput } from '@/utils/internalLabelCode';
 import { feedbackNotBound, feedbackQueryFailed, feedbackQuerySuccess } from '@/utils/feedback';
 import { isQRCode, shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
 import { cancelScanSubmit, RECENT_SCAN_DUPLICATE_WINDOW_MS, resolvePendingScannerSubmit, scheduleScanSubmitWithCompletionCheck, sanitizeStructuredScannerInput } from '@/utils/scannerInput';
 import { logger } from '@/utils/logger';
+import {
+  getStockQuerySelectedAccount,
+  getStockQuerySnapshot,
+  rememberStockQueryAccount,
+  saveStockQuerySnapshot,
+} from '@/utils/stockQuerySession';
+import { formatDateTime } from '@/utils/time';
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
 import { createStyles } from './styles';
 
 type ParsedStockScan = {
   model: string;
   version: string;
-};
-
-type LastQuery = {
-  inventoryCode: string;
-  specification: string;
 };
 
 const ACCOUNT_LABELS: Record<ErpAccountConfig['key'], string> = {
@@ -48,6 +51,7 @@ const formatQuantity = (value: number | null) =>
   value === null ? '-' : value.toLocaleString(undefined, { maximumFractionDigits: 4 });
 
 const STOCK_QUERY_AUTO_SUBMIT_DEBOUNCE_MS = 150;
+const EMPTY_STOCK_ROWS: CurrentStockRow[] = [];
 
 const parseStockScan = async (content: string, rules: readonly QRCodeRule[]): Promise<ParsedStockScan> => {
   const rule = await detectRule(content, rules);
@@ -82,12 +86,21 @@ export default function StockQueryScreen() {
     promise: Promise<QRCodeRule[]>;
   } | null>(null);
   const queryingRef = useRef(false);
-  const [selectedAccount, setSelectedAccount] = useState<ErpAccountConfig>(ERP_ACCOUNTS[0]);
+  const [selectedAccount, setSelectedAccount] = useState(() =>
+    ERP_ACCOUNTS.find(account => account.key === getStockQuerySelectedAccount()) ?? ERP_ACCOUNTS[0]
+  );
+  const selectedAccountRef = useRef(selectedAccount);
   const [inputValue, setInputValue] = useState('');
   const [querying, setQuerying] = useState(false);
-  const [lastQuery, setLastQuery] = useState<LastQuery | null>(null);
-  const [stockRows, setStockRows] = useState<CurrentStockRow[]>([]);
+  const [lastQuery, setLastQuery] = useState(() => getStockQuerySnapshot(selectedAccount.key));
   const [errorMessage, setErrorMessage] = useState('');
+  const stockRows = useMemo(() => {
+    const rows = lastQuery?.rows ?? EMPTY_STOCK_ROWS;
+    return rows.filter(row => row.quantity !== null && Number.isFinite(row.quantity) && row.quantity > 0);
+  }, [lastQuery]);
+  const stockQuantity = useMemo(() => {
+    return stockRows.reduce((sum, row) => sum + (row.quantity ?? 0), 0);
+  }, [stockRows]);
   const selectedAccountAvailable = isErpAccountAvailable(selectedAccount);
 
   const focusScannerInput = useCallback((delay = 0) => {
@@ -126,6 +139,8 @@ export default function StockQueryScreen() {
       rulesPreparationRef.current = null;
       queryingRef.current = false;
       setQuerying(false);
+      setLastQuery(getStockQuerySnapshot(selectedAccountRef.current.key));
+      setErrorMessage('');
       focusScannerInput(120);
       void prepareActiveRules().catch((error) => {
         if (screenActiveRef.current && focusSessionRef.current === session) {
@@ -142,6 +157,7 @@ export default function StockQueryScreen() {
         inputRevisionRef.current += 1;
         pendingNativeSubmitTextRef.current = null;
         setInputValue('');
+        inputRef.current?.clear({ discardPendingSubmits: true });
         cancelScanSubmit(autoSubmitTimerRef);
       };
     }, [focusScannerInput, prepareActiveRules])
@@ -181,7 +197,7 @@ export default function StockQueryScreen() {
       cancelScanSubmit(autoSubmitTimerRef);
 
       const rawContent = sanitizeStructuredScannerInput(nextInput ?? liveInputRef.current);
-      if (!rawContent || queryingRef.current) {
+      if (!screenActiveRef.current || !rawContent || queryingRef.current) {
         return;
       }
       lastConsumedInputRef.current = { text: rawContent, at: Date.now() };
@@ -191,21 +207,24 @@ export default function StockQueryScreen() {
       pendingNativeSubmitTextRef.current = null;
       setInputValue('');
       queryingRef.current = true;
+      const account = selectedAccountRef.current;
       const requestId = ++requestIdRef.current;
-      const isCurrent = () => screenActiveRef.current && requestIdRef.current === requestId;
+      const isCurrent = () => screenActiveRef.current && requestIdRef.current === requestId
+        && selectedAccountRef.current.key === account.key;
 
       try {
-        const rules = await prepareActiveRules();
+        const internalInput = isInternalLabelInput(rawContent);
+        const rules = internalInput ? [] : await prepareActiveRules();
         if (!isCurrent()) return;
         if (!isQRCode(rawContent, rules)) return;
         setQuerying(true);
         setErrorMessage('');
         setLastQuery(null);
-        setStockRows([]);
-        if (!selectedAccountAvailable) {
-          throw new Error(`${getAccountLabel(selectedAccount)}账套暂未开放，暂不能查询库存`);
+        if (!isErpAccountAvailable(account)) {
+          throw new Error(`${getAccountLabel(account)}账套暂未开放，暂不能查询库存`);
         }
-        const parsed = await parseStockScan(rawContent, rules);
+        const label = internalInput ? await requireActiveInternalLabel(rawContent) : null;
+        const parsed = label ? { model: label.inventoryName, version: '' } : await parseStockScan(rawContent, rules);
         if (!isCurrent()) return;
         const model = parsed.model.trim();
 
@@ -213,7 +232,7 @@ export default function StockQueryScreen() {
           throw new Error('未识别到型号');
         }
 
-        const inventoryCode = await getInventoryCodeByModel(model, parsed.version);
+        const inventoryCode = label?.inventoryCode ?? await getInventoryCodeByModel(model, parsed.version);
         if (!isCurrent()) return;
 
         if (!inventoryCode) {
@@ -224,21 +243,27 @@ export default function StockQueryScreen() {
           return;
         }
 
-        const result = await fetchCurrentStockByInventoryCode(selectedAccount, inventoryCode);
+        const result = await fetchCurrentStockByInventoryCode(account, inventoryCode);
         if (!isCurrent()) return;
-        setLastQuery({
+        if (result.accountKey !== account.key) {
+          throw new Error('ERP返回的账套与当前账套不一致，请重新查询');
+        }
+        if (label && label.accountKey !== account.key) assertInternalLabelStockMatches(label, result.rows);
+        const snapshot = {
           inventoryCode:
             result.rows.find((row) => row.inventoryCode)?.inventoryCode || result.inventoryCode,
           specification: result.rows.find((row) => row.specification)?.specification || '-',
-        });
-        setStockRows(result.rows);
+          queriedAt: new Date().toISOString(),
+          rows: result.rows,
+        };
+        saveStockQuerySnapshot(account.key, snapshot);
+        setLastQuery(snapshot);
         void feedbackQuerySuccess();
       } catch (error) {
         if (!isCurrent()) return;
         logger.error('[库存查询] 查询失败:', error);
         setErrorMessage(formatUserFacingErrorMessage(error, '库存查询失败，请稍后重试'));
         setLastQuery(null);
-        setStockRows([]);
         void feedbackQueryFailed();
       } finally {
         if (isCurrent()) {
@@ -248,12 +273,12 @@ export default function StockQueryScreen() {
         }
       }
     },
-    [focusScannerInput, prepareActiveRules, selectedAccount, selectedAccountAvailable]
+    [focusScannerInput, prepareActiveRules]
   );
 
   const handleInputChange = useCallback((text: string) => {
     cancelScanSubmit(autoSubmitTimerRef);
-    if (queryingRef.current) return;
+    if (!screenActiveRef.current || queryingRef.current) return;
     const revision = ++inputRevisionRef.current;
     if (pendingNativeSubmitTextRef.current !== text) pendingNativeSubmitTextRef.current = null;
     liveInputRef.current = text;
@@ -305,15 +330,17 @@ export default function StockQueryScreen() {
           onPress={() => {
             if (queryingRef.current) return;
             cancelScanSubmit(autoSubmitTimerRef);
+            inputRef.current?.clear({ discardPendingSubmits: true });
             requestIdRef.current += 1;
             liveInputRef.current = '';
             inputRevisionRef.current += 1;
             pendingNativeSubmitTextRef.current = null;
 
+            selectedAccountRef.current = account;
+            rememberStockQueryAccount(account.key);
             setSelectedAccount(account);
             setInputValue('');
-            setLastQuery(null);
-            setStockRows([]);
+            setLastQuery(available ? getStockQuerySnapshot(account.key) : null);
             setErrorMessage(available ? '' : `${getAccountLabel(account)}账套暂未开放，暂不能查询库存`);
             focusScannerInput(120);
           }}
@@ -430,11 +457,10 @@ export default function StockQueryScreen() {
                   </Text>
                 </View>
                 <View style={styles.queryFieldRow}>
-                  <Text style={styles.queryLabel}>ERP 总库存</Text>
-                  <Text style={styles.queryValue}>
-                    {formatQuantity(stockRows.some(row => row.quantity === null) ? null : stockRows.reduce((sum, row) => sum + (row.quantity ?? 0), 0))}
-                  </Text>
+                  <Text style={styles.queryLabel}>现存量合计</Text>
+                  <Text style={styles.queryValue}>{formatQuantity(stockQuantity)}</Text>
                 </View>
+                <Text style={styles.queryTime}>上次查询：{formatDateTime(lastQuery.queriedAt)}</Text>
               </View>
               <View style={styles.queryBadge}>
                 <Text style={styles.queryBadgeText}>{stockRows.length} 仓库</Text>
@@ -468,8 +494,10 @@ export default function StockQueryScreen() {
               ListEmptyComponent={
                 <AppEmptyState
                   icon="search"
-                  title={lastQuery ? 'ERP未返回库存' : '等待查询'}
-                  description={lastQuery ? '该账套未返回此物料的库存明细' : '扫描物料二维码后显示现存量'}
+                  title={lastQuery ? '当前账套暂无可显示的库存' : '等待查询'}
+                  description={lastQuery
+                    ? '仅显示当前账套现存量大于 0 的仓库'
+                    : '扫描物料二维码后显示现存量'}
                   compact
                   style={styles.empty}
                 />

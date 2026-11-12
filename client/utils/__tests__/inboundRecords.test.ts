@@ -33,6 +33,34 @@ describe('inboundRecords', () => {
     expect(resolveInboundInventoryCodeFromBindings(bindings, 'model-a', 'V3')).toBe('ic.default');
   });
 
+  it('resolves every configured version to the same code without merging actual record versions', () => {
+    const bindings = [
+      { scan_model: 'MODEL-A', version: 'V1', versions: ['V1', ' V2 '], inventory_code: 'ic.shared' },
+    ];
+    const before = JSON.stringify(bindings);
+
+    expect(resolveInboundInventoryCodeFromBindings(bindings, 'model-a', ' v1 ')).toBe('ic.shared');
+    expect(resolveInboundInventoryCodeFromBindings(bindings, 'MODEL-A', 'v2')).toBe('ic.shared');
+    expect(resolveInboundInventoryCodeFromBindings(bindings, 'MODEL-A', 'V10')).toBe('');
+    expect(resolveInboundInventoryCodeFromBindings(bindings, 'MODEL-A', '')).toBe('');
+    expect(resolveInboundInventoryCodeFromBindings(bindings, 'OTHER-MODEL', 'V2')).toBe('');
+    expect(buildInboundModelVersionKey('MODEL-A', 'V1')).not.toBe(
+      buildInboundModelVersionKey('MODEL-A', 'V2')
+    );
+    expect(JSON.stringify(bindings)).toBe(before);
+  });
+
+  it('uses a generic binding only after all configured versions have been checked', () => {
+    const bindings = [
+      { scan_model: 'MODEL-A', versions: [], inventory_code: 'ic.default' },
+      { scan_model: 'MODEL-A', version: 'V1', versions: ['V1', '', ' V2 '], inventory_code: 'ic.shared' },
+    ];
+
+    expect(resolveInboundInventoryCodeFromBindings(bindings, 'MODEL-A', 'V2')).toBe('ic.shared');
+    expect(resolveInboundInventoryCodeFromBindings(bindings, 'MODEL-A', 'V10')).toBe('ic.default');
+    expect(resolveInboundInventoryCodeFromBindings(bindings, 'MODEL-A', '')).toBe('ic.default');
+  });
+
   it('removes duplicate query rows with the same database id only', () => {
     const records = [
       { id: 'row-1', quantity: 100 },

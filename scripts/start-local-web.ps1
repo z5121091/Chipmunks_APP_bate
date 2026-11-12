@@ -5,6 +5,8 @@ param(
   [switch]$NoProxy,
   [switch]$NoOpen,
   [switch]$ClearCache,
+  [switch]$Managed,
+  [ValidateRange(1, 4)][int]$MaxWorkers = 2,
   [switch]$DryRun
 )
 
@@ -18,6 +20,12 @@ $ProxyUrl = 'http://localhost:{0}' -f $ProxyPort
 $ProxyScript = Join-Path $PSScriptRoot 'local-backend-proxy.mjs'
 $ProxyLogPath = Join-Path $RepoRoot 'client\.local-backend-proxy.log'
 $ProxyErrorLogPath = Join-Path $RepoRoot 'client\.local-backend-proxy.err.log'
+if ($Managed -and $env:CHIPMUNKS_WEB_PREVIEW_LOG_DIRECTORY) {
+  $previewLogDirectory = $env:CHIPMUNKS_WEB_PREVIEW_LOG_DIRECTORY
+  [IO.Directory]::CreateDirectory($previewLogDirectory) | Out-Null
+  $ProxyLogPath = Join-Path $previewLogDirectory 'proxy.log'
+  $ProxyErrorLogPath = Join-Path $previewLogDirectory 'proxy.err.log'
+}
 $LocalEnvPath = Join-Path $RepoRoot '.env.local'
 $ErpProxyConfigPath = Join-Path $RepoRoot 'server\erp-proxy.config.json'
 
@@ -102,7 +110,12 @@ if (-not $env:EXPO_PUBLIC_BACKEND_ACCESS_KEY -and $env:BACKEND_ACCESS_KEY) {
   $env:EXPO_PUBLIC_BACKEND_ACCESS_KEY = $env:BACKEND_ACCESS_KEY
 }
 
-$expoArgs = @('exec', 'expo', 'start', '--web', '--offline', '--port', [string]$Port)
+$expoArgs = @('exec', 'expo', 'start', '--web', '--offline', '--port', [string]$Port, '--max-workers', [string]$MaxWorkers)
+$LocalExpoCli = Join-Path $ClientDir 'node_modules/expo/bin/cli'
+$UseDirectExpo = $Managed -and (Test-Path -LiteralPath $LocalExpoCli -PathType Leaf)
+if ($Managed) {
+  if (-not $env:CHIPMUNKS_WEB_PREVIEW_SESSION -and -not $DryRun) { throw 'Managed preview session is missing.' }
+}
 if ($ClearCache) {
   $expoArgs += '--clear'
 }
@@ -121,34 +134,51 @@ if ($DryRun) {
   if (-not $NoProxy) {
     Write-Host ('Proxy command: node "{0}" --target "{1}" --port {2}' -f $ProxyScript, $ResolvedBackendBaseUrl, $ProxyPort)
   }
-  Write-Host ('Command: pnpm {0}' -f ($expoArgs -join ' '))
+  if ($UseDirectExpo) {
+    Write-Host ('Command: node "{0}" {1}' -f $LocalExpoCli, (($expoArgs | Select-Object -Skip 2) -join ' '))
+  } else {
+    Write-Host ('Command: pnpm {0}' -f ($expoArgs -join ' '))
+  }
   exit 0
 }
 
-$nodeCommand = & where.exe node 2>$null | Select-Object -First 1
+$nodeCommand = (Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if (-not $nodeCommand -and $Managed) {
+  $cachedNode = Join-Path $env:LOCALAPPDATA 'ChipmunksBuildTools/node/node-v22.23.1-win-x64/node.exe'
+  if (Test-Path -LiteralPath $cachedNode -PathType Leaf) { $nodeCommand = $cachedNode }
+}
 if (-not $nodeCommand) {
   Write-Host 'node was not found. Please install Node.js first.' -ForegroundColor Red
   exit 1
 }
 
-$pnpmCommand = & where.exe pnpm 2>$null
-if (-not $pnpmCommand) {
+$env:PATH = (Split-Path $nodeCommand -Parent) + ';' + $env:PATH
+$pnpmCommand = (Get-Command pnpm.cmd -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if (-not $pnpmCommand -and $Managed) {
+  $cachedPnpm = Join-Path $env:LOCALAPPDATA 'ChipmunksBuildTools/bin/pnpm.cmd'
+  if (Test-Path -LiteralPath $cachedPnpm -PathType Leaf) {
+    $pnpmCommand = $cachedPnpm
+    $env:COREPACK_HOME = Join-Path $env:LOCALAPPDATA 'ChipmunksBuildTools/corepack'
+  }
+}
+if (-not $pnpmCommand -and -not $UseDirectExpo) {
   Write-Host 'pnpm was not found. Please install project dependencies first.' -ForegroundColor Red
   exit 1
 }
 
 if (-not $NoProxy) {
   if (Test-LocalPort -TargetPort $ProxyPort) {
+    if ($Managed) { throw "Preview proxy port $ProxyPort is already occupied. Stop its existing owner before retrying." }
     Write-Host ('Local backend proxy is already running at {0}.' -f $ProxyUrl) -ForegroundColor Yellow
   } else {
     Write-Host ('Starting local backend proxy at {0}...' -f $ProxyUrl)
-    Start-Process `
+    $proxyProcess = Start-Process `
       -FilePath $nodeCommand `
-      -ArgumentList @($ProxyScript, '--target', $ResolvedBackendBaseUrl, '--port', [string]$ProxyPort) `
+      -ArgumentList @(('"{0}"' -f $ProxyScript), '--target', ('"{0}"' -f $ResolvedBackendBaseUrl), '--port', [string]$ProxyPort) `
       -WorkingDirectory $RepoRoot `
       -RedirectStandardOutput $ProxyLogPath `
       -RedirectStandardError $ProxyErrorLogPath `
-      -WindowStyle Hidden | Out-Null
+      -WindowStyle Hidden -PassThru
 
     for ($index = 0; $index -lt 20; $index += 1) {
       if (Test-LocalPort -TargetPort $ProxyPort) {
@@ -161,6 +191,10 @@ if (-not $NoProxy) {
 }
 
 if (Test-LocalPort -TargetPort $Port) {
+  if ($Managed) {
+    if ($proxyProcess -and -not $proxyProcess.HasExited) { $proxyProcess.Kill() }
+    throw "Preview port $Port is already occupied. Stop its existing owner before retrying."
+  }
   Write-Host ('{0} is already running. Opening browser.' -f $Url) -ForegroundColor Yellow
   Write-Host 'If ERP fetch still fails, close the existing Expo window and run this script again.' -ForegroundColor Yellow
   if (-not $NoOpen) {
@@ -206,5 +240,17 @@ if (-not $NoOpen) {
 }
 
 Set-Location $ClientDir
-& pnpm @expoArgs
-exit $LASTEXITCODE
+try {
+  if ($UseDirectExpo) {
+    # Use the project's already installed CLI directly; no pnpm bootstrap,
+    # workspace discovery, or package-manager process is needed for preview.
+    $directExpoArgs = @($expoArgs | Select-Object -Skip 2)
+    & $nodeCommand $LocalExpoCli @directExpoArgs
+  } else {
+    & $pnpmCommand @expoArgs
+  }
+  $previewExitCode = $LASTEXITCODE
+} finally {
+  if ($Managed -and $proxyProcess -and -not $proxyProcess.HasExited) { $proxyProcess.Kill() }
+}
+exit $previewExitCode

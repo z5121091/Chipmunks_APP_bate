@@ -1,13 +1,17 @@
 jest.mock('@react-native-async-storage/async-storage', () =>
   jest.requireActual('@react-native-async-storage/async-storage/jest/async-storage-mock')
 );
+jest.mock('../backendApi', () => ({
+  ...jest.requireActual('../backendApi'), backendJsonRequest: jest.fn(),
+}));
 
+import { backendJsonRequest } from '../backendApi';
 import type { ErpAccountConfig } from '../erpAccounts';
 import {
   isPurchaseReceiveWarehouseAllowed,
   mapPurchaseReceiveVoucher,
 } from '../erpPurchaseReceive';
-import { mapSaleDispatchVoucher } from '../erpSaleDispatch';
+import { fetchSaleDispatchVoucher, mapSaleDispatchVoucher } from '../erpSaleDispatch';
 
 const account: ErpAccountConfig = {
   backendBaseUrl: 'http://example.test',
@@ -19,6 +23,17 @@ const account: ErpAccountConfig = {
 };
 
 describe('ERP voucher payload mapping', () => {
+  it('fetches an outbound voucher with its actual warehouse independently of the account default', async () => {
+    const code = 'IO-2026-07-26-001';
+    jest.mocked(backendJsonRequest).mockResolvedValueOnce({ success: true, data: { code: '0', data: {
+      Code: code, VoucherState: { Code: '00' }, Warehouse: { Name: ' A 仓 ' },
+    } } });
+
+    await expect(fetchSaleDispatchVoucher(account, code)).resolves.toMatchObject({
+      accountKey: account.key, warehouseName: 'A 仓',
+    });
+  });
+
   it('maps a sales dispatch voucher and preserves its inventory code casing', () => {
     const voucher = mapSaleDispatchVoucher(account, {
       Clerk: { Name: '仓管员' },

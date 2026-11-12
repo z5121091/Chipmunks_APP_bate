@@ -35,6 +35,8 @@ import {
   importInventoryBindings,
 } from '@/utils/database';
 import { formatDate } from '@/utils/time';
+import { getBindingVersions, normalizeBindingVersions } from '@/utils/bindingVersions';
+import { writeBindingWorkbook } from '@/utils/bindingVersionExcel';
 
 const FileSystem = FileSystemLegacy;
 const PAGE_SIZE = 10;
@@ -58,11 +60,12 @@ export default function InventoryBindingScreen() {
   const [editingBinding, setEditingBinding] = useState<InventoryBinding | null>(null);
   const [formData, setFormData] = useState({
     scan_model: '',
-    version: '',
     inventory_code: '',
     supplier: '',
     description: '',
   });
+  const nextVersionInputId = useRef(1);
+  const [versionInputs, setVersionInputs] = useState([{ id: 0, value: '' }]);
   const [importing, setImporting] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -130,11 +133,14 @@ export default function InventoryBindingScreen() {
 
   // 打开添加/编辑弹窗
   const handleOpenModal = useCallback((binding?: InventoryBinding) => {
+    const versions = binding ? getBindingVersions(binding) : [];
+    setVersionInputs((versions.length ? versions : ['']).map(value => ({
+      id: nextVersionInputId.current++, value,
+    })));
     if (binding) {
       setEditingBinding(binding);
       setFormData({
         scan_model: binding.scan_model,
-        version: binding.version || '',
         inventory_code: binding.inventory_code,
         supplier: binding.supplier || '',
         description: binding.description || '',
@@ -143,7 +149,6 @@ export default function InventoryBindingScreen() {
       setEditingBinding(null);
       setFormData({
         scan_model: '',
-        version: '',
         inventory_code: '',
         supplier: '',
         description: '',
@@ -172,10 +177,11 @@ export default function InventoryBindingScreen() {
       const allBindings = await getAllInventoryBindings();
       const inventoryCode = formData.inventory_code.trim();
       const scanModel = formData.scan_model.trim();
-      const version = formData.version.trim();
+      const versions = normalizeBindingVersions(versionInputs.map(input => input.value));
+      const version = versions[0] || '';
       const inventoryCodeMatchKey = normalizeBindingMatchKey(inventoryCode);
       const modelMatchKey = normalizeBindingMatchKey(scanModel);
-      const versionMatchKey = normalizeBindingMatchKey(version);
+      const versionMatchKeys = new Set((versions.length ? versions : ['']).map(normalizeBindingMatchKey));
       const existingCode = allBindings.find(
         (binding) =>
           normalizeBindingMatchKey(binding.inventory_code) === inventoryCodeMatchKey &&
@@ -191,17 +197,23 @@ export default function InventoryBindingScreen() {
       const existingModelVersion = allBindings.find(
         (binding) =>
           normalizeBindingMatchKey(binding.scan_model) === modelMatchKey &&
-          normalizeBindingMatchKey(binding.version) === versionMatchKey &&
+          (getBindingVersions(binding).length ? getBindingVersions(binding) : [''])
+            .some(value => versionMatchKeys.has(normalizeBindingMatchKey(value))) &&
           (!editingBinding || binding.id !== editingBinding.id)
       );
       if (existingModelVersion) {
-        alert.showWarning('该型号和版本号已存在绑定，请编辑已有记录');
+        const existingVersions = getBindingVersions(existingModelVersion);
+        const conflictVersion = existingVersions.find(value => versionMatchKeys.has(normalizeBindingMatchKey(value)));
+        alert.showWarning(
+          `该型号${conflictVersion ? `的版本号「${conflictVersion}」` : '的通用绑定'}已绑定存货编码「${existingModelVersion.inventory_code}」，请编辑已有记录`
+        );
         return;
       }
 
       const payload = {
         scan_model: scanModel,
         version,
+        versions,
         inventory_code: inventoryCode,
         supplier: formData.supplier.trim(),
         description: formData.description.trim(),
@@ -282,8 +294,8 @@ export default function InventoryBindingScreen() {
         .replace(/[（(](?:可选|选填|必填)[）)]$/, '')
         .replace(/^扫描型号$/, '型号'));
       // 按表头读取，兼容旧版列顺序，避免供应商和版本号错位。
-      const [modelColumn, codeColumn, supplierColumn, versionColumn, descriptionColumn] =
-        ['型号', '存货编码', '供应商', '版本号', '描述'].map((header) => {
+      const [modelColumn, codeColumn, supplierColumn, descriptionColumn] =
+        ['型号', '存货编码', '供应商', '描述'].map((header) => {
           const index = headers.indexOf(header);
           if (index !== headers.lastIndexOf(header)) {
             throw new Error(`Excel表头「${header}」重复，请检查后重新导入`);
@@ -293,11 +305,24 @@ export default function InventoryBindingScreen() {
       if (modelColumn < 0 || codeColumn < 0) {
         throw new Error('Excel表头不正确，请使用物料绑定导出文件或导入模板');
       }
+      // 新表使用一个版本号列，兼容已导出的旧版编号列。
+      const versionColumns = new Map<number, number>();
+      headers.forEach((header, column) => {
+        const match = /^版本号([1-9]\d*)?$/.exec(header);
+        if (!match) return;
+        const versionNumber = Number(match[1] || 1);
+        if (versionColumns.has(versionNumber)) {
+          throw new Error(`Excel表头「版本号${versionNumber === 1 ? '' : versionNumber}」重复，请检查后重新导入`);
+        }
+        versionColumns.set(versionNumber, column);
+      });
+      const orderedVersionColumns = [...versionColumns].sort(([a], [b]) => a - b).map(([, column]) => column);
 
       // 跳过表头，从第二行开始
       const bindingsToImport: Array<{
         scan_model: string;
         version?: string;
+        versions?: string[];
         inventory_code: string;
         supplier?: string;
         description?: string;
@@ -310,11 +335,15 @@ export default function InventoryBindingScreen() {
         const scanModel = readCell(modelColumn);
         const inventoryCode = readCell(codeColumn);
         if (scanModel && inventoryCode) {
+          const versions = normalizeBindingVersions(
+            orderedVersionColumns.flatMap((column) => readCell(column).split(/\r\n?|\n/))
+          );
           bindingsToImport.push({
             scan_model: scanModel,
             inventory_code: inventoryCode,
             supplier: readCell(supplierColumn) || undefined,
-            version: readCell(versionColumn) || undefined,
+            version: versions[0] || undefined,
+            versions,
             description: readCell(descriptionColumn) || undefined,
           });
         }
@@ -330,7 +359,7 @@ export default function InventoryBindingScreen() {
       const processedCount = importResult.inserted + importResult.updated;
       let message =
         `导入完成\n\n新增 ${importResult.inserted} 条` +
-        `\n更新供应商/描述 ${importResult.updated} 条` +
+        `\n更新版本/供应商/描述 ${importResult.updated} 条` +
         `\n内容未变化 ${importResult.unchanged} 条`;
 
       if (importResult.conflicts.length > 0) {
@@ -370,7 +399,7 @@ export default function InventoryBindingScreen() {
         b.scan_model,
         b.inventory_code,
         b.supplier || '',
-        b.version || '',
+        getBindingVersions(b).join('\n'),
         b.description || '',
         b.created_at ? formatDate(b.created_at) : '',
       ]);
@@ -384,12 +413,12 @@ export default function InventoryBindingScreen() {
         { wch: 20 },
         { wch: 20 },
         { wch: 15 },
-        { wch: 12 },
+        { wch: 30 },
         { wch: 30 },
         { wch: 12 },
       ];
 
-      const wbout = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
+      const wbout = writeBindingWorkbook(wb, ws);
       const fileName = `物料绑定_${new Date().toLocaleDateString('zh-CN').replace(/\//g, '-')}.xlsx`;
       const filePath = `${FileSystem.cacheDirectory}${fileName}`;
 
@@ -415,16 +444,16 @@ export default function InventoryBindingScreen() {
     try {
       // 模板表头 + 示例数据行
       const headers = ['扫描型号（必填）', '存货编码（必填）', '供应商（可选）', '版本号（可选）', '描述（可选）'];
-      const exampleRow = ['示例型号ABC', 'INV001', '供应商A', 'A1', '这是示例描述'];
+      const exampleRow = ['示例型号ABC', 'INV001', '供应商A', 'A1\nA2', '这是示例描述'];
 
       const ws = XLSX.utils.aoa_to_sheet([headers, exampleRow]);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, '物料绑定模板');
 
       // 设置列宽
-      ws['!cols'] = [{ wch: 20 }, { wch: 20 }, { wch: 15 }, { wch: 14 }, { wch: 30 }];
+      ws['!cols'] = [{ wch: 20 }, { wch: 20 }, { wch: 15 }, { wch: 30 }, { wch: 30 }];
 
-      const wbout = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
+      const wbout = writeBindingWorkbook(wb, ws);
       const fileName = `物料绑定导入模板.xlsx`;
       const filePath = `${FileSystem.cacheDirectory}${fileName}`;
 
@@ -437,7 +466,7 @@ export default function InventoryBindingScreen() {
           mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
           dialogTitle: '导出导入模板',
         });
-        alert.showSuccess('模板已导出\n\n请按照模板格式填写数据后导入');
+        alert.showSuccess('模板已导出\n\n多个版本号可在同一单元格内换行填写，每行一个版本。');
       } else {
         alert.showError('当前设备不支持文件分享，未能导出模板');
       }
@@ -476,8 +505,8 @@ export default function InventoryBindingScreen() {
 
               <View style={styles.bindingMetaRow}>
                 <Text style={styles.bindingMetaLabel}>版本号</Text>
-                <Text style={styles.bindingMetaValue} numberOfLines={1} ellipsizeMode="tail">
-                  {binding.version || '未设置'}
+                <Text style={styles.bindingMetaValue}>
+                  {getBindingVersions(binding).join('、') || '未设置'}
                 </Text>
               </View>
 
@@ -620,7 +649,7 @@ export default function InventoryBindingScreen() {
                     style={styles.searchInput}
                     value={searchInput}
                     onChangeText={setSearchInput}
-                    placeholder="型号/编码/供应商"
+                    placeholder="型号/编码/版本/供应商"
                     placeholderTextColor={theme.textMuted}
                     autoCapitalize="none"
                     autoCorrect={false}
@@ -820,16 +849,40 @@ export default function InventoryBindingScreen() {
                 </TouchableOpacity>
               </AppFormField>
 
-              <AppFormField label="版本号">
-                <TextInput
-                  style={styles.input}
-                  value={formData.version}
-                  onChangeText={(text) => setFormData({ ...formData, version: text })}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  placeholder="同型号多版本时填写"
-                  placeholderTextColor={theme.textMuted}
-                />
+              <AppFormField label="版本号" hint="填写的版本号满足任意一个即可，按完整版本匹配；全部留空则不区分版本。">
+                <View style={styles.versionInputs}>
+                  {versionInputs.map((input, index) => (
+                    <View key={input.id} style={styles.versionInputRow}>
+                      <TextInput
+                        style={[styles.input, styles.versionInput]}
+                        value={input.value}
+                        onChangeText={(value) => setVersionInputs(current => current.map(row => row.id === input.id ? { ...row, value } : row))}
+                        accessibilityLabel={`版本号${index + 1}`}
+                        editable={!saving}
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                        placeholder={index === 0 ? '同型号多版本时填写' : '输入另一个版本号'}
+                        placeholderTextColor={theme.textMuted}
+                      />
+                      <TouchableOpacity
+                        accessibilityRole="button"
+                        accessibilityLabel={index === 0 ? '添加版本号' : `删除版本号${index + 1}`}
+                        disabled={saving}
+                        style={styles.versionAction}
+                        onPress={() => {
+                          if (index === 0) {
+                            const id = nextVersionInputId.current++;
+                            setVersionInputs(current => [...current, { id, value: '' }]);
+                          } else {
+                            setVersionInputs(current => current.filter(row => row.id !== input.id));
+                          }
+                        }}
+                      >
+                        <Feather name={index === 0 ? 'plus' : 'minus'} size={19} color={index === 0 ? theme.primary : theme.textMuted} />
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </View>
               </AppFormField>
 
               <AppFormField label="描述" style={styles.formGroupLast}>
@@ -867,7 +920,7 @@ export default function InventoryBindingScreen() {
         <View style={styles.modalOverlay}>
           <AppModalCard
             title="物料绑定数据工具"
-            subtitle="批量维护和备份型号对应关系"
+            subtitle="绑定表的多个版本号在同一格内换行填写。出入库和盘点单显示实际扫描版本。"
             onClose={() => setDataToolsVisible(false)}
             style={styles.modalContent}
             bodyStyle={styles.dataToolsBody}

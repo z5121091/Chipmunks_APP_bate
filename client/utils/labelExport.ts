@@ -15,6 +15,9 @@ export interface UnpackLabelExportRecord {
   customer_name?: string;
   supplier?: string;
   inventory_code?: string;
+  inventory_name?: string | null;
+  specification?: string | null;
+  source_qr?: string | null;
   model?: string;
   version?: string;
   package?: string;
@@ -25,6 +28,7 @@ export interface UnpackLabelExportRecord {
   traceNo?: string;
   new_traceNo?: string;
   sourceNo?: string;
+  new_sourceNo?: string | null;
   unpacked_at?: string;
 }
 
@@ -61,7 +65,12 @@ export const buildUnpackLabelSheet = (
         ],
         traceNoValue: getLabelTraceNo,
       }),
+      ...(records.some(record => record.source_qr) ? [
+        { header: '原始二维码', value: (record: UnpackLabelExportRecord) => record.source_qr || '' },
+        { header: '存货名称', value: (record: UnpackLabelExportRecord) => record.inventory_name || '' },
+        { header: '规格型号', value: (record: UnpackLabelExportRecord) => record.specification || '' },
+      ] : []),
       { header: EXCEL_HEADERS.unpackTime, value: (record) => formatTime(record.unpacked_at) },
     ],
-    records
+    records.map(record => record.new_sourceNo ? { ...record, sourceNo: record.new_sourceNo } : record)
   );

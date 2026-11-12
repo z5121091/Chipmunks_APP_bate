@@ -202,11 +202,12 @@ export default function HomeScreen() {
   const handleRecentDocumentPress = useCallback(
     (document: RecentDocumentSummary) => {
       if (document.type === 'outbound') {
-        navigateToRoute('/orders', { orderNo: document.document_no });
+        navigateToRoute('/orders', { orderNo: document.document_no, warehouseId: document.warehouse_id });
         return;
       }
       navigateToRoute(
-        document.type === 'inbound' ? '/inbound-records' : '/inventory-records'
+        document.type === 'inbound' ? '/inbound-records' : '/inventory-records',
+        { documentNo: document.document_no, warehouseId: document.warehouse_id }
       );
     },
     [navigateToRoute]

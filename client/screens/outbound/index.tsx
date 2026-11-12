@@ -10,6 +10,15 @@ import { useConfirmedRouteExit } from '@/hooks/useConfirmedRouteExit';
 import { workDraftStorage as AsyncStorage } from '@/utils/workDraftIsolation';
 import { safeJsonParseNullable } from '@/utils/json';
 import { logger } from '@/utils/logger';
+import { buildPackageKey, packageFieldValue } from '@/utils/packageRecognition';
+import {
+  INTERNAL_LABEL_RULE_NAME,
+  INTERNAL_LABEL_SEPARATOR,
+  internalLabelPackageKey,
+  isInternalLabelInput,
+  isInternalLabelPackageKey,
+  type InternalLabelPackage,
+} from '@/utils/internalLabelCode';
 import { parseQuantity } from '@/utils/quantity';
 import { isQRCode, recoverConfirmedScannerContent, shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
 import { useTheme } from '@/hooks/useTheme';
@@ -32,11 +41,15 @@ import {
   detectRule,
   getActiveRules,
   parseWithRule,
+  FIELD_LABELS,
   QRCodeRuleConflictError,
   checkMaterialExists,
   getMaterialsByOrder,
+  findOutboundOrderWarehouseConflict,
   getInventoryCodeByModel,
   getInventoryBindingMatchByModel,
+  getInternalLabelSpecifications,
+  requireActiveInternalLabel,
   getMaterialById,
   getSalesReturnsByOrder,
   getSalesReturnById,
@@ -62,6 +75,7 @@ import {
   feedbackDuplicate,
   feedbackOutboundOrderReady,
   feedbackSalesReturnOrderReady,
+  type OutboundOrderReadyStatus,
   feedbackSalesReturnSaved,
   feedbackNotBound,
   feedbackNotInOrder,
@@ -97,7 +111,8 @@ import {
   type OutboundOrderRuleConfig,
   type OutboundWarehouseSampleRuleMap,
 } from '@/utils/outboundOrderRule';
-import { getErpAccountByOutboundOrderNo, type ErpAccountConfig } from '@/utils/erpAccounts';
+import { ERP_ACCOUNTS, getErpAccountByOutboundOrderNo, type ErpAccountConfig } from '@/utils/erpAccounts';
+import { findErpWarehouse } from '@/utils/erpWarehouse';
 import {
   fetchSaleDispatchVoucher,
   type SaleDispatchVoucher,
@@ -142,6 +157,8 @@ interface MaterialItem {
   package?: string;
   productionDate?: string;
   inventoryCode?: string;
+  packageKey?: string | null;
+  internalSpecification?: string;
   customFields?: Record<string, string>;
   operationType?: MaterialRecord['operation_type'];
 }
@@ -171,6 +188,7 @@ interface PendingOutboundUnpack {
   recoveryItem?: QueueItem;
   materialId?: string;
   genericBinding?: boolean;
+  internalPackage?: InternalLabelPackage;
 }
 
 interface OutboundScanOptions {
@@ -483,6 +501,13 @@ type RefreshedErpVoucherState = {
   warehouse: Warehouse;
 };
 
+function announceErpOrderReady(status: OutboundOrderReadyStatus, warehouse: Warehouse, isReturn: boolean) {
+  const feedback = isReturn ? feedbackSalesReturnOrderReady : feedbackOutboundOrderReady;
+  const name = warehouse.name.trim();
+  if (ERP_ACCOUNTS.some(account => account.expectedWarehouseName === name)) return feedback(status);
+  return feedback(status, name);
+}
+
 const createOutboundWorkDraft = (
   orderNo: string,
   customerName: string,
@@ -499,7 +524,8 @@ const createOutboundWorkDraft = (
 
 const mapQueueItemToMaterialItem = (
   materialId: string,
-  parsed: QueueItemParsedPayload
+  parsed: QueueItemParsedPayload,
+  internalSpecification?: string,
 ): MaterialItem => ({
   id: materialId,
   model: parsed.model || '',
@@ -512,10 +538,12 @@ const mapQueueItemToMaterialItem = (
   package: parsed.package,
   productionDate: parsed.productionDate,
   inventoryCode: parsed.inventoryCode,
+  packageKey: parsed.package_key,
+  internalSpecification,
   customFields: parsed.customFields,
 });
 
-const mapMaterialRecordToMaterialItem = (material: MaterialRecord): MaterialItem => ({
+const mapMaterialRecordToMaterialItem = (material: MaterialRecord, internalSpecification?: string): MaterialItem => ({
   id: material.id,
   model: material.model,
   batch: material.batch,
@@ -527,6 +555,8 @@ const mapMaterialRecordToMaterialItem = (material: MaterialRecord): MaterialItem
   package: material.package,
   productionDate: material.productionDate,
   inventoryCode: (material.inventory_code || '').trim(),
+  packageKey: material.package_key,
+  internalSpecification,
   customFields: material.customFields,
   operationType: material.operation_type,
 });
@@ -536,6 +566,17 @@ const assertSaleDispatchDirection = (voucher: SaleDispatchVoucher) => {
     throw new Error('ERP单据数量无效：仅支持全正数出库单或全负数退货单，数量须为非零整数；正负混合单请在ERP拆分后操作');
   }
 };
+
+function assertInternalPackageMatchesSaleDispatch(pkg: InternalLabelPackage, voucher: SaleDispatchVoucher): void {
+  if (pkg.accountKey === voucher.accountKey) return;
+  const normalizeSpecification = (value: string) => value.normalize('NFKC').replace(/\s+/g, '').toUpperCase();
+  const specification = normalizeSpecification(pkg.specification);
+  const inventoryCode = normalizeInventoryCode(pkg.inventoryCode);
+  const lines = voucher.lines.filter(line => normalizeInventoryCode(line.inventoryCode) === inventoryCode);
+  if (!specification || !lines.length || lines.some(line => normalizeSpecification(line.specification) !== specification)) {
+    throw new Error(`跨账套无法核对内部标签 ${pkg.inventoryCode} 的规格，请核对标签和当前 ERP 单据`);
+  }
+}
 
 const buildSaleDispatchProgress = (lines: SaleDispatchVoucher['lines'], records: MaterialItem[]) =>
   getSaleDispatchDirection(lines) === 'sales_return'
@@ -568,6 +609,7 @@ const mapQueueItemToMaterialRecord = (
   productionDate: parsed.productionDate || '',
   traceNo: parsed.traceNo || '',
   sourceNo: parsed.sourceNo || '',
+  package_key: parsed.package_key,
   scanned_at: getISODateTime(),
   raw_content: rawContent,
   separator: parsed.separator,
@@ -580,7 +622,9 @@ const mapQueueItemToMaterialRecord = (
 });
 
 const buildMaterialGroupKey = (item: MaterialItem) =>
-  JSON.stringify([item.model || '', item.version || '']);
+  JSON.stringify(isInternalLabelPackageKey(item.packageKey)
+    ? [INTERNAL_LABEL_RULE_NAME, normalizeInventoryCode(item.inventoryCode), item.version || '']
+    : [item.model || '', item.version || '']);
 
 const buildOrderMaterialsKey = (no: string, warehouseId?: string) =>
   JSON.stringify([normalizeOrderNoCandidate(no), warehouseId || '']);
@@ -686,7 +730,7 @@ export default function PDAScanScreen() {
     (warehouseList: Warehouse[], explicitWarehouse: Warehouse | null, sessionId?: number) => Promise<void>
   >(async () => undefined);
   const loadOrderMaterialsRef = useRef<
-    (orderNo: string, explicitWarehouseId?: string) => Promise<MaterialItem[]>
+    (orderNo: string, explicitWarehouseId?: string, warehouseList?: Warehouse[]) => Promise<MaterialItem[]>
   >(async () => []);
   const forceRefreshErpVoucherForOrderRef = useRef<
     (
@@ -1050,6 +1094,7 @@ export default function PDAScanScreen() {
       lastConfirmedNativeTextRef.current = null;
       liveInputValueRef.current = '';
       setInputValue('');
+      inputRef.current?.clear({ discardPendingSubmits: true });
       initializingRef.current = true;
       processingRef.current = true;
       setIsErpOrderLoading(true);
@@ -1195,7 +1240,7 @@ export default function PDAScanScreen() {
           }
 
           try {
-            await loadOrderMaterialsRef.current(draftOrderNo, draftWarehouse.id);
+            await loadOrderMaterialsRef.current(draftOrderNo, draftWarehouse.id, list);
           } catch (error) {
             logger.warn('[loadOutboundState] 快速恢复出库物料失败:', error);
             throw error;
@@ -1220,7 +1265,7 @@ export default function PDAScanScreen() {
               return;
             }
 
-            const workWarehouse = restoredErpState?.warehouse || draftWarehouse;
+            const workWarehouse = restoredErpState?.warehouse || currentWarehouseRef.current || draftWarehouse;
             const workCustomerName = (
               restoredErpState?.voucher.customerName ||
               restoredCustomerName ||
@@ -1232,13 +1277,13 @@ export default function PDAScanScreen() {
               draftOrderNo,
               workCustomerName,
               workWarehouse,
-              restoredErpState?.voucher || null
+              restoredErpState?.voucher ?? cachedErpVoucher
             );
             if (!isCurrentSession(sessionId) || orderNoRef.current !== draftOrderNo) return;
 
             if (workWarehouse.id !== draftWarehouse.id ||
                 orderMaterialsKeyRef.current !== buildOrderMaterialsKey(draftOrderNo, workWarehouse.id)) {
-              await loadOrderMaterialsRef.current(draftOrderNo, workWarehouse.id);
+              await loadOrderMaterialsRef.current(draftOrderNo, workWarehouse.id, list);
             }
           })().catch((error) => {
             logger.warn('[loadOutboundState] 后台刷新 ERP 出库草稿失败:', error);
@@ -1325,7 +1370,7 @@ export default function PDAScanScreen() {
         setActiveCustomerName(workCustomerName);
         await saveOutboundWorkDraft(savedOrderNo, workCustomerName, workWarehouse);
         if (!isCurrentSession(sessionId) || orderNoRef.current !== savedOrderNo) return;
-        await loadOrderMaterialsRef.current(savedOrderNo, workWarehouse.id);
+        await loadOrderMaterialsRef.current(savedOrderNo, workWarehouse.id, list);
       }
       } catch (error) {
         if (!isCurrentSession(sessionId)) return;
@@ -1404,21 +1449,24 @@ export default function PDAScanScreen() {
   };
 
   const resolveWarehouseForErpVoucher = useCallback(
-    (voucher: SaleDispatchVoucher, warehouseList: Warehouse[]) => {
-      const expectedNames = [voucher.warehouseName, voucher.expectedWarehouseName].filter(Boolean);
-
-      for (const warehouseName of expectedNames) {
-        // 同名仓库优先沿用当前有效 ID，不因列表顺序产生一次无意义的切换。
-        const current = currentWarehouseRef.current;
-        const matchedWarehouse = warehouseList.find((warehouse) =>
-          warehouse.id === current?.id && warehouse.name.trim() === warehouseName.trim()) ||
-          warehouseList.find((warehouse) => warehouse.name.trim() === warehouseName.trim());
-        if (matchedWarehouse) {
-          return matchedWarehouse;
-        }
+    async (voucher: SaleDispatchVoucher, warehouseList: Warehouse[]) => {
+      const name = voucher.warehouseName.trim();
+      if (!name) {
+        throw new Error(`ERP 未返回单据 ${voucher.code} 的仓库（${voucher.accountName}），请在 ERP 核对`);
       }
-
-      return null;
+      // 如果旧档案已有同名仓库，优先沿用当前有效的仓库 ID。
+      const current = warehouseList.find((warehouse) => warehouse.id === currentWarehouseRef.current?.id);
+      const matched = current?.name.trim() === name ? current : findErpWarehouse(name, warehouseList);
+      if (!matched?.id.trim()) {
+        throw new Error(`ERP 单据 ${voucher.code} 的仓库「${name}」未在仓库档案登记（${voucher.accountName}）`);
+      }
+      const conflict = await findOutboundOrderWarehouseConflict(voucher.code, matched.id, voucher.accountKey);
+      if (conflict) {
+        const previousName = warehouseList.find((warehouse) => warehouse.id === conflict.warehouse_id)?.name
+          || conflict.warehouse_name || '未归档仓库';
+        throw new Error(`单据 ${voucher.code} 在「${previousName}」已有扫码记录，ERP 当前仓库为「${matched.name}」，请核对后再继续`);
+      }
+      return matched;
     },
     []
   );
@@ -1474,14 +1522,13 @@ export default function PDAScanScreen() {
         ) {
           return null;
         }
-        const matchedWarehouse = resolveWarehouseForErpVoucher(
+        const matchedWarehouse = await resolveWarehouseForErpVoucher(
           voucher,
           warehouseList
         );
-        if (!matchedWarehouse) {
-          throw new Error(
-            `本地未找到ERP仓库：${voucher.warehouseName || voucher.expectedWarehouseName || '-'}`
-          );
+        if (!isCurrentSession(sessionId) ||
+            normalizeOrderNoCandidate(orderNoRef.current) !== normalizeOrderNoCandidate(nextOrderNo)) {
+          return null;
         }
 
         setActiveErpVoucher(voucher);
@@ -1490,7 +1537,7 @@ export default function PDAScanScreen() {
         }
         setErpVoucherRecoveryRequired(false);
 
-        if (matchedWarehouse && matchedWarehouse.id !== currentWarehouseRef.current?.id) {
+        if (matchedWarehouse.id !== currentWarehouseRef.current?.id) {
           setActiveWarehouse(matchedWarehouse);
           await AsyncStorage.setItem(
             STORAGE_KEYS.GLOBAL_WAREHOUSE,
@@ -1633,7 +1680,7 @@ export default function PDAScanScreen() {
 
   // 加载订单物料（从数据库加载已保存的记录）
   const loadOrderMaterials = useCallback(
-    async (no: string, explicitWarehouseId?: string): Promise<MaterialItem[]> => {
+    async (no: string, explicitWarehouseId?: string, warehouseList = warehouses): Promise<MaterialItem[]> => {
       const sessionId = pageSessionRef.current;
       // 优先使用显式传入的 warehouseId，避免恢复流程读取旧闭包。
       let warehouseId = explicitWarehouseId || currentWarehouseRef.current?.id;
@@ -1693,7 +1740,7 @@ export default function PDAScanScreen() {
         fallbackWarehouseId &&
         fallbackWarehouseId !== warehouseId.trim()
       ) {
-        const fallbackWarehouse = warehouses.find(
+        const fallbackWarehouse = warehouseList.find(
           (warehouse) => warehouse.id === fallbackWarehouseId
         );
         if (fallbackWarehouse) {
@@ -1726,10 +1773,17 @@ export default function PDAScanScreen() {
       return [];
     }
 
+    const internalPackageKeys = list.map(material => material.package_key).filter(isInternalLabelPackageKey);
+    const internalSpecifications = internalPackageKeys.length
+      ? await getInternalLabelSpecifications(internalPackageKeys).catch(error => {
+        logger.warn('[loadOrderMaterials] 读取内部标签规格失败:', error);
+        return new Map<string, string>();
+      })
+      : new Map<string, string>();
     // 加载全部数据用于聚合，显示时限制10行
     const materials = await Promise.all(
       list.slice().map(async (material) => {
-        const item = mapMaterialRecordToMaterialItem(material);
+        const item = mapMaterialRecordToMaterialItem(material, internalSpecifications.get(material.package_key || ''));
         if ((item.inventoryCode || '').trim() || !item.model.trim()) {
           return item;
         }
@@ -1806,6 +1860,14 @@ export default function PDAScanScreen() {
       let failureSpeech = '扫码处理失败，请查看提示';
       let materialSaved = false;
       try {
+        const confirmedPrefix = options.confirmedNativePrefix;
+        if (confirmedPrefix && isInternalLabelInput(confirmedPrefix) &&
+            code.length > confirmedPrefix.length && code.startsWith(confirmedPrefix)) {
+          activeRulesRef.current ??= await getActiveRules();
+          ensureCurrent();
+          code = recoverConfirmedScannerContent(code, confirmedPrefix, activeRulesRef.current);
+        }
+        const internalInput = isInternalLabelInput(code);
         const normalizedOrderCode = normalizeOrderNoCandidate(code);
         const matchedErpAccount = getErpAccountByOutboundOrderNo(normalizedOrderCode);
         const activeErpAccount = activeOrderNo
@@ -1823,12 +1885,12 @@ export default function PDAScanScreen() {
         const legacyParsedOrderNo = hasWarehouseSampleRules
           ? null
           : parseOutboundOrderNo(normalizedOrderCode, outboundOrderRule);
-        const isOrderNoScan =
+        const isOrderNoScan = !internalInput && (
           matchedErpAccount !== null ||
           matchedAvailableWarehouseRules.length > 0 ||
-          legacyParsedOrderNo !== null;
+          legacyParsedOrderNo !== null);
         // 订单号仍可用一维码录入；无分隔符的物料码静默忽略。
-        if (!isOrderNoScan && !isQRCode(code)) {
+        if (!internalInput && !isOrderNoScan && !isQRCode(code)) {
           activeRulesRef.current ??= await getActiveRules();
           ensureCurrent();
           if (!isQRCode(code, activeRulesRef.current)) {
@@ -1841,7 +1903,7 @@ export default function PDAScanScreen() {
           }
         }
         if (erpVoucherRecoveryRequired && activeOrderNo && !isOrderNoScan) {
-          showToast('ERP单据未验证，请重新扫描订单或点击刷新', 'error');
+          showToast(erpVerificationErrorRef.current || 'ERP单据未验证，请重新扫描订单或点击刷新', 'error');
           void feedbackError('订单未核验，请重新扫描订单');
           return;
         }
@@ -1925,8 +1987,7 @@ export default function PDAScanScreen() {
               const complete = isSaleDispatchOrderComplete(activeErpVoucher.lines, scanRecordsRef.current);
               showToast(isReturn ? (complete ? '本单退货已收齐' : '当前退货单，请继续扫码')
                 : (complete ? '本单已扫完' : '当前订单，请继续扫码'), 'success');
-              void (isReturn ? feedbackSalesReturnOrderReady(complete ? 'complete' : 'current')
-                : feedbackOutboundOrderReady(complete ? 'complete' : 'current'));
+              void announceErpOrderReady(complete ? 'complete' : 'current', workWarehouse, isReturn);
               return;
             }
 
@@ -1945,7 +2006,7 @@ export default function PDAScanScreen() {
                 (error: unknown) => ({ ok: false as const, error })
               ),
             };
-            const { fromCache, voucher, receivedAt } = await loadSaleDispatchVoucher(
+            let loaded = await loadSaleDispatchVoucher(
               matchedErpAccount,
               normalizedOrderCode,
               { bypassProxyCache: true, preparedRequest: preparedVerification }
@@ -1953,29 +2014,20 @@ export default function PDAScanScreen() {
             if (!isCurrentSession(sessionId)) {
               return;
             }
-            const matchedWarehouse = resolveWarehouseForErpVoucher(
-              voucher,
-              warehouses
-            );
-
-            if (!matchedWarehouse) {
-              showToast(
-                `本地未找到ERP仓库：${voucher.warehouseName || voucher.expectedWarehouseName || '-'}`,
-                'error'
-              );
-              void feedbackError('未找到订单仓库，请查看提示');
-              return;
+            let matchedWarehouse: Warehouse;
+            try {
+              matchedWarehouse = await resolveWarehouseForErpVoucher(loaded.voucher, warehouses);
+            } catch (error) {
+              if (!loaded.fromCache) throw error;
+              // 缓存仓库可能已失效。等待同一个在途 ERP 请求，再按实际仓库判断。
+              const outcome = await preparedVerification.outcome;
+              ensureCurrent();
+              if (!outcome.ok) throw outcome.error;
+              loaded = outcome.result;
+              matchedWarehouse = await resolveWarehouseForErpVoucher(loaded.voucher, warehouses);
             }
-
-            if (
-              !matchedWarehouse.id ||
-              typeof matchedWarehouse.id !== 'string' ||
-              matchedWarehouse.id.trim() === ''
-            ) {
-              showToast('仓库信息无效，请重新选择仓库', 'error');
-              void feedbackError('仓库信息无效，请重新选择');
-              return;
-            }
+            ensureCurrent();
+            const { fromCache, voucher, receivedAt } = loaded;
 
             const shouldPersistWarehouse = !activeWarehouse || activeWarehouse.id !== matchedWarehouse.id;
 
@@ -2084,21 +2136,18 @@ export default function PDAScanScreen() {
             }
 
             showToast(orderLoadedMessage, 'success');
-            if (isReturn) {
-              void feedbackSalesReturnOrderReady(currentOrderComplete ? 'complete'
-                : isSameOrder ? 'current' : isSwitchingOrder ? 'switched' : 'loaded');
-            } else if (currentOrderComplete) {
-              void feedbackOutboundOrderReady('complete');
-            } else if (isSameOrder) {
-              void feedbackOutboundOrderReady('current');
-            } else {
-              void feedbackOutboundOrderReady(isSwitchingOrder ? 'switched' : 'loaded');
-            }
+            const status = currentOrderComplete ? 'complete'
+              : isSameOrder ? 'current' : isSwitchingOrder ? 'switched' : 'loaded';
+            void announceErpOrderReady(status, readyWarehouse, isReturn);
             return;
           }
 
-          setActiveErpVoucher(null);
-          setErpVoucherRecoveryRequired(false);
+          // 格式匹配不代表已确定 ERP 账套。拒绝未知单号时保留当前已核验作业，
+          // 既不能绕过双账套路由，也不能让一次误扫清掉当前单据的核验状态。
+          // 已排队的物料仍保留原 expectedOrderNo；这里只恢复之后新扫码的归属。
+          if (scanAcceptanceOrderRef.current === normalizedOrderCode) {
+            scanAcceptanceOrderRef.current = normalizeOrderNoCandidate(activeOrderNo);
+          }
           showToast('出库单未匹配到ERP账套，请检查单号规则', 'error');
           void feedbackError('订单未匹配账套，请查看提示');
           return;
@@ -2132,6 +2181,7 @@ export default function PDAScanScreen() {
 
         // 解析
         let parsed: {
+          package_key?: string;
           model: string;
           batch: string;
           quantity: string;
@@ -2149,8 +2199,22 @@ export default function PDAScanScreen() {
         let ruleName = '';
         let customFields: Record<string, string> = {};
         let selectedRule: Awaited<ReturnType<typeof detectRule>> = null;
+        let internalPackage: InternalLabelPackage | undefined;
 
-        try {
+        if (internalInput) {
+          if (!activeErpVoucher) throw new Error('请先载入 ERP 出库单或退货单，再扫描内部标签');
+          code = code.trim();
+          internalPackage = await requireActiveInternalLabel(code);
+          ensureCurrent();
+          separator = INTERNAL_LABEL_SEPARATOR;
+          ruleName = INTERNAL_LABEL_RULE_NAME;
+          parsed = {
+            package_key: internalLabelPackageKey(internalPackage.packageId),
+            model: internalPackage.inventoryName.trim() || internalPackage.inventoryCode,
+            batch: '',
+            quantity: String(internalPackage.quantity),
+          };
+        } else {
           activeRulesRef.current ??= await getActiveRules();
           code = recoverConfirmedScannerContent(code, options.confirmedNativePrefix ?? null, activeRulesRef.current);
           const rule = await detectRule(code, activeRulesRef.current);
@@ -2161,10 +2225,11 @@ export default function PDAScanScreen() {
             ruleName = rule.name || '';
             const { standardFields, customFields: parsedCustomFields } = parseWithRule(code, rule);
             parsed = {
+              package_key: buildPackageKey(rule, standardFields, FIELD_LABELS),
               model: standardFields.model || '',
               batch: standardFields.batch || '',
               quantity: standardFields.quantity || '',
-              traceNo: standardFields.traceNo,
+              traceNo: packageFieldValue(standardFields.traceNo) || undefined,
               sourceNo: standardFields.sourceNo,
               package: standardFields.package,
               version: standardFields.version,
@@ -2172,9 +2237,6 @@ export default function PDAScanScreen() {
             };
             customFields = parsedCustomFields || {};
           }
-        } catch (error) {
-          logger.error('[扫码出库] 规则解析失败:', error);
-          throw error;
         }
 
         if (!parsed) {
@@ -2184,6 +2246,7 @@ export default function PDAScanScreen() {
         }
 
         const normalizedModel = (parsed.model || '').trim();
+        const packageKey = parsed.package_key;
         const normalizedQuantity = parseQuantity(parsed.quantity);
 
         if (!normalizedModel) {
@@ -2220,7 +2283,7 @@ export default function PDAScanScreen() {
           const refreshed = await forceRefreshErpVoucherForOrder(activeOrderNo, warehouses);
           ensureCurrent();
           if (!refreshed) {
-            showToast('ERP单据实时核验失败，已阻止本次物料扫码', 'error');
+            showToast(erpVerificationErrorRef.current || 'ERP单据实时核验失败，已阻止本次物料扫码', 'error');
             void feedbackError('订单核验失败，本次未录入');
             return;
           }
@@ -2281,9 +2344,10 @@ export default function PDAScanScreen() {
             parsed.sourceNo,
             parsed.traceNo,
             normalizedQuantity.toString(),
-            workWarehouse.id
+            internalPackage ? undefined : workWarehouse.id,
+            ...(packageKey ? [packageKey] : [])
           ),
-          (async () => {
+          internalPackage ? Promise.resolve({ inventoryCode: internalPackage.inventoryCode, matchKind: 'none' as const }) : (async () => {
             const key = JSON.stringify([normalizedModel, parsed.version?.trim() || '']);
             const cached = inventoryBindingsRef.current.get(key);
             if (cached) return cached;
@@ -2294,13 +2358,13 @@ export default function PDAScanScreen() {
         ]);
         ensureCurrent();
         const inventoryCode = bindingMatch.inventoryCode;
-        await assertRuleSupplierForScan({ rule: selectedRule, inventoryCode });
+        if (!internalPackage) await assertRuleSupplierForScan({ rule: selectedRule, inventoryCode });
         ensureCurrent();
         logger.log('[扫码出库] 重复检查结果:', check);
         logger.log('[扫码出库] 存货编码:', inventoryCode);
 
         if (check.material && !check.canRescan) {
-          showToast('已扫过此追溯码', 'warning');
+          showToast(packageKey ? '此包装已出库或已拆包，请核对标签' : '已扫过此追溯码', 'warning');
           feedbackDuplicate();
           return;
         }
@@ -2310,6 +2374,8 @@ export default function PDAScanScreen() {
           throw new Error('出库作业已变化或记录未恢复，请重新扫描');
         }
         const normalizedInventoryCode = normalizeInventoryCode(inventoryCode);
+        const scannedSpecification = internalPackage?.specification.trim();
+        const displayModel = scannedSpecification || internalPackage?.inventoryCode || normalizedModel;
         let successToastText = `已扫码：${normalizedModel}`;
 
         if (activeErpVoucher) {
@@ -2330,18 +2396,19 @@ export default function PDAScanScreen() {
           const erpRequiredQuantity = matchedErpLine?.requiredQuantity ?? 0;
 
           if (!matchedErpLine) {
-            logger.warn('[扫码出库] 绑定存货编码未出现在ERP单据中:', {
+            logger.warn('[扫码出库] 存货编码未出现在ERP单据中:', {
               inventoryCode: normalizedInventoryCode,
               model: normalizedModel,
               version: parsed.version || '',
             });
             showToast(
-              `不在ERP${isReturnScan ? '退货' : '出库'}单：${normalizedModel}${parsed.version ? ` / ${parsed.version}` : ''}\n绑定存货编码：${inventoryCode?.trim() || normalizedInventoryCode}`,
+              `不在ERP${isReturnScan ? '退货' : '出库'}单：${displayModel}${parsed.version ? ` / ${parsed.version}` : ''}\n${internalPackage ? '存货编码' : '绑定存货编码'}：${inventoryCode?.trim() || normalizedInventoryCode}`,
               'error'
             );
             feedbackNotInOrder();
             return;
           }
+          if (internalPackage) assertInternalPackageMatchesSaleDispatch(internalPackage, activeErpVoucher);
 
           if (parseQuantity(erpRequiredQuantity) === null || matchedErpLine.status === 'invalid') {
             logger.warn('[扫码出库] ERP单据物料数量无效:', {
@@ -2366,15 +2433,15 @@ export default function PDAScanScreen() {
               return;
             }
             if (remainingQuantity <= 0) {
-              showToast(`本物料已扫够：${normalizedModel}`, 'warning');
+              showToast(internalPackage ? '本物料已扫够' : `本物料已扫够：${normalizedModel}`, 'warning');
               feedbackOverQuantity();
               return;
             }
 
             const splitRemainingQuantity = normalizedQuantity - remainingQuantity;
             const nextPendingOutboundUnpack: PendingOutboundUnpack = {
-              lineSpecification: matchedErpLine.specification,
-              newTraceNo: await buildNextUnpackTraceNo(parsed.traceNo),
+              lineSpecification: scannedSpecification || matchedErpLine.specification,
+              newTraceNo: internalPackage ? '' : await buildNextUnpackTraceNo(parsed.traceNo),
               originalQuantity: normalizedQuantity,
               rawContent: code,
               remainingQuantity: splitRemainingQuantity,
@@ -2386,6 +2453,7 @@ export default function PDAScanScreen() {
                 quantity: normalizedQuantity.toString(),
                 traceNo: parsed.traceNo,
                 sourceNo: parsed.sourceNo,
+                package_key: packageKey,
                 package: parsed.package,
                 version: parsed.version,
                 productionDate: parsed.productionDate,
@@ -2401,6 +2469,7 @@ export default function PDAScanScreen() {
               recoveryItem: options.recoveryItem,
               materialId: eventId,
               genericBinding: bindingMatch.matchKind === 'generic',
+              internalPackage,
             };
             ensureCurrent();
             setOutboundUnpackNotes('');
@@ -2415,9 +2484,10 @@ export default function PDAScanScreen() {
             0,
             erpRequiredQuantity - scannedQuantity - normalizedQuantity
           );
+          const materialHint = internalPackage && displayModel.length > 22 ? '' : `：${displayModel}`;
           successToastText = isReturnScan
-            ? `已收：${normalizedModel} ${normalizedQuantity}，待收 ${nextRemainingQuantity}；本次已放行`
-            : `已扫：${normalizedModel}，剩余 ${nextRemainingQuantity}`;
+            ? `已收${materialHint} ${normalizedQuantity}，待收 ${nextRemainingQuantity}；本次已放行`
+            : `已扫${materialHint}，剩余 ${nextRemainingQuantity}`;
         }
 
         // 扫码出库必须在数据库提交成功后再提示成功，避免“已扫码”但实际未落库。
@@ -2429,6 +2499,7 @@ export default function PDAScanScreen() {
           quantity: normalizedQuantity.toString(),
           traceNo: parsed.traceNo,
           sourceNo: parsed.sourceNo,
+          package_key: packageKey,
           package: parsed.package,
           version: parsed.version,
           productionDate: parsed.productionDate,
@@ -2450,6 +2521,7 @@ export default function PDAScanScreen() {
             quantity: parseQuantity(savedPayload.quantity || '1') ?? 1,
             traceNo: savedPayload.traceNo,
             sourceNo: savedPayload.sourceNo,
+            package_key: savedPayload.package_key,
             package: savedPayload.package,
             version: savedPayload.version,
             productionDate: savedPayload.productionDate,
@@ -2489,7 +2561,7 @@ export default function PDAScanScreen() {
         let orderJustCompleted = false;
         if (activeOrderNo === orderNoRef.current) {
           const recordsBeforeSave = scanRecordsRef.current;
-          const savedItem = mapQueueItemToMaterialItem(materialId, savedPayload);
+          const savedItem = mapQueueItemToMaterialItem(materialId, savedPayload, scannedSpecification);
           savedItem.operationType = isReturnScan ? 'sales_return' : 'outbound';
           const preservedItems = recordsBeforeSave.filter(
             (item) => item.id !== savedItem.id
@@ -2572,7 +2644,9 @@ export default function PDAScanScreen() {
       } finally {
         if (isCurrentSession(sessionId)) {
           setIsErpOrderLoading(false);
-          resumePendingScanCodes(170, sessionId);
+          // The transaction has finished. Release the queue on the next turn;
+          // scanner frame boundaries and modal focus guards are handled separately.
+          resumePendingScanCodes(0, sessionId);
         }
       }
     },
@@ -2806,6 +2880,11 @@ export default function PDAScanScreen() {
   const renderErpLineProgress = useCallback(
     ({ item }: { item: ErpLineProgress }) => {
       const isExpanded = expandedGroups.has(item.key);
+      const internalItems = item.scannedItems.filter(record => isInternalLabelPackageKey(record.packageKey));
+      const hasInternalLabel = internalItems.length > 0;
+      const internalSpecification = internalItems.find(record => record.internalSpecification)?.internalSpecification;
+      const title = internalSpecification || (hasInternalLabel && item.sourceLineCount === 0
+        ? item.inventoryCode : item.specification) || '物料明细';
       const progressRatio =
         item.requiredQuantity > 0
           ? Math.min(1, Math.max(0, item.scannedQuantity / item.requiredQuantity))
@@ -2831,8 +2910,8 @@ export default function PDAScanScreen() {
             onPress={() => toggleExpand(item.key)}
           >
             <View style={styles.erpLineContent}>
-              <Text style={styles.erpLineCode} numberOfLines={2} ellipsizeMode="tail">
-                {item.specification || '物料明细'}
+              <Text style={styles.erpLineCode} numberOfLines={isExpanded && hasInternalLabel ? undefined : 2} ellipsizeMode="tail">
+                {title}
               </Text>
               {item.sourceLineCount > 1 ? (
                 <Text style={styles.erpLineMergeHint}>
@@ -2889,10 +2968,12 @@ export default function PDAScanScreen() {
   const renderAggregatedGroup = useCallback(
     ({ item }: { item: AggregatedGroup }) => {
       const isExpanded = expandedGroups.has(item.key);
+      const internalSpecification = item.items.find(record => record.internalSpecification)?.internalSpecification;
       return (
         <AggregatedRecordItem
           groupKey={item.key}
-          model={item.model}
+          model={internalSpecification || item.model}
+          titleNumberOfLines={internalSpecification ? (isExpanded ? 0 : 2) : undefined}
           version={item.version}
           totalQuantity={item.totalQuantity}
           records={item.items}
@@ -2962,7 +3043,7 @@ export default function PDAScanScreen() {
         return;
       }
       const candidate = normalizeOrderNoCandidate(code);
-      const isOrder = Boolean(getErpAccountByOutboundOrderNo(candidate) ||
+      const isOrder = !isInternalLabelInput(code) && Boolean(getErpAccountByOutboundOrderNo(candidate) ||
         getMatchingOutboundWarehouseOrderRules(candidate, outboundWarehouseOrderRules).length ||
         parseOutboundOrderNo(candidate, outboundOrderRule));
       if (isOrder) scanAcceptanceOrderRef.current = candidate;
@@ -3084,8 +3165,15 @@ export default function PDAScanScreen() {
 
       // 如果当前有输入内容，启动定时器检测扫码完成
       if (text.length > 0) {
+        // Enter already supplied a complete native frame. Once its matching JS
+        // change arrives, it is safe to consume without another debounce cycle.
+        // A promoted submit snapshot alone still keeps the existing merge timer.
+        if (!alreadyNormalized && pendingNativeSubmitTextRef.current === text) {
+          flushScannerInput(text);
+          return;
+        }
         const normalizedOrderText = normalizeOrderNoCandidate(text);
-        const shouldFastSubmitOrder =
+        const shouldFastSubmitOrder = !isInternalLabelInput(text) &&
           (Boolean(getErpAccountByOutboundOrderNo(normalizedOrderText)) ||
             getMatchingOutboundWarehouseOrderRules(
               normalizedOrderText,
@@ -3116,6 +3204,7 @@ export default function PDAScanScreen() {
             isCurrent,
             shouldWaitForMore: async () => {
               if (pendingNativeSubmitTextRef.current === text) return false;
+              if (isInternalLabelInput(text)) return shouldWaitForQRCodeContinuation(text, []);
               const rules = activeRulesRef.current ?? await getActiveRules();
               if (!isCurrent()) return false;
               activeRulesRef.current = rules;
@@ -3208,6 +3297,7 @@ export default function PDAScanScreen() {
           orderMaterialsKeyRef.current !== buildOrderMaterialsKey(savedPayload.orderNo, warehouse.id)) {
         throw new Error('ERP仓库发生变化，请取消拆包后重新扫描');
       }
+      if (pending.internalPackage) assertInternalPackageMatchesSaleDispatch(pending.internalPackage, voucher);
       const progress = buildOutboundProgress(voucher.lines, scanRecordsRef.current);
       const line = progress.find((item) => item.inventoryCode === normalizeInventoryCode(savedPayload.inventoryCode));
       if (!line || progress.some((item) => ['unmatched', 'invalid', 'over'].includes(item.status)) ||
@@ -3221,8 +3311,8 @@ export default function PDAScanScreen() {
         savedPayload,
         pending.rawContent
       );
-      const resolvedNewTraceNo =
-        pending.newTraceNo || (await buildNextUnpackTraceNo(savedPayload.traceNo));
+      const resolvedNewTraceNo = pending.internalPackage ? ''
+        : pending.newTraceNo || (await buildNextUnpackTraceNo(savedPayload.traceNo));
       const unpackResult = await saveUnpackOperation({
         operationId: `outbound-unpack:${materialId}`,
         material: materialRecord,
@@ -3237,6 +3327,7 @@ export default function PDAScanScreen() {
             quantity: pending.originalQuantity,
             traceNo: savedPayload.traceNo,
             sourceNo: savedPayload.sourceNo,
+            package_key: savedPayload.package_key,
             package: savedPayload.package,
             version: savedPayload.version,
             productionDate: savedPayload.productionDate,
@@ -3271,7 +3362,9 @@ export default function PDAScanScreen() {
         ...savedPayload,
         quantity: pending.shippedQuantity.toString(),
         traceNo: unpackResult.shippedRecord.new_traceNo || savedPayload.traceNo,
-      });
+        sourceNo: unpackResult.shippedRecord.new_sourceNo || savedPayload.sourceNo,
+        package_key: unpackResult.shippedRecord.package_key || savedPayload.package_key,
+      }, pending.internalPackage?.specification.trim());
 
       await saveOutboundWorkDraft(savedPayload.orderNo, savedPayload.customerName || '', warehouse);
       if (!isCurrentSession(sessionId)) return;
@@ -3674,6 +3767,8 @@ export default function PDAScanScreen() {
                           <Text style={[styles.detailText, { color: task.status === 'failed' ? theme.warning : theme.textSecondary }]}>{label} · 尝试 {task.attempt_count} 次</Text>
                           {task.shipped_quantity != null ? <Text style={styles.detailText}>出库 {task.shipped_quantity} / 剩余 {task.remaining_quantity}</Text> : null}
                           {task.remainder_traceNo ? <Text style={styles.detailText}>剩余追溯码：{task.remainder_traceNo}</Text> : null}
+                          {task.shipped_sourceNo ? <Text style={styles.detailText}>出库箱号：{task.shipped_sourceNo}</Text> : null}
+                          {task.remainder_sourceNo ? <Text style={styles.detailText}>剩余箱号：{task.remainder_sourceNo}</Text> : null}
                           <Text style={styles.detailText}>更新时间：{formatPrintTaskTime(task.updated_at)}</Text>
                           {task.last_error || task.last_message ? <Text style={styles.detailText}>{task.last_error || task.last_message}</Text> : null}
                           {canRetry ? <UiToolbarButton label={inFlight ? '正在提交...' : '核对后重试'} icon="printer" compact disabled={inFlight}
@@ -3758,17 +3853,17 @@ export default function PDAScanScreen() {
                 bottomOffset={32}
                 showsVerticalScrollIndicator
               >
-                <AppFormField label="型号">
+                {!pendingOutboundUnpack?.internalPackage ? <AppFormField label="型号">
                   <View style={[styles.unpackTextInput, styles.readOnlyInputContent]}>
                     <Text style={styles.unpackReadOnlyText} numberOfLines={2}>
                       {pendingOutboundUnpack?.savedPayload.model || '-'}
                     </Text>
                   </View>
-                </AppFormField>
+                </AppFormField> : null}
 
-                <AppFormField label="规格/型号描述">
+                <AppFormField label={pendingOutboundUnpack?.internalPackage ? '规格型号' : '规格/型号描述'}>
                   <View style={[styles.unpackTextInput, styles.readOnlyInputContent]}>
-                    <Text style={styles.unpackReadOnlyText} numberOfLines={3}>
+                    <Text style={styles.unpackReadOnlyText} numberOfLines={pendingOutboundUnpack?.internalPackage ? undefined : 3}>
                       {pendingOutboundUnpack?.lineSpecification || '-'}
                     </Text>
                   </View>
@@ -3795,10 +3890,15 @@ export default function PDAScanScreen() {
                   </View>
                 </View>
 
-                <AppFormField label="新追踪码（自动生成）">
+                <AppFormField label={pendingOutboundUnpack?.internalPackage ? '内部包号'
+                  : pendingOutboundUnpack?.savedPayload.package_key ? '拆包箱号' : '新追踪码（自动生成）'}>
                   <View style={[styles.unpackTextInput, styles.readOnlyInputContent]}>
                     <Text style={styles.unpackTraceText} numberOfLines={2}>
-                      {pendingOutboundUnpack?.newTraceNo || '-'}
+                      {pendingOutboundUnpack?.internalPackage
+                        ? `原包 ${pendingOutboundUnpack.internalPackage.packageId}，确认后为两份标签分别编号`
+                        : pendingOutboundUnpack?.savedPayload.package_key
+                        ? `原箱号 ${pendingOutboundUnpack.savedPayload.sourceNo || '-'}，确认后为两份标签分别编号`
+                        : pendingOutboundUnpack?.newTraceNo || '-'}
                     </Text>
                   </View>
                 </AppFormField>

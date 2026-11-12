@@ -14,6 +14,7 @@ interface SyncConnectionDependencies {
     setItem: (key: string, value: string) => Promise<void>;
   };
   checkHealth: (config: SyncConfig, options: { force: boolean }) => Promise<boolean>;
+  onHealthy?: (config: SyncConfig, isCurrent: () => boolean) => Promise<void>;
   onError?: (error: unknown) => void;
 }
 
@@ -161,6 +162,10 @@ export const createSyncConnectionMonitor = (dependencies: SyncConnectionDependen
     }
     const status: ConnectionStatus = healthy || confirmedOnline ? 'success' : 'disconnected';
     if (publish(config, status)) await persistStatus(expectedGeneration);
+    const isCurrent = () => active && generation === expectedGeneration;
+    if (healthy && isCurrent()) {
+      void dependencies.onHealthy?.(config, isCurrent).catch(error => dependencies.onError?.(error));
+    }
   };
 
   const drainChecks = async () => {
@@ -273,6 +278,10 @@ export const createSyncConnectionMonitor = (dependencies: SyncConnectionDependen
 const monitor = createSyncConnectionMonitor({
   storage: AsyncStorage,
   checkHealth: testConnection,
+  onHealthy: async (config, isCurrent) => {
+    const { syncWarehouseDirectories } = await import('./syncWarehouseDirectories');
+    await syncWarehouseDirectories(config, isCurrent);
+  },
   onError: (error) => logger.warn('[同步助手] 连接监测失败:', error),
 });
 

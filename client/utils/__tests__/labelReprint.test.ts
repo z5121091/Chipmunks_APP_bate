@@ -1,8 +1,11 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { detectRule, generateId, getActiveRules, getAllInventoryBindings, getInventorySupplierById, parseWithRule, type InventoryBinding, type QRCodeRule } from '../database';
+import { logger } from '../logger';
+import { checkInternalLabelPrint, detectRule, generateId, getActiveRules, getAllInventoryBindings, getInventorySupplierById, parseWithRule, storeInternalLabelPrintTask, type InventoryBinding, type QRCodeRule } from '../database';
 import {
   prepareLabelReprint,
   applyLabelQuantityCorrection,
+  createInternalLabelReprintTask,
+  getLabelPrintCopies,
   parseLabelCorrectionQuantity,
   IgnoredLabelReprintScan,
   resolveLabelReprintSupplier,
@@ -16,6 +19,7 @@ jest.mock('@react-native-async-storage/async-storage', () => ({
 }));
 jest.mock('../database', () => ({
   detectRule: jest.fn(), generateId: jest.fn(), getActiveRules: jest.fn(), getAllInventoryBindings: jest.fn(), parseWithRule: jest.fn(),
+  checkInternalLabelPrint: jest.fn(), storeInternalLabelPrintTask: jest.fn(),
   getInventorySupplierById: jest.fn(), getInventoryBindingByCode: jest.fn(),
   getQRCodeRuleValueSpans: (...args: Parameters<typeof import('../database')['getQRCodeRuleValueSpans']>) =>
     jest.requireActual<typeof import('../database')>('../database').getQRCodeRuleValueSpans(...args),
@@ -39,7 +43,7 @@ const health = (session = 'session-1', suppliers = [supplier]) => ({
   labelReprintSessionId:session, labelReprintSuppliers:suppliers,
 });
 const success = (task:LabelReprintTask, duplicate = false) => ({
-  success:true, state:'submitted', jobId:task.id, copies:2, duplicate,
+  success:true, state:'submitted', jobId:task.id, copies:task.internalAction === 'create' ? 1 : 2, duplicate,
 });
 const mockFetch = jest.fn();
 const realFetch = global.fetch;
@@ -343,11 +347,86 @@ describe('memory-only reprint transport', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps the same print identity when the helper accepted an internal job but saving the receipt failed', async () => {
+    const task = createInternalLabelReprintTask({
+      inventoryCode: 'IC.00000226.00', inventoryName: '隔离芯片', specification: 'SOIC16-WB',
+      accountKey: 'shanghai-chipmunk', warehouseName: '无锡总仓', warehouseCode: '001',
+      quantity: 100, packageId: 'PACKAGERECEIPT001', revision: 1,
+    }, 'create');
+    jest.mocked(checkInternalLabelPrint).mockResolvedValue(undefined);
+    const diagnosticSecret = 'HLS~#~SENSITIVE-CODE~#~100~#~PACKAGERECEIPT001~#~1';
+    const warning = jest.spyOn(logger, 'warn').mockImplementation(() => { /* Capture diagnostics without writing test secrets. */ });
+    jest.mocked(storeInternalLabelPrintTask).mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error(`database write failed: ${diagnosticSecret}`));
+    const internalHealth = { ...health(), labelReprintInternal: true, labelReprintInternalCreateSingle: true };
+    mockFetch.mockResolvedValueOnce(response(internalHealth)).mockResolvedValueOnce(response(success(task)));
+    const failed = await submitLabelReprint(task, { syncConfig: config });
+    expect(failed).toMatchObject({ id: task.id, reprintSessionId: 'session-1', status: 'failed',
+      errorCode: 'PRINT_RECEIPT_NOT_SAVED', resultUnknown: true, retryAllowed: true });
+    expect(warning).toHaveBeenCalled();
+    expect(JSON.stringify(warning.mock.calls)).not.toContain(diagnosticSecret);
+    expect(warning.mock.calls.every(call => call.length === 1)).toBe(true);
+    warning.mockRestore();
+
+    mockFetch.mockResolvedValueOnce(response(internalHealth)).mockResolvedValueOnce(response(success(task, true)));
+    expect(await submitLabelReprint(failed, { syncConfig: config, retryConfirmed: true })).toMatchObject({ id: task.id, status: 'submitted' });
+    expect(JSON.parse(mockFetch.mock.calls[3][1].body)).toMatchObject({ print_job_id: task.id, record: task.record });
+  });
+
   it('blocks missing templates before any POST', async () => {
     const task = await prepareLabelReprint(raw);
     mockFetch.mockResolvedValue(response(health('session-1',[])));
     expect(await submitLabelReprint(task,{syncConfig:config})).toMatchObject({status:'failed',errorCode:'NO_TEMPLATE',retryAllowed:false,resultUnknown:false});
     expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  const internalTask = (action?: LabelReprintTask['internalAction']) => createInternalLabelReprintTask({
+    inventoryCode: 'RES.01120042.00', inventoryName: '贴片电阻', specification: '12KΩ,±1%,0402',
+    accountKey: 'shanghai-chipmunk', warehouseName: '无锡总仓', warehouseCode: '001',
+    quantity: 477, packageId: 'SINGLECOPYTEST001', revision: 1,
+  }, action);
+  const singleCopyHealth = () => ({ ...health(), labelReprintInternal: true, labelReprintInternalCreateSingle: true });
+
+  it('requests one physical label for a new internal package and records its actual receipt', async () => {
+    const task = internalTask('create');
+    mockFetch.mockResolvedValueOnce(response(singleCopyHealth())).mockResolvedValueOnce(response(success(task)));
+    const result = await submitLabelReprint(task, { syncConfig: config });
+    expect(result).toMatchObject({ status: 'submitted', printedCopies: 1, lastMessage: '已提交一张标签，实际出纸请核对' });
+    expect(getLabelPrintCopies(task)).toBe(1);
+    expect(getLabelPrintCopies(result)).toBe(1);
+    expect(JSON.parse(mockFetch.mock.calls[1][1].body)).toMatchObject({ internal_action: 'create', record: task.record });
+    expect(task.record.source_qr).toBe(task.sourceQr);
+  });
+
+  it.each([undefined, 'correction'] as const)('keeps internal reprinting and quantity correction at two copies: %s', async action => {
+    const task = internalTask(action);
+    mockFetch.mockResolvedValueOnce(response(singleCopyHealth())).mockResolvedValueOnce(response(success(task)));
+    expect(await submitLabelReprint(task, { syncConfig: config })).toMatchObject({ status: 'submitted', printedCopies: 2 });
+    expect(JSON.parse(mockFetch.mock.calls[1][1].body)).not.toHaveProperty('internal_action');
+    expect(getLabelPrintCopies(task)).toBe(2);
+  });
+
+  it('does not send a one-copy creation task to an old helper that would silently print two', async () => {
+    mockFetch.mockResolvedValueOnce(response({ ...health(), labelReprintInternal: true }));
+    expect(await submitLabelReprint(internalTask('create'), { syncConfig: config })).toMatchObject({ status: 'failed', errorCode: 'UNSUPPORTED_HELPER', resultUnknown: false });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('recovers an old submitted two-copy create receipt without requesting additional paper', async () => {
+    const task = internalTask('create');
+    mockFetch.mockResolvedValueOnce(response(singleCopyHealth())).mockResolvedValueOnce(response({ ...success(task, true), copies: 2 }));
+    const result = await submitLabelReprint(task, { syncConfig: config });
+    expect(result).toMatchObject({ status: 'submitted', printedCopies: 2 });
+    expect(result.lastMessage).toContain('本次未重复打印');
+    expect(getLabelPrintCopies(result)).toBe(2);
+    expect(getLabelPrintCopies({ ...task, status: 'submitted' })).toBe(2);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not accept an unexpected new two-copy print as a one-copy creation success', async () => {
+    const task = internalTask('create');
+    mockFetch.mockResolvedValueOnce(response(singleCopyHealth())).mockResolvedValueOnce(response({ ...success(task), copies: 2 }));
+    expect(await submitLabelReprint(task, { syncConfig: config })).toMatchObject({ status: 'failed', errorCode: 'INVALID_RESPONSE', resultUnknown: true });
   });
 
   it('uses the pairing key for both health and print while preserving the original QR', async () => {

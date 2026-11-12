@@ -81,6 +81,7 @@ const EDITOR_SECTIONS = {
   fields: '手动字段顺序',
   prefixes: '字段前缀',
   conditions: '识别条件',
+  packaging: '包装识别',
 };
 
 const SORT_LAYOUT_TRANSITION = LinearTransition.springify().damping(APP_MOTION.sortLayout.damping)
@@ -218,6 +219,9 @@ export default function RulesScreen() {
   const [supplierName, setSupplierName] = useState('');
   const [supplierId, setSupplierId] = useState('');
   const [supplierPickerVisible, setSupplierPickerVisible] = useState(false);
+  const [packagingFields, setPackagingFields] = useState<string[]>([]);
+  const availablePackagingFields = selectedFields.filter(field => AVAILABLE_FIELDS.includes(field) && field !== 'traceNo');
+  const selectedPackagingFields = packagingFields.filter(field => availablePackagingFields.includes(field));
   const [matchConditions, setMatchConditions] = useState<MatchCondition[]>([]);
   const [conditionMode, setConditionMode] = useState<RuleConditionMode>('all');
   const [newConditionGroup, setNewConditionGroup] = useState<RuleConditionGroup>('any');
@@ -252,6 +256,7 @@ export default function RulesScreen() {
       terminator,
       fieldOrder: selectedFields,
       matchConditions,
+      packagingFields: packagingFields.filter(field => selectedFields.includes(field)),
       conditionMode,
       supplierId,
       supplierName,
@@ -271,6 +276,7 @@ export default function RulesScreen() {
     ruleTerminator,
     selectedFields,
     matchConditions,
+    packagingFields,
     conditionMode,
     supplierId,
     supplierName,
@@ -318,6 +324,7 @@ export default function RulesScreen() {
     setSupplierId('');
     setSupplierPickerVisible(false);
     setMatchConditions([]);
+    setPackagingFields([]);
     setConditionMode('all');
     setNewConditionGroup('any');
     setNewConditionIndex('');
@@ -403,6 +410,7 @@ export default function RulesScreen() {
     setSupplierId(rule.supplierId || '');
     setSupplierPickerVisible(false);
     setMatchConditions(rule.matchConditions || []);
+    setPackagingFields(rule.packagingFields || []);
     setConditionMode(rule.conditionMode ?? 'all');
     setNewConditionGroup('any');
 
@@ -551,6 +559,7 @@ export default function RulesScreen() {
       supplierName: supplierName.trim(),
       supplierId,
       matchConditions: matchConditions.length > 0 ? matchConditions : [],
+      packagingFields: selectedPackagingFields,
       conditionMode,
       fieldPrefixes,
       customFieldIds: [],
@@ -1302,6 +1311,11 @@ export default function RulesScreen() {
                     icon: 'filter',
                     value: `${CONDITION_MODE_LABELS[conditionMode]} · ${matchConditions.length} 个条件${newConditionKeyword.trim() ? ' · 有待添加条件' : ''}`,
                   },
+                  {
+                    section: 'packaging',
+                    icon: 'box',
+                    value: selectedPackagingFields.length ? selectedPackagingFields.map(getFieldDisplayName).join(' + ') : '未启用',
+                  },
                 ] as const
               ).map((item) => (
                 <TouchableOpacity
@@ -1326,6 +1340,32 @@ export default function RulesScreen() {
                   <Feather name="chevron-right" size={18} color={theme.textMuted} />
                 </TouchableOpacity>
               ))}
+            </>
+          )}
+
+          {editorSection === 'packaging' && (
+            <>
+              <Text style={styles.inputLabel}>勾选用于区分每一包货的字段</Text>
+              <Text style={styles.settingsValue}>有原厂追溯码时照常识别。无码时按勾选字段判重，全不勾选则沿用原扫码方式。</Text>
+              <Text style={styles.settingsValue}>例如选型号、批次和箱号。只有字段组合能区分每一包时才启用。数量会随作业变化，通常无需勾选。</Text>
+              <Text style={styles.settingsValue}>如需按箱号拆包，请勾选箱号。标签缺少箱号和追溯码时仍可按原方式扫码。</Text>
+              {availablePackagingFields.length === 0 && <Text style={styles.noFieldsHint}>请先设置手动字段顺序</Text>}
+              {availablePackagingFields.map(field => {
+                const checked = selectedPackagingFields.includes(field);
+                return (
+                  <TouchableOpacity
+                    key={field}
+                    accessibilityRole="checkbox"
+                    accessibilityLabel={getFieldDisplayName(field)}
+                    accessibilityState={{ checked }}
+                    style={styles.settingsRow}
+                    onPress={() => setPackagingFields(previous => checked ? previous.filter(item => item !== field) : [...previous, field])}
+                  >
+                    <Feather name={checked ? 'check-square' : 'square'} size={18} color={theme.textSecondary} />
+                    <Text style={styles.settingsTitle}>{getFieldDisplayName(field)}</Text>
+                  </TouchableOpacity>
+                );
+              })}
             </>
           )}
 

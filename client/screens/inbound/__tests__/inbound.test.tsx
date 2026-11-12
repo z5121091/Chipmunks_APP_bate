@@ -21,6 +21,7 @@ import { syncExcelToComputer } from '@/utils/excel';
 import { STORAGE_KEYS } from '@/constants/config';
 import { logger } from '@/utils/logger';
 import { buildRuleConflictDiagnostic, formatRuleConflictDiagnostic } from '@/utils/ruleConflictDiagnosis';
+import { GEEHY_SCAN_SAMPLES } from '@/utils/testFixtures/geehyScans';
 
 jest.mock('@react-native-async-storage/async-storage', () =>
   jest.requireActual('@react-native-async-storage/async-storage/jest/async-storage-mock'));
@@ -99,6 +100,14 @@ jest.mock('@/utils/inventoryReconciliation', () => ({
 jest.mock('@/utils/erpCurrentStock', () => ({ fetchCurrentStockByInventoryCode: jest.fn() }));
 
 const account = ERP_ACCOUNTS.find(item => item.key === 'shanghai-chipmunk')!;
+const stockQueryResult = (
+  selected = account,
+): Awaited<ReturnType<typeof fetchCurrentStockByInventoryCode>> => ({
+  accountKey: selected.key,
+  accountName: selected.name,
+  inventoryCode: 'A',
+  rows: [],
+});
 const no = 'II-2026-09-06-01';
 const warehouse = { id: 'W1', name: account.expectedWarehouseName, is_default: true, created_at: '' };
 const draftKey = `inbound_scan_records:${account.key}:${warehouse.id}:${no}`;
@@ -146,9 +155,8 @@ beforeEach(async () => {
   jest.mocked(database.getInventoryCodeByModel).mockResolvedValue('A');
   jest.mocked(database.getInventorySupplierById).mockReset();
   jest.mocked(database.getInventoryBindingByCode).mockReset();
-  jest.mocked(fetchCurrentStockByInventoryCode).mockReset().mockResolvedValue({
-    inventoryCode: 'A', rows: [],
-  } as Awaited<ReturnType<typeof fetchCurrentStockByInventoryCode>>);
+  jest.mocked(fetchCurrentStockByInventoryCode).mockReset()
+    .mockImplementation(async selected => stockQueryResult(selected));
   jest.mocked(database.generateId).mockImplementation(() => `scan-${jest.mocked(database.generateId).mock.calls.length}`);
   jest.mocked(erp.fetchPurchaseReceiveVoucher).mockReset().mockResolvedValue(voucher());
   jest.mocked(erp.fetchPurchaseReceiveVoucherStatuses).mockResolvedValue([]);
@@ -174,6 +182,41 @@ describe.each([
   ['inbound', InboundScreen],
   ['inventory', InventoryScreen],
 ] as const)('%s material input', (_name, Screen) => {
+  it('consumes 30 Geehy packs immediately when the delayed final change agrees with native Enter', async () => {
+    const rule = { id: 'geehy-burst', name: '极海', separator: '/', fieldOrder: [
+      'model', 'batch', 'package', 'version', 'quantity', 'productionDate', 'traceNo', 'sourceNo',
+    ], isActive: true } as database.QRCodeRule;
+    jest.mocked(database.getActiveRules).mockResolvedValue([rule]);
+    jest.mocked(database.detectRule).mockResolvedValue(rule);
+    jest.mocked(database.parseWithRule).mockImplementation(jest.requireActual('@/utils/database').parseWithRule);
+    jest.mocked(erp.fetchPurchaseReceiveVoucher).mockResolvedValue(voucher(30000));
+    await act(async () => { root = TestRenderer.create(<Screen />); });
+    await tick();
+    for (const [index, sample] of GEEHY_SCAN_SAMPLES.entries()) {
+      await act(async () => {
+        scanner().props.onChangeText(sample.raw.slice(0, -7));
+        scanner().props.onSubmitEditing({ nativeEvent: { text: sample.raw } });
+      });
+      await tick(10);
+      expect(feedbackSuccess).toHaveBeenCalledTimes(index);
+      await act(async () => { scanner().props.onChangeText(sample.raw); });
+      expect(scanner().props.value).toBe('');
+      await tick(0);
+      expect(feedbackSuccess).toHaveBeenCalledTimes(index + 1);
+    }
+    const raw = await AsyncStorage.getItem(_name === 'inbound' ? draftKey : 'inventory_check_records_by_erp_account_v1');
+    const data = JSON.parse(raw!);
+    const stored = (_name === 'inbound' ? data : Object.values(data).flat()) as Array<{
+      id: string; traceNo: string; model: string; sourceNo: string; quantity: number;
+    }>;
+    expect(stored).toHaveLength(30);
+    expect(new Set(stored.map(row => row.id)).size).toBe(30);
+    expect(new Set(stored.map(row => row.traceNo))).toEqual(new Set(GEEHY_SCAN_SAMPLES.map(row => row.traceNo)));
+    expect(stored.every(row => row.model === 'APM32F103RBT6' && row.sourceNo === 'OPGD144429023')).toBe(true);
+    expect(stored.reduce((sum, row) => sum + row.quantity, 0)).toBe(28800);
+    expect(feedbackNotBound).not.toHaveBeenCalled();
+  });
+
   it('keeps a matching but unfinished last field until its continuation and Enter arrive', async () => {
     await act(async () => { root = TestRenderer.create(<Screen />); });
     await tick();
@@ -397,7 +440,7 @@ it('does not announce a late stock response after leaving the page', async () =>
   expect(fetchCurrentStockByInventoryCode).toHaveBeenCalledTimes(1);
   await act(async () => { root!.unmount(); });
   root = undefined;
-  await act(async () => { finish({ inventoryCode: 'A', rows: [] } as Awaited<ReturnType<typeof fetchCurrentStockByInventoryCode>>); });
+  await act(async () => { finish(stockQueryResult()); });
   expect(feedbackQuerySuccess).not.toHaveBeenCalled();
   expect(feedbackQueryFailed).not.toHaveBeenCalled();
 });
@@ -606,10 +649,8 @@ describe('inbound scanner delivery boundaries', () => {
       scanner().props.onSubmitEditing({ nativeEvent: { text: completeCode } });
     });
     await tick(10);
-    await act(async () => { scanner().props.onChangeText(completeCode); });
-    await tick(149);
     expect(database.detectRule).not.toHaveBeenCalled();
-    await tick(1);
+    await act(async () => { scanner().props.onChangeText(completeCode); });
     expect(database.detectRule).toHaveBeenCalledTimes(1);
     expect(database.detectRule).toHaveBeenLastCalledWith(completeCode, [rule]);
     expect(feedbackSuccess).toHaveBeenCalledTimes(1);

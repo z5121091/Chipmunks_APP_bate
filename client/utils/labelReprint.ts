@@ -2,11 +2,15 @@ import { beginOtaSensitiveOperation } from '@/utils/otaSafety';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NETWORK_CONFIG, STORAGE_KEYS, type SyncConfig } from '@/constants/config';
 import {
+  checkInternalLabelPrint,
   detectRule,
   generateId,
   getActiveRules,
   getAllInventoryBindings,
   parseWithRule,
+  requireActiveInternalLabel,
+  stageInternalLabelCorrection,
+  storeInternalLabelPrintTask,
   type InventoryBinding,
   type QRCodeRule,
 } from '@/utils/database';
@@ -20,6 +24,8 @@ import { parseQuantity } from '@/utils/quantity';
 import { isQRCode } from '@/utils/qrcodeParser';
 import { assertRuleSupplierForScan, RuleSupplierValidationError } from '@/utils/ruleSupplierValidation';
 import { nextLabelTraceNo, rewriteLabelQrQuantity } from '@/utils/labelQrQuantity';
+import { buildInternalLabel, isInternalLabelInput, type InternalLabelPackage } from '@/utils/internalLabelCode';
+import { logger } from '@/utils/logger';
 
 export interface LabelReprintRecord {
   model: string;
@@ -32,9 +38,11 @@ export interface LabelReprintRecord {
   supplier: string;
   package: string;
   source_qr: string;
+  inventory_code?: string;
+  inventory_name?: string;
+  specification?: string;
 }
 
-/** Display and retry state belongs only to the open page, never to storage. */
 export interface LabelReprintTask {
   id: string;
   model: string;
@@ -56,6 +64,12 @@ export interface LabelReprintTask {
   errorCode?: string;
   retryAllowed?: boolean;
   resultUnknown?: boolean;
+  internalPackageId?: string;
+  internalAction?: 'create' | 'correction';
+  internalActivated?: boolean;
+  internalCanceled?: boolean;
+  /** Actual receipt count. Submitted tasks from before this field used two copies. */
+  printedCopies?: 1 | 2;
   /** A scan-time snapshot for one unsubmitted edit; never sent to the helper or stored. */
   quantityEditContext?: {
     readonly rule: QRCodeRule;
@@ -146,10 +160,36 @@ export const resolveLabelReprintSupplier = (
   return [...suppliers.values()][0];
 };
 
-/** Only reads configured rules/bindings; never creates a business or print row. */
+export function createInternalLabelReprintTask(label: InternalLabelPackage, internalAction?: LabelReprintTask['internalAction']): LabelReprintTask {
+  const sourceQr = buildInternalLabel(label);
+  const now = new Date().toISOString();
+  return {
+    id: `reprint-${generateId()}`, model: label.inventoryCode, version: '', batch: '', quantity: label.quantity,
+    traceNo: '', boxNo: '', supplier: '内部包装标签', sourceQr, createdAt: now, updatedAt: now,
+    status: 'pending', lastError: '', lastMessage: '', attemptCount: 0,
+    internalPackageId: label.packageId, internalAction,
+    record: {
+      model: label.inventoryCode, version: '', batch: '', quantity: label.quantity, production_date: '',
+      trace_no: '', source_no: '', supplier: '', package: '', source_qr: sourceQr,
+      inventory_code: label.inventoryCode, inventory_name: label.inventoryName, specification: label.specification,
+    },
+  };
+}
+
+/** Receipt-aware count for task cards and retry prompts, including old two-copy jobs. */
+export function getLabelPrintCopies(task: Pick<LabelReprintTask, 'internalAction' | 'status' | 'printedCopies'>): 1 | 2 {
+  if (task.printedCopies === 1 || task.printedCopies === 2) return task.printedCopies;
+  if (task.status === 'submitted') return 2;
+  return task.internalAction === 'create' ? 1 : 2;
+}
+
+/** Reads the matching label and prepares one print request. */
 export const prepareLabelReprint = async (raw: string): Promise<LabelReprintTask> => {
   if (!raw.trim()) {
     throw new LabelReprintValidationError('等待扫码', '请扫描需要补打的标签。');
+  }
+  if (isInternalLabelInput(raw)) {
+    return createInternalLabelReprintTask(await requireActiveInternalLabel(raw, { forReprint: true }));
   }
   const rule = await detectRule(raw);
   if (!rule) {
@@ -249,6 +289,12 @@ export const applyLabelQuantityCorrection = async (
     throw new LabelReprintValidationError('请重新扫码', '这张标签已处理过，请重新扫码后修改数量。');
   }
   if (newQuantity === original.quantity) return original;
+  if (original.internalPackageId) {
+    return stageInternalLabelCorrection(original.sourceQr, newQuantity, label => ({
+      ...createInternalLabelReprintTask(label, 'correction'),
+      quantityCorrection: { originalQuantity: original.quantity, originalTraceNo: '' },
+    }));
+  }
   const context = original.quantityEditContext;
   if (!context) {
     throw new LabelReprintValidationError('请重新扫码', '缺少本次标签的解析规则，请重新扫码后修改数量。');
@@ -309,6 +355,8 @@ interface ReprintHealth {
   labelReprintApiVersion?: number;
   labelReprintSessionId?: string;
   labelReprintSuppliers?: string[];
+  labelReprintInternal?: boolean;
+  labelReprintInternalCreateSingle?: boolean;
 }
 
 interface ReprintResponse {
@@ -394,6 +442,7 @@ const requestJson = async <T>(
 };
 
 const activeSubmissions = new Map<string, Promise<LabelReprintTask>>();
+export const isLabelReprintInFlight = (taskId: string): boolean => activeSubmissions.has(taskId);
 
 const performSubmission = async (
   original: LabelReprintTask,
@@ -412,6 +461,8 @@ const performSubmission = async (
   };
   try {
     checkActive(options);
+    if (task.internalPackageId) await checkInternalLabelPrint(task);
+    if (task.internalAction) await storeInternalLabelPrintTask(task);
     const config = options.syncConfig || await loadConfig();
     checkActive(options);
     const configError = getSyncConfigError(config);
@@ -438,7 +489,16 @@ const performSubmission = async (
         '当前同步助手尚不支持标签补打，请使用包含标签补打功能的同步助手。', 'UNSUPPORTED_HELPER'
       );
     }
-    if (!health.payload.labelReprintSuppliers.includes(task.supplier)) {
+    if (task.internalPackageId && health.payload.labelReprintInternal !== true) {
+      throw new LabelReprintSubmissionError('当前同步助手尚不支持内部包装标签，请更新同步助手。', 'UNSUPPORTED_HELPER');
+    }
+    const requestedCopies = task.internalAction === 'create' ? 1 : 2;
+    if (requestedCopies === 1 && health.payload.labelReprintInternalCreateSingle !== true) {
+      throw new LabelReprintSubmissionError(
+        '请更新电脑端同步助手，当前版本不支持新建内部标签单张打印。本次未提交打印。', 'UNSUPPORTED_HELPER'
+      );
+    }
+    if (!task.internalPackageId && !health.payload.labelReprintSuppliers.includes(task.supplier)) {
       throw new LabelReprintSubmissionError(
         `供应商「${task.supplier}」没有可用标签模板，本次未打印。`, 'NO_TEMPLATE', false
       );
@@ -460,6 +520,7 @@ const performSubmission = async (
           reprint_session_id: sessionId,
           record: task.record,
           retry_confirmed: options.retryConfirmed === true,
+          ...(task.internalAction === 'create' ? { internal_action: 'create' } : {}),
         }),
       },
       NETWORK_CONFIG.SYNC_TIMEOUT,
@@ -474,7 +535,9 @@ const performSubmission = async (
         payload?.resultUnknown ?? true
       );
     }
-    if (payload.state !== 'submitted' || payload.jobId !== task.id || payload.copies !== 2) {
+    const legacyCreateReceipt = requestedCopies === 1 && payload.duplicate === true && payload.copies === 2;
+    if (payload.state !== 'submitted' || payload.jobId !== task.id ||
+        (payload.copies !== requestedCopies && !legacyCreateReceipt)) {
       throw new LabelReprintSubmissionError(
         '同步助手返回的打印任务结果不一致，请先核对标签是否已出纸，再重试。',
         'INVALID_RESPONSE', true, true
@@ -483,30 +546,32 @@ const performSubmission = async (
     return {
       ...task,
       status: 'submitted',
+      printedCopies: payload.copies as 1 | 2,
       updatedAt: new Date().toISOString(),
-      lastMessage: payload.duplicate === true
+      lastMessage: legacyCreateReceipt ? '该旧任务此前已按两张提交，本次未重复打印，请核对已有标签'
+        : payload.duplicate === true
         ? '同步助手已识别为同一任务，请核对已有标签'
-        : '已提交两张标签，实际出纸请核对',
+        : `已提交${requestedCopies === 1 ? '一' : '两'}张标签，实际出纸请核对`,
       retryAllowed: false,
       resultUnknown: false,
     };
   } catch (error) {
     const failure = error instanceof LabelReprintSubmissionError
       ? error
-      : new LabelReprintSubmissionError('标签补打提交失败，请检查同步助手后重试。', 'SUBMISSION_FAILED');
+      : new LabelReprintSubmissionError(task.internalPackageId && error instanceof Error
+        ? error.message : '标签补打提交失败，请检查同步助手后重试。', 'SUBMISSION_FAILED');
     return {
       ...task,
       status: 'failed',
       updatedAt: new Date().toISOString(),
       lastError: failure.message,
       errorCode: failure.code,
-      retryAllowed: failure.retryAllowed,
+      retryAllowed: task.internalAction && failure.code === 'CANCELED' ? true : failure.retryAllowed,
       resultUnknown: failure.resultUnknown,
     };
   }
 };
 
-/** In-flight coalescing is memory only; /labels and durable unpack tasks are never used. */
 export const submitLabelReprint = (
   task: LabelReprintTask,
   options: LabelReprintSubmitOptions = {}
@@ -515,7 +580,29 @@ export const submitLabelReprint = (
   const active = activeSubmissions.get(task.id);
   if (active) return active;
   const request = Promise.resolve()
-    .then(() => performSubmission(task, options))
+    .then(async () => {
+      const result = await performSubmission(task, options);
+      if (task.internalAction) {
+        try {
+          await storeInternalLabelPrintTask(result);
+        } catch {
+          // Native/SQLite errors may embed SQL parameters, including QR content.
+          logger.warn('[标签补打] 保存内部标签打印结果失败，请核对打印任务状态');
+          if (result.status === 'submitted') {
+            // The helper accepted the job. Keep its task and session identifiers for receipt recovery.
+            return {
+              ...result,
+              status: 'failed' as const,
+              errorCode: 'PRINT_RECEIPT_NOT_SAVED',
+              lastError: '同步助手已接收打印任务，但本机未能保存回执。请先核对出纸，再在打印任务中处理。',
+              retryAllowed: true,
+              resultUnknown: true,
+            };
+          }
+        }
+      }
+      return result;
+    })
     .finally(() => {
       if (activeSubmissions.get(task.id) === request) activeSubmissions.delete(task.id);
     });

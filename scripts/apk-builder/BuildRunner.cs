@@ -24,6 +24,7 @@ namespace Chipmunks.ApkBuilder
         public string SyncScriptPath { get; set; }
         public string LogDirectory { get; set; }
         public string PowerShellPath { get; set; }
+        internal Func<WaitHandle, int, bool> WaitForOutputEnd { get; set; }
     }
 
     public sealed class BuildSnapshot
@@ -45,11 +46,15 @@ namespace Chipmunks.ApkBuilder
         public BuildState State { get; internal set; }
         public int ExitCode { get; internal set; }
         public string ErrorMessage { get; internal set; }
+        public string WarningMessage { get; internal set; }
         public string ApkPath { get; internal set; }
         public string ArtifactPath { get; internal set; }
         public BuildTarget Target { get; internal set; }
         public string LogPath { get; internal set; }
         public string AttentionCode { get; internal set; }
+        public string UpdateId { get; internal set; }
+        public string Runtime { get; internal set; }
+        public long ArtifactBytes { get; internal set; }
     }
 
     /// <summary>
@@ -66,6 +71,7 @@ namespace Chipmunks.ApkBuilder
         private readonly string syncScriptPath;
         private readonly string logDirectory;
         private readonly string powerShellPath;
+        private readonly Func<WaitHandle, int, bool> waitForOutputEnd;
         private readonly string mutexName;
         private readonly Queue<string> displayLines = new Queue<string>();
         private static readonly Regex AnsiCsi = new Regex(@"(?:\x1B\[|\u009B)[0-?]*[ -/]*[@-~]", RegexOptions.Compiled);
@@ -77,10 +83,16 @@ namespace Chipmunks.ApkBuilder
         private bool cancellationRequested;
         private bool sawPublish;
         private string publishNotesFile;
+        private string publishPackageFile;
+        private string otaPath;
+        private string updateId;
+        private string updateRuntime;
+        private long otaBytes;
         private bool sawSuccess;
         private bool sawCheckSuccess;
         private bool sawPrepareSuccess;
         private string apkPath;
+        private string apkSha256;
         private string exeBuildId;
         private string exeSha256;
         private string attentionCode;
@@ -99,6 +111,7 @@ namespace Chipmunks.ApkBuilder
             syncScriptPath = Path.GetFullPath(options.SyncScriptPath ?? Path.Combine(repositoryPath, "scripts", "build.ps1"));
             logDirectory = options.LogDirectory == null ? null : Path.GetFullPath(options.LogDirectory);
             powerShellPath = options.PowerShellPath ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
+            waitForOutputEnd = options.WaitForOutputEnd ?? delegate(WaitHandle handle, int milliseconds) { return handle.WaitOne(milliseconds); };
             using (SHA256 hash = SHA256.Create())
             {
                 byte[] digest = hash.ComputeHash(Encoding.UTF8.GetBytes(repositoryPath.ToUpperInvariant()));
@@ -142,6 +155,17 @@ namespace Chipmunks.ApkBuilder
             lock (sync) {
                 if (running) throw new InvalidOperationException("当前任务尚未结束。");
                 publishNotesFile = Path.GetFullPath(notesFile);
+                publishPackageFile = null;
+                return StartInternal(BuildMode.PublishUpdate, BuildTarget.Apk, false);
+            }
+        }
+
+        public Task<BuildResult> StartPublishPackageAsync(string packageFile)
+        {
+            lock (sync) {
+                if (running) throw new InvalidOperationException("当前任务尚未结束。");
+                publishPackageFile = Path.GetFullPath(packageFile);
+                publishNotesFile = null;
                 return StartInternal(BuildMode.PublishUpdate, BuildTarget.Apk, false);
             }
         }
@@ -165,15 +189,20 @@ namespace Chipmunks.ApkBuilder
         {
             if (!Enum.IsDefined(typeof(BuildMode), mode)) throw new ArgumentOutOfRangeException("mode");
             if (!Enum.IsDefined(typeof(BuildTarget), target)) throw new ArgumentOutOfRangeException("target");
-            if (mode == BuildMode.PublishUpdate && (target != BuildTarget.Apk || String.IsNullOrEmpty(publishNotesFile) || !File.Exists(publishNotesFile)))
-                throw new InvalidOperationException("热更新只能从 APK 目标使用有效更新说明发布。");
+            if (mode == BuildMode.PublishUpdate && (target != BuildTarget.Apk ||
+                !((!String.IsNullOrEmpty(publishNotesFile) && File.Exists(publishNotesFile)) ||
+                  (!String.IsNullOrEmpty(publishPackageFile) && File.Exists(publishPackageFile)))))
+                throw new InvalidOperationException("请选择有效的更新说明或已生成的热更新包。");
             lock (sync)
             {
                 if (disposed) throw new ObjectDisposedException("BuildRunner");
                 if (running) throw new InvalidOperationException("当前构建任务尚未结束。请等待完成或停止后再试。");
                 running = true;
                 cancellationRequested = sawPublish = sawSuccess = sawCheckSuccess = sawPrepareSuccess = false;
-                apkPath = exeBuildId = exeSha256 = attentionCode = failureLine = logFailure = null;
+                apkPath = apkSha256 = exeBuildId = exeSha256 = attentionCode = failureLine = logFailure = null;
+                otaPath = updateId = updateRuntime = null;
+                if (mode == BuildMode.PublishUpdate) otaPath = publishPackageFile;
+                otaBytes = 0;
                 displayLines.Clear();
                 snapshot = new BuildSnapshot { State = BuildState.Running, Mode = mode, Target = target, Stage = 0,
                     StageText = "准备构建环境", StartedAtUtc = DateTime.UtcNow, LastOutputAtUtc = DateTime.UtcNow };
@@ -251,6 +280,7 @@ namespace Chipmunks.ApkBuilder
             Mutex taskMutex = null;
             Mutex publicationMutex = null;
             bool ownsMutex = false;
+            bool acceptOutput = true;
             ManualResetEvent stdoutEnded = new ManualResetEvent(false);
             ManualResetEvent stderrEnded = new ManualResetEvent(false);
             try
@@ -274,7 +304,9 @@ namespace Chipmunks.ApkBuilder
                 string gateName = @"Local\ChipmunksApkGate_" + Guid.NewGuid().ToString("N");
                 gate = new EventWaitHandle(false, EventResetMode.ManualReset, gateName);
                 string modeSwitch = mode == BuildMode.CheckEnvironment ? " -CheckOnly" : mode == BuildMode.PrepareEnvironment ? " -PrepareOnly" : String.Empty;
-                if (mode == BuildMode.PublishUpdate) modeSwitch = " -NotesFile '" + publishNotesFile.Replace("'", "''") + "'";
+                if (mode == BuildMode.PublishUpdate) modeSwitch = publishPackageFile != null
+                    ? " -PackagePath '" + publishPackageFile.Replace("'", "''") + "'"
+                    : " -NotesFile '" + publishNotesFile.Replace("'", "''") + "'";
                 string command = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; " +
                     "$g=[System.Threading.EventWaitHandle]::OpenExisting('" + gateName + "'); if(-not $g.WaitOne(30000)){exit 91}; $g.Dispose(); " +
                     "& '" + selectedScript.Replace("'", "''") + "'" + modeSwitch + "; if($null -eq $LASTEXITCODE){exit 0}else{exit $LASTEXITCODE}";
@@ -314,8 +346,16 @@ namespace Chipmunks.ApkBuilder
                 lock (sync) { currentJob = job; currentPublicationMutex = publicationMutex; }
                 if (Cancelled()) { result.State = BuildState.Cancelled; return result; }
                 process = new Process { StartInfo = info };
-                process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data == null) SignalEnded(stdoutEnded); else WriteLine(e.Data); };
-                process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data == null) SignalEnded(stderrEnded); else WriteLine(e.Data); };
+                // Each reader owns this run's gate. Late callbacks from a timed-out
+                // pipe must not write into the next task's parser or log writer.
+                process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) {
+                    if (e.Data == null) SignalEnded(stdoutEnded);
+                    else lock (sync) { if (acceptOutput) WriteLine(e.Data); }
+                };
+                process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) {
+                    if (e.Data == null) SignalEnded(stderrEnded);
+                    else lock (sync) { if (acceptOutput) WriteLine(e.Data); }
+                };
                 if (!process.Start()) throw new InvalidOperationException("无法启动构建进程。");
                 // The PowerShell wrapper is held at the gate and cannot spawn script children yet.
                 try { job.Assign(process); }
@@ -334,8 +374,34 @@ namespace Chipmunks.ApkBuilder
                 result.ExitCode = process.ExitCode;
                 // End only descendants of this task, including any daemon holding a pipe open.
                 while (!TryTerminateCurrentTask()) Thread.Sleep(25);
-                if (!interactive && (!stdoutEnded.WaitOne(10000) || !stderrEnded.WaitOne(10000)))
-                    throw new IOException("构建进程已退出，但日志管道未正常关闭。请检查完整日志。");
+                bool jobEmpty = job.WaitUntilEmpty(5000);
+                bool incompleteLog = false;
+                if (!interactive)
+                {
+                    Stopwatch drainWatch = Stopwatch.StartNew();
+                    bool stdoutComplete = waitForOutputEnd(stdoutEnded, 10000);
+                    bool stderrComplete = waitForOutputEnd(stderrEnded, Math.Max(0, 10000 - (int)drainWatch.ElapsedMilliseconds));
+                    lock (sync) { acceptOutput = false; }
+                    incompleteLog = !stdoutComplete || !stderrComplete;
+                    if (incompleteLog)
+                    {
+                        // Cancel pending readers after freezing their callbacks. A
+                        // retained pipe handle cannot contaminate a later task.
+                        try { process.CancelOutputRead(); } catch (InvalidOperationException) { }
+                        try { process.CancelErrorRead(); } catch (InvalidOperationException) { }
+                        string streams = !stdoutComplete && !stderrComplete ? "标准输出和错误输出"
+                            : !stdoutComplete ? "标准输出" : "错误输出";
+                        result.WarningMessage = "日志通道收尾超时（" + streams + "），部分末尾日志可能不完整，请查看完整日志。";
+                        WriteLine("[日志收尾警告] " + result.WarningMessage);
+                        WriteLine("[日志收尾诊断] exitCode=" + result.ExitCode +
+                            "; stdoutEnded=" + stdoutComplete.ToString().ToLowerInvariant() +
+                            "; stderrEnded=" + stderrComplete.ToString().ToLowerInvariant() +
+                            "; jobEmpty=" + jobEmpty.ToString().ToLowerInvariant() +
+                            "; terminateSucceeded=" + job.LastTerminationSucceeded.ToString().ToLowerInvariant() +
+                            "; terminateError=" + job.LastTerminationError);
+                    }
+                }
+                if (!jobEmpty) throw new IOException("本次构建的子进程尚未完全退出，无法确认安全交付。请查看完整日志。");
                 if (interactive)
                 {
                     WriteLine("环境准备窗口已退出，退出码：" + result.ExitCode);
@@ -344,7 +410,13 @@ namespace Chipmunks.ApkBuilder
                     else if (result.ExitCode == 0) result.State = BuildState.Succeeded;
                     else result.ErrorMessage = "环境准备未完成（退出码 " + result.ExitCode + "）。请重新打开准备环境窗口查看提示。";
                 }
-                else result = Evaluate(mode, result, signingTaskId);
+                else
+                {
+                    result = Evaluate(mode, result, signingTaskId, incompleteLog);
+                    if (incompleteLog) WriteLine(result.State == BuildState.Succeeded
+                        ? "[结果核验] 退出状态、成功标记与本次任务验证均通过；保留日志收尾警告。"
+                        : "[结果核验] 任务未通过成功校验：" + (result.ErrorMessage ?? result.State.ToString()));
+                }
             }
             catch (Exception error)
             {
@@ -354,6 +426,7 @@ namespace Chipmunks.ApkBuilder
             }
             finally
             {
+                lock (sync) { acceptOutput = false; }
                 bool ownedProcessesExited = true;
                 if (job != null)
                 {
@@ -414,10 +487,18 @@ namespace Chipmunks.ApkBuilder
             } catch (Exception error) { return "本任务临时签名文件未能完全清理：" + ProtectOutput(error.Message); }
         }
 
-        private BuildResult Evaluate(BuildMode mode, BuildResult result, string expectedBuildId)
+        private BuildResult Evaluate(BuildMode mode, BuildResult result, string expectedBuildId, bool incompleteLog)
         {
             lock (sync)
             {
+                if (mode == BuildMode.PublishUpdate) {
+                    result.UpdateId = updateId;
+                    result.Runtime = updateRuntime;
+                    if (!String.IsNullOrWhiteSpace(otaPath) && Path.IsPathRooted(otaPath) && File.Exists(otaPath)) {
+                        result.ArtifactPath = otaPath;
+                        result.ArtifactBytes = new FileInfo(otaPath).Length;
+                    } else result.ArtifactBytes = otaBytes;
+                }
                 if (cancellationRequested) { result.State = BuildState.Cancelled; return result; }
                 if (!String.IsNullOrEmpty(logFailure)) { result.ErrorMessage = "无法继续保存构建日志：" + logFailure; return result; }
                 if (!String.IsNullOrEmpty(attentionCode))
@@ -435,6 +516,7 @@ namespace Chipmunks.ApkBuilder
                 }
                 if (mode == BuildMode.Build)
                 {
+                    if (!String.IsNullOrEmpty(failureLine)) { result.ErrorMessage = failureLine; return result; }
                     if (!sawSuccess) { result.ErrorMessage = "进程已退出，但没有构建成功标记。请查看日志，当前不认定为成功。"; return result; }
                     if (String.IsNullOrWhiteSpace(apkPath) || !Path.IsPathRooted(apkPath) || !File.Exists(apkPath)) { result.ErrorMessage = "收到构建成功标记，但找不到本次产物文件。请查看日志。"; return result; }
                     FileInfo artifact = new FileInfo(apkPath);
@@ -456,8 +538,21 @@ namespace Chipmunks.ApkBuilder
                         // Copy-Item preserves LastWriteTime for cached source APKs, while
                         // a newly delivered target has a new CreationTime.
                         if (artifact.CreationTimeUtc < snapshot.StartedAtUtc.AddSeconds(-2)) { result.ErrorMessage = "成功提示指向此前已存在的产物，未找到本次新交付的文件。请查看日志。"; return result; }
+                        // Older scripts did not emit a hash. An incomplete log
+                        // cannot use that compatibility path; current scripts
+                        // always emit SHA256 and their bytes must match it.
+                        if (incompleteLog || !String.IsNullOrEmpty(apkSha256))
+                        {
+                            if (!Regex.IsMatch(apkSha256 ?? String.Empty, @"\A[a-f0-9]{64}\z")) { result.ErrorMessage = "产物缺少有效的 SHA256 校验值，当前不认定为成功。请查看日志。"; return result; }
+                            string actualHash;
+                            using (FileStream stream = new FileStream(apkPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                            using (SHA256 hash = SHA256.Create())
+                                actualHash = BitConverter.ToString(hash.ComputeHash(stream)).Replace("-", String.Empty).ToLowerInvariant();
+                            if (!String.Equals(actualHash, apkSha256, StringComparison.Ordinal)) { result.ErrorMessage = "产物的 SHA256 校验不一致，当前不认定为成功。请重新构建。"; return result; }
+                        }
                     }
                     result.ArtifactPath = apkPath;
+                    result.ArtifactBytes = artifact.Length;
                     result.ApkPath = snapshot.Target == BuildTarget.Apk ? apkPath : null;
                 }
                 else if (mode == BuildMode.CheckEnvironment && !sawCheckSuccess) { result.ErrorMessage = "检查进程已退出，但没有检查通过标记。请查看完整日志。"; return result; }
@@ -506,21 +601,29 @@ namespace Chipmunks.ApkBuilder
                     if (number <= (snapshot.Target == BuildTarget.Apk ? 5 : 4)) { snapshot.Stage = number; snapshot.StageText = stage.Groups[3].Value; }
                 }
                 string trimmed = line.Trim();
-                if (Regex.IsMatch(trimmed, @"^PUBLISHED: [a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$")) sawPublish = true;
+                if (Regex.IsMatch(trimmed, @"^PUBLISHED: [a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$")) { sawPublish = true; updateId = trimmed.Substring(11).Trim(); }
+                if (trimmed.StartsWith("OTA-ARTIFACT:", StringComparison.Ordinal)) otaPath = trimmed.Substring(13).Trim();
+                if (trimmed.StartsWith("OTA-ID:", StringComparison.Ordinal)) updateId = trimmed.Substring(7).Trim();
+                if (trimmed.StartsWith("OTA-RUNTIME:", StringComparison.Ordinal)) updateRuntime = trimmed.Substring(12).Trim();
+                if (trimmed.StartsWith("OTA-SIZE:", StringComparison.Ordinal)) Int64.TryParse(trimmed.Substring(9).Trim(), out otaBytes);
                 if (trimmed == "BUILD SUCCEEDED") sawSuccess = true;
                 if (trimmed.StartsWith("CHECK PASSED:", StringComparison.Ordinal)) sawCheckSuccess = true;
                 if (trimmed == (snapshot.Target == BuildTarget.Apk ? "APK ENVIRONMENT READY. No APK build started." : "SYNC ENVIRONMENT READY. No EXE build started.")) sawPrepareSuccess = true;
                 if (trimmed.StartsWith(snapshot.Target == BuildTarget.Apk ? "APK:" : "EXE:", StringComparison.Ordinal)) apkPath = trimmed.Substring(4).Trim();
                 if (snapshot.Target == BuildTarget.SyncHelper && trimmed.StartsWith("EXE-BUILD-ID:", StringComparison.Ordinal)) exeBuildId = trimmed.Substring(13).Trim();
                 if (snapshot.Target == BuildTarget.SyncHelper && trimmed.StartsWith("SHA256:", StringComparison.Ordinal)) exeSha256 = trimmed.Substring(7).Trim();
+                if (snapshot.Target == BuildTarget.Apk && trimmed.StartsWith("SHA256:", StringComparison.Ordinal)) apkSha256 = trimmed.Substring(7).Trim().ToLowerInvariant();
                 if (trimmed == "[GUI:ATTENTION:SDK_LICENSE]") attentionCode = "SDK_LICENSE";
                 if (trimmed.StartsWith("BUILD FAILED:", StringComparison.Ordinal)) failureLine = trimmed.Substring(13).Trim();
+                if (trimmed.StartsWith("Publication failed:", StringComparison.Ordinal)) failureLine = trimmed.Substring(19).Trim();
             }
         }
 
         private sealed class JobObject : IDisposable
         {
             private SafeJobHandle handle;
+            public bool LastTerminationSucceeded { get; private set; }
+            public int LastTerminationError { get; private set; }
             public JobObject()
             {
                 handle = CreateJobObject(IntPtr.Zero, null);
@@ -536,8 +639,11 @@ namespace Chipmunks.ApkBuilder
             }
             public void Terminate()
             {
-                try { if (!handle.IsClosed && !handle.IsInvalid) TerminateJobObject(handle, 1223); }
-                catch (ObjectDisposedException) { }
+                try {
+                    LastTerminationSucceeded = !handle.IsClosed && !handle.IsInvalid && TerminateJobObject(handle, 1223);
+                    LastTerminationError = LastTerminationSucceeded ? 0 : Marshal.GetLastWin32Error();
+                }
+                catch (ObjectDisposedException) { LastTerminationSucceeded = false; LastTerminationError = 6; }
             }
             public bool WaitUntilEmpty(int timeoutMilliseconds)
             {

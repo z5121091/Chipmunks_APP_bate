@@ -252,12 +252,6 @@ export const fetchSaleDispatchVoucher = async (
     );
   }
 
-  if (voucher.warehouseName && voucher.warehouseName !== account.expectedWarehouseName) {
-    throw new Error(
-      `${account.name} 单据仓库应为 ${account.expectedWarehouseName}，实际为 ${voucher.warehouseName}`
-    );
-  }
-
   assertSaleDispatchStatusAllowed(voucher);
 
   return voucher;

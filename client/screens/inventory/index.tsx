@@ -32,6 +32,11 @@ import {
   getActiveRules,
   detectRule,
   parseWithRule,
+  FIELD_LABELS,
+  assertPackageIsNotSplit,
+  matchesLegacyPackage,
+  requireActiveInternalLabel,
+  getInternalLabelSpecifications,
   getInventoryCodeByModel,
   addInventoryCheckRecordsBatch,
   generateCheckNo,
@@ -39,6 +44,9 @@ import {
   updateInventoryCheckDocumentSyncStatus,
 } from '@/utils/database';
 import { isQRCode, recoverConfirmedScannerContent, shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
+import { buildPackageKey, packageFieldValue } from '@/utils/packageRecognition';
+import { fetchCurrentStockByInventoryCode } from '@/utils/erpCurrentStock';
+import { assertInternalLabelStockMatches, internalLabelPackageKey, INTERNAL_LABEL_RULE_ID, INTERNAL_LABEL_RULE_NAME, isInternalLabelInput, isInternalLabelPackageKey } from '@/utils/internalLabelCode';
 import { parseQuantity } from '@/utils/quantity';
 import {
   feedbackSuccess,
@@ -94,6 +102,7 @@ interface ScanRecord {
   quantity: number;
   actualQuantity?: number;
   inventoryCode?: string;
+  internalSpecification?: string;
   scanTime: string;
   ruleId?: string;
   ruleName?: string;
@@ -103,6 +112,7 @@ interface ScanRecord {
   productionDate?: string;
   traceNo?: string;
   sourceNo?: string;
+  package_key?: string;
   // 占位字段解析值（仅用于兼容和排查，不展示、不导出）
   customFields?: Record<string, string>;
 }
@@ -110,6 +120,7 @@ interface ScanRecord {
 type InventoryAggregatedRecord = {
   key: string;
   model: string;
+  internalSpecification?: string;
   version: string;
   records: ScanRecord[];
   totalQuantity: number;
@@ -126,10 +137,13 @@ const INVENTORY_RECORD_SIGNATURE_FIELDS = [
   'productionDate',
   'quantity',
   'actualQuantity',
+  'internalSpecification',
 ] as const;
 
 const buildInventoryGroupKey = (record: ScanRecord) =>
-  JSON.stringify([record.model || '', record.version || '']);
+  JSON.stringify(isInternalLabelPackageKey(record.package_key)
+    ? [INTERNAL_LABEL_RULE_ID, record.inventoryCode?.trim().toUpperCase() || '', record.version || '']
+    : [record.model || '', record.version || '']);
 
 const INVENTORY_CHECK_RECORDS_KEY = 'inventory_check_records_by_erp_account_v1';
 type InventoryDraftStore = Record<string, ScanRecord[]>;
@@ -270,7 +284,21 @@ export default function InventoryScreen() {
       if (records !== undefined && !Array.isArray(records)) {
         throw new Error('本账套盘点草稿格式异常，未覆盖原草稿');
       }
-      return Array.isArray(records) ? records : [];
+      if (!Array.isArray(records)) return [];
+
+      // Older drafts contain only the package key. Recover the display value locally.
+      const missingSpecifications = records.filter(record =>
+        record.internalSpecification === undefined && isInternalLabelPackageKey(record.package_key)
+      );
+      if (!missingSpecifications.length) return records;
+
+      const specifications = await getInternalLabelSpecifications(missingSpecifications.map(record => record.package_key))
+        .catch(() => new Map<string, string>());
+      return records.map(record => {
+        if (record.internalSpecification !== undefined || !record.package_key) return record;
+        const specification = specifications.get(record.package_key);
+        return specification ? { ...record, internalSpecification: specification } : record;
+      });
     },
     []
   );
@@ -683,19 +711,23 @@ export default function InventoryScreen() {
           return;
         }
         // 解析二维码
-        const rule = await detectRule(code, rules);
+        const internal = isInternalLabelInput(code) ? await requireActiveInternalLabel(code) : null;
+        const rule = internal ? null : await detectRule(code, rules);
         if (!isCurrent()) return;
-        if (!rule) {
+        if (!rule && !internal) {
           showToast('没有匹配的二维码解析规则，请先在设置中配置', 'error');
           logger.error('[盘点] 无法识别二维码格式:', code);
           feedbackError();
           return;
         }
 
-        const { standardFields, customFields } = parseWithRule(code, rule);
-        const model = standardFields.model || '';
+        const { standardFields, customFields } = rule ? parseWithRule(code, rule) : { standardFields: {}, customFields: {} };
+        const packageKey = internal ? internalLabelPackageKey(internal.packageId)
+          : rule ? buildPackageKey(rule, standardFields, FIELD_LABELS) : undefined;
+        const traceNo = packageFieldValue(standardFields.traceNo);
+        const model = internal?.inventoryName || standardFields.model || '';
         const batch = standardFields.batch || '';
-        const quantity = parseQuantity(standardFields.quantity, { min: 1 });
+        const quantity = internal?.quantity ?? parseQuantity(standardFields.quantity, { min: 1 });
         const version = standardFields.version || '';
 
         if (!model) {
@@ -717,7 +749,7 @@ export default function InventoryScreen() {
         }
 
         // 盘点必须按“型号 + 可选版本号”匹配，保持与出入库一致。
-        const inventoryCode = await getInventoryCodeByModel(model, version);
+        const inventoryCode = internal?.inventoryCode ?? await getInventoryCodeByModel(model, version);
         if (!isCurrent()) return;
         if (!inventoryCode) {
           showToast(`未绑定存货编码：${model}${version ? ` / ${version}` : ''}`, 'error');
@@ -725,8 +757,16 @@ export default function InventoryScreen() {
           return;
         }
 
-        if (hasMatchingTraceNo(scanRecordsRef.current, standardFields.traceNo)) {
-          showToast('已扫过此追溯码', 'warning');
+        if (internal && internal.accountKey !== selectedAccount.key) {
+          const result = await fetchCurrentStockByInventoryCode(selectedAccount, internal.inventoryCode);
+          assertInternalLabelStockMatches(internal, result.rows);
+        }
+        if (packageKey && !internal) await assertPackageIsNotSplit(packageKey);
+        if (!isCurrent()) return;
+        if (hasMatchingTraceNo(scanRecordsRef.current, traceNo) ||
+            (packageKey && scanRecordsRef.current.some(record => record.package_key === packageKey ||
+              (rule && !record.package_key && record.ruleId === rule.id && matchesLegacyPackage(packageKey, rule, record.traceCode))))) {
+          showToast(packageKey ? '本盘点单已扫过此包装' : '已扫过此追溯码', 'warning');
           feedbackDuplicate();
           return;
         }
@@ -740,14 +780,16 @@ export default function InventoryScreen() {
           quantity,
           actualQuantity: quantity,
           inventoryCode: inventoryCode || undefined,
+          internalSpecification: internal?.specification.trim(),
           scanTime: formatDateTime(new Date().toISOString()),
-          ruleId: rule.id,
-          ruleName: rule.name,
+          ruleId: rule?.id ?? INTERNAL_LABEL_RULE_ID,
+          ruleName: rule?.name ?? INTERNAL_LABEL_RULE_NAME,
           // 扩展字段
           package: standardFields.package || undefined,
           version: version || undefined,
           productionDate: standardFields.productionDate || undefined,
-          traceNo: standardFields.traceNo || undefined,
+          traceNo: traceNo || undefined,
+          package_key: packageKey,
           sourceNo: standardFields.sourceNo || undefined,
           // 占位字段解析值
           customFields: customFields || {},
@@ -759,7 +801,8 @@ export default function InventoryScreen() {
         }
         if (!isCurrent()) return;
         replaceScanRecords(nextRecords);
-        showToast(`已扫码：${model}`, 'success');
+        const displayModel = internal ? newRecord.internalSpecification || internal.inventoryCode : model;
+        showToast(internal && displayModel.length > 22 ? '已扫码' : `已扫码：${displayModel}`, 'success');
         feedbackSuccess();
       } catch (e) {
         if (!isCurrent()) return;
@@ -786,8 +829,7 @@ export default function InventoryScreen() {
       currentWarehouse,
       replaceScanRecords,
       saveCheckRecords,
-      selectedAccount.key,
-      selectedAccount.name,
+      selectedAccount,
       selectedAccountAvailable,
       showToast,
       switchingAccount,
@@ -818,7 +860,7 @@ export default function InventoryScreen() {
   }, [processScan]);
 
   // 字段齐全不代表末段收完；回车保持快速提交，无回车时等待静默收尾。
-  const handleInputChange = useCallback((text: string) => {
+  const handleInputChange = useCallback((text: string, nativeSnapshotOnly = false) => {
     if (!draftReadyRef.current || quantityModalVisibleRef.current || saveConfirmRef.current || saveInProgressRef.current ||
       accountSwitchInProgressRef.current) return;
     cancelScanSubmit(autoSubmitTimerRef);
@@ -827,6 +869,10 @@ export default function InventoryScreen() {
     liveInputValueRef.current = text;
     setInputValue(text);
     if (!text) return;
+    if (!nativeSnapshotOnly && pendingNativeSubmitTextRef.current === text) {
+      flushScannerInput();
+      return;
+    }
 
     const session = inventorySessionRef.current;
     const isCurrent = () => screenActiveRef.current && session === inventorySessionRef.current
@@ -861,7 +907,7 @@ export default function InventoryScreen() {
     if (!pending) return;
     if (pending.advanced || pendingNativeSubmitTextRef.current === pending.text) {
       pendingNativeSubmitTextRef.current = pending.text;
-      handleInputChange(pending.text);
+      handleInputChange(pending.text, true);
       return;
     }
     cancelScanSubmit(autoSubmitTimerRef);
@@ -932,7 +978,7 @@ export default function InventoryScreen() {
   const syncInventorySnapshot = async (
     records: InventoryExportRecord[],
     mode: InventoryExportMode,
-    warehouseName: string,
+    warehouse: Pick<Warehouse, 'id' | 'name'>,
     checkNo: string
   ): Promise<{ success: boolean; skipped: boolean; fileName?: string; message?: string }> => {
     const savedSyncConfig = await AsyncStorage.getItem(STORAGE_KEYS.SYNC_CONFIG);
@@ -944,7 +990,7 @@ export default function InventoryScreen() {
       return { success: false, skipped: true };
     }
 
-    const fileName = buildInventoryExportFileNameFromNo(warehouseName, mode, checkNo);
+    const fileName = buildInventoryExportFileNameFromNo(warehouse.name, mode, checkNo);
     const result = await syncExcelToComputer(
       buildInventorySheets(records),
       '/inventory',
@@ -952,7 +998,8 @@ export default function InventoryScreen() {
       undefined,
       undefined,
       undefined,
-      fileName
+      fileName,
+      { warehouse },
     );
 
     return {
@@ -1040,6 +1087,7 @@ export default function InventoryScreen() {
           version: record.version,
           productionDate: record.productionDate,
           traceNo: record.traceNo,
+          package_key: record.package_key,
           sourceNo: record.sourceNo,
           customFields: record.customFields,
           rule_id: record.ruleId,
@@ -1048,9 +1096,10 @@ export default function InventoryScreen() {
           erp_account_name: selectedAccount.name,
           erp_quantity: erpQuantity,
         };
-        recordsToSave.push(base);
+        recordsToSave.push(isInternalLabelInput(record.traceCode) ? { ...base, internalLabelQr: record.traceCode } : base);
         exportRecords.push({
           ...base,
+          internalSpecification: record.internalSpecification,
           account_name: selectedAccount.name,
           created_at: createdAt,
         });
@@ -1079,7 +1128,7 @@ export default function InventoryScreen() {
         syncResult = await syncInventorySnapshot(
           exportRecords,
           exportMode,
-          currentWarehouse.name,
+          currentWarehouse,
           checkNo
         );
       } catch (syncError) {
@@ -1204,7 +1253,7 @@ export default function InventoryScreen() {
     );
   };
 
-  // 计算每个型号+版本的累计数量
+  // 使用相同的分组规则计算列表与累计数量。
   const modelVersionTotals = useMemo(() => {
     const totals: { [key: string]: { qty: number; actualQty: number; count: number } } = {};
     scanRecords.forEach((r) => {
@@ -1245,7 +1294,7 @@ export default function InventoryScreen() {
         ? '调整实际数量'
         : '继续扫码或完成盘点';
 
-  // 聚合显示数据（按型号+版本号聚合，显示规则与扫码入库保持一致）
+  // 普通标签按型号和版本汇总，内部标签按存货编码区分同名物料。
   const aggregatedRecords = useMemo<InventoryAggregatedRecord[]>(() => {
     const map = new Map<
       string,
@@ -1268,9 +1317,11 @@ export default function InventoryScreen() {
       .map(([key, group]) => {
         const records = group.records.slice().sort((a, b) => b.id.localeCompare(a.id));
         const firstRecord = records[0];
+        const internalSpecification = records.find(record => record.internalSpecification)?.internalSpecification;
         return {
           key,
-          model: firstRecord?.model || '',
+          model: internalSpecification || firstRecord?.model || firstRecord?.inventoryCode || '',
+          internalSpecification,
           version: firstRecord?.version || '',
           batch: firstRecord?.batch || '',
           sourceNo: firstRecord?.sourceNo || '',
@@ -1366,6 +1417,9 @@ export default function InventoryScreen() {
           onLongPress={() => handleDeleteRecord(record)}
           delayLongPress={500}
         >
+          {record.internalSpecification ? (
+            <Text style={styles.detailText}>规格型号: {record.internalSpecification}</Text>
+          ) : null}
           <Text style={styles.detailText}>
             批次: {record.batch || '-'} | 生产日期: {record.productionDate || '-'} | 标签:{' '}
             {record.quantity}
@@ -1399,6 +1453,7 @@ export default function InventoryScreen() {
         <AggregatedRecordItem
           groupKey={key}
           model={item.model}
+          titleNumberOfLines={item.internalSpecification ? 2 : undefined}
           version={item.version}
           totalQuantity={item.totalQuantity}
           records={item.records}

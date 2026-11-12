@@ -35,6 +35,7 @@ it('exports all months for exactly the requested warehouse and preserves pairing
   expect(call[1]).toBe('/outbound');
   expect(call[2]).toEqual({ ip: '127.0.0.1', port: '8080', pairingKey: 'fixture-key' });
   expect(call[6]).toBe(result.fileName);
+  expect(call[7]).toEqual({ warehouse });
   expect(incrementExportCount).toHaveBeenCalledWith('outbound');
   await exportOutboundHistoryToComputer({ id: 'B', name: 'B仓库' });
   expect(getOutboundExportRows).toHaveBeenLastCalledWith('B');

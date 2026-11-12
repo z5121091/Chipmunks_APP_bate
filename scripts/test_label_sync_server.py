@@ -524,6 +524,11 @@ class UnpackTimeLabelTest(unittest.TestCase):
                                       production_date='2528HE', version='LEVEL2',
                                       trace_no='2507260140109-' + str(row_index + 1),
                                       source_no='3001-250721001', package='01-A0162')
+                if supplier == '广东仁懋电子有限公司':
+                    for record in records:
+                        record.update(model='MOT3114G', version='810411G01000101',
+                                      package='PDFN5*6', batch='ZYA.C',
+                                      production_date='20261022', source_no='0005', trace_no='')
                 send.reset_mock()
                 result = label_sync_server.submit_native_unpack_labels(records, f'PAIR-{index}')
                 self.assertEqual(records[1]['unpacked_at'], '2026-09-15 14:30')

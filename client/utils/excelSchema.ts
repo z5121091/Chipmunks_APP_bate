@@ -11,6 +11,7 @@ export type MaterialExportRecord = {
   inventory_code?: string | null;
   scan_model?: string | null;
   model?: string | null;
+  internalSpecification?: string;
   version?: string | null;
   package?: string | null;
   batch?: string | null;
@@ -68,7 +69,7 @@ const toCellText = (value: string | number | null | undefined): string => {
 };
 
 const getMaterialModel = (record: MaterialExportRecord): string => {
-  return toCellText(record.scan_model || record.model);
+  return toCellText(record.internalSpecification?.trim() || record.scan_model || record.model);
 };
 
 export const buildMaterialWarehouseColumn = <

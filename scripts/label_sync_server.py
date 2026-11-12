@@ -4,7 +4,7 @@
 """
 掌上仓库 ERP版同步助手
 功能：接收手机发送的数据，自动保存为Excel文件
-支持：系统托盘、开机自启动、日志轮转
+支持：系统托盘、开机自启动、运行日志窗口
 """
 
 import cherrypy
@@ -22,17 +22,17 @@ import sqlite3
 import subprocess
 import threading
 import uuid
-import logging
 from zipfile import BadZipFile
 from decimal import Decimal, InvalidOperation
-from logging.handlers import RotatingFileHandler
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, Border, Side
 
 try:
     from .sync_notifications import BusinessNotificationDispatcher
+    from .sync_export_folders import WAREHOUSE_ARCHIVE_API_VERSION, ensure_warehouse_folders, get_document_save_path
     from .sync_connection_qr import ConnectionQrWindow
+    from .sync_log_window import LogWindow, RuntimeLogBuffer
     from .sync_pairing_settings import PAIRING_ENV as SYNC_PAIRING_ENV, PairingSettingsWindow, hide_pairing_config, read_pairing_settings
     from .label_templates import (
         NATIVE_LABEL_COPIES,
@@ -43,9 +43,12 @@ try:
         get_native_label_records,
         get_native_label_template,
     )
+    from .label_templates.internal import is_internal_label_qr, normalize_internal_label_record
 except ImportError:
     from sync_notifications import BusinessNotificationDispatcher
+    from sync_export_folders import WAREHOUSE_ARCHIVE_API_VERSION, ensure_warehouse_folders, get_document_save_path
     from sync_connection_qr import ConnectionQrWindow
+    from sync_log_window import LogWindow, RuntimeLogBuffer
     from sync_pairing_settings import PAIRING_ENV as SYNC_PAIRING_ENV, PairingSettingsWindow, hide_pairing_config, read_pairing_settings
     from label_templates import (
         NATIVE_LABEL_COPIES,
@@ -56,6 +59,7 @@ except ImportError:
         get_native_label_records,
         get_native_label_template,
     )
+    from label_templates.internal import is_internal_label_qr, normalize_internal_label_record
 
 # ==================== 配置 ====================
 SYNC_SERVICE_ID = 'palm-warehouse-sync'
@@ -64,6 +68,7 @@ SYNC_DISPLAY_NAME = '掌上仓库 ERP版同步助手'
 SYNC_EDITION = 'ERP'
 SYNC_VERSION = 'V1.0'
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_WAREHOUSE_ROSTER_BYTES = 64 * 1024
 MAX_FILE_NAME_LENGTH = 120
 DIRECT_PRINT_PRINTER_NAME = (
     os.environ.get('PALM_WAREHOUSE_PRINTER_NAME', '').strip()
@@ -80,8 +85,8 @@ LABEL_REPRINT_API_VERSION = 1
 LABEL_REPRINT_SESSION_ID = uuid.uuid4().hex
 MAX_LABEL_REPRINT_BYTES = 32 * 1024
 MAX_EPHEMERAL_REPRINT_JOBS = 5000
-# Only hashes and short receipts live in this process. No label fields, QR,
-# Excel, database, JSON history or application log is written by reprinting.
+# Supplier reprints keep only hashes and short receipts in this process.
+# Internal print jobs use the durable native ledger without saving label fields.
 EPHEMERAL_REPRINT_JOBS = {}
 RAW_PRINT_CHUNK_BYTES = 64 * 1024
 NETWORK_ADDRESS_REFRESH_SECONDS = 15
@@ -189,48 +194,17 @@ else:
     # 脚本路径
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 日志文件配置
-LOG_FILE = os.path.join(APP_DIR, '日志记录.log')
-# 日志轮转配置：单个文件最大5MB，保留10个备份
-MAX_LOG_SIZE = 5 * 1024 * 1024  # 5MB
-BACKUP_COUNT = 10
-
-# 初始化日志记录器
-def init_logger():
-    """初始化带轮转功能的日志记录器"""
-    logger = logging.getLogger('SyncService')
-    logger.setLevel(logging.INFO)
-    
-    # 避免重复添加handler
-    if not logger.handlers:
-        # 创建轮转文件处理器
-        rotating_handler = RotatingFileHandler(
-            LOG_FILE,
-            maxBytes=MAX_LOG_SIZE,
-            backupCount=BACKUP_COUNT,
-            encoding='utf-8'
-        )
-        rotating_handler.setLevel(logging.INFO)
-        
-        # 设置日志格式
-        formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-        rotating_handler.setFormatter(formatter)
-        
-        logger.addHandler(rotating_handler)
-    
-    return logger
-
-# 初始化全局日志记录器
-logger = init_logger()
+RUNTIME_LOGS = RuntimeLogBuffer()
 
 def log(message):
-    """写入日志（同时输出到控制台和文件）"""
+    """Record the event even when the windowed EXE has no console."""
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log_line = f"[{timestamp}] {message}"
-    # 写入轮转日志文件
-    logger.info(message)
-    # 同时输出到控制台
-    print(log_line)
+    log_line = RUNTIME_LOGS.append(f"[{timestamp}] {message}")
+    if sys.stdout is not None:
+        try:
+            print(log_line)
+        except (OSError, ValueError):
+            pass
 
 def publish_business_notification(category, outcome, **details):
     """Notification delivery must never change a save/print HTTP result."""
@@ -518,6 +492,10 @@ def send_raw_tspl_to_printer(printer_name, commands, job_name, submission_callba
             win32print.ClosePrinter(handle)
 
 
+class NativePrintLedgerError(RuntimeError):
+    """The durable receipt cannot be read or saved."""
+
+
 def validate_native_print_history(jobs):
     if not isinstance(jobs, dict) or any(
         not isinstance(job_id, str) or not isinstance(entry, dict)
@@ -557,7 +535,7 @@ def open_native_print_ledger():
             connection.close()
         # A broken ledger or legacy file must never silently erase print evidence.
         log(f'读取原生标签打印历史失败，已停止提交以保护去重记录：{type(error).__name__}')
-        raise RuntimeError('拆包打印历史无法读取，不能确认之前是否出纸。请先检查同步助手数据目录及历史文件，再重试。') from error
+        raise NativePrintLedgerError('拆包打印历史无法读取，不能确认之前是否出纸。请先检查同步助手数据目录及历史文件，再重试。') from error
 
 
 def load_native_print_job(job_id):
@@ -566,7 +544,7 @@ def load_native_print_job(job_id):
         row = connection.execute('SELECT receipt FROM print_jobs WHERE job_id = ?', (job_id,)).fetchone()
         return validate_native_print_history({job_id: json.loads(row[0])})[job_id] if row else None
     except Exception as error:
-        raise RuntimeError('拆包打印历史无法读取，不能确认之前是否出纸。请先检查同步助手数据目录及历史文件，再重试。') from error
+        raise NativePrintLedgerError('拆包打印历史无法读取，不能确认之前是否出纸。请先检查同步助手数据目录及历史文件，再重试。') from error
     finally:
         connection.close()
 
@@ -633,8 +611,28 @@ class UnpackPrintOutcomeUnknownError(RuntimeError):
     """A durable task may already have reached the Windows print queue."""
 
 
+class NativePrintJobConflictError(ValueError):
+    """A durable print task was reused for different content."""
+
+
+class InternalLabelLayoutError(RuntimeError):
+    """Validated HLS data could not be rendered on the label."""
+
+
 def submit_native_unpack_labels(records, print_job_id, retry_confirmed=False):
-    """提交一组拆包标签；相同任务标识只允许提交一次。"""
+    return submit_durable_native_labels(records, print_job_id, retry_confirmed, unpack=True)
+
+
+def submit_durable_native_labels(records, print_job_id, retry_confirmed=False, *, unpack, copies_per_label=NATIVE_LABEL_COPIES):
+    """Submit one physical print operation and persist the receipt for safe retries."""
+    action = '拆包' if unpack else '内部标签'
+    label_description = '拆包标签' if unpack else '内部标签'
+    if isinstance(copies_per_label, bool) or not isinstance(copies_per_label, int) or copies_per_label not in (1, NATIVE_LABEL_COPIES):
+        raise ValueError('标签打印份数无效。')
+    if copies_per_label != NATIVE_LABEL_COPIES and (
+        unpack or not records or any(not is_internal_label_qr(record.get('source_qr')) for record in records)
+    ):
+        raise ValueError('单张打印仅用于新建内部标签，不能用于拆包或供应商标签。')
     normalized_job_id = normalize_native_print_job_id(print_job_id)
     fingerprint = hashlib.sha256(json.dumps(
         records, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str,
@@ -642,12 +640,15 @@ def submit_native_unpack_labels(records, print_job_id, retry_confirmed=False):
     with NATIVE_PRINT_LOCK:
         existing = load_native_print_job(normalized_job_id)
         existing_state = existing.get('state', 'submitted') if existing else None
-        if existing and existing_state != 'failed':
+        if existing and (existing_state != 'failed' or any(is_internal_label_qr(record.get('source_qr')) for record in records)):
             if existing.get('fingerprint') and existing['fingerprint'] != fingerprint:
-                raise ValueError('原拆包打印任务的标签内容已变化，不能作为同一任务重试。请先核对拆包记录和供应商绑定。')
+                message = '原拆包打印任务的标签内容已变化，不能作为同一任务重试。请先核对拆包记录和供应商绑定。' if unpack else '同一内部标签任务不能更改标签内容。'
+                raise NativePrintJobConflictError(message)
+        if existing and existing_state in ('submitting', 'unknown') and existing.get('copiesPerLabel', NATIVE_LABEL_COPIES) != copies_per_label:
+            raise NativePrintJobConflictError('原任务的出纸结果未确认，不能更改打印份数。请先核对已有标签。')
         if existing and existing_state in ('submitting', 'unknown') and retry_confirmed is not True:
             raise UnpackPrintOutcomeUnknownError(
-                '上次拆包打印可能已提交或部分出纸，已阻止自动重复打印。请先核对标签，再使用“核对后重试”。'
+                f'上次{action}打印可能已提交或部分出纸，已阻止自动重复打印。请先核对标签，再使用“核对后重试”。'
             )
         if existing and existing_state == 'submitted':
             log(f'原生标签打印任务已存在，跳过重复出纸：{normalized_job_id}')
@@ -689,29 +690,34 @@ def submit_native_unpack_labels(records, print_job_id, retry_confirmed=False):
                 'template_names': [],
             }
 
-        commands = b''.join(
-            build_native_label(record, template)
-            for record, template in printable_records
-        )
-        # A print_job_id represents one unpack pair; retries reuse the same five-label job.
-        time_record = next(
-            (record for record, _template in printable_records if record.get('label_type') == '剩余标签'),
-            printable_records[0][0],
-        )
-        commands += build_native_unpack_time_label(time_record)
-        physical_label_count = len(printable_records) * NATIVE_LABEL_COPIES + 1
+        try:
+            commands = b''.join(
+                template['builder'](record, template, copies=copies_per_label)
+                if copies_per_label == 1 else build_native_label(record, template)
+                for record, template in printable_records
+            )
+        except (RuntimeError, ValueError) as error:
+            if unpack:
+                raise
+            raise InternalLabelLayoutError(get_safe_reprint_template_error(error)) from error
+        time_records = [record for record, template in printable_records if template['key'] != 'internal'] if unpack else []
+        time_label_count = int(bool(time_records))
+        if time_records:
+            time_record = next((record for record in time_records if record.get('label_type') == '剩余标签'), time_records[0])
+            commands += build_native_unpack_time_label(time_record)
+        physical_label_count = len(printable_records) * copies_per_label + time_label_count
         entry = {
             'state': 'submitting',
             'fingerprint': fingerprint,
             'submittedAt': datetime.datetime.now().isoformat(timespec='seconds'),
             'spoolJobId': None,
             'labelCount': len(printable_records),
-            'timeLabelCount': 1,
+            'timeLabelCount': time_label_count,
             'physicalLabelCount': physical_label_count,
             'skippedCount': skipped_count,
             'skippedSuppliers': skipped_suppliers,
             'templateNames': template_names,
-            'copiesPerLabel': NATIVE_LABEL_COPIES,
+            'copiesPerLabel': copies_per_label,
         }
         jobs = {normalized_job_id: entry}
         # Persist uncertainty BEFORE calling Windows. If this save fails, no
@@ -719,7 +725,7 @@ def submit_native_unpack_labels(records, print_job_id, retry_confirmed=False):
         try:
             save_native_print_history(jobs)
         except Exception as error:
-            raise RuntimeError('拆包打印任务状态无法保存，本次未提交打印。请检查同步助手数据目录权限和磁盘空间。') from error
+            raise NativePrintLedgerError(f'{action}打印任务状态无法保存，本次未提交打印。请检查同步助手数据目录权限和磁盘空间。') from error
         submission_started = False
 
         def mark_submission_started():
@@ -730,7 +736,7 @@ def submit_native_unpack_labels(records, print_job_id, retry_confirmed=False):
             spool_job_id = send_raw_tspl_to_printer(
                 DIRECT_PRINT_PRINTER_NAME,
                 commands,
-                f'Palm Warehouse Unpack {normalized_job_id[:24]}',
+                f'Palm Warehouse {"Unpack" if unpack else "Internal Label"} {normalized_job_id[:24]}',
                 submission_callback=mark_submission_started,
             )
         except Exception as error:
@@ -746,7 +752,7 @@ def submit_native_unpack_labels(records, print_job_id, retry_confirmed=False):
                 pass
             if result_unknown:
                 raise UnpackPrintOutcomeUnknownError(
-                    'Windows 打印队列提交过程中发生异常，拆包标签可能已出纸。请先核对，再使用“核对后重试”。'
+                    f'Windows 打印队列提交过程中发生异常，{label_description}可能已出纸。请先核对，再使用“核对后重试”。'
                 ) from error
             raise
         entry.update(state='submitted', spoolJobId=spool_job_id)
@@ -759,10 +765,10 @@ def submit_native_unpack_labels(records, print_job_id, retry_confirmed=False):
                 '标签已提交 Windows 打印队列，但提交结果无法保存。请先核对是否出纸，再使用“核对后重试”。'
             ) from error
         log(
-            f'原生拆包标签已提交: {DIRECT_PRINT_PRINTER_NAME}，'
+            f'原生{label_description}已提交: {DIRECT_PRINT_PRINTER_NAME}，'
             f'任务 {normalized_job_id}，模板 {"、".join(template_names)}，'
-            f'{len(printable_records)} 条，每条 {NATIVE_LABEL_COPIES} 份，'
-            f'另加拆包时间标签 1 张，共 {physical_label_count} 张，'
+            f'{len(printable_records)} 条，每条 {copies_per_label} 份，'
+            f'拆包时间标签 {time_label_count} 张，共 {physical_label_count} 张，'
             f'跳过 {skipped_count} 条，'
             f'打印队列任务号 {spool_job_id}'
         )
@@ -771,7 +777,7 @@ def submit_native_unpack_labels(records, print_job_id, retry_confirmed=False):
             'spool_job_id': spool_job_id,
             'duplicate': False,
             'printed_count': len(printable_records),
-            'time_label_count': 1,
+            'time_label_count': time_label_count,
             'physical_label_count': physical_label_count,
             'skipped_count': skipped_count,
             'skipped_suppliers': skipped_suppliers,
@@ -832,6 +838,10 @@ def get_safe_reprint_template_error(error):
             r'先积原始二维码第[1-6]个字段应以(?:P/N:|PKG:|QTY:|D/C:|LOT:|DATE:)开头，请核对该字段和解析规则',
             r'荣湃标签(?:型号|数量|批次|生产日期|封装（原库位）|追溯码|箱号|版本号)(?:含二维码分隔符分号，无法完整打印|含无法安全完整打印的字符|文字超出模板宽度，请核对该字段内容和解析规则)',
             r'荣湃原始二维码(?:型号|数量|批次|生产日期|封装（原库位）|追溯码|箱号|版本号)与解析结果不一致，请核对该字段和解析规则',
+            r'仁懋标签' + fields + r'(?:含二维码分隔符空格，无法完整打印|含无法安全完整打印的字符|内容超过1000字符，无法完整打印|文字超出模板宽度，请核对该字段内容和解析规则)',
+            r'仁懋标签缺少' + fields,
+            r'仁懋原始二维码' + fields + r'与解析结果不一致，请核对该字段和解析规则',
+            r'内部标签(?:存货编码|存货名称|规格型号|数量)内容过长，无法完整打印',
         )
         if any(re.fullmatch(pattern, message) for pattern in patterns):
             return message
@@ -857,6 +867,9 @@ def get_safe_reprint_template_error(error):
             '荣湃标签数量须为有效的正整数',
             '荣湃标签缺少型号',
             '荣湃标签缺少追溯码',
+            '仁懋原始二维码须包含完整的八个空格分隔字段',
+            '仁懋原始二维码第1段固定标识应为B',
+            '仁懋标签数量须为有效的正整数',
         }
         if message in known_messages or re.fullmatch(
             r'原始二维码内容过长：当前\d+个字符，本模板最多支持\d+个字符，无法完整打印', message,
@@ -870,6 +883,8 @@ def get_safe_reprint_template_error(error):
             return '同步助手缺少二维码组件（qrcode），请更新或重新安装同步助手后重试。'
         if message.startswith('未找到 Windows 字体文件：'):
             return '同步助手未找到 Arial 字体，请检查并修复 Windows 的 Arial 字体后重试。'
+        if message.startswith('未找到微软雅黑字体，'):
+            return '同步助手未找到微软雅黑字体，请检查 Windows 的中文字体后重试。'
         if message.startswith('未找到标签图片文件：'):
             filename = os.path.basename(message.split('：', 1)[1].replace('\\', '/'))
             image_names = {
@@ -878,6 +893,7 @@ def get_safe_reprint_template_error(error):
                 'dongwei-logo.png': '东微Logo',
                 'rongpai-logo.png': '荣湃Logo',
                 'linearin-logo.png': '先积Logo',
+                'renmao-logo.png': '仁懋Logo',
                 'pb-logo.png': '环保标识', 'esd-warning.png': '静电警告标识',
                 'keep-dry.png': '防潮标识',
             }
@@ -912,6 +928,8 @@ def normalize_reprint_record(record):
     """Validate the JSON label without changing the original QR or its fields."""
     if not isinstance(record, dict):
         raise ValueError('未收到有效的标签数据，请重新扫码。')
+    if is_internal_label_qr(record.get('source_qr')):
+        return normalize_internal_label_record(record)
     normalized = {}
     for key in (
         'model', 'version', 'batch', 'quantity', 'production_date', 'trace_no',
@@ -955,8 +973,38 @@ def normalize_reprint_record(record):
     return normalized
 
 
+def submit_native_internal_label(record, job_id, retry_confirmed, copies_per_label=NATIVE_LABEL_COPIES):
+    """Keep only the durable job fingerprint and receipt, never the label fields."""
+    try:
+        result = submit_durable_native_labels([record], job_id, retry_confirmed, unpack=False, copies_per_label=copies_per_label)
+    except NativePrintJobConflictError as error:
+        return reprint_failure('JOB_CONFLICT', str(error))
+    except UnpackPrintOutcomeUnknownError as error:
+        return reprint_failure('PRINT_RESULT_UNKNOWN', str(error), retry_allowed=True, result_unknown=True)
+    except NativePrintLedgerError:
+        return reprint_failure(
+            'PRINT_HISTORY_UNAVAILABLE',
+            '同步助手无法读取或保存内部标签打印记录，请核对是否已出纸，并检查数据目录权限和磁盘空间。',
+            retry_allowed=True, result_unknown=True,
+        )
+    except InternalLabelLayoutError as error:
+        invalid = isinstance(error.__cause__, ValueError)
+        return reprint_failure('INVALID_LABEL_CONTENT' if invalid else 'TEMPLATE_FAILED', str(error), retry_allowed=not invalid)
+    except Exception as error:
+        return reprint_failure('PRINT_FAILED', get_safe_reprint_printer_error(error), retry_allowed=True)
+    return {
+        'success': True,
+        'state': 'submitted',
+        'jobId': job_id,
+        'spoolJobId': result['spool_job_id'],
+        'duplicate': result['duplicate'],
+        'copies': result['physical_label_count'],
+        'message': '已提交同步助手，请核对标签是否实际出纸',
+    }
+
+
 def submit_native_label_reprint(payload):
-    """Print two original labels, with process-only retry deduplication."""
+    """Create internal labels once; keep reprints in pairs and deduplicate retries."""
     if not isinstance(payload, dict):
         return reprint_failure('INVALID_REQUEST', '标签补打请求须为 JSON 对象')
     if payload.get('reprint_session_id') != LABEL_REPRINT_SESSION_ID:
@@ -971,10 +1019,18 @@ def submit_native_label_reprint(payload):
         record = normalize_reprint_record(payload.get('record'))
     except ValueError as error:
         return reprint_failure('INVALID_LABEL_CONTENT', str(error))
+    retry_confirmed = payload.get('retry_confirmed') is True
+    internal_action = payload.get('internal_action')
+    if 'internal_action' in payload and internal_action != 'create':
+        return reprint_failure('INVALID_REQUEST', '内部标签操作类型无效。')
+    if internal_action == 'create' and not is_internal_label_qr(record['source_qr']):
+        return reprint_failure('INVALID_REQUEST', '单张首打仅适用于新建内部标签。')
+    if is_internal_label_qr(record['source_qr']):
+        copies_per_label = 1 if internal_action == 'create' else NATIVE_LABEL_COPIES
+        return submit_native_internal_label(record, job_id, retry_confirmed, copies_per_label=copies_per_label)
     fingerprint = hashlib.sha256(json.dumps(
         record, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
     ).encode('utf-8')).hexdigest()
-    retry_confirmed = payload.get('retry_confirmed') is True
 
     with NATIVE_PRINT_LOCK:
         existing = EPHEMERAL_REPRINT_JOBS.get(job_id)
@@ -1236,6 +1292,9 @@ class Health:
             'nativePrintModes': sorted(SUPPORTED_NATIVE_LABEL_PRINT_MODES),
             'labelReprintApiVersion': LABEL_REPRINT_API_VERSION,
             'labelReprintSessionId': LABEL_REPRINT_SESSION_ID,
+            'labelReprintInternal': True,
+            'labelReprintInternalCreateSingle': True,
+            'warehouseArchiveApiVersion': WAREHOUSE_ARCHIVE_API_VERSION,
             'labelReprintSuppliers': sorted(NATIVE_LABEL_TEMPLATE_BY_SUPPLIER),
             'maxUploadBytes': MAX_UPLOAD_BYTES,
             # PDA 可用的地址。服务监听 0.0.0.0，因此网卡 IP 变化后无需重启。
@@ -1243,6 +1302,50 @@ class Health:
             'lanIps': lan_addresses,
             'port': SERVER_PORT,
         })
+
+
+class Warehouses:
+    """Precreate archive folders for the PDA's current warehouse list."""
+    exposed = True
+
+    def OPTIONS(self):
+        enable_cors()
+        return b''
+
+    def POST(self):
+        enable_cors()
+        denial = require_sync_pairing()
+        if denial is not None:
+            return denial
+        try:
+            headers = cherrypy.request.headers
+            if headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json':
+                raise ValueError('JSON required')
+            raw_length = headers.get('Content-Length', '').strip()
+            content_length = int(raw_length) if raw_length else None
+            if content_length is not None and not 0 < content_length <= MAX_WAREHOUSE_ROSTER_BYTES:
+                raise ValueError('invalid body size')
+            # As with label reprints, read the raw stream when CherryPy's form
+            # and multipart body processing is disabled for this JSON endpoint.
+            stream = getattr(cherrypy.request, 'rfile', None) or cherrypy.request.body
+            body = stream.read(content_length or MAX_WAREHOUSE_ROSTER_BYTES + 1)
+            if not body or len(body) > MAX_WAREHOUSE_ROSTER_BYTES:
+                raise ValueError('invalid body size')
+            if content_length is not None and len(body) != content_length:
+                raise ValueError('incomplete body')
+            payload = json.loads(body.decode('utf-8'))
+            warehouses = payload.get('warehouses') if isinstance(payload, dict) else None
+            if not isinstance(warehouses, list) or not all(isinstance(item, dict) for item in warehouses):
+                raise ValueError('invalid warehouse roster')
+            folders = ensure_warehouse_folders(DATA_ROOT, [item.get('name') for item in warehouses])
+        except ValueError:
+            cherrypy.response.status = 400
+            return json_response({'success': False, 'message': '仓库清单格式无效或超过大小限制'})
+        except (OSError, RuntimeError) as error:
+            log(f'创建仓库归档目录失败: {error}')
+            cherrypy.response.status = 500
+            return json_response({'success': False, 'message': '创建仓库归档目录失败，请检查同步文件夹'})
+        return json_response({'success': True, 'count': len(folders)})
 
 
 # ==================== 入库单接口 ====================
@@ -1254,7 +1357,7 @@ class Inbound:
         enable_cors()
         return b''
 
-    def POST(self, name_suffix='', file_name=''):
+    def POST(self, name_suffix='', file_name='', warehouse_id='', warehouse_name='', erp_account_key=''):
         enable_cors()
         denial = require_sync_pairing()
         if denial is not None:
@@ -1275,7 +1378,7 @@ class Inbound:
                 filename = f'入库单_{safe_name_suffix}_{today}.xlsx'
             else:
                 filename = f'入库单_{today}.xlsx'
-            save_path = os.path.join(DATA_ROOT, filename)
+            save_path = get_document_save_path(DATA_ROOT, filename, 'inbound', warehouse_name)
             
             temp_file = build_temp_excel_path(save_path)
             with EXCEL_WRITE_LOCK:
@@ -1319,7 +1422,7 @@ class Outbound:
         enable_cors()
         return b''
 
-    def POST(self, name_suffix='', file_name=''):
+    def POST(self, name_suffix='', file_name='', warehouse_id='', warehouse_name='', erp_account_key=''):
         enable_cors()
         denial = require_sync_pairing()
         if denial is not None:
@@ -1340,7 +1443,7 @@ class Outbound:
                 filename = f'出库单_{safe_name_suffix}_{today}.xlsx'
             else:
                 filename = f'出库单_{today}.xlsx'
-            save_path = os.path.join(DATA_ROOT, filename)
+            save_path = get_document_save_path(DATA_ROOT, filename, 'outbound', warehouse_name)
             
             temp_file = build_temp_excel_path(save_path)
             with EXCEL_WRITE_LOCK:
@@ -1380,7 +1483,7 @@ class Inventory:
         enable_cors()
         return b''
 
-    def POST(self, name_suffix='', file_name=''):
+    def POST(self, name_suffix='', file_name='', warehouse_id='', warehouse_name='', erp_account_key=''):
         enable_cors()
         denial = require_sync_pairing()
         if denial is not None:
@@ -1404,7 +1507,8 @@ class Inventory:
                 filename = f'盘点单_{safe_name_suffix}_{today}.xlsx'
             else:
                 filename = f'盘点单_{today}.xlsx'
-            save_path = os.path.join(DATA_ROOT, filename)
+            archive_warehouse = '' if safe_name_suffix == '拆包标签' else warehouse_name
+            save_path = get_document_save_path(DATA_ROOT, filename, 'inventory', archive_warehouse)
             
             temp_file = build_temp_excel_path(save_path)
             with EXCEL_WRITE_LOCK:
@@ -1554,7 +1658,7 @@ class Labels:
 
 
 class LabelReprint:
-    """Independent JSON printing endpoint: no business/export/history writes."""
+    """Independent JSON printing endpoint without inventory or Excel writes."""
     exposed = True
 
     def OPTIONS(self):
@@ -1671,6 +1775,10 @@ class TrayIcon:
             SYNC_CONFIG_FILE, lambda: self.ip_address, SERVER_PORT,
             lambda message: self.notify('连接二维码', message),
         )
+        self.log_window = LogWindow(
+            RUNTIME_LOGS, resource_path('icon.ico'),
+            lambda message: self.notify('运行日志', message),
+        )
         
     def create_icon_image(self):
         """创建托盘图标"""
@@ -1706,15 +1814,8 @@ class TrayIcon:
         except Exception as e:
             log(f"打开文件夹失败: {e}")
     
-    def open_logs(self):
-        """打开日志文件"""
-        try:
-            if os.path.exists(LOG_FILE):
-                os.startfile(LOG_FILE)
-            else:
-                log("日志文件不存在")
-        except Exception as e:
-            log(f"打开日志失败: {e}")
+    def open_logs(self, *_args):
+        self.log_window.show()
 
     def open_pairing_settings(self, *_args):
         """打开设置窗口；仅点击确定后保存，不启动配置文件编辑器。"""
@@ -1823,6 +1924,7 @@ class TrayIcon:
         self.address_monitor.stop()
         self.pairing_window.close()
         self.connection_qr_window.close()
+        self.log_window.close()
         if self.icon:
             self.icon.stop()
         cherrypy.engine.exit()
@@ -1885,6 +1987,8 @@ def start_server():
             'server.socket_port': SERVER_PORT,
             'server.thread_pool': 10,
             'engine.autoreload.on': False,
+            'log.access_file': '',
+            'log.error_file': '',
             'log.screen': False,
         }
     }
@@ -1893,6 +1997,13 @@ def start_server():
     cherrypy.tree.mount(Health(), '/health', {
         '/': {
             'request.dispatch': cherrypy.dispatch.MethodDispatcher(),
+            'tools.cors.on': True,
+        }
+    })
+    cherrypy.tree.mount(Warehouses(), '/warehouses', {
+        '/': {
+            'request.dispatch': cherrypy.dispatch.MethodDispatcher(),
+            'request.process_request_body': False,
             'tools.cors.on': True,
         }
     })

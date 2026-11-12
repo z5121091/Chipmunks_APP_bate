@@ -3,7 +3,8 @@ import { BackHandler, FlatList, TextInput, TouchableOpacity } from 'react-native
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import InventoryScreen from '../index';
 import { feedbackSuccess, feedbackConfirm } from '@/utils/feedback';
-import { addInventoryCheckRecordsBatch, generateCheckNo, getActiveRules, getInventoryCodeByModel, updateInventoryCheckDocumentSyncStatus } from '@/utils/database';
+import { addInventoryCheckRecordsBatch, generateCheckNo, getActiveRules, getInternalLabelSpecifications, getInventoryCodeByModel, requireActiveInternalLabel, updateInventoryCheckDocumentSyncStatus } from '@/utils/database';
+import { buildInternalLabel, internalLabelPackageKey, parseInternalLabel } from '@/utils/internalLabelCode';
 import { shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
 import { reconcileInventoryRecords } from '@/utils/inventoryReconciliation';
 import { syncExcelToComputer } from '@/utils/excel';
@@ -57,6 +58,8 @@ jest.mock('@/utils/database', () => ({
   getActiveRules: jest.fn(async () => [{}]), detectRule: jest.fn(async () => ({ id: 'R', name: '规则' })),
   parseWithRule: (code: string) => ({ standardFields: { model: 'MODEL', quantity: '10', traceNo: code }, customFields: {} }),
   getInventoryCodeByModel: jest.fn(async () => 'INV'), generateId: () => 'record-1',
+  requireActiveInternalLabel: jest.fn(),
+  getInternalLabelSpecifications: jest.fn(async () => new Map()),
   addInventoryCheckRecordsBatch: jest.fn(), generateCheckNo: jest.fn(), updateInventoryCheckDocumentSyncStatus: jest.fn(),
 }));
 
@@ -116,6 +119,58 @@ const expectNavigationBlocked = async () => {
   expect(mockRouter.back).not.toHaveBeenCalled();
   expect(mockToast).toHaveBeenCalledWith('正在完成盘点，请稍候', 'warning');
 };
+
+it('counts equal-quantity internal packs separately, groups by stock code and rejects a repeat scan', async () => {
+  const specification = '川土微,CA-IS2062VW,集成隔离电源,CAN隔离器,独立逻辑电源,封装:SOIC16-WB';
+  const codes = ['RES.A', 'RES.A', 'RES.B'].map((inventoryCode, index) => buildInternalLabel({
+    inventoryCode, quantity: 10, packageId: `PACKAGEID00${index}`, revision: 1,
+  }));
+  jest.mocked(requireActiveInternalLabel).mockImplementation(async raw => ({
+    ...parseInternalLabel(raw), accountKey: 'shanghai-chipmunk', warehouseCode: '001', warehouseName: '无锡总仓',
+    inventoryName: '隔离芯片', specification,
+  }));
+  await act(async () => { root = TestRenderer.create(<InventoryScreen />); });
+  for (const code of [...codes, codes[0]]) {
+    await scan(code);
+    await act(async () => { await jest.advanceTimersByTimeAsync(1); });
+  }
+  expect(records()).toHaveLength(2);
+  expect(records()).toEqual(expect.arrayContaining([
+    expect.objectContaining({ model: specification, totalQuantity: 20, count: 2, records: expect.arrayContaining([
+      expect.objectContaining({ inventoryCode: 'RES.A', model: '隔离芯片', internalSpecification: specification }),
+    ]) }),
+    expect.objectContaining({ model: specification, totalQuantity: 10, count: 1, records: expect.arrayContaining([
+      expect.objectContaining({ inventoryCode: 'RES.B', model: '隔离芯片', internalSpecification: specification }),
+    ]) }),
+  ]));
+  const group = records()[0];
+  const card = root.root.findByType(FlatList).props.renderItem({ item: group });
+  expect(card.props.titleNumberOfLines).toBe(2);
+  const detail = card.props.renderDetail(group.records[0]);
+  expect(detail.props.children[0].props.children).toEqual(['规格型号: ', specification]);
+  expect(detail.props.children[0].props.numberOfLines).toBeUndefined();
+  expect(mockToast).toHaveBeenCalledWith('本盘点单已扫过此包装', 'warning');
+  expect(getInventoryCodeByModel).not.toHaveBeenCalled();
+});
+
+it('recovers the specification from the local label registry for an older inventory draft', async () => {
+  const packageId = 'PACKAGEID000';
+  const packageKey = internalLabelPackageKey(packageId);
+  const traceCode = buildInternalLabel({ inventoryCode: 'RES.A', quantity: 10, packageId, revision: 1 });
+  await AsyncStorage.setItem(DRAFT_KEY, JSON.stringify({ [SCOPE]: [{
+    id: 'older-draft', traceCode, model: '贴片电阻', batch: '', quantity: 10, inventoryCode: 'RES.A',
+    scanTime: '2026-11-11', package_key: packageKey,
+  }] }));
+  jest.mocked(getInternalLabelSpecifications).mockResolvedValueOnce(new Map([[packageKey, '12KΩ,±1%,0402']]));
+
+  await act(async () => { root = TestRenderer.create(<InventoryScreen />); });
+
+  expect(getInternalLabelSpecifications).toHaveBeenCalledWith([packageKey]);
+  expect(records()).toEqual([expect.objectContaining({
+    model: '12KΩ,±1%,0402', records: [expect.objectContaining({ model: '贴片电阻', inventoryCode: 'RES.A' })],
+  })]);
+  expect(requireActiveInternalLabel).not.toHaveBeenCalled();
+});
 
 it('blocks header, hardware and native route removal throughout ERP, DB, draft cleanup, sync and status commit', async () => {
   await AsyncStorage.setItem(STORAGE_KEYS.SYNC_CONFIG, JSON.stringify({ ip: '127.0.0.1' }));
@@ -323,7 +378,8 @@ it('waits for a split label and keeps the complete native Enter text until its f
   const full = 'MODEL/10/COMPLETE';
   await act(async () => { root.root.findByType('ScanInput' as never).props.onSubmitEditing({ nativeEvent: { text: full } }); });
   await act(async () => { await jest.advanceTimersByTimeAsync(10); root.root.findByType('ScanInput' as never).props.onChangeText(full); });
-  await act(async () => { await jest.advanceTimersByTimeAsync(500); });
+  // Once the true final change agrees with native Submit, no merge timer remains.
+  expect(root.root.findByType('ScanInput' as never).props.value).toBe('');
   expect(records()[0].records).toHaveLength(1);
   expect(records()[0].records[0].traceCode).toBe(full);
   await act(async () => { root.root.findByType('ScanInput' as never).props.onSubmitEditing({ nativeEvent: { text: full } }); await jest.advanceTimersByTimeAsync(500); });

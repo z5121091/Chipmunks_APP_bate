@@ -12,7 +12,7 @@ from wsgiref.util import setup_testing_defaults
 
 from scripts import label_sync_server as server
 from scripts import label_templates
-from scripts.label_templates import apm, boya, dongwei, linearin, rongpai, union, wch
+from scripts.label_templates import apm, boya, dongwei, linearin, renmao, rongpai, union, wch
 from scripts.label_templates.common import build_reprint_qr_image, get_native_arial_font, normalize_tspl_value
 
 
@@ -288,9 +288,9 @@ class OriginalPayloadTemplateTest(unittest.TestCase):
         source = ' CH334U|LOT|QSOP28|V1|250||TRACE|BOX;'
         for supplier, template in label_templates.NATIVE_LABEL_TEMPLATE_BY_SUPPLIER.items():
             with self.subTest(supplier=supplier), ExitStack() as stack:
-                for module in (apm, boya, dongwei, linearin, rongpai, union, wch):
+                for module in (apm, boya, dongwei, linearin, renmao, rongpai, union, wch):
                     stack.enter_context(patch.object(module, 'build_native_text_bitmap', return_value=b'BITMAP\r\n'))
-                module = {'geehy': apm, 'leadcore': apm, 'boya': boya, 'union': union, 'wch': wch, 'dongwei': dongwei, 'linearin': linearin, 'rongpai': rongpai}[template['key']]
+                module = {'geehy': apm, 'leadcore': apm, 'boya': boya, 'union': union, 'wch': wch, 'dongwei': dongwei, 'linearin': linearin, 'renmao': renmao, 'rongpai': rongpai}[template['key']]
                 qr_layer = stack.enter_context(patch.object(module, 'build_reprint_qr_image', wraps=build_reprint_qr_image))
                 raw = SOURCE_QR if template['key'] == 'wch' else source
                 supplier_record = dict(record, production_date='2638') if template['key'] == 'union' else record
@@ -311,6 +311,12 @@ class OriginalPayloadTemplateTest(unittest.TestCase):
                                            trace_no='', source_no='')
                     raw = ('P/N:LTA8292XS8/R8\rPKG:SOIC-8L\rQTY:4000\r'
                            'D/C:J-L14\rLOT:231012PJ\rDATE:17-04-2023')
+                if template['key'] == 'renmao':
+                    supplier_record = dict(record, supplier=supplier, version='810411G01000101',
+                                           model='MOT3114G', package='PDFN5*6', batch='ZYA.C',
+                                           quantity='5000', production_date='20261022',
+                                           source_no='0005', trace_no='')
+                    raw = 'B 810411G01000101 MOT3114G PDFN5*6 ZYA.C 5000 20261022 0005'
                 commands = label_templates.build_native_label(supplier_record, template, source_qr=raw)
             self.assertEqual(qr_layer.call_args.args[0], raw)
             self.assertEqual(commands.count(b'PRINT 1,2\r\n'), 1)

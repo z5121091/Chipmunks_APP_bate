@@ -19,14 +19,26 @@ let lastSpeechStartedAt = 0;
 let speechWarmupPromise: Promise<void> | null = null;
 let speechResetPromise: Promise<void> = Promise.resolve();
 let latestOrderReadyRequest = 0;
-type SpeechMode = 'enqueue' | 'replace' | 'order-ready';
+type SpeechMode = 'enqueue' | 'replace' | 'order-ready' | 'scan-success';
 type ActiveCompletionSpeech = { finished: Promise<void>; finish: () => void };
 let activeCompletionSpeech: ActiveCompletionSpeech | null = null;
+type ScanSuccessSpeech = {
+  generation: number;
+  response: Promise<void>;
+  settle: () => void;
+  watchdog?: ReturnType<typeof setTimeout>;
+};
+let activeScanSuccess: ScanSuccessSpeech | null = null;
+let pendingScanSuccess: ScanSuccessSpeech | null = null;
+
+// 所有普通扫码成功共用文案和语速，其它业务语音保持各自含义和原速。
+const SCAN_SUCCESS_VOICE = { text: '成功', rate: 1.3 } as const;
 
 const SPEECH_MIN_INTERVAL_MS = 120;
 const SPEECH_STOP_SETTLE_MS = Platform.OS === 'android' ? 120 : 40;
 const SPEECH_RESUME_SETTLE_MS = Platform.OS === 'android' ? 350 : 120;
 const SPEECH_FINISH_TIMEOUT_MS = 2500;
+const SCAN_SUCCESS_PLAYBACK_TIMEOUT_MS = 5000;
 const COMPLETION_CALLBACK_TIMEOUT_MS = 10000;
 const isWebPlatform = Platform.OS === 'web';
 
@@ -68,14 +80,7 @@ const waitForSpeechReady = async (): Promise<void> => {
   }
 };
 
-const resetSpeechSession = (
-  reason: string,
-  settleMs = SPEECH_STOP_SETTLE_MS
-): Promise<void> => {
-  if (isWebPlatform) {
-    return Promise.resolve();
-  }
-
+const queueSpeechStop = (reason: string, settleMs: number): Promise<void> => {
   // 串行停止，避免较早的异步 stop 在新提示开始后才返回。
   speechResetPromise = speechResetPromise.then(async () => {
     try {
@@ -87,6 +92,18 @@ const resetSpeechSession = (
     speechReadyAt = Math.max(speechReadyAt, Date.now() + settleMs);
   });
   return speechResetPromise;
+};
+
+const resetSpeechSession = (
+  reason: string,
+  settleMs = SPEECH_STOP_SETTLE_MS
+): Promise<void> => {
+  clearTimeout(activeScanSuccess?.watchdog);
+  activeScanSuccess?.settle();
+  pendingScanSuccess?.settle();
+  activeScanSuccess = null;
+  pendingScanSuccess = null;
+  return isWebPlatform ? Promise.resolve() : queueSpeechStop(reason, settleMs);
 };
 
 const warmupSpeechEngine = (reason: string): Promise<void> => {
@@ -176,20 +193,35 @@ export function isSoundEnabled(): boolean {
 async function speakChinese(
   text: string,
   mode: SpeechMode = 'enqueue',
-  isOrderCompletion = false
+  isOrderCompletion = false,
+  scanSuccess?: { request: ScanSuccessSpeech; onFinished: () => void },
+  rate = 1.0
 ) {
+  let submitted = false;
+  let playbackFinished = false;
+  const isPlaybackCurrent = () => !scanSuccess ||
+    (activeScanSuccess === scanSuccess.request && scanSuccess.request.generation === speechSessionGeneration);
+  const notifyPlaybackFinished = () => {
+    if (playbackFinished) return;
+    playbackFinished = true;
+    clearTimeout(scanSuccess?.request.watchdog);
+    scanSuccess?.onFinished();
+  };
   if (!soundEnabled) {
     logger.log('[Feedback] 声音已关闭，跳过语音');
+    notifyPlaybackFinished();
     return;
   }
 
   if (isWebPlatform) {
     logger.log('[Feedback] Web 预览跳过语音:', text);
+    notifyPlaybackFinished();
     return;
   }
 
   const normalizedText = text.trim();
   if (!normalizedText) {
+    notifyPlaybackFinished();
     return;
   }
 
@@ -207,13 +239,19 @@ async function speakChinese(
       await precedingCompletion.finished;
       if (orderReadyRequest !== latestOrderReadyRequest) return;
     }
-    if (!soundEnabled || generation !== speechSessionGeneration) {
+    if (!soundEnabled || generation !== speechSessionGeneration || !isPlaybackCurrent()) {
       return;
     }
 
     await warmupSpeechEngine('before-speak');
-    await waitForSpeechReady();
-    if (!soundEnabled || generation !== speechSessionGeneration) {
+    // Recovery can queue a stop while another utterance is waiting to speak.
+    for (;;) {
+      const pendingStop = speechResetPromise;
+      await pendingStop;
+      await waitForSpeechReady();
+      if (pendingStop === speechResetPromise) break;
+    }
+    if (!soundEnabled || generation !== speechSessionGeneration || !isPlaybackCurrent()) {
       return;
     }
 
@@ -229,17 +267,32 @@ async function speakChinese(
         resolve();
       };
       const finishPlayback = () => {
+        if (playbackFinished) return;
         completionPlayback?.finish();
+        notifyPlaybackFinished();
         resolveOnce();
       };
       const timeoutId = setTimeout(resolveOnce, SPEECH_FINISH_TIMEOUT_MS);
 
+      if (scanSuccess) {
+        const recoverScanSuccess = async () => {
+          // Native stop is global. Let an already-playing order completion finish first.
+          if (activeCompletionSpeech) await activeCompletionSpeech.finished;
+          if (playbackFinished || !isPlaybackCurrent()) return;
+          logger.warn('[Feedback] 成功语音结束回调超时，恢复播报队列');
+          // Queue the native stop before handing the slot to a pending success.
+          void queueSpeechStop('scan-success-timeout', SPEECH_RESUME_SETTLE_MS);
+          finishPlayback();
+        };
+        scanSuccess.request.watchdog = setTimeout(() => { void recoverScanSuccess(); }, SCAN_SUCCESS_PLAYBACK_TIMEOUT_MS);
+      }
+      submitted = true;
       Speech.speak(normalizedText, {
         language: 'zh-CN',
         pitch: 1.0,
-        rate: 1.0,
+        rate,
         onStart: () => {
-          if (generation === speechSessionGeneration) {
+          if (!playbackFinished && isPlaybackCurrent() && generation === speechSessionGeneration) {
             lastSpeechStartedAt = Date.now();
             if (isOrderCompletion) completionPlayback = trackCompletionPlayback();
           }
@@ -247,6 +300,7 @@ async function speakChinese(
         onDone: finishPlayback,
         onStopped: finishPlayback,
         onError: (error) => {
+          if (playbackFinished) return;
           logger.error('播放语音失败:', error);
           speechReadyAt = Math.max(speechReadyAt, Date.now() + SPEECH_RESUME_SETTLE_MS);
           finishPlayback();
@@ -263,8 +317,57 @@ async function speakChinese(
       await resetSpeechSession('speak-error', SPEECH_RESUME_SETTLE_MS);
       await warmupSpeechEngine('speak-error');
     }
+    notifyPlaybackFinished();
+  } finally {
+    // A cancelled preparation never reached the native queue. A submitted
+    // utterance keeps its slot even after the caller's 2.5-second wait expires.
+    if (!submitted) notifyPlaybackFinished();
   }
 }
+
+const createScanSuccessSpeech = (): ScanSuccessSpeech => {
+  let resolve!: () => void;
+  const response = new Promise<void>(done => { resolve = done; });
+  const timer = setTimeout(() => resolve(), SPEECH_FINISH_TIMEOUT_MS);
+  return {
+    generation: speechSessionGeneration,
+    response,
+    settle: () => { clearTimeout(timer); resolve(); },
+  };
+};
+
+const playScanSuccess = (request: ScanSuccessSpeech) => {
+  activeScanSuccess = request;
+  const finished = () => {
+    request.settle();
+    // A late/double native callback cannot release a newer playback slot.
+    if (activeScanSuccess !== request) return;
+    activeScanSuccess = null;
+    const pending = pendingScanSuccess;
+    pendingScanSuccess = null;
+    if (!pending) return;
+    if (!soundEnabled || pending.generation !== speechSessionGeneration) {
+      pending.settle();
+      return;
+    }
+    playScanSuccess(pending);
+  };
+  void speakChinese(SCAN_SUCCESS_VOICE.text, 'enqueue', false, { request, onFinished: finished },
+    SCAN_SUCCESS_VOICE.rate).then(request.settle);
+};
+
+const queueScanSuccess = (): Promise<void> => {
+  if (!soundEnabled || isWebPlatform) return Promise.resolve();
+  if (activeScanSuccess) {
+    // Reserve one shared pending utterance, including during slow TTS warmup.
+    // Further saved packs still vibrate individually without growing the queue.
+    pendingScanSuccess ??= createScanSuccessSpeech();
+    return pendingScanSuccess.response;
+  }
+  const request = createScanSuccessSpeech();
+  playScanSuccess(request);
+  return request.response;
+};
 
 const notifyWithSpeech = async (
   text: string,
@@ -273,7 +376,8 @@ const notifyWithSpeech = async (
   isOrderCompletion = false
 ): Promise<void> => {
   // 语音先登记，震动独立执行；慢震动不能让旧成功提示越过新的错误提示。
-  const speech = speakChinese(text, mode, isOrderCompletion);
+  const speech = mode === 'scan-success'
+    ? queueScanSuccess() : speakChinese(text, mode, isOrderCompletion);
   try {
     await performNotificationHaptic(type);
   } catch (error) {
@@ -283,11 +387,11 @@ const notifyWithSpeech = async (
 };
 
 /**
- * 扫码成功反馈 - 震动 + "扫码成功"语音
+ * 普通扫码成功反馈 - 震动 + 1.3 倍速的“成功”语音
  */
 export async function feedbackSuccess() {
   logger.log('[Feedback] feedbackSuccess 触发');
-  await notifyWithSpeech('扫码成功', Haptics.NotificationFeedbackType.Success);
+  await notifyWithSpeech(SCAN_SUCCESS_VOICE.text, Haptics.NotificationFeedbackType.Success, 'scan-success');
 }
 
 /**
@@ -390,7 +494,7 @@ export async function feedbackUnpackComplete() {
 
 /**
  * 出库单在本次扫码后刚好全部完成时的专用反馈。
- * 使用一条完整语音，避免与普通“扫码成功”或“拆包完成”相互抢占。
+ * 使用一条完整语音，避免与普通“成功”或“拆包完成”相互抢占。
  */
 export async function feedbackOutboundOrderComplete(afterUnpack = false) {
   await notifyWithSpeech(
@@ -401,9 +505,12 @@ export async function feedbackOutboundOrderComplete(afterUnpack = false) {
   );
 }
 
+export type OutboundOrderReadyStatus = 'loaded' | 'switched' | 'current' | 'complete';
+
 /** 扫描订单并恢复界面后的提示，与物料保存成功分开。 */
 export async function feedbackOutboundOrderReady(
-  status: 'loaded' | 'switched' | 'current' | 'complete' | 'verifying'
+  status: OutboundOrderReadyStatus | 'verifying',
+  warehouseName?: string,
 ) {
   const messages = {
     loaded: '订单已载入',
@@ -415,12 +522,14 @@ export async function feedbackOutboundOrderReady(
   const haptic = status === 'switched' || status === 'verifying'
     ? Haptics.NotificationFeedbackType.Warning
     : Haptics.NotificationFeedbackType.Success;
-  await notifyWithSpeech(messages[status], haptic, 'order-ready', status === 'complete');
+  const text = warehouseName ? `${messages[status]}，${warehouseName}` : messages[status];
+  await notifyWithSpeech(text, haptic, 'order-ready', status === 'complete');
 }
 
 /** 销售退货使用专用文案，复用订单切换与原生完成播报的保护逻辑。 */
 export async function feedbackSalesReturnOrderReady(
-  status: 'loaded' | 'switched' | 'current' | 'complete'
+  status: OutboundOrderReadyStatus,
+  warehouseName?: string,
 ) {
   const messages = {
     loaded: '销售退货单已载入',
@@ -431,16 +540,18 @@ export async function feedbackSalesReturnOrderReady(
   const haptic = status === 'switched'
     ? Haptics.NotificationFeedbackType.Warning
     : Haptics.NotificationFeedbackType.Success;
-  await notifyWithSpeech(messages[status], haptic, 'order-ready', status === 'complete');
+  const text = warehouseName ? `${messages[status]}，${warehouseName}` : messages[status];
+  await notifyWithSpeech(text, haptic, 'order-ready', status === 'complete');
 }
 
 /** 仅在退货记录保存成功之后调用；收齐时只播报一条完成提示。 */
 export async function feedbackSalesReturnSaved(complete = false) {
+  if (!complete) return feedbackSuccess();
   await notifyWithSpeech(
-    complete ? '本单退货已收齐' : '退货扫码成功',
+    '本单退货已收齐',
     Haptics.NotificationFeedbackType.Success,
-    complete ? 'replace' : 'enqueue',
-    complete
+    'replace',
+    true
   );
 }
 

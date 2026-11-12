@@ -1,6 +1,9 @@
+import { bindingMatchesVersion, getBindingVersions } from './bindingVersions';
+
 export type InventoryBindingIdentity = {
   scan_model?: string | null;
   version?: string | null;
+  versions?: readonly string[];
   inventory_code?: string | null;
 };
 
@@ -25,7 +28,6 @@ export const resolveInboundInventoryCodeFromBindings = (
   version?: string | null
 ): string => {
   const modelKey = buildInboundModelKey(model);
-  const versionKey = normalizeInboundVersion(version).toUpperCase();
   if (!modelKey) {
     return '';
   }
@@ -41,11 +43,10 @@ export const resolveInboundInventoryCodeFromBindings = (
       continue;
     }
 
-    const bindingVersionKey = normalizeInboundVersion(binding.version).toUpperCase();
-    if (bindingVersionKey === versionKey) {
+    if (bindingMatchesVersion(binding, version)) {
       return inventoryCode;
     }
-    if (!bindingVersionKey && !defaultInventoryCode) {
+    if (getBindingVersions(binding).length === 0 && !defaultInventoryCode) {
       defaultInventoryCode = inventoryCode;
     }
   }

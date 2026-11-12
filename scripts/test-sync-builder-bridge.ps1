@@ -30,7 +30,7 @@ function New-SyncFixture {
     [IO.File]::Copy($sourceScript, (Join-Path $project 'scripts/build.ps1'))
     [IO.File]::WriteAllText((Join-Path $project 'scripts/label_sync_server.py'), "SYNC_VERSION = 'V1.0'`r`n", $utf8)
     [IO.File]::WriteAllText((Join-Path $project "scripts/dist/$appName.exe"), 'previous verified helper - never run', $utf8)
-    foreach ($asset in @('geehy-logo.png','boya-logo.png','pb-logo.png','union-logo.png','esd-warning.png','keep-dry.png','wch-logo.png','dongwei-logo.png','rongpai-logo.png','linearin-logo.png')) {
+    foreach ($asset in @('geehy-logo.png','boya-logo.png','pb-logo.png','union-logo.png','esd-warning.png','keep-dry.png','wch-logo.png','dongwei-logo.png','rongpai-logo.png','linearin-logo.png','renmao-logo.png')) {
         [IO.File]::WriteAllText((Join-Path $project "scripts/assets/$asset"), 'fixture')
     }
     $environment = @'

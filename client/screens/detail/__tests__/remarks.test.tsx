@@ -4,8 +4,10 @@ import * as Clipboard from 'expo-clipboard';
 import DetailScreen from '../index';
 import { getMaterial, getQueryOrder, getMaterialRemarks, updateSalesReturnNotes, type MaterialRecord, type MaterialRemarkDTO } from '@/utils/database';
 import { AppModalCard } from '@/components/AppModalCard';
+import { AppPressable } from '@/components/AppPressable';
 
 let mockRecordId = 'material-1';
+const mockAlert = { showSuccess: jest.fn(), showError: jest.fn(), AlertComponent: null };
 
 jest.mock('@/hooks/useSafeRouter', () => ({
   useSafeRouter: () => ({ back: jest.fn() }),
@@ -28,14 +30,14 @@ jest.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
 }));
 jest.mock('@/components/CustomAlert', () => ({
-  useCustomAlert: () => ({ showSuccess: jest.fn(), showError: jest.fn(), AlertComponent: null }),
+  useCustomAlert: () => mockAlert,
 }));
 jest.mock('@/utils/database', () => ({
   getMaterial: jest.fn(), getQueryOrder: jest.fn(), getMaterialRemarks: jest.fn(), updateSalesReturnNotes: jest.fn(),
   getRuleById: jest.fn(), getAllRules: jest.fn(async () => []),
 }));
 jest.mock('@/utils/time', () => ({ formatDateTime: (value: string) => value }));
-jest.mock('expo-clipboard', () => ({ setStringAsync: jest.fn(async () => undefined) }));
+jest.mock('expo-clipboard', () => ({ setStringAsync: jest.fn(async () => true) }));
 jest.mock('@/utils/logger', () => ({ logger: { log: jest.fn(), warn: jest.fn(), error: jest.fn() } }));
 
 const material = (id = 'material-1', orderNo = 'ORDER-1'): MaterialRecord => ({
@@ -96,6 +98,28 @@ it('omits the remark field and copy line when all remarks are empty', async () =
     button.findAllByType(Text).some(text => text.props.children === '复制内容'))!;
   await act(async () => { await copy.props.onPress(); });
   expect(jest.mocked(Clipboard.setStringAsync).mock.calls[0][0]).not.toContain('备注:');
+});
+
+it('copies only the chosen order number, customer, batch or trace number on long press', async () => {
+  jest.mocked(getMaterial).mockResolvedValue({ ...material(), batch: '0005', traceNo: 'TRACE-1-02' });
+  await renderScreen();
+  const fields = root!.root.findAllByType(AppPressable).filter(button => button.props.accessibilityHint === '长按复制');
+  expect(fields.map(field => field.props.accessibilityLabel)).toEqual([
+    '订单号，ORDER-1', '客户名称，客户 A', '批次，0005', '追溯码，TRACE-1-02',
+  ]);
+  expect(fields.every(field => field.props.onPress === undefined)).toBe(true);
+  for (const field of fields) await act(async () => { await field.props.onLongPress(); });
+  expect(jest.mocked(Clipboard.setStringAsync).mock.calls).toEqual([['ORDER-1'], ['客户 A'], ['0005'], ['TRACE-1-02']]);
+  expect(mockAlert.showSuccess.mock.calls).toEqual([['订单号已复制'], ['客户名称已复制'], ['批次已复制'], ['追溯码已复制']]);
+});
+
+it('leaves missing customer, batch and trace placeholders as read-only text', async () => {
+  jest.mocked(getMaterial).mockResolvedValue({ ...material(), customer_name: '', batch: '  ', traceNo: '—' });
+  await renderScreen();
+  expect(textValues()).toEqual(expect.arrayContaining(['客户名称', '批次', '追溯码']));
+  const fields = root!.root.findAllByType(AppPressable).filter(button => button.props.accessibilityHint === '长按复制');
+  expect(fields.map(field => field.props.accessibilityLabel)).toEqual(['订单号，ORDER-1']);
+  expect(Clipboard.setStringAsync).not.toHaveBeenCalled();
 });
 
 it('keeps valid record details visible and distinguishes a failed remark read from no remarks', async () => {

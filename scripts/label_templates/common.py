@@ -2,6 +2,7 @@ import datetime
 import os
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 NATIVE_LABEL_COPIES = 2
@@ -28,6 +29,11 @@ NATIVE_LABEL_FIELD_HEADERS = {
 }
 NATIVE_LABEL_REQUIRED_HEADERS = ('型号', '标签数量', '追溯码')
 NATIVE_LABEL_REQUIRED_VALUES = (('型号', 'model'), ('标签数量', 'quantity'))
+NATIVE_LABEL_SOURCE_HEADERS = {
+    'source_qr': '原始二维码',
+    'inventory_name': '存货名称',
+    'specification': '规格型号',
+}
 
 _FONT_CACHE = {}
 _IMAGE_CACHE = {}
@@ -78,6 +84,8 @@ def get_native_label_records(workbook):
             key: get_value(row, header)
             for key, header in NATIVE_LABEL_FIELD_HEADERS.items()
         }
+        if get_value(row, NATIVE_LABEL_SOURCE_HEADERS['source_qr']):
+            record.update({key: get_value(row, header) for key, header in NATIVE_LABEL_SOURCE_HEADERS.items()})
         missing_values = [
             label for label, key in NATIVE_LABEL_REQUIRED_VALUES if not record[key]
         ]
@@ -291,6 +299,19 @@ def get_native_arial_font(bold=False, size_pixels=NATIVE_LABEL_FONT_SIZE_PIXELS)
     font = ImageFont.truetype(font_path, size_pixels)
     _FONT_CACHE[cache_key] = font
     return font
+
+
+@lru_cache(maxsize=32)
+def get_native_chinese_font(bold=False, size_pixels=NATIVE_LABEL_FONT_SIZE_PIXELS):
+    try:
+        from PIL import ImageFont
+    except ImportError as error:
+        raise RuntimeError('缺少 Pillow，无法生成中文标签文字') from error
+    windows_root = os.environ.get('WINDIR') or os.environ.get('SystemRoot') or 'C:/Windows'
+    font_path = os.path.join(windows_root, 'Fonts', 'msyhbd.ttc' if bold else 'msyh.ttc')
+    if not os.path.isfile(font_path):
+        raise RuntimeError('未找到微软雅黑字体，无法打印中文标签')
+    return ImageFont.truetype(font_path, size_pixels)
 
 
 def get_native_right_aligned_text_x(text, right_edge_x, bold=False):

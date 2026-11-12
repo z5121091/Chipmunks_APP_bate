@@ -6,7 +6,7 @@ import { AppModal as Modal } from '@/components/AppModal';
 import { useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { View, Text, useWindowDimensions, Platform, FlatList, Linking, InteractionManager } from 'react-native';
-import { useFocusEffect } from 'expo-router';
+import { useFocusEffect, useNavigation } from 'expo-router';
 import { useIsFocused } from 'expo-router/react-navigation';
 import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import * as Updates from 'expo-updates';
@@ -239,6 +239,7 @@ const getNextDatedFileName = async (
 export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: boolean }) {
   const { theme, isDark } = useTheme();
   const isFocused = useIsFocused();
+  const navigation = useNavigation();
   const router = useSafeRouter();
   const alert = useCustomAlert();
   const showSettingsLoadError = alert.showError;
@@ -278,6 +279,9 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
   const [dbRestoreLoading, setDbRestoreLoading] = useState(false);
   const [backupDiagnostic, setBackupDiagnostic] = useState<BackupDiagnostic | null>(null);
   const [expandedSettingsGroup, setExpandedSettingsGroup] = useState<SettingsGroupId | null>(null);
+  useEffect(() => navigation.addListener('blur', () => {
+    setExpandedSettingsGroup(null);
+  }), [navigation]);
   const [erpConnectionStates, setErpConnectionStates] = useState<
     Record<ErpAccountKey, ErpConnectionState>
   >(() =>
@@ -897,7 +901,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
           UTI: 'public.json',
         });
         alert.showSuccess(
-          `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 操作提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n物料绑定请使用独立的 Excel 导入/导出。\n请妥善保管备份文件！`
+          `已备份配置:\n• 解析规则: ${backupData.rules?.length || 0} 条\n• 仓库: ${backupData.warehouses?.length || 0} 个\n• 出库单号规则: ${Object.keys(backupData.outboundWarehouseOrderRules || {}).length} 条\n• 操作提示音: ${backupData.soundEnabled === false ? '关闭' : '开启'}\n• 同步服务器: ${backupData.syncConfig ? backupData.syncConfig.ip : '未配置'}\n\n物料绑定可用 Excel 导入或导出。内部标签包号和打印任务请用「备份数据库」保存。`
         );
       } else {
         alert.showError('当前设备不支持文件分享，未能导出配置备份');
@@ -1004,7 +1008,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
 
     alert.showConfirm(
       '备份数据库文件',
-      '即将备份完整的数据库文件（.db），包含所有数据：\n\n• 配置数据：规则、字段、绑定、仓库\n• 业务数据：订单、物料、拆包记录',
+      '即将备份完整的数据库文件（.db）。\n\n• 配置数据：规则、字段、绑定、仓库\n• 业务数据：订单、物料、盘点、拆包记录、内部标签包号和打印任务',
       async () => {
         setDbBackupLoading(true);
         try {
@@ -1070,7 +1074,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
 
     alert.showAlert(
       '恢复数据库文件',
-      '[严重警告] 即将从备份文件恢复数据库！\n\n此操作将：\n• 替换当前所有数据（配置 + 业务）\n• 恢复为备份时的完整状态\n• 将当前未完成作业保存为独立副本，不自动混入恢复后的数据库\n\n恢复前会自动备份当前数据库。作业副本可在设置中核对后恢复。',
+      '数据库将替换为备份时的状态。已有内部标签按该备份中的包号和版本识别，请先核对备份时间。\n\n恢复前会备份当前数据库，并将未完成作业保存为独立副本。作业副本可在设置中核对后恢复。',
       [
         { text: '取消', style: 'cancel' },
         {
@@ -1314,10 +1318,6 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
         decelerationRate="normal" // 正常减速率，改善滑动手感
         directionalLockEnabled={true} // 锁定滚动方向，提升跟手性
       >
-        <View style={styles.settingsPageHeader}>
-          <Text style={styles.settingsPageTitle}>设置</Text>
-        </View>
-
         <UiListSection style={styles.settingsOverview}>
           <UiListItem
             title="作业与物料"
@@ -1470,7 +1470,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
               )}
               {renderMenuCard(
                 '备份数据库',
-                '导出完整数据库文件',
+                '导出完整数据库，含内部包号和打印任务',
                 'database',
                 theme.success,
                 handleDatabaseBackup,

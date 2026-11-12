@@ -2,7 +2,6 @@
 import { withAlpha } from '@/utils/colors';
 import { Spacing, BorderRadius, Theme, BorderWidth } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
-import { UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 import { rs, rf } from '@/utils/responsive';
 
 // 动态计算更新弹窗内容区域的最大高度
@@ -46,20 +45,6 @@ const getBaseStyles = (theme: Theme) => {
       paddingHorizontal: Spacing.md,
       paddingTop: Spacing.sm,
       paddingBottom: Spacing.xl,
-    },
-    settingsPageHeader: {
-      minHeight: 50,
-      justifyContent: 'center',
-      paddingVertical: Spacing.xs,
-      marginBottom: Spacing.sm,
-      paddingHorizontal: 0,
-    },
-    settingsPageTitle: {
-      ...UI_REDESIGN_TOKENS.typography.title,
-      fontWeight: '800',
-      color: theme.textPrimary,
-      textAlign: 'center',
-      includeFontPadding: false,
     },
     settingsOverview: {
       gap: Spacing.sm,
@@ -672,7 +657,7 @@ const getBaseStyles = (theme: Theme) => {
       flexDirection: 'row',
       alignItems: 'center',
       paddingHorizontal: Spacing.md,
-      paddingVertical: Spacing.md,
+      paddingVertical: Spacing.sm,
     },
     aboutLogo: {
       width: rs(24),
@@ -717,12 +702,13 @@ const getBaseStyles = (theme: Theme) => {
     aboutDetailsSection: {
       width: '100%',
       paddingHorizontal: Spacing.lg,
-      paddingVertical: Spacing.md,
+      paddingVertical: 4,
     },
     aboutDetailRow: {
       flexDirection: 'row',
       alignItems: 'center',
-      paddingVertical: Spacing.sm,
+      minHeight: 32,
+      paddingVertical: 2,
     },
     aboutDetailIconWrapper: {
       width: rs(20),
@@ -756,14 +742,15 @@ const getBaseStyles = (theme: Theme) => {
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'center',
-      marginTop: Spacing.lg,
+      marginTop: 2,
       gap: Spacing['2xl'],
     },
     helpEntry: {
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'center',
-      paddingVertical: Spacing.md,
+      minHeight: 32,
+      paddingVertical: 4,
     },
     helpIconWrapper: {
       marginRight: Spacing.xs,
@@ -1284,9 +1271,6 @@ const getDynamicStyles = (
       paddingHorizontal: isCompactScreen ? Spacing.sm : Spacing.md,
       paddingTop: isCompactScreen ? Spacing.xs : Spacing.sm,
       paddingBottom: Spacing.xl,
-    },
-    settingsPageHeader: {
-      marginBottom: isCompactScreen ? Spacing.sm : Spacing.md,
     },
     sectionHeader: {
       marginTop: Spacing.md,

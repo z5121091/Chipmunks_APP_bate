@@ -28,6 +28,11 @@ internal static class RunnerTests
         Run("success-with-empty-apk-fails", EmptyApk);
         Run("old-apk-cannot-impersonate-new-delivery", OldApk);
         Run("new-copy-with-old-modified-time-is-valid", NewCopyOldModifiedTime);
+        Run("output-end-timeout-verified-apk-succeeds-with-warning-and-stream-diagnostics", OutputEndTimeoutSuccess);
+        Run("output-end-timeout-rejects-unverified-apk-deliveries", OutputEndTimeoutInvalidApk);
+        Run("output-end-timeout-preserves-nonzero-and-cancelled-results", OutputEndTimeoutFailureAndCancel);
+        Run("output-end-timeout-keeps-sync-receipt-and-hash-checks", OutputEndTimeoutSync);
+        Run("normal-apk-output-hash-is-validated-when-present", ApkOutputHash);
         Run("check-environment-success", CheckSuccess);
         Run("check-environment-requires-marker", CheckNoMarker);
         Run("hidden-prepare-success", HiddenPrepare);
@@ -53,6 +58,7 @@ internal static class RunnerTests
         Run("cross-target-single-task-and-stage-denominator", CrossTargetTask);
         Run("signing-workspace-cleanup-is-owned-and-nonrecursive", SigningCleanup);
         Run("default-target-script-dispatch-and-log-separation", TargetDefaults);
+        Run("ota-retry-same-package-metadata-and-failed-artifact-retention", PublishPackage);
         string summary = "{\"passed\":" + passed + ",\"failed\":" + failed + ",\"fixturesOnly\":true,\"tests\":[" + String.Join(",", results.ToArray()) + "]}";
         File.WriteAllText(Path.Combine(root, "results.json"), summary, new UTF8Encoding(true));
         Console.WriteLine("Runner tests: " + passed + " passed, " + failed + " failed.");
@@ -82,7 +88,7 @@ internal static class RunnerTests
         public string Apk;
         public string Sync;
         public BuildRunner Runner;
-        public Fixture(string script)
+        public Fixture(string script, Func<WaitHandle, int, bool> waitForOutputEnd = null)
         {
             DirectoryPath = Path.Combine(root, "测试 空格 ' " + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(DirectoryPath);
@@ -90,13 +96,34 @@ internal static class RunnerTests
             Apk = Path.Combine(DirectoryPath, "掌上仓库 测试.apk");
             Sync = Path.Combine(DirectoryPath, "同步 测试.exe");
             SetScript(script);
-            Runner = NewRunner();
+            Runner = NewRunner(waitForOutputEnd);
         }
         public void SetScript(string script) { File.WriteAllText(Script, "param([switch]$CheckOnly,[switch]$PrepareOnly)\r\n$ErrorActionPreference='Stop'\r\n" + script.Replace("__APK__", Quote(Apk)).Replace("__SYNC__", Quote(Sync)).Replace("__DIR__", Quote(DirectoryPath)), new UTF8Encoding(true)); }
-        public BuildRunner NewRunner() { return new BuildRunner(new BuildRunnerOptions { RepositoryPath = DirectoryPath, ScriptPath = Script, SyncScriptPath = Script, LogDirectory = Path.Combine(DirectoryPath, "日志 空格") }); }
+        public BuildRunner NewRunner(Func<WaitHandle, int, bool> waitForOutputEnd = null) { return new BuildRunner(new BuildRunnerOptions { RepositoryPath = DirectoryPath, ScriptPath = Script, SyncScriptPath = Script, LogDirectory = Path.Combine(DirectoryPath, "日志 空格"), WaitForOutputEnd = waitForOutputEnd }); }
         public void Dispose() { Runner.Dispose(); }
     }
     private static string Quote(string value) { return "'" + value.Replace("'", "''") + "'"; }
+    private static void PublishPackage()
+    {
+        using (Fixture f = new Fixture(SuccessScript)) {
+            string scripts = Path.Combine(f.DirectoryPath, "scripts"); Directory.CreateDirectory(scripts);
+            string package = Path.Combine(f.DirectoryPath, "saved update.zip"); File.WriteAllBytes(package, new byte[] { 1, 2, 3 });
+            string script = Path.Combine(scripts, "publish-ota.ps1");
+            string body = "param([string]$PackagePath,[string]$NotesFile)\r\nif($PackagePath -ne " + Quote(package) + " -or $NotesFile){exit 71}\r\n" +
+                "[Console]::WriteLine('OTA-ARTIFACT: '+$PackagePath); [Console]::WriteLine('OTA-ID: 12345678-1234-1234-1234-123456789012'); " +
+                "[Console]::WriteLine('OTA-SIZE: 3'); [Console]::WriteLine('OTA-RUNTIME: fixture-runtime'); ";
+            File.WriteAllText(script, body + "[Console]::WriteLine('PUBLISHED: 12345678-1234-1234-1234-123456789012'); exit 0", new UTF8Encoding(true));
+            BuildResult result = Finish(f.Runner.StartPublishPackageAsync(package));
+            Assert(result.State == BuildState.Succeeded && result.ArtifactPath == package && result.ArtifactBytes == 3, "Retry artifact metadata missing: " + result.ErrorMessage);
+            Assert(result.UpdateId == "12345678-1234-1234-1234-123456789012" && result.Runtime == "fixture-runtime", "Retry ID/runtime changed.");
+            File.WriteAllText(script, body + "[Console]::WriteLine('Publication failed: connection timed out'); exit 2", new UTF8Encoding(true));
+            result = Finish(f.Runner.StartPublishPackageAsync(package));
+            Assert(result.State == BuildState.Failed && result.ArtifactPath == package && result.ArtifactBytes == 3, "Failed upload lost reusable archive.");
+            Assert(result.ErrorMessage == "connection timed out", "Publisher failure detail was lost.");
+            result = Finish(f.Runner.StartAsync(BuildMode.Build));
+            Assert(result.State == BuildState.Succeeded && result.UpdateId == null && result.Runtime == null, "OTA metadata leaked into next build.");
+        }
+    }
     private static BuildResult Finish(Task<BuildResult> task)
     {
         Assert(task.Wait(30000), "Fixture did not finish within 30 seconds.");
@@ -109,6 +136,131 @@ internal static class RunnerTests
         return predicate();
     }
     private static readonly string SuccessScript = "[IO.File]::WriteAllBytes(__APK__,[byte[]](1,2,3,4)); [Console]::WriteLine('BUILD SUCCEEDED'); [Console]::WriteLine('APK: ' + __APK__); exit 0";
+    private const string ApkHashLine = "[Console]::WriteLine('SHA256: '+(Get-FileHash -LiteralPath __APK__ -Algorithm SHA256).Hash.ToLowerInvariant()); ";
+    private static readonly string HashedSuccessScript = SuccessScript.Replace("exit 0", ApkHashLine + "exit 0");
+
+    // Deterministic fault injection, not a reproduction of a real inherited pipe:
+    // first observe the genuine EOF, then report one selected stream as timed out.
+    // The second task on the same runner receives the real EOF results normally.
+    private sealed class OutputEndFault
+    {
+        private readonly int timedOutStream;
+        public int WaitCount;
+        public OutputEndFault(int timedOutStream) { this.timedOutStream = timedOutStream; }
+        public bool Wait(WaitHandle handle, int milliseconds)
+        {
+            Assert(handle.WaitOne(milliseconds), "Fault injection requires the fixture's real output stream to have ended.");
+            return Interlocked.Increment(ref WaitCount) - 1 != timedOutStream;
+        }
+    }
+
+    private static void OutputEndTimeoutSuccess()
+    {
+        foreach (int stream in new[] { 0, 1 }) {
+            var fault = new OutputEndFault(stream);
+            using (Fixture f = new Fixture(HashedSuccessScript, fault.Wait)) {
+                BuildResult result = Finish(f.Runner.StartAsync(BuildMode.Build));
+                Assert(result.State == BuildState.Succeeded && result.ExitCode == 0 && result.ArtifactPath == f.Apk,
+                    result.ErrorMessage ?? "A fully verified APK became a failed build after injected EOF timeout.");
+                Assert(result.ArtifactBytes == 4 && !String.IsNullOrEmpty(result.WarningMessage) && String.IsNullOrEmpty(result.ErrorMessage),
+                    "Successful EOF warning lost the artifact, or was misclassified as a build error.");
+                string log = File.ReadAllText(result.LogPath);
+                string expectedStreams = stream == 0 ? "stdoutEnded=false; stderrEnded=true" : "stdoutEnded=true; stderrEnded=false";
+                Assert(log.Contains("exitCode=0; " + expectedStreams), "The diagnostic did not identify the timed-out output stream.");
+                Assert(log.Contains("jobEmpty=true") && log.Contains("terminateSucceeded=true") && log.Contains("terminateError=0"),
+                    "The diagnostic omitted task-owned process cleanup results.");
+                Assert(fault.WaitCount == 2, "Both output streams must be checked even if stdout timed out.");
+
+                File.Delete(f.Apk); // Deliver a new APK, rather than relying on the two-second freshness tolerance.
+                f.SetScript(SuccessScript);
+                BuildResult next = Finish(f.Runner.StartAsync(BuildMode.Build));
+                Assert(next.State == BuildState.Succeeded && String.IsNullOrEmpty(next.WarningMessage) && String.IsNullOrEmpty(next.ErrorMessage),
+                    "The prior task's output warning/hash requirement leaked into a normal legacy APK task.");
+                Assert(fault.WaitCount == 4, "The next task did not independently wait for both output streams.");
+                Assert(!File.ReadAllText(next.LogPath).Contains(result.WarningMessage), "The previous task's EOF warning contaminated the next log.");
+            }
+        }
+    }
+
+    private static void OutputEndTimeoutInvalidApk()
+    {
+        string[] scripts = {
+            HashedSuccessScript.Replace("[Console]::WriteLine('BUILD SUCCEEDED'); ", ""),
+            "[Console]::WriteLine('BUILD SUCCEEDED'); [Console]::WriteLine('APK: '+__APK__); [Console]::WriteLine('SHA256: '+('0'*64)); exit 0",
+            HashedSuccessScript.Replace("[byte[]](1,2,3,4)", "[byte[]]@()"),
+            HashedSuccessScript.Replace("[IO.File]::WriteAllBytes(__APK__,[byte[]](1,2,3,4)); ", ""),
+            SuccessScript,
+            HashedSuccessScript.Replace("(Get-FileHash -LiteralPath __APK__ -Algorithm SHA256).Hash.ToLowerInvariant()", "('0'*64)"),
+            HashedSuccessScript.Replace("(Get-FileHash -LiteralPath __APK__ -Algorithm SHA256).Hash.ToLowerInvariant()", "'bad-hash'"),
+        };
+        for (int index = 0; index < scripts.Length; index++) {
+            var fault = new OutputEndFault(0);
+            using (Fixture f = new Fixture(scripts[index], fault.Wait)) {
+                if (index == 3) {
+                    File.WriteAllBytes(f.Apk, new byte[] { 1, 2, 3, 4 });
+                    File.SetCreationTimeUtc(f.Apk, DateTime.UtcNow.AddDays(-1));
+                }
+                BuildResult result = Finish(f.Runner.StartAsync(BuildMode.Build));
+                Assert(result.State == BuildState.Failed && result.ArtifactPath == null,
+                    "Unverified delivery accepted during EOF timeout, case " + index + ".");
+                if (index >= 4) Assert(result.ErrorMessage.Contains("SHA256"), "Missing/malformed/mismatched SHA256 lost its failure reason.");
+                Assert(File.ReadAllText(result.LogPath).Contains("stdoutEnded=false; stderrEnded=true"),
+                    "A genuinely failed delivery lost the separate EOF diagnostic.");
+            }
+        }
+    }
+
+    private static void OutputEndTimeoutFailureAndCancel()
+    {
+        foreach (int exitCode in new[] { 0, 7 }) {
+            var failedOutput = new OutputEndFault(1);
+            using (Fixture f = new Fixture(HashedSuccessScript.Replace("exit 0", "[Console]::Error.WriteLine('BUILD FAILED: fixture expected'); exit " + exitCode), failedOutput.Wait)) {
+                BuildResult result = Finish(f.Runner.StartAsync(BuildMode.Build));
+                Assert(result.State == BuildState.Failed && result.ExitCode == exitCode && result.ErrorMessage.Contains("fixture expected"),
+                    "EOF timeout hid an explicit build failure behind the success marker/artifact.");
+            }
+        }
+        var cancelledOutput = new OutputEndFault(0);
+        using (Fixture f = new Fixture("[Console]::WriteLine('READY'); Start-Sleep -Seconds 60; " + HashedSuccessScript, cancelledOutput.Wait)) {
+            Task<BuildResult> task = f.Runner.StartAsync(BuildMode.Build);
+            Assert(WaitUntil(delegate { return f.Runner.GetSnapshot().OutputLineCount >= 2; }, 15000), "Cancellation fixture never became ready.");
+            f.Runner.Cancel();
+            BuildResult result = Finish(task);
+            Assert(result.State == BuildState.Cancelled && result.ArtifactPath == null, "EOF timeout turned cancellation into success or generic failure.");
+        }
+    }
+
+    private static void OutputEndTimeoutSync()
+    {
+        var fault = new OutputEndFault(1);
+        using (Fixture f = new Fixture(SyncSuccessScript, fault.Wait)) {
+            BuildResult result = Finish(f.Runner.StartAsync(BuildMode.Build, BuildTarget.SyncHelper));
+            Assert(result.State == BuildState.Succeeded && result.ArtifactPath == f.Sync && !String.IsNullOrEmpty(result.WarningMessage),
+                result.ErrorMessage ?? "A verified synchronization helper was rejected after injected EOF timeout.");
+        }
+        foreach (string script in new[] {
+            SyncSuccessScript.Replace("$env:CHIPMUNKS_BUILD_TASK_ID", "'00000000000000000000000000000000'"),
+            SyncSuccessScript.Replace("(Get-FileHash -LiteralPath __SYNC__ -Algorithm SHA256).Hash.ToLowerInvariant()", "('0'*64)"),
+        }) {
+            var invalidOutput = new OutputEndFault(0);
+            using (Fixture f = new Fixture(script, invalidOutput.Wait)) {
+                BuildResult result = Finish(f.Runner.StartAsync(BuildMode.Build, BuildTarget.SyncHelper));
+                Assert(result.State == BuildState.Failed && result.ArtifactPath == null,
+                    "Injected output timeout bypassed the helper task receipt or hash validation.");
+            }
+        }
+    }
+
+    private static void ApkOutputHash()
+    {
+        foreach (string hash in new[] { "bad-hash", new string('0', 64) }) {
+            using (Fixture f = new Fixture(HashedSuccessScript.Replace("(Get-FileHash -LiteralPath __APK__ -Algorithm SHA256).Hash.ToLowerInvariant()", Quote(hash)))) {
+                BuildResult result = Finish(f.Runner.StartAsync(BuildMode.Build));
+                Assert(result.State == BuildState.Failed && result.ErrorMessage.Contains("SHA256"),
+                    "A normal (non-timeout) APK task ignored its explicit invalid SHA256.");
+            }
+        }
+    }
 
     private static void LargeOutput()
     {

@@ -97,6 +97,13 @@ const requestUpstream = (targetUrl, options) =>
   });
 
 const server = http.createServer(async (request, response) => {
+  const previewSession = process.env.CHIPMUNKS_WEB_PREVIEW_SESSION;
+  if (previewSession && request.url === '/_chipmunks/preview') {
+    response.setHeader('Content-Type', 'application/json; charset=utf-8');
+    response.setHeader('X-Chipmunks-Preview-Session', previewSession);
+    response.end(JSON.stringify({ service: 'chipmunks-preview-proxy', ready: true }));
+    return;
+  }
   setCorsHeaders(request, response);
 
   if (request.method === 'OPTIONS') {

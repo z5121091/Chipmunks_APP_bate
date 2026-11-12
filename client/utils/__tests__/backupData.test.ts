@@ -84,10 +84,13 @@ describe('native automatic database backup', () => {
     const tableNames = [
       '出库单',
       '出库明细',
+      '拆包记录',
+      '内部标签包装',
+      '销售退货记录',
+      '物料绑定',
+      '物料绑定版本',
       '入库记录',
       '盘点记录',
-      '拆包记录',
-      '销售退货记录',
     ];
 
     for (const workerPath of workerPaths) {

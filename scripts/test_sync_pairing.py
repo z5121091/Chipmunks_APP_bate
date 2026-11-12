@@ -194,11 +194,13 @@ class SyncPairingTest(unittest.TestCase):
         tray.address_monitor = unittest.mock.Mock()
         tray.pairing_window = unittest.mock.Mock()
         tray.connection_qr_window = unittest.mock.Mock()
+        tray.log_window = unittest.mock.Mock()
         with patch.object(server.cherrypy.engine, 'exit') as exit_service:
             tray.quit_app()
         self.assertFalse(tray.running)
         tray.pairing_window.close.assert_called_once_with()
         tray.connection_qr_window.close.assert_called_once_with()
+        tray.log_window.close.assert_called_once_with()
         exit_service.assert_called_once_with()
 
     def test_authenticated_reprint_never_creates_a_persistent_print_ledger(self):

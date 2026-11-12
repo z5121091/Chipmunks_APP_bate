@@ -6,7 +6,10 @@ import { NETWORK_CONFIG, SyncConfig } from '@/constants/config';
 const SYNC_SERVICE_ID = 'palm-warehouse-sync';
 const HEALTH_SUCCESS_CACHE_TTL_MS = 30_000;
 
-const successfulHealthChecks = new Map<string, number>();
+const successfulHealthChecks = new Map<string, {
+  expiresAt: number;
+  warehouseArchiveSession: string | null;
+}>();
 const inFlightHealthChecks = new Map<string, Promise<boolean>>();
 const healthCacheGenerations = new Map<string, number>();
 
@@ -16,6 +19,8 @@ type SyncHealthResponse = {
   status?: string;
   pairingRequired?: boolean;
   pairingAuthenticated?: boolean;
+  warehouseArchiveApiVersion?: number;
+  labelReprintSessionId?: string;
 };
 
 export const normalizeSyncConfig = (config: SyncConfig): SyncConfig => ({
@@ -70,6 +75,11 @@ export const invalidateSuccessfulHealthCheck = (config: SyncConfig): void => {
   healthCacheGenerations.set(key, (healthCacheGenerations.get(key) || 0) + 1);
 };
 
+export const getWarehouseArchiveSession = (config: SyncConfig): string | null => {
+  const health = successfulHealthChecks.get(getHealthCacheKey(config));
+  return health && health.expiresAt > Date.now() ? health.warehouseArchiveSession : null;
+};
+
 /**
  * 测试连接（单次）
  */
@@ -84,7 +94,7 @@ export const testConnection = async (
   const activeCheck = inFlightHealthChecks.get(cacheKey);
   if (activeCheck) return activeCheck;
 
-  const cachedUntil = successfulHealthChecks.get(cacheKey) || 0;
+  const cachedUntil = successfulHealthChecks.get(cacheKey)?.expiresAt || 0;
   if (!options.force && cachedUntil > Date.now()) {
     return true;
   }
@@ -112,7 +122,12 @@ export const testConnection = async (
             (payload.serviceId === undefined && payload.service === '掌上仓库同步服务'))
       );
       if (healthy) {
-        successfulHealthChecks.set(cacheKey, Date.now() + HEALTH_SUCCESS_CACHE_TTL_MS);
+        successfulHealthChecks.set(cacheKey, {
+          expiresAt: Date.now() + HEALTH_SUCCESS_CACHE_TTL_MS,
+          warehouseArchiveSession: payload?.warehouseArchiveApiVersion === 1
+            ? payload.labelReprintSessionId || ''
+            : null,
+        });
       }
       return healthy;
     } catch {

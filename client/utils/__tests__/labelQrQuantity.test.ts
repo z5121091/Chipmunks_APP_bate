@@ -53,6 +53,14 @@ const vendors = [
     rule: rule(['model', 'batch', 'productionDate', 'quantity', 'traceNo', 'ignore:1', 'version', 'sourceNo', 'ignore:2', 'package'], ';'),
     expected: 'Pai8485E-W1R;A552588.1;2528HE;123;2507260140109-1;A;LEVEL2;3001-250721001;1;01-A0162;', trace: '2507260140109-1',
   },
+  {
+    name: '仁懋空格八段（固定B、箱号前导零、无追溯码）',
+    raw: 'B 810411G01000101 MOT3114G PDFN5*6 ZYA.C 5000 20261022 0005',
+    rule: rule(['ignore:1', 'version', 'model', 'package', 'batch', 'quantity', 'productionDate', 'sourceNo'], ' ', {
+      matchConditions: [{ fieldIndex: 0, operator: 'equals', keyword: 'B' }],
+    }),
+    expected: 'B 810411G01000101 MOT3114G PDFN5*6 ZYA.C 123 20261022 0005', trace: '',
+  },
 ];
 
 describe('label quantity source rewriting', () => {

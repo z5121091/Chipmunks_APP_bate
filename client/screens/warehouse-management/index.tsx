@@ -16,6 +16,7 @@ import { KeyboardAwareModalContainer } from '@/components/KeyboardAwareForm';
 import { createStyles } from './styles';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { logger } from '@/utils/logger';
+import { refreshSyncConnection } from '@/utils/syncConnection';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { ERP_ACCOUNTS } from '@/utils/erpAccounts';
 import {
@@ -130,6 +131,7 @@ export default function WarehouseManagementScreen() {
         alert.showSuccess('仓库已添加');
       }
       setModalVisible(false);
+      void refreshSyncConnection();
       await loadWarehouses();
     } catch (error) {
       logger.error('保存仓库失败:', error);

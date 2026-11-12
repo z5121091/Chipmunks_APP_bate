@@ -39,6 +39,25 @@ function Invoke-Checked {
     if ($code -ne 0) { throw "$Program failed (exit $code). See the build log." }
 }
 
+function Assert-FreshEmbeddedUpdateManifest {
+    param([IO.Compression.ZipArchive]$Archive, [long]$BuildStartedAtMs)
+    $entry = $Archive.GetEntry('assets/app.manifest')
+    if (-not $entry) { throw 'APK is missing its embedded Expo update manifest.' }
+    $reader = New-Object IO.StreamReader($entry.Open(), [Text.Encoding]::UTF8)
+    try {
+        try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json }
+        catch { throw 'APK embedded Expo update manifest could not be parsed.' }
+    } finally { $reader.Dispose() }
+    $id = [Guid]::Empty
+    if (-not [Guid]::TryParseExact([string]$manifest.id, 'D', [ref]$id) -or $id -eq [Guid]::Empty -or
+        $manifest.commitTime -isnot [long]) {
+        throw 'APK embedded Expo update manifest has an invalid ID or timestamp.'
+    }
+    if ($manifest.commitTime -lt $BuildStartedAtMs -or $manifest.commitTime -gt [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) {
+        throw 'APK embedded Expo update manifest timestamp is outside this build. Check Gradle update-resource generation.'
+    }
+}
+
 function Assert-BuildSources {
     param([string]$SourceRoot)
     foreach ($file in @('package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', 'client/package.json', 'server/package.json')) {
@@ -243,7 +262,8 @@ try {
     Write-Host '[3/5] Checking launch resources, NAS backup schema and building signed ARM64 APK...'
     Invoke-Checked $node @('client/scripts/check-android-launch.cjs')
     Invoke-Checked $node @('client/scripts/check-android-backup.cjs')
-    $gradleArgs = @(':app:assembleRelease', '-PreactNativeArchitectures=arm64-v8a', '--max-workers=2', '--console=plain', '-Dorg.gradle.internal.http.connectionTimeout=20000', '-Dorg.gradle.internal.http.socketTimeout=30000')
+    # Expo can otherwise reuse app.manifest even when the embedded JS bundle changed.
+    $gradleArgs = @(':app:createReleaseUpdatesResources', '--rerun', ':app:assembleRelease', '-PreactNativeArchitectures=arm64-v8a', '--max-workers=2', '--console=plain', '-Dorg.gradle.internal.http.connectionTimeout=20000', '-Dorg.gradle.internal.http.socketTimeout=30000')
     # Keep GUI cancellation inside its process job instead of reusing a CMD-owned daemon.
     if ($NonInteractive) { $gradleArgs += '--no-daemon' }
     $uri = [Uri]'https://dl.google.com'
@@ -253,6 +273,7 @@ try {
         Write-Host 'Using the existing system proxy for this build only.'
     }
     Set-Location -LiteralPath (Join-Path $buildRoot 'client/android')
+    $buildStartedAtMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     Invoke-Checked '.\gradlew.bat' $gradleArgs
     $apk = Join-Path $buildRoot 'client/android/app/build/outputs/apk/release/app-release.apk'
     if (-not (Test-Path -LiteralPath $apk)) { throw 'Gradle returned without producing app-release.apk.' }
@@ -285,9 +306,11 @@ try {
     if (-not $themeBlock -or $themeBlock -match '(android:windowBackground\(|0x01010054=)') {
         throw 'Launch theme overrides the Android 11 logo layer with a plain background.'
     }
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($apk)
     try {
+        Assert-FreshEmbeddedUpdateManifest -Archive $zip -BuildStartedAtMs $buildStartedAtMs
+        Write-Host '[OTA] Verified the embedded update manifest was generated for this build.'
         $appConfigEntry = $zip.GetEntry('assets/app.config')
         if (-not $appConfigEntry) { throw 'APK is missing its Expo app configuration.' }
         $appConfigReader = New-Object IO.StreamReader($appConfigEntry.Open(), [Text.Encoding]::UTF8)

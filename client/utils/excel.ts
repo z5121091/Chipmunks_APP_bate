@@ -15,6 +15,7 @@ import {
   getSyncConfigError,
   getSyncPairingHeaders,
   getSyncServiceBaseUrl,
+  getWarehouseArchiveSession,
   invalidateSuccessfulHealthCheck,
   testConnection,
 } from '@/utils/heartbeat';
@@ -105,6 +106,7 @@ export interface ExportResult {
 
 export interface SyncExcelOptions {
   queryParams?: Record<string, string | undefined>;
+  warehouse?: { id: string; name: string };
   requireNativePrint?: boolean;
   acceptNativePrintPolicySkip?: boolean;
 }
@@ -264,6 +266,7 @@ export const syncExcelToComputer = async (
     return { success: false, message };
   }
 
+  const archiveSupported = options?.warehouse && getWarehouseArchiveSession(syncConfig) !== null;
   await setStoredConnectionStatus(syncConfig, 'success');
 
   try {
@@ -286,6 +289,11 @@ export const syncExcelToComputer = async (
         queryParams.set(key, normalizedValue);
       }
     });
+    const warehouse = options?.warehouse;
+    if (archiveSupported && warehouse?.name.trim()) {
+      queryParams.set('warehouse_id', warehouse.id.trim());
+      queryParams.set('warehouse_name', warehouse.name.trim());
+    }
     const queryString = queryParams.toString();
     const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
 

@@ -76,6 +76,9 @@ it('skips unchanged order propagation while keeping real customer changes and un
     expect((await database.getMaterialsByOrder(material.order_no, warehouse.id))[0])
       .toMatchObject({ customer_name: 'After', quantity: 1500, remaining_quantity: '1000' });
     expect((await database.getOrder(material.order_no, warehouse.id))?.customer_name).toBe('After');
+    expect(await database.findOutboundOrderWarehouseConflict(material.order_no, warehouse.id, 'wuxi-duneng')).toBeNull();
+    expect(await database.findOutboundOrderWarehouseConflict(material.order_no, 'OUT-W2', 'wuxi-duneng'))
+      .toEqual({ warehouse_id: warehouse.id, warehouse_name: warehouse.name });
   } finally {
     log.mockRestore();
     if (platform) Object.defineProperty(Platform, 'OS', platform);
@@ -110,6 +113,63 @@ it('enforces inbound batch trace checks and idempotency while allowing identical
   } finally {
     log.mockRestore();
     error.mockRestore();
+    if (platform) Object.defineProperty(Platform, 'OS', platform);
+  }
+});
+
+it('searches the original and split trace numbers in the web preview database', async () => {
+  const platform = Object.getOwnPropertyDescriptor(Platform, 'OS');
+  Object.defineProperty(Platform, 'OS', { configurable: true, value: 'web' });
+  const log = jest.spyOn(logger, 'log').mockImplementation(() => undefined);
+  try {
+    const database: typeof import('../database') = require('../database');
+    await database.initDatabase();
+    const warehouse = { id: 'WEB-TRACE-WAREHOUSE', name: 'Web trace warehouse' };
+    const material = {
+      id: 'WEB-TRACE-MATERIAL', order_no: 'WEB-TRACE-ORDER', customer_name: '', model: 'Web Model', batch: 'Web Lot',
+      quantity: 300, package: '', version: '', productionDate: '', traceNo: 'WEB-TRACE-ORIGINAL', sourceNo: 'WEB-BOX',
+      warehouse_id: warehouse.id, warehouse_name: warehouse.name, operation_type: 'outbound' as const,
+      raw_content: 'WEB-TRACE-ORIGINAL', scanned_at: new Date().toISOString(),
+    };
+    await database.saveUnpackOperation({ material, createMaterial: { material, warehouse },
+      shippedQuantity: 100, remainingQuantity: 200, newTraceNo: 'WEB-TRACE-ORIGINAL-1' });
+    const [order] = await database.getQueryFilteredOrders({
+      searchType: 'trace', searchText: 'trace-original', warehouseId: warehouse.id,
+    });
+    expect(order.order_no).toBe(material.order_no);
+    expect(order.traceMatches?.map(match => match.traceNo).sort()).toEqual([
+      'WEB-TRACE-ORIGINAL', 'WEB-TRACE-ORIGINAL-1', 'WEB-TRACE-ORIGINAL-2',
+    ]);
+    expect(await database.getQueryFilteredOrders({ searchType: 'trace', searchText: 'WEB-BOX' })).toEqual([]);
+  } finally {
+    log.mockRestore();
+    if (platform) Object.defineProperty(Platform, 'OS', platform);
+  }
+});
+
+it('matches a complete batch number in the web preview and scopes it by warehouse', async () => {
+  const platform = Object.getOwnPropertyDescriptor(Platform, 'OS');
+  Object.defineProperty(Platform, 'OS', { configurable: true, value: 'web' });
+  try {
+    const database: typeof import('../database') = require('../database');
+    await database.initDatabase();
+    const orderNo = 'IO-WEB-BATCH-EXACT';
+    for (const [id, batch] of [['WEB-BATCH-A', '  Web-Batch-12  '], ['WEB-BATCH-B', 'Web-Batch-120']] as const) {
+      const warehouse = { id, name: id };
+      await database.addMaterialWithOrder({
+        id, order_no: orderNo, customer_name: '', model: 'Web Model', batch, quantity: 300,
+        package: '', version: '', productionDate: '', traceNo: id, sourceNo: '', raw_content: id,
+        warehouse_id: id, warehouse_name: id, operation_type: 'outbound', scanned_at: new Date().toISOString(),
+      }, '', warehouse);
+    }
+    const search = (searchText: string, warehouseId?: string) =>
+      database.getQueryFilteredOrders({ searchType: 'batch', searchText, warehouseId });
+    expect(await search(' web-batch-12 ')).toEqual([
+      expect.objectContaining({ order_no: orderNo, warehouse_id: 'WEB-BATCH-A' }),
+    ]);
+    expect(await search('web-batch-12', 'WEB-BATCH-B')).toEqual([]);
+    expect(await search('web-batch-1')).toEqual([]);
+  } finally {
     if (platform) Object.defineProperty(Platform, 'OS', platform);
   }
 });

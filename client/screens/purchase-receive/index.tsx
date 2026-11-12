@@ -10,7 +10,7 @@ import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { Screen } from '@/components/Screen';
 import { UiPageHeader, UiWorkflowSummary } from '@/components/UiRedesign';
-import { WarehouseScanInput } from '@/components/WarehouseScanInput';
+import { WarehouseScanInput, type WarehouseScanInputHandle } from '@/components/WarehouseScanInput';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useTheme } from '@/hooks/useTheme';
 import { getInboundDocumentSummaries } from '@/utils/database';
@@ -66,6 +66,7 @@ export default function PurchaseReceiveScreen() {
   const manualLookupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const manualLookupInProgressRef = useRef('');
   const manualVoucherCodeRef = useRef('');
+  const scannerRef = useRef<WarehouseScanInputHandle>(null);
   const focusedRef = useRef(false);
   const appStateRef = useRef(AppState.currentState);
   const loadingDetailCodeRef = useRef('');
@@ -301,6 +302,7 @@ export default function PurchaseReceiveScreen() {
         cancelScanSubmit(manualLookupTimerRef);
         manualVoucherCodeRef.current = '';
         setManualVoucherCode('');
+        scannerRef.current?.clear({ discardPendingSubmits: true });
       };
     }, [
       loadCompletedVoucherCodes,
@@ -374,6 +376,7 @@ export default function PurchaseReceiveScreen() {
   const handleAccountPress = useCallback((account: ErpAccountConfig) => {
     if (account.key === selectedAccount.key) return;
     cancelScanSubmit(manualLookupTimerRef);
+    scannerRef.current?.clear({ discardPendingSubmits: true });
     requestIdRef.current += 1;
     completionRequestIdRef.current += 1;
     statusRequestIdRef.current += 1;
@@ -766,6 +769,7 @@ export default function PurchaseReceiveScreen() {
         </View>
 
         <WarehouseScanInput
+          inputRef={scannerRef}
           active={manualVoucherCode.trim().length > 0}
           processing={Boolean(loadingDetailCode)}
           statusLabel="采购入库单号查询"

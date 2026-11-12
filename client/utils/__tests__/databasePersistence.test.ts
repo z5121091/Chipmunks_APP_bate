@@ -1,6 +1,9 @@
 import { createRequire } from 'node:module';
 import type { SQLiteDatabase } from 'expo-sqlite';
 import { Platform } from 'react-native';
+import { buildUnpackLabelSheet } from '../labelExport';
+import { buildPackageKey } from '../packageRecognition';
+import { internalLabelPackageKey, parseInternalLabel } from '../internalLabelCode';
 
 jest.mock('@react-native-async-storage/async-storage', () =>
   require('@react-native-async-storage/async-storage/jest/async-storage-mock'));
@@ -12,6 +15,7 @@ const originalPlatform = Object.getOwnPropertyDescriptor(Platform, 'OS');
 let mockMigrationFailureId = '';
 let mockOrderWriteFailureId = '';
 let mockOutboxWriteFailure = false;
+let mockBeforeExclusiveTransaction: (() => void) | undefined;
 const mockAdapter = {
   closeAsync: async () => { /* Keep the in-memory fixture alive across simulated app restarts. */ },
   execAsync: async (sql: string) => { sqlite.exec(sql); },
@@ -31,6 +35,9 @@ const mockAdapter = {
     return { changes: Number(result.changes), lastInsertRowId: Number(result.lastInsertRowid) };
   },
   withExclusiveTransactionAsync: async (task: (db: SQLiteDatabase) => Promise<void>) => {
+    const beforeTransaction = mockBeforeExclusiveTransaction;
+    mockBeforeExclusiveTransaction = undefined;
+    beforeTransaction?.();
     sqlite.exec('BEGIN IMMEDIATE');
     try { await task(mockAdapter as unknown as SQLiteDatabase); sqlite.exec('COMMIT'); }
     catch (error) { sqlite.exec('ROLLBACK'); throw error; }
@@ -55,6 +62,210 @@ afterAll(() => {
   if (originalPlatform) Object.defineProperty(Platform, 'OS', originalPlatform);
 });
 
+it('persists internal labels, checks their revision and keeps equal-quantity packs distinct across warehouses', async () => {
+  const labels: typeof import('../internalLabels') = require('../internalLabels');
+  const printing: typeof import('../labelReprint') = require('../labelReprint');
+  const stock = { accountKey: account, warehouseName: warehouse.name, warehouseCode: '001',
+    inventoryCode: 'RES.01120042.00', inventoryName: '贴片电阻', specification: '12KΩ,±1%,0402', quantity: 477 } as const;
+  await expect(labels.createInternalLabelTasks(stock, [200, 200])).rejects.toThrow('有差额');
+  const [first, second, third] = await labels.createInternalLabelTasks(stock, [200, 200, 77]);
+  expect(new Set([first.internalPackageId, second.internalPackageId, third.internalPackageId]).size).toBe(3);
+  expect(await labels.findExistingInternalLabelPackage(stock)).toBe(true);
+  expect((await printing.prepareLabelReprint(first.sourceQr)).sourceQr).toBe(first.sourceQr);
+
+  const correction = await printing.applyLabelQuantityCorrection(await printing.prepareLabelReprint(third.sourceQr), 70);
+  expect(parseInternalLabel(correction.sourceQr)).toMatchObject({ packageId: third.internalPackageId, revision: 2, quantity: 70 });
+  await expect(database.requireActiveInternalLabel(correction.sourceQr)).rejects.toThrow('尚未启用');
+  expect((await database.requireActiveInternalLabel(third.sourceQr)).quantity).toBe(77);
+  await database.storeInternalLabelPrintTask({ ...correction, status: 'submitted' });
+  await labels.activateInternalLabelCorrection(correction);
+  await expect(database.requireActiveInternalLabel(third.sourceQr)).rejects.toThrow('版本已失效');
+  expect((await database.requireActiveInternalLabel(correction.sourceQr)).quantity).toBe(70);
+  const canceled = await printing.applyLabelQuantityCorrection(await printing.prepareLabelReprint(correction.sourceQr), 71);
+  await labels.cancelInternalLabelCorrection(canceled);
+  const next = await printing.applyLabelQuantityCorrection(await printing.prepareLabelReprint(correction.sourceQr), 71);
+  expect(parseInternalLabel(next.sourceQr).revision).toBe(4);
+  await labels.cancelInternalLabelCorrection(next);
+
+  const scan = (task: typeof first, id: string, workWarehouse = warehouse) => ({
+    ...material, id, order_no: id, inventory_code: stock.inventoryCode, model: stock.inventoryName,
+    raw_content: task.sourceQr, quantity: task.quantity, traceNo: '', batch: '',
+    package_key: internalLabelPackageKey(task.internalPackageId!), warehouse_id: workWarehouse.id,
+    warehouse_name: workWarehouse.name,
+  });
+  await database.addMaterialWithOrder(scan(first, 'HLS-OUT-1'), '客户 A', warehouse);
+  const other = { id: 'HLS-OTHER-W', name: '其他仓' };
+  await expect(database.addMaterialWithOrder(scan(first, 'HLS-OUT-2', other), '客户 B', other)).rejects.toThrow('已出库');
+  await database.addMaterialWithOrder(scan(second, 'HLS-OUT-3', other), '客户 B', other);
+  expect((await labels.loadInternalLabelTasks()).some(task => task.id === correction.id && task.internalActivated)).toBe(true);
+
+  const packageKey = internalLabelPackageKey(third.internalPackageId!);
+  const checkNo = 'HLS-COUNT-SPEC';
+  await database.addInventoryCheckRecord({
+    ...common, check_no: checkNo, check_type: 'whole', check_date: '2026-11-11',
+    inventory_code: stock.inventoryCode, scan_model: stock.inventoryName, quantity: 70,
+    package_key: packageKey, internalLabelQr: correction.sourceQr,
+  });
+  const counted = await database.getInventoryCheckRecordsByNo(checkNo, warehouse.id);
+  expect(counted).toEqual([expect.objectContaining({ scan_model: stock.inventoryName, package_key: packageKey })]);
+  expect(await database.getInternalLabelSpecifications(counted.map(row => row.package_key)))
+    .toEqual(new Map([[packageKey, stock.specification]]));
+
+  const configBackup = await database.exportBackupData();
+  expect(JSON.stringify(configBackup)).not.toContain(third.internalPackageId);
+  await expect(database.importBackupData(configBackup)).resolves.toMatchObject({ success: true });
+  await expect(database.requireActiveInternalLabel(correction.sourceQr)).resolves.toMatchObject({ quantity: 70 });
+  expect((await labels.loadInternalLabelTasks()).some(task => task.id === correction.id && task.internalActivated)).toBe(true);
+});
+
+it('keeps registered internal stock codes independent of ordinary bindings with the same name', async () => {
+  const { createInternalLabelTasks }: typeof import('../internalLabels') = require('../internalLabels');
+  const stock = { accountKey: account, warehouseName: warehouse.name, warehouseCode: '001',
+    inventoryCode: 'IC.INTERNAL-BINDING', inventoryName: '隔离芯片绑定隔离测试', specification: 'SOIC16', quantity: 200 } as const;
+  const [wholeTask, splitTask] = await createInternalLabelTasks(stock, [100, 100]);
+  const makeScan = (id: string, task: typeof wholeTask) => ({
+    ...material, id, order_no: id, customer_name: '客户 A', package: '', version: '', productionDate: '', sourceNo: '',
+    inventory_code: stock.inventoryCode, model: stock.inventoryName, traceNo: '', batch: '', quantity: task.quantity,
+    raw_content: task.sourceQr, package_key: internalLabelPackageKey(task.internalPackageId!),
+  });
+  const wholeScan = makeScan('HLS-BINDING-WHOLE', wholeTask);
+  const splitScan = makeScan('HLS-BINDING-SPLIT', splitTask);
+  const ordinary = { ...material, id: 'HLS-BINDING-ORDINARY', order_no: 'HLS-BINDING-ORDINARY',
+    model: stock.inventoryName, version: '', inventory_code: '', traceNo: 'HLS-BINDING-ORDINARY-TRACE' };
+  await database.addMaterialWithOrder(ordinary, '客户 A', warehouse);
+  await database.addMaterialWithOrder(wholeScan, '客户 A', warehouse);
+  const returned = { ...wholeScan, id: 'HLS-BINDING-RETURN', order_no: 'HLS-BINDING-RETURN' };
+  await database.saveSalesReturnWithOrder({ material: returned, requiredQuantity: 100 });
+  const split = await database.saveUnpackOperation({ material: splitScan,
+    createMaterial: { material: splitScan, customerName: '客户 A', warehouse }, shippedQuantity: 60,
+    remainingQuantity: 40, newTraceNo: '', operationId: 'HLS-BINDING-PAIR' });
+  await database.addInventoryCheckRecord({ ...common, check_no: 'HLS-BINDING-COUNT', check_type: 'whole',
+    check_date: '2026-11-11', scan_model: stock.inventoryName, inventory_code: stock.inventoryCode,
+    quantity: 40, package_key: split.remainingRecord.package_key, internalLabelQr: split.remainingRecord.source_qr! });
+
+  const bindingId = await database.addInventoryBinding({ scan_model: stock.inventoryName, version: '', inventory_code: 'ORDINARY-A' });
+  expect((await database.getMaterial(ordinary.id))?.inventory_code).toBe('ORDINARY-A');
+  await database.updateInventoryBinding(bindingId, { inventory_code: 'ORDINARY-B' });
+  expect((await database.getMaterial(ordinary.id))?.inventory_code).toBe('ORDINARY-B');
+
+  const assertInternalCodes = async () => {
+    expect((await database.getMaterial(wholeScan.id))?.inventory_code).toBe(stock.inventoryCode);
+    expect((await database.getMaterial(splitScan.id))?.inventory_code).toBe(stock.inventoryCode);
+    expect((await database.getSalesReturnById(returned.id))?.inventory_code).toBe(stock.inventoryCode);
+    expect((await database.getMaterialsByOrder(wholeScan.order_no, warehouse.id))[0]?.inventory_code).toBe(stock.inventoryCode);
+    const labelRecords = await database.getUnpackPrintTaskRecords(split.pairId);
+    expect(labelRecords.map(record => record.inventory_code)).toEqual([stock.inventoryCode, stock.inventoryCode]);
+    const count = await database.getInventoryCheckRecordsByNo('HLS-BINDING-COUNT', warehouse.id);
+    expect(count[0]?.inventory_code).toBe(stock.inventoryCode);
+    expect((await database.getOutboundExportRows(warehouse.id)).find(row => row.order_no === wholeScan.order_no))
+      .toMatchObject({ inventory_code: stock.inventoryCode, model: stock.specification });
+  };
+  await assertInternalCodes();
+  await database.deleteInventoryBinding(bindingId);
+  expect((await database.getMaterial(ordinary.id))?.inventory_code).toBe('ORDINARY-B');
+  await assertInternalCodes();
+});
+
+it('accepts a registered internal return with no local shipment as unknown history', async () => {
+  const { createInternalLabelTasks }: typeof import('../internalLabels') = require('../internalLabels');
+  const stock = { accountKey: account, warehouseName: warehouse.name, warehouseCode: '001',
+    inventoryCode: 'IC.INTERNAL-UNKNOWN-RETURN', inventoryName: '未知来源内标', specification: 'SOIC8', quantity: 100 } as const;
+  const [task] = await createInternalLabelTasks(stock, [100]);
+  const scan = { ...material, id: 'HLS-UNKNOWN-RETURN', order_no: 'HLS-UNKNOWN-RETURN', customer_name: '客户 A',
+    inventory_code: stock.inventoryCode, model: stock.inventoryName, traceNo: '', batch: '', quantity: 100,
+    raw_content: task.sourceQr, package_key: internalLabelPackageKey(task.internalPackageId!) };
+  const returned = await database.saveSalesReturnWithOrder({ material: scan, requiredQuantity: 100 });
+  expect(returned).toMatchObject({ source_kind: 'trace_unknown', source_material_ids: [], package_key: scan.package_key });
+  await expect(database.saveSalesReturnWithOrder({ material: { ...scan, id: 'HLS-UNKNOWN-RETURN-AGAIN',
+    order_no: 'HLS-UNKNOWN-RETURN-AGAIN' }, requiredQuantity: 100 })).rejects.toThrow('已验收回库');
+});
+
+it('splits one registered internal package into two durable print labels with transactional rollback', async () => {
+  const { createInternalLabelTasks }: typeof import('../internalLabels') = require('../internalLabels');
+  const [task] = await createInternalLabelTasks({ accountKey: account, warehouseName: warehouse.name,
+    warehouseCode: '001', inventoryCode: 'RES.HLS-SPLIT', inventoryName: '贴片电阻', specification: '0402', quantity: 477 }, [477]);
+  const scan = { ...material, id: 'HLS-SPLIT', order_no: 'HLS-SPLIT-ORDER', model: '贴片电阻', traceNo: '', batch: '',
+    inventory_code: 'RES.HLS-SPLIT', quantity: 477, raw_content: task.sourceQr,
+    package_key: internalLabelPackageKey(task.internalPackageId!) };
+  const params = { material: { package: '', version: '', productionDate: '', sourceNo: '', ...scan },
+    createMaterial: { material: scan, customerName: '客户 A', warehouse },
+    shippedQuantity: 200, remainingQuantity: 277, newTraceNo: '', operationId: 'HLS-SPLIT-PAIR' };
+  mockOutboxWriteFailure = true;
+  try {
+    await expect(database.saveUnpackOperation(params)).rejects.toThrow('outbox write failure');
+  } finally {
+    mockOutboxWriteFailure = false;
+  }
+  expect((await database.requireActiveInternalLabel(task.sourceQr)).quantity).toBe(477);
+  const split = await database.saveUnpackOperation(params);
+  const retried = await database.saveUnpackOperation(params);
+  expect(retried.shippedRecord.source_qr).toBe(split.shippedRecord.source_qr);
+  expect(retried.remainingRecord.source_qr).toBe(split.remainingRecord.source_qr);
+  const shipped = await database.requireActiveInternalLabel(split.shippedRecord.source_qr!);
+  const remaining = await database.requireActiveInternalLabel(split.remainingRecord.source_qr!);
+  expect([shipped.quantity, remaining.quantity]).toEqual([200, 277]);
+  expect(new Set([shipped.packageId, remaining.packageId, task.internalPackageId]).size).toBe(3);
+  await expect(database.requireActiveInternalLabel(task.sourceQr)).rejects.toThrow('已拆包');
+  const specifications = await database.getInternalLabelSpecifications([
+    scan.package_key, split.shippedRecord.package_key, split.remainingRecord.package_key, 'ordinary-package',
+  ]);
+  expect(specifications).toEqual(new Map([
+    [scan.package_key, '0402'],
+    [internalLabelPackageKey(shipped.packageId), '0402'],
+    [internalLabelPackageKey(remaining.packageId), '0402'],
+  ]));
+  expect((await database.getMaterial(scan.id))?.model).toBe('贴片电阻');
+  expect((await database.getOutboundExportRows(warehouse.id)).find(row => row.order_no === scan.order_no))
+    .toMatchObject({ model: '0402', quantity: 200 });
+  const labelSheet = buildUnpackLabelSheet([split.shippedRecord, split.remainingRecord]);
+  expect(JSON.stringify(labelSheet)).toContain(split.shippedRecord.source_qr!);
+  expect(JSON.stringify(labelSheet)).toContain('贴片电阻');
+
+  await expect(database.deleteMaterial(scan.id)).rejects.toThrow('内部标签已确认拆包');
+  await expect(database.deleteOrder(scan.order_no, warehouse.id)).rejects.toThrow('内部标签已确认拆包');
+  await expect(database.deleteUnpackRecord(split.shippedRecord.id)).rejects.toThrow('内部标签已确认拆包');
+  expect((await database.getMaterial(scan.id))?.quantity).toBe(200);
+  await expect(database.getUnpackPrintTask(split.pairId)).resolves.toMatchObject({ pair_id: split.pairId, status: 'pending' });
+  await expect(database.requireActiveInternalLabel(task.sourceQr)).rejects.toThrow('已拆包');
+  await expect(database.requireActiveInternalLabel(split.remainingRecord.source_qr!)).resolves.toMatchObject({ quantity: 277 });
+
+  const { applyLabelQuantityCorrection, prepareLabelReprint }: typeof import('../labelReprint') = require('../labelReprint');
+  const remainingQr = split.remainingRecord.source_qr!;
+  const correctionInput = await prepareLabelReprint(remainingQr);
+  await expect(applyLabelQuantityCorrection(correctionInput, 276)).rejects.toThrow('原拆包打印任务尚未提交成功');
+  const childScan = { ...params.material, id: 'HLS-SPLIT-AGAIN', order_no: 'HLS-SPLIT-AGAIN-ORDER',
+    raw_content: remainingQr, package_key: internalLabelPackageKey(remaining.packageId), quantity: 277 };
+  const childParams = { ...params, operationId: 'HLS-SPLIT-AGAIN-PAIR', material: childScan,
+    createMaterial: { ...params.createMaterial, material: childScan }, shippedQuantity: 100, remainingQuantity: 177 };
+  await expect(database.saveUnpackOperation(childParams)).rejects.toThrow('原拆包打印任务尚未提交成功');
+  expect(await database.getMaterial(childScan.id)).toBeNull();
+
+  await expect(database.updateUnpackPrintTask(split.pairId, { status: 'submitted' }, 'pending')).resolves.toBe(true);
+  const correction = await applyLabelQuantityCorrection(correctionInput, 276);
+  expect(parseInternalLabel(correction.sourceQr).quantity).toBe(276);
+  await database.finishInternalLabelCorrection(correction.id, false);
+  await expect(database.saveUnpackOperation(childParams)).resolves.toMatchObject({ pairId: childParams.operationId });
+});
+
+it('keeps ERP outbound history and exports in the recorded warehouse and detects a later warehouse change', async () => {
+  const actualWarehouse = { id: 'OUT-ERP-A', name: 'A 仓' };
+  const otherWarehouse = { id: 'OUT-ERP-B', name: 'B 仓' };
+  const scan = { ...material, id: 'ACTUAL-ERP-WAREHOUSE', order_no: 'IO-2026-11-10-51',
+    traceNo: 'ERP-WAREHOUSE-TRACE', warehouse_id: actualWarehouse.id, warehouse_name: actualWarehouse.name };
+
+  await database.upsertOrder(scan.order_no, '客户 A', otherWarehouse);
+  expect(await database.findOutboundOrderWarehouseConflict(scan.order_no, actualWarehouse.id, account)).toBeNull();
+  await database.addMaterialWithOrder(scan, '客户 A', actualWarehouse);
+
+  expect(await database.findOutboundOrderWarehouseConflict(scan.order_no, actualWarehouse.id, account)).toBeNull();
+  expect(await database.findOutboundOrderWarehouseConflict(scan.order_no, otherWarehouse.id, account))
+    .toEqual({ warehouse_id: actualWarehouse.id, warehouse_name: actualWarehouse.name });
+  expect(await database.getMaterialsByOrder(scan.order_no, otherWarehouse.id)).toEqual([]);
+  expect(await database.getOutboundExportRows(actualWarehouse.id))
+    .toEqual(expect.arrayContaining([expect.objectContaining({ order_no: scan.order_no, warehouse_name: actualWarehouse.name })]));
+  expect(await database.getOutboundExportRows(otherWarehouse.id)).toEqual([]);
+});
+
 it('persists and updates a custom rule terminator in native SQLite and configuration backup', async () => {
   const ruleId = await database.addRule({
     name: '结束符持久化', description: '', separator: '&', terminator: ';',
@@ -63,6 +274,145 @@ it('persists and updates a custom rule terminator in native SQLite and configura
   expect((await database.getAllRules()).find(item => item.id === ruleId)?.terminator).toBe(';');
   await database.updateRule(ruleId, { terminator: '\r\n' });
   expect((await database.exportBackupData()).rules.find(item => item.id === ruleId)?.terminator).toBe('\r\n');
+});
+
+it('keeps an opt-in box identity through backup, racing scans, two splits and the native label export', async () => {
+  const supplier = '广东仁懋电子有限公司';
+  const ruleId = await database.addRule({
+    name: '仁懋组合包装测试', description: '', separator: ' ', isActive: true,
+    fieldOrder: ['ignore:1', 'version', 'model', 'package', 'batch', 'quantity', 'productionDate', 'sourceNo'],
+    packagingFields: ['model', 'batch', 'sourceNo'],
+  });
+  const backup = await database.exportBackupData();
+  expect((await database.importBackupData(backup)).success).toBe(true);
+  const rule = (await database.getAllRules()).find(item => item.id === ruleId)!;
+  expect(rule.packagingFields).toEqual(['model', 'batch', 'sourceNo']);
+  await database.addInventoryBinding({ scan_model: 'MOT3114G', version: '810411G01000101', inventory_code: 'MOT-BOX-TEST', supplier });
+
+  const makeScan = (id: string, box: string, quantity: number, batch = 'ZYA.C') => {
+    const raw = `B 810411G01000101 MOT3114G PDFN5*6 ${batch} ${quantity} 20261022 ${box}`;
+    const fields = database.parseWithRule(raw, rule).standardFields;
+    return { ...material, ...fields, raw_content: raw, id, order_no: id, rule_id: ruleId,
+      model: fields.model, batch: fields.batch, sourceNo: box, traceNo: '', quantity, customer_name: '客户 A',
+      inventory_code: 'MOT-BOX-TEST', package_key: buildPackageKey(rule, fields, database.FIELD_LABELS) };
+  };
+  const save = (scan: ReturnType<typeof makeScan>) => database.addMaterialWithOrder(scan, scan.customer_name, warehouse);
+  const duplicate = (scan: ReturnType<typeof makeScan>) => database.checkMaterialExists('NEXT-COMBO', scan.model, scan.batch,
+    scan.sourceNo, '', String(scan.quantity), warehouse.id, scan.package_key);
+  const split = (scan: ReturnType<typeof makeScan>, shipped: number, remaining: number) => database.saveUnpackOperation({
+    operationId: `box:${scan.id}`, material: scan, createMaterial: { material: scan, customerName: scan.customer_name, warehouse },
+    shippedQuantity: shipped, remainingQuantity: remaining, newTraceNo: '',
+  });
+
+  const original = makeScan('COMBO-ORIGINAL', '0005', 5000);
+  const first = await split(original, 2000, 3000);
+  expect(await split(original, 2000, 3000)).toEqual(first);
+  expect((await database.getMaterial(original.id))?.sourceNo).toBe('0005');
+  const sheet = buildUnpackLabelSheet(await database.getUnpackPrintTaskRecords(first.pairId));
+  const boxColumn = sheet.headers.indexOf('箱号');
+  expect(sheet.rows.map(row => row[boxColumn])).toEqual(['0005-1', '0005-2']);
+  await expect(duplicate(original)).rejects.toThrow('已拆包');
+  expect(await duplicate(makeScan('COMBO-SHIPPED', '0005-1', 2000))).toMatchObject({ canRescan: false, material: { id: original.id } });
+
+  const remaining = makeScan('COMBO-REMAINING', '0005-2', 3000);
+  expect(await duplicate(remaining)).toMatchObject({ material: null });
+  const second = await split(remaining, 1000, 2000);
+  expect([second.shippedRecord.new_sourceNo, second.remainingRecord.new_sourceNo]).toEqual(['0005-3', '0005-4']);
+  await expect(duplicate(remaining)).rejects.toThrow('已拆包');
+  await expect(database.deleteMaterial(original.id)).rejects.toThrow('后续出库');
+
+  const anotherBatch = makeScan('COMBO-DIFFERENT-BATCH', '0005', 5000, 'ZYA.D');
+  const outcomes = await Promise.allSettled([save(anotherBatch), save({ ...anotherBatch, id: 'COMBO-RACE' })]);
+  expect(outcomes.map(result => result.status).sort()).toEqual(['fulfilled', 'rejected']);
+  const old = makeScan('COMBO-LEGACY', '0007', 5000);
+  await save({ ...old, package_key: undefined });
+  expect(await duplicate(old)).toMatchObject({ material: { id: old.id } });
+
+  const unnumbered = makeScan('COMBO-NONE-ONE', '-', 5000);
+  expect(unnumbered.package_key).toBeUndefined();
+  await save(unnumbered);
+  await save({ ...unnumbered, id: 'COMBO-NONE-TWO' });
+
+  const received = makeScan('COMBO-RECEIPT', '0008', 5000);
+  const inbound = { ...receipt, id: received.id, inbound_no: received.id, scan_model: received.model, traceNo: '', package_key: received.package_key };
+  await database.addInboundRecord(inbound);
+  await expect(database.addInboundRecord({ ...inbound, id: 'COMBO-RECEIPT-TWO' })).rejects.toThrow('已入库');
+  const count = { ...common, id: 'COMBO-COUNT', check_no: 'COMBO-COUNT', scan_model: received.model, check_type: 'whole' as const,
+    check_date: '2026-11-09', package_key: received.package_key };
+  await database.addInventoryCheckRecord(count);
+  await expect(database.addInventoryCheckRecord({ ...count, id: 'COMBO-COUNT-REPEAT' })).rejects.toThrow('本盘点单');
+  await database.addInventoryCheckRecord({ ...count, id: 'COMBO-COUNT-NEXT', check_no: 'COMBO-COUNT-NEXT' });
+
+  const returned = { ...anotherBatch, id: 'COMBO-RETURN', order_no: 'COMBO-RETURN' };
+  await expect(database.saveSalesReturnWithOrder({ material: { ...returned, customer_name: '客户 B' }, requiredQuantity: 5000 }))
+    .rejects.toThrow('客户 A');
+  await database.saveSalesReturnWithOrder({ material: returned, requiredQuantity: 5000 });
+  expect(await duplicate(anotherBatch)).toMatchObject({ canRescan: true });
+  await save({ ...anotherBatch, id: 'COMBO-RESOLD', order_no: 'COMBO-RESOLD' });
+  expect(await duplicate(anotherBatch)).toMatchObject({ canRescan: false });
+});
+
+it('reads the split supplier after acquiring the write snapshot and rolls back an unsupported template', async () => {
+  const ruleId = await database.addRule({
+    name: '拆包供应商快照测试', description: '', separator: ' ', isActive: true,
+    fieldOrder: ['ignore:1', 'version', 'model', 'package', 'batch', 'quantity', 'productionDate', 'sourceNo'],
+    packagingFields: ['model', 'batch', 'sourceNo'],
+  });
+  const supplier = '广东仁懋电子有限公司';
+  const model = 'SUPPLIER-SNAPSHOT';
+  const inventoryCode = 'SUPPLIER-SNAPSHOT-INV';
+  const bindingId = await database.addInventoryBinding({ scan_model: model, version: 'V1', inventory_code: inventoryCode, supplier });
+  const rule = (await database.getRuleById(ruleId))!;
+  const raw = `B V1 ${model} PDFN5*6 SNAPSHOT-LOT 100 20261022 0001`;
+  const fields = database.parseWithRule(raw, rule).standardFields;
+  const scan = { ...material, ...fields, id: 'SUPPLIER-SNAPSHOT-MATERIAL', order_no: 'SUPPLIER-SNAPSHOT-ORDER',
+    model, quantity: 100, traceNo: '', inventory_code: inventoryCode, raw_content: raw,
+    package_key: buildPackageKey(rule, fields, database.FIELD_LABELS), rule_id: ruleId };
+
+  // Simulate another committed binding edit between invocation and BEGIN IMMEDIATE.
+  mockBeforeExclusiveTransaction = () => {
+    sqlite.prepare('UPDATE [物料绑定] SET supplier = ? WHERE id = ?').run('尚未支持的供应商', bindingId);
+  };
+  await expect(database.saveUnpackOperation({ material: scan,
+    createMaterial: { material: scan, customerName: '客户 A', warehouse },
+    shippedQuantity: 40, remainingQuantity: 60, newTraceNo: '', operationId: 'SUPPLIER-SNAPSHOT-PAIR',
+  })).rejects.toThrow('暂不支持');
+  expect(await database.getMaterial(scan.id)).toBeNull();
+  expect(await database.getUnpackPrintTask('SUPPLIER-SNAPSHOT-PAIR')).toBeNull();
+  expect(sqlite.prepare('SELECT id FROM [拆包记录] WHERE pair_id = ?').all('SUPPLIER-SNAPSHOT-PAIR')).toEqual([]);
+  expect(sqlite.prepare('SELECT supplier FROM [物料绑定] WHERE id = ?').get(bindingId))
+    .toEqual(expect.objectContaining({ supplier: '尚未支持的供应商' }));
+});
+
+it('supports a full Dongwei box split without allocating a zero-quantity child', async () => {
+  const supplier = '苏州东微半导体股份有限公司';
+  const ruleId = await database.addRule({
+    name: '东微整包拆出测试', description: '', separator: ';', terminator: ';', isActive: true,
+    fieldOrder: ['model', 'version', 'package', 'batch', 'quantity', 'productionDate', 'sourceNo'],
+    packagingFields: ['model', 'batch', 'sourceNo'],
+  });
+  const model = 'SFS10R09UNNF-FULL';
+  await database.addInventoryBinding({ scan_model: model, version: '1009UN', inventory_code: 'DONGWEI-FULL-INV', supplier });
+  const rule = (await database.getRuleById(ruleId))!;
+  const raw = `${model};1009UN;PDFN3.3*3.3;70I0BH6770001;2000;G36PE01N;1-4;`;
+  const fields = database.parseWithRule(raw, rule).standardFields;
+  const scan = { ...material, ...fields, id: 'DONGWEI-FULL-MATERIAL', order_no: 'DONGWEI-FULL-ORDER',
+    model, quantity: 2000, traceNo: '', inventory_code: 'DONGWEI-FULL-INV', raw_content: raw,
+    package_key: buildPackageKey(rule, fields, database.FIELD_LABELS), rule_id: ruleId };
+  const params = { material: scan, createMaterial: { material: scan, customerName: '客户 A', warehouse },
+    shippedQuantity: 2000, remainingQuantity: 0, newTraceNo: '', operationId: 'DONGWEI-FULL-PAIR' };
+  const split = await database.saveUnpackOperation(params);
+  expect(await database.saveUnpackOperation(params)).toEqual(split);
+  expect(split.shippedRecord).toMatchObject({ new_sourceNo: '1-4-1', new_quantity: '2000', package_supplier: supplier });
+  expect(split.shippedRecord.package_key).toBeTruthy();
+  expect(split.remainingRecord).toMatchObject({ new_quantity: '0', new_traceNo: '' });
+  expect(split.remainingRecord.new_sourceNo).toBeNull();
+  expect(split.remainingRecord.package_key).toBeNull();
+  expect((await database.getMaterial(scan.id))?.remaining_quantity).toBe('0');
+  const sheet = buildUnpackLabelSheet(await database.getUnpackPrintTaskRecords(split.pairId));
+  // Keep both audit rows for the task pair; only submission omits the empty remainder.
+  expect(sheet.rows).toHaveLength(2);
+  expect(sheet.rows[0][sheet.headers.indexOf('箱号')]).toBe('1-4-1');
 });
 
 it('preserves manual display order across restart, editing, and configuration restore without changing detection', async () => {
@@ -768,6 +1118,32 @@ it('rejects return backup schemas that lost one half of the receipt-allocation p
   }
 });
 
+it('rejects backups with incomplete internal-label tables or with labels but no registry', async () => {
+  const db = mockAdapter as unknown as SQLiteDatabase;
+  await expect(database.validateRestoredDatabaseSchema(db)).resolves.toBeUndefined();
+  sqlite.exec('SAVEPOINT internal_backup_fixture');
+  try {
+    sqlite.exec('ALTER TABLE [内部标签打印任务] RENAME TO [测试保留的内部标签打印任务]');
+    await expect(database.validateRestoredDatabaseSchema(db)).rejects.toThrow('包装登记和打印任务必须同时存在');
+
+    sqlite.exec('CREATE TABLE [内部标签打印任务] (id TEXT PRIMARY KEY)');
+    await expect(database.validateRestoredDatabaseSchema(db)).rejects.toThrow('内部标签打印任务 缺少字段: task_json');
+
+    sqlite.exec('DROP TABLE [内部标签打印任务]');
+    sqlite.exec('ALTER TABLE [内部标签包装] RENAME TO [测试保留的内部标签包装]');
+    for (const table of ['出库明细', '拆包记录', '盘点记录', '销售退货记录']) {
+      sqlite.exec(`UPDATE [${table}] SET package_key = NULL WHERE package_key GLOB 'HLS:*'`);
+    }
+    await expect(database.validateRestoredDatabaseSchema(db)).resolves.toBeUndefined();
+
+    sqlite.prepare('INSERT INTO [出库明细] (id, model, scanned_at, package_key) VALUES (?, ?, ?, ?)')
+      .run('HLS-BACKUP-FIXTURE', '测试物料', '2026-11-11', internalLabelPackageKey('BACKUPFIXTURE1'));
+    await expect(database.validateRestoredDatabaseSchema(db)).rejects.toThrow('备份含内部标签作业记录');
+  } finally {
+    sqlite.exec('ROLLBACK TO internal_backup_fixture; RELEASE internal_backup_fixture');
+  }
+});
+
 it('protects return-linked binding codes transactionally and permits supplier-only and normalized-code edits', async () => {
   const source = { ...returnMaterial('BINDING-LINK-SOURCE', 'BINDING-LINK-TRACE'),
     model: 'BINDING-LINK-MODEL', version: 'V1', inventory_code: 'BINDING-LINK-A' };
@@ -927,4 +1303,84 @@ it('reads saved receipt accounts for compact metadata without guessing from ware
   await database.addInboundRecordsBatch([row]);
   expect((await database.getInboundDocumentSummaries()).find(item => item.inbound_no === row.inbound_no))
     .toMatchObject({ erp_account_keys: 'shanghai-chipmunk' });
+});
+
+it('finds trace numbers on outbound scans, split labels, and returns while respecting order scope', async () => {
+  const a = { id: 'TRACE-SEARCH-A', name: '追溯查询 A' };
+  const b = { id: 'TRACE-SEARCH-B', name: '追溯查询 B' };
+  const orderNo = 'IO-2025-01-02-77';
+  const source = { ...material, id: 'TRACE-SEARCH-SOURCE', order_no: orderNo,
+    warehouse_id: a.id, warehouse_name: a.name, traceNo: 'FIND-PACK_%', sourceNo: 'ONLY-BOX-FOR-SEARCH' };
+  const split = await database.saveUnpackOperation({
+    operationId: 'TRACE-SEARCH-SPLIT', material: source,
+    createMaterial: { material: source, customerName: '追溯测试客户', warehouse: a },
+    shippedQuantity: 1000, remainingQuantity: 1500, newTraceNo: 'FIND-PACK_%-1',
+  });
+  await database.addMaterialWithOrder({ ...source, id: 'TRACE-SEARCH-OTHER-WAREHOUSE', traceNo: 'FIND-PACK-OTHER',
+    warehouse_id: b.id, warehouse_name: b.name }, '另一仓库客户', b);
+  sqlite.prepare('UPDATE [出库单] SET created_at = ? WHERE order_no = ? AND warehouse_id = ?')
+    .run('2025/01/02 09:00', orderNo, a.id);
+
+  const search = (searchText: string, warehouseId?: string, timeFilter: 'all' | 'today' = 'all') =>
+    database.getQueryFilteredOrders({ searchType: 'trace', searchText, warehouseId, timeFilter });
+  const aOrders = await search('  find-pack_%  ');
+  expect(aOrders).toHaveLength(1);
+  expect(aOrders[0]).toMatchObject({ order_no: orderNo, warehouse_id: a.id, customer_name: '追溯测试客户' });
+  expect(aOrders[0].traceMatches?.map(match => match.traceNo).sort()).toEqual([
+    source.traceNo, split.shippedRecord.new_traceNo, split.remainingRecord.new_traceNo,
+  ]);
+  expect(await search(split.shippedRecord.new_traceNo, a.id)).toEqual([expect.objectContaining({
+    traceMatches: [{ materialId: source.id, model: source.model, batch: source.batch, traceNo: split.shippedRecord.new_traceNo }],
+  })]);
+  expect(await search('FIND-PACK_%', b.id)).toEqual([]);
+  expect(await search('FIND-PACK_%', a.id, 'today')).toEqual([]);
+  expect(await search(source.sourceNo, a.id)).toEqual([]);
+
+  const bothWarehouses = await search('find-pack');
+  expect(bothWarehouses.map(order => order.warehouse_id).sort()).toEqual([a.id, b.id]);
+  expect(bothWarehouses.find(order => order.warehouse_id === b.id)?.traceMatches?.[0]?.traceNo).toBe('FIND-PACK-OTHER');
+
+  const legacyOrderNo = 'IO-2025-01-02-78';
+  const legacyId = 'TRACE-SEARCH-LEGACY';
+  await database.addMaterialWithOrder({ ...source, id: legacyId, order_no: legacyOrderNo,
+    traceNo: split.shippedRecord.new_traceNo }, '旧记录客户', a);
+  sqlite.prepare('UPDATE [出库明细] SET warehouse_id = NULL WHERE id = ?').run(legacyId);
+  expect((await search(split.shippedRecord.new_traceNo, a.id)).map(order => order.order_no).sort())
+    .toEqual([orderNo, legacyOrderNo]);
+
+  const returned = { ...returnMaterial('TRACE-SEARCH-RETURN', 'FIND-RETURN-PACK'),
+    warehouse_id: a.id, warehouse_name: a.name };
+  await database.saveSalesReturnWithOrder({ material: returned, requiredQuantity: 100 });
+  expect(await search('find-return-pack', a.id)).toEqual([expect.objectContaining({
+    order_no: returned.order_no, operation_type: 'sales_return',
+    traceMatches: [expect.objectContaining({ materialId: returned.id, traceNo: returned.traceNo })],
+  })]);
+});
+
+it('matches complete batch numbers literally in outbound and sales return history', async () => {
+  const a = { id: 'EXACT-BATCH-A', name: '批次查询 A' };
+  const b = { id: 'EXACT-BATCH-B', name: '批次查询 B' };
+  const orderNo = 'IO-2025-01-03-71';
+  for (const [id, order_no, batch, wh] of [
+    ['BATCH-HIT', orderNo, '  Exact_%  ', a],
+    ['BATCH-OTHER-WH', orderNo, 'EXACT_%2', b],
+    ['BATCH-SIMILAR', 'IO-2025-01-03-72', 'EXACT_%2', a],
+    ['BATCH-WILDCARD', 'IO-2025-01-03-73', 'EXACT-A1', a],
+  ] as const) {
+    await database.addMaterialWithOrder({ ...material, id, order_no, batch, traceNo: id,
+      warehouse_id: wh.id, warehouse_name: wh.name }, '批次测试客户', wh);
+  }
+  const returned = { ...returnMaterial('BATCH-RETURN', 'BATCH-RETURN-TRACE'), batch: 'Exact_%',
+    warehouse_id: a.id, warehouse_name: a.name };
+  await database.saveSalesReturnWithOrder({ material: returned, requiredQuantity: 100 });
+
+  const search = (searchText: string, warehouseId?: string) =>
+    database.getQueryFilteredOrders({ searchType: 'batch', searchText, warehouseId });
+  expect(await search('  exact_%  ')).toEqual(expect.arrayContaining([
+    expect.objectContaining({ order_no: orderNo, warehouse_id: a.id }),
+    expect.objectContaining({ order_no: returned.order_no, warehouse_id: a.id, operation_type: 'sales_return' }),
+  ]));
+  expect(await search('  exact_%  ')).toHaveLength(2);
+  expect(await search('exact_%', b.id)).toEqual([]);
+  expect(await search('exact_')).toEqual([]);
 });

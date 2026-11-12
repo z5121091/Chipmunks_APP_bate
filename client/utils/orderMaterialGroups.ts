@@ -1,5 +1,7 @@
 import type { MaterialRecord } from '@/utils/database';
 
+export const normalizeOrderBatch = (value?: string | null): string => (value ?? '').trim().toLowerCase();
+
 export interface OrderBatchGroup {
   key: string;
   batch: string;

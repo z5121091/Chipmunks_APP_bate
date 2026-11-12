@@ -1,5 +1,5 @@
 import TestRenderer, { act } from 'react-test-renderer';
-import { Text, TextInput, TouchableOpacity, Linking } from 'react-native';
+import { Text, TextInput, TouchableOpacity, Linking, StyleSheet, View } from 'react-native';
 import SettingsToolsScreen from '../index';
 import { readBackupDiagnostic } from '@/utils/backupDiagnostic';
 import { saveSyncConnectionConfig } from '@/utils/syncConnection';
@@ -7,6 +7,7 @@ import { verifySyncPairingConnection } from '@/utils/syncPairing';
 
 const mockParams = { section: 'sync' };
 const mockBack = jest.fn();
+const mockLongDiagnosticValue = 'backup-' + 'long-file-name-'.repeat(30) + '.db';
 const mockSnapshot = { config: { ip: '192.168.1.8', port: '8080', pairingKey: 'test-key' }, status: 'success' };
 jest.mock('expo-router', () => ({ useFocusEffect: (fn: () => void) => require('react').useEffect(fn, [fn]) }));
 jest.mock('@/hooks/useSafeRouter', () => ({ useSafeSearchParams: () => mockParams,
@@ -28,7 +29,7 @@ jest.mock('@/utils/syncConnection', () => ({
 }));
 jest.mock('@/utils/backupDiagnostic', () => ({ readBackupDiagnostic: jest.fn(), describeBackupDiagnostic: () => ({
   label: '备份异常', latestSuccessText: '2026-11-01 10:00', errors: ['网络错误：' + '详细原因'.repeat(40)],
-  rows: [['后台说明', '完整后台信息']],
+  rows: [['后台说明', '完整后台信息'], ['后台文件', mockLongDiagnosticValue]],
 }) }));
 
 let root: TestRenderer.ReactTestRenderer;
@@ -115,6 +116,15 @@ it('shows complete failures before expanding diagnostics and permits refresh aft
   expect(root.root.findAllByType(Text).some(node => node.props.children === '完整后台信息')).toBe(false);
   await press('查看详细诊断');
   expect(root.root.findAllByType(Text).some(node => node.props.children === '完整后台信息')).toBe(true);
+  expect(StyleSheet.flatten(root.root.findByType('Scroll').props.contentContainerStyle)).toMatchObject({ width: '100%', maxWidth: 448 });
+  const fileName = root.root.findAllByType(Text).find(node => node.props.children === mockLongDiagnosticValue);
+  expect(fileName?.props.selectable).toBe(true);
+  expect(fileName?.props.numberOfLines).toBeUndefined();
+  expect(StyleSheet.flatten(fileName?.props.style)).toMatchObject({ flex: 1, minWidth: 0 });
+  expect(root.root.findAllByType(View).some(view => StyleSheet.flatten(view.props.style)?.flexDirection === 'row'
+    && view.findAllByType(Text).some(text => text.props.children === mockLongDiagnosticValue))).toBe(true);
+  await press('收起详细诊断');
+  expect(root.root.findAllByType(Text).some(node => node.props.children === mockLongDiagnosticValue)).toBe(false);
 });
 it('opens system app settings as fallback when the battery settings activity is unavailable', async () => {
   mockParams.section = 'background';

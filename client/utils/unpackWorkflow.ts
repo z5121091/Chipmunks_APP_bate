@@ -3,11 +3,14 @@ import { STORAGE_KEYS, type SyncConfig } from '@/constants/config';
 import {
   getNextUnpackIndex,
   getSupplierForInventoryBinding,
+  requireActiveInternalLabel,
   type UnpackRecord,
 } from '@/utils/database';
 import { formatSyncErrorMessage, syncExcelToComputer } from '@/utils/excel';
 import { safeJsonParseNullable } from '@/utils/json';
 import { buildUnpackLabelSheet } from '@/utils/labelExport';
+import { internalLabelPackageKey, isInternalLabelPackageKey } from '@/utils/internalLabelCode';
+import { parseQuantity } from '@/utils/quantity';
 
 const NATIVE_LABEL_PRINT_MODE = 'native_tsc_supplier_v2';
 
@@ -18,6 +21,14 @@ const enrichUnpackRecordsWithSuppliers = async (
   const enrichedRecords: UnpackRecord[] = [];
 
   for (const record of records) {
+    if (isInternalLabelPackageKey(record.parent_package_key)) {
+      enrichedRecords.push(record);
+      continue;
+    }
+    if (record.package_supplier) {
+      enrichedRecords.push({ ...record, supplier: record.package_supplier });
+      continue;
+    }
     const cacheKey = [
       record.inventory_code?.trim().toLowerCase() || '',
       record.model.trim().toLowerCase(),
@@ -114,8 +125,21 @@ export const submitUnpackRecordsToComputer = async (
   ) {
     throw new Error('拆包标签缺少统一的打印任务标识');
   }
+  // A full split retains a zero remainder in the audit pair, but no child
+  // package or physical label exists for it. Keep it out of validation/printing.
+  const printableRecords = records.filter(record =>
+    record.label_type !== 'remaining' || parseQuantity(record.new_quantity, { min: 0 }) !== 0);
+  if (!printableRecords.length) throw new Error('拆包任务没有可打印的标签');
+  const internalRecords = printableRecords.filter(record => isInternalLabelPackageKey(record.parent_package_key));
+  for (const record of internalRecords) {
+    const label = await requireActiveInternalLabel(record.source_qr || '');
+    if (record.package_key !== internalLabelPackageKey(label.packageId) || !label.parentPackageId ||
+        record.parent_package_key !== internalLabelPackageKey(label.parentPackageId)) {
+      throw new Error('拆包任务中的内部包号与当前登记不一致，请核对标签');
+    }
+  }
   const config = syncConfig || (await loadLabelSyncConfig());
-  const enrichedRecords = await enrichUnpackRecordsWithSuppliers(records);
+  const enrichedRecords = await enrichUnpackRecordsWithSuppliers(printableRecords);
   const labelSheet = buildUnpackLabelSheet(enrichedRecords, '标签数据');
   const nameSuffix = records[0]?.order_no || '拆包标签';
   const result = await syncExcelToComputer(
@@ -133,7 +157,7 @@ export const submitUnpackRecordsToComputer = async (
         ...(options.retryConfirmed === true ? { retry_confirmed: 'true' } : {}),
       },
       requireNativePrint: true,
-      acceptNativePrintPolicySkip: true,
+      acceptNativePrintPolicySkip: internalRecords.length === 0,
     }
   );
 

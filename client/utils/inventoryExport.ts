@@ -16,6 +16,7 @@ export interface InventoryExportRecord {
   warehouse_name?: string;
   inventory_code?: string;
   scan_model?: string;
+  internalSpecification?: string;
   batch?: string;
   quantity?: number;
   check_type: 'whole' | 'partial';
@@ -32,6 +33,7 @@ export interface InventoryExportRecord {
 type InventorySummaryItem = {
   inventoryCode: string;
   model: string;
+  internalSpecification?: string;
   physicalQuantity: number;
   erpQuantity: number | null;
 };
@@ -59,6 +61,7 @@ const createInventorySummaryItem = (
 ): InventorySummaryItem => ({
   inventoryCode: toCellText(record.inventory_code),
   model: toCellText(record.scan_model),
+  internalSpecification: record.internalSpecification?.trim() || undefined,
   physicalQuantity: 0,
   erpQuantity:
     record.erp_quantity !== undefined && Number.isFinite(Number(record.erp_quantity))
@@ -76,7 +79,7 @@ const buildInventorySummaryRows = (
     })
     .map((item) => [
       item.inventoryCode,
-      item.model,
+      item.internalSpecification || item.model,
       item.physicalQuantity,
       item.erpQuantity ?? '',
       item.erpQuantity === null ? '' : item.physicalQuantity - item.erpQuantity,
@@ -121,6 +124,7 @@ export const buildInventorySheets = (records: InventoryExportRecord[]): ExcelShe
     }
 
     const summary = summaryMap.get(key)!;
+    summary.internalSpecification ??= record.internalSpecification?.trim() || undefined;
     summary.physicalQuantity += getEffectiveQuantity(record);
     if (
       summary.erpQuantity === null &&
@@ -132,6 +136,17 @@ export const buildInventorySheets = (records: InventoryExportRecord[]): ExcelShe
   });
 
   return [
+    {
+      name: '盘点差异',
+      headers: [
+        EXCEL_HEADERS.inventoryCode,
+        EXCEL_HEADERS.model,
+        EXCEL_HEADERS.actualQuantity,
+        EXCEL_HEADERS.erpQuantity,
+        EXCEL_HEADERS.differenceQuantity,
+      ],
+      rows: buildInventorySummaryRows(summaryMap.values()),
+    },
     buildExcelSheet(
       '盘点明细',
       [
@@ -150,16 +165,5 @@ export const buildInventorySheets = (records: InventoryExportRecord[]): ExcelShe
       ],
       records
     ),
-    {
-      name: '盘点差异',
-      headers: [
-        EXCEL_HEADERS.inventoryCode,
-        EXCEL_HEADERS.model,
-        EXCEL_HEADERS.actualQuantity,
-        EXCEL_HEADERS.erpQuantity,
-        EXCEL_HEADERS.differenceQuantity,
-      ],
-      rows: buildInventorySummaryRows(summaryMap.values()),
-    },
   ];
 };

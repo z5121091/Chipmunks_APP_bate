@@ -4,7 +4,8 @@ $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($buildScript, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Assert-BuildSources', 'Sync-BuildSourceFolder')) {
+Add-Type -AssemblyName System.IO.Compression
+foreach ($name in @('Assert-BuildSources', 'Sync-BuildSourceFolder', 'Assert-FreshEmbeddedUpdateManifest')) {
     $definition = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $false))
     if ($definition.Count -ne 1) { throw "Expected one build helper: $name" }
     . ([scriptblock]::Create($definition[0].Extent.Text))
@@ -29,6 +30,24 @@ function Test-Case {
     $script:passed++
     Write-Host "PASS: $Name"
 }
+function Test-EmbeddedManifest {
+    param([string]$Content, [long]$BuildStartedAtMs)
+    $buffer = [IO.MemoryStream]::new()
+    try {
+        $writer = [IO.Compression.ZipArchive]::new($buffer, [IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            if ($Content) {
+                $entry = $writer.CreateEntry('assets/app.manifest')
+                $text = [IO.StreamWriter]::new($entry.Open())
+                try { $text.Write($Content) } finally { $text.Dispose() }
+            }
+        } finally { $writer.Dispose() }
+        $buffer.Position = 0
+        $reader = [IO.Compression.ZipArchive]::new($buffer, [IO.Compression.ZipArchiveMode]::Read, $true)
+        try { Assert-FreshEmbeddedUpdateManifest -Archive $reader -BuildStartedAtMs $BuildStartedAtMs }
+        finally { $reader.Dispose() }
+    } finally { $buffer.Dispose() }
+}
 function Assert-FixturePath {
     param([string]$Path)
     $absolute = [IO.Path]::GetFullPath($Path).TrimEnd('\')
@@ -51,6 +70,16 @@ try {
     foreach ($file in @('pnpm-workspace.yaml', 'pnpm-lock.yaml', '.npmrc')) { [IO.File]::WriteAllText((Join-Path $source $file), '') }
 
     Test-Case 'optional patches are not required build inputs' { Assert-BuildSources $source }
+    Test-Case 'APK release validates embedded update identity and build time' {
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $buildStart = $now - 1000
+        $id = [Guid]::NewGuid().ToString('D')
+        Test-EmbeddedManifest (@{ id = $id; commitTime = $now } | ConvertTo-Json -Compress) $buildStart
+        Assert-Throws { Test-EmbeddedManifest (@{ id = $id; commitTime = $buildStart - 1 } | ConvertTo-Json -Compress) $buildStart } 'timestamp is outside this build'
+        Assert-Throws { Test-EmbeddedManifest (@{ id = $id; commitTime = $now + 60000 } | ConvertTo-Json -Compress) $buildStart } 'timestamp is outside this build'
+        Assert-Throws { Test-EmbeddedManifest (@{ id = 'invalid'; commitTime = $now } | ConvertTo-Json -Compress) $buildStart } 'invalid ID or timestamp'
+        Assert-Throws { Test-EmbeddedManifest '' $buildStart } 'missing its embedded Expo update manifest'
+    }
     Test-Case 'missing optional patches succeed and reset stale exit code' {
         $global:LASTEXITCODE = 16
         Sync-BuildSourceFolder $source $cache 'patches'

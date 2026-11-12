@@ -100,7 +100,7 @@ try {
     $iconPath = Join-Path $PSScriptRoot 'icon.ico'
     $assetsPath = Assert-SyncDirectory (Join-Path $PSScriptRoot 'assets')
     if (-not [IO.Directory]::Exists($assetsPath)) { throw 'Missing sync label asset directory: scripts/assets.' }
-    foreach ($assetName in @('geehy-logo.png', 'boya-logo.png', 'pb-logo.png', 'union-logo.png', 'esd-warning.png', 'keep-dry.png', 'wch-logo.png', 'dongwei-logo.png', 'rongpai-logo.png', 'linearin-logo.png')) {
+    foreach ($assetName in @('geehy-logo.png', 'boya-logo.png', 'pb-logo.png', 'union-logo.png', 'esd-warning.png', 'keep-dry.png', 'wch-logo.png', 'dongwei-logo.png', 'rongpai-logo.png', 'linearin-logo.png', 'renmao-logo.png')) {
         if (-not [IO.File]::Exists((Join-Path $assetsPath $assetName))) { throw "Missing sync label asset: $assetName" }
     }
     $appName = '掌上仓库ERP版同步助手'

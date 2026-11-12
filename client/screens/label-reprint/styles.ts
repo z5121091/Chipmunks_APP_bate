@@ -4,15 +4,15 @@ import { BorderRadius, BorderWidth, Spacing, Typography, type Theme } from '@/co
 export const createStyles = (theme: Theme) => StyleSheet.create({
   container: { flex: 1 },
   header: {
-    flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between',
     gap: Spacing.sm, paddingHorizontal: Spacing.md, paddingVertical: Spacing.sm,
     backgroundColor: theme.backgroundElevated,
     borderBottomWidth: BorderWidth.normal, borderBottomColor: theme.border,
   },
   title: { ...Typography.h3, color: theme.textPrimary, fontWeight: '700' },
-  headerActions: { flexDirection: 'row', width: 200, maxWidth: '100%', flexShrink: 0, gap: Spacing.xs, marginLeft: 'auto' },
+  headerActions: { flexDirection: 'row', gap: Spacing.xs },
   // AnimatedButton owns an outer View: constrain that View, not only its touch target.
   headerActionSlot: { flex: 1, flexBasis: 0, minWidth: 0 },
+  internalLabelActionSlot: { flex: 1.25 },
   boundedAction: { width: '100%', minWidth: 0 },
   scanArea: { paddingTop: Spacing.xs },
   hint: { ...Typography.tiny, color: theme.textMuted, marginHorizontal: Spacing.md },
@@ -51,4 +51,10 @@ export const createStyles = (theme: Theme) => StyleSheet.create({
   correctionActions: { flexDirection: 'row', gap: Spacing.sm },
   correctionAction: { flex: 1, flexBasis: 0, minWidth: 0 },
   correctionError: { ...Typography.small, color: theme.error },
+  formLabel: { ...Typography.smallMedium, color: theme.textPrimary },
+  internalScanner: { marginHorizontal: 0, marginVertical: 0 },
+  packageRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.sm },
+  packageQuantity: { flex: 1, minWidth: 0 },
+  packageRemoveContainer: { flexGrow: 0, flexShrink: 0, alignSelf: 'center' },
+  packageRemove: { width: 'auto', minWidth: 0, minHeight: 32, height: 32, paddingHorizontal: Spacing.xs },
 });

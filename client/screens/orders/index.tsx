@@ -6,6 +6,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from 'expo-router';
 import { Feather, FontAwesome6 } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Clipboard from 'expo-clipboard';
 import { useTheme } from '@/hooks/useTheme';
 import { useHardwareBack } from '@/hooks/useHardwareBack';
 import { Screen } from '@/components/Screen';
@@ -20,6 +21,7 @@ import {
   getQueryOrder,
   getQueryMaterialsByOrder,
   Order,
+  type OrderSearchType,
   MaterialRecord,
   Warehouse,
   getAllWarehouses,
@@ -29,11 +31,15 @@ import { safeJsonParseNullable } from '@/utils/json';
 import { STORAGE_KEYS } from '@/constants/config';
 import { formatDate } from '@/utils/time';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
-import { groupOrderMaterials, type OrderMaterialGroup } from '@/utils/orderMaterialGroups';
+import { groupOrderMaterials, normalizeOrderBatch, type OrderMaterialGroup } from '@/utils/orderMaterialGroups';
 import { logger } from '@/utils/logger';
 
-// 搜索类型
-type SearchType = 'order' | 'customer' | 'batch';
+const ORDER_SEARCH_OPTIONS = [
+  { key: 'order', label: '订单号', icon: 'file-lines', placeholder: '搜索订单号...' },
+  { key: 'customer', label: '客户', icon: 'user', placeholder: '搜索客户名称...' },
+  { key: 'batch', label: '批次', icon: 'barcode', placeholder: '输入完整批次号...' },
+  { key: 'trace', label: '追溯码', icon: 'qrcode', placeholder: '搜索追溯码...' },
+] as const;
 
 // 订单视图类型
 type TimeFilterType = 'current' | 'today' | 'all';
@@ -50,12 +56,16 @@ export default function OrdersScreen() {
   const alert = useCustomAlert();
   const [exportingHistory, setExportingHistory] = useState(false);
   const exportBusyRef = useRef(false);
-  const exportVisitRef = useRef(0);
-  const params = useSafeSearchParams<{ orderNo?: string; materialId?: number }>();
+  const screenVisitRef = useRef(0);
+  const params = useSafeSearchParams<{ orderNo?: string; warehouseId?: string }>();
+  const targetOrderNo = params.orderNo?.trim() || '';
+  const targetWarehouseId = targetOrderNo ? params.warehouseId?.trim() : undefined;
+  const targetKey = targetOrderNo ? JSON.stringify([targetOrderNo, targetWarehouseId]) : '';
 
   const [filteredOrders, setFilteredOrders] = useState<Order[]>([]);
   const [searchText, setSearchText] = useState('');
-  const [searchType, setSearchType] = useState<SearchType>('order');
+  const [searchType, setSearchType] = useState<OrderSearchType>('order');
+  const batchKeyword = searchType === 'batch' ? normalizeOrderBatch(searchText) : '';
 
   // 仓库相关状态
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
@@ -74,7 +84,9 @@ export default function OrdersScreen() {
   const [expandedMaterials, setExpandedMaterials] = useState<MaterialRecord[]>([]);
   const [expandedBatchKeys, setExpandedBatchKeys] = useState<Set<string>>(new Set());
   const currentMaterialGroups = useMemo(() => groupOrderMaterials(currentOrderMaterials), [currentOrderMaterials]);
-  const expandedMaterialGroups = useMemo(() => groupOrderMaterials(expandedMaterials), [expandedMaterials]);
+  const expandedMaterialGroups = useMemo(() => groupOrderMaterials(batchKeyword
+    ? expandedMaterials.filter(material => normalizeOrderBatch(material.batch) === batchKeyword)
+    : expandedMaterials), [batchKeyword, expandedMaterials]);
   const [expandedMaterialsLoadingId, setExpandedMaterialsLoadingId] = useState<string | null>(null);
   const expandedOrderIdRef = useRef<string | null>(null);
 
@@ -86,7 +98,7 @@ export default function OrdersScreen() {
   const warehouseLoadRequestRef = useRef(0);
   const currentOrderRequestRef = useRef(0);
   const searchRequestRef = useRef(0);
-  const appliedTargetOrderRef = useRef('');
+  const appliedTargetRef = useRef<{ key: string; warehouseId?: string }>({ key: '' });
 
   useHardwareBack(useCallback(() => {
     if (!showWarehousePicker) return false;
@@ -123,7 +135,7 @@ export default function OrdersScreen() {
 
       return () => {
         screenActiveRef.current = false;
-        exportVisitRef.current += 1;
+        screenVisitRef.current += 1;
         warehouseLoadRequestRef.current += 1;
         currentOrderRequestRef.current += 1;
         searchRequestRef.current += 1;
@@ -136,21 +148,21 @@ export default function OrdersScreen() {
   const handleExportHistory = () => {
     if (exportBusyRef.current || !currentWarehouse) return;
     const warehouse = { id: currentWarehouse.id, name: currentWarehouse.name };
-    const visit = exportVisitRef.current;
+    const visit = screenVisitRef.current;
     alert.showConfirm(
       '导出历史',
       `将导出「${warehouse.name}」的全部历史出库扫码记录到电脑，不受当前搜索和日期筛选影响。仅包含本机已保存的数据。`,
       async () => {
-        if (!screenActiveRef.current || exportVisitRef.current !== visit || exportBusyRef.current) return;
+        if (!screenActiveRef.current || screenVisitRef.current !== visit || exportBusyRef.current) return;
         exportBusyRef.current = true;
         setExportingHistory(true);
         try {
           const result = await exportOutboundHistoryToComputer(warehouse);
-          if (screenActiveRef.current && exportVisitRef.current === visit) {
+          if (screenActiveRef.current && screenVisitRef.current === visit) {
             alert.showSuccess(`「${warehouse.name}」历史出库记录已导出到电脑，共 ${result.recordCount} 条\n文件：${result.fileName}`);
           }
         } catch (error) {
-          if (screenActiveRef.current && exportVisitRef.current === visit) {
+          if (screenActiveRef.current && screenVisitRef.current === visit) {
             const message = error instanceof Error ? error.message : '请检查电脑同步助手';
             alert.showError(`「${warehouse.name}」导出失败：${formatSyncErrorMessage(message)}`);
           }
@@ -165,22 +177,33 @@ export default function OrdersScreen() {
   };
 
   // 加载仓库
-  const loadWarehouses = useCallback(async (isCurrent: () => boolean): Promise<Warehouse | null> => {
+  const loadWarehouses = useCallback(async (
+    isCurrent: () => boolean,
+    preferredWarehouseId?: string
+  ): Promise<Warehouse | null> => {
     const list = await getAllWarehouses();
     if (!isCurrent()) return null;
     setWarehouses(list);
 
-    // 尝试从订单管理独立的 Storage Key 加载仓库（不与扫码出库共享）
-    const savedWarehouse = await AsyncStorage.getItem(STORAGE_KEYS.GLOBAL_WAREHOUSE);
+    // 工作台指定的仓库只用于查看单据，不改变扫码作业所用的全局仓库。
+    const preferredWarehouse = list.find(warehouse => warehouse.id === preferredWarehouseId);
+    if (preferredWarehouse) {
+      setCurrentWarehouse(preferredWarehouse);
+      return preferredWarehouse;
+    }
+
+    // 首次进入沿用作业仓库；后续查询选择只保存在查询页，不能改变出库作业。
+    const savedWarehouse = await AsyncStorage.getItem(STORAGE_KEYS.ORDERS_WAREHOUSE)
+      || await AsyncStorage.getItem(STORAGE_KEYS.GLOBAL_WAREHOUSE);
     if (!isCurrent()) return null;
     if (savedWarehouse) {
-      const warehouse = safeJsonParseNullable<Warehouse>(savedWarehouse, 'orders.globalWarehouse');
+      const warehouse = safeJsonParseNullable<Warehouse>(savedWarehouse, 'orders.warehouse');
       // 确保仓库仍然存在
       const latestWarehouse = warehouse ? list.find((w) => w.id === warehouse.id) : null;
       if (latestWarehouse) {
         setCurrentWarehouse(latestWarehouse);
         await AsyncStorage.setItem(
-          STORAGE_KEYS.GLOBAL_WAREHOUSE,
+          STORAGE_KEYS.ORDERS_WAREHOUSE,
           JSON.stringify(latestWarehouse)
         );
         return latestWarehouse;
@@ -204,7 +227,7 @@ export default function OrdersScreen() {
       timeFilterValue = getQueryTimeFilter(timeFilter),
     }: {
       text: string;
-      type?: SearchType;
+      type?: OrderSearchType;
       warehouseId?: string;
       timeFilterValue?: QueryTimeFilterType;
     }) => {
@@ -226,22 +249,21 @@ export default function OrdersScreen() {
       timeFilterValue,
     }: {
       text: string;
-      type: SearchType;
+      type: OrderSearchType;
       warehouseId?: string;
       timeFilterValue: QueryTimeFilterType;
     }) => [warehouseId || '', timeFilterValue, type, text.trim()].join('::'),
     []
   );
 
-  const loadCurrentOrder = useCallback(async (warehouseId?: string, selectCurrentView = false) => {
+  const loadCurrentOrder = useCallback(async (warehouseId?: string) => {
     const requestId = ++currentOrderRequestRef.current;
     const isCurrent = () => screenActiveRef.current && requestId === currentOrderRequestRef.current;
     setCurrentOrderLoading(true);
-    if (selectCurrentView) setTimeFilter('current');
 
     try {
       // 查询历史订单仅切换本页展示，不能修改扫码出库的当前单和草稿。
-      const savedOrderNo = params.orderNo?.trim() ||
+      const savedOrderNo = targetOrderNo ||
         (await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_ORDER_NO))?.trim() || '';
 
       if (!isCurrent()) {
@@ -278,7 +300,7 @@ export default function OrdersScreen() {
         setCurrentOrderLoading(false);
       }
     }
-  }, [params.orderNo]);
+  }, [targetOrderNo]);
 
   const loadExpandedMaterials = useCallback(
     async (
@@ -376,7 +398,7 @@ export default function OrdersScreen() {
       if (currentExpandedId) {
         const expandedOrder = allOrdersForWarehouse.find((o) => o.id === currentExpandedId);
         if (expandedOrder) {
-          await loadExpandedMaterials(expandedOrder, { warehouseId });
+          await loadExpandedMaterials(expandedOrder, { warehouseId: expandedOrder.warehouse_id || warehouseId });
         }
       }
     } catch (error) {
@@ -398,7 +420,7 @@ export default function OrdersScreen() {
   }, []);
 
   // 搜索类型变更时重新搜索
-  const handleSearchTypeChange = useCallback((type: SearchType) => {
+  const handleSearchTypeChange = useCallback((type: OrderSearchType) => {
     setSearchType(type);
   }, []);
 
@@ -449,7 +471,7 @@ export default function OrdersScreen() {
           logger.error('搜索订单失败:', error);
         });
       },
-      searchType === 'batch' ? 220 : 120
+      searchType === 'batch' || searchType === 'trace' ? 220 : 120
     );
 
     return () => {
@@ -484,8 +506,12 @@ export default function OrdersScreen() {
       const isCurrent = () => isMounted && screenActiveRef.current && requestId === warehouseLoadRequestRef.current;
 
       const init = async () => {
-        const warehouse = await loadWarehouses(isCurrent);
+        const isNewTarget = appliedTargetRef.current.key !== targetKey;
+        const preferredWarehouseId = isNewTarget ? targetWarehouseId : appliedTargetRef.current.warehouseId;
+        const warehouse = await loadWarehouses(isCurrent, preferredWarehouseId);
         if (isCurrent()) {
+          appliedTargetRef.current = { key: targetKey, warehouseId: preferredWarehouseId };
+          if (isNewTarget && targetKey) setTimeFilter('current');
           await loadDataForWarehouseRef.current(warehouse?.id);
         }
       };
@@ -495,7 +521,7 @@ export default function OrdersScreen() {
       return () => {
         isMounted = false;
       };
-    }, [loadWarehouses])
+    }, [loadWarehouses, targetKey, targetWarehouseId])
   );
 
   // 处理仓库切换
@@ -505,6 +531,7 @@ export default function OrdersScreen() {
         setShowWarehousePicker(false);
         return;
       }
+      appliedTargetRef.current.warehouseId = undefined;
       setCurrentWarehouse(warehouse);
       setFilteredOrders([]);
       setCurrentOrder(null);
@@ -512,7 +539,7 @@ export default function OrdersScreen() {
       setShowWarehousePicker(false);
 
       // 保存到订单管理独立的 Storage Key（不与扫码出库共享）
-      void AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(warehouse));
+      void AsyncStorage.setItem(STORAGE_KEYS.ORDERS_WAREHOUSE, JSON.stringify(warehouse));
 
       // 清空展开的订单（因为仓库切换后物料列表可能为空）
       expandedMaterialsRequestRef.current += 1;
@@ -542,18 +569,6 @@ export default function OrdersScreen() {
     }
   }, [clearExpandedMaterialsTimer, currentWarehouse?.id, loadCurrentOrder, loadDataForWarehouse, setExpandedOrderId]);
 
-  // 只在首次进入或目标单号变化时选择“当前”。从物料详情返回时保留查询视图。
-  useEffect(() => {
-    const targetOrderNo = params.orderNo?.trim() || '';
-    if (!targetOrderNo) {
-      appliedTargetOrderRef.current = '';
-      return;
-    }
-    if (!currentWarehouse?.id || appliedTargetOrderRef.current === targetOrderNo) return;
-    appliedTargetOrderRef.current = targetOrderNo;
-    void loadCurrentOrder(currentWarehouse.id, true);
-  }, [params.orderNo, currentWarehouse?.id, loadCurrentOrder]);
-
   // 点击订单 - 展开/收起显示物料列表
   const handleToggleOrder = async (order: Order) => {
     if (expandedOrderIdRef.current === order.id) {
@@ -565,7 +580,19 @@ export default function OrdersScreen() {
     } else {
       setExpandedOrderId(order.id);
       setExpandedMaterials([]);
-      await loadExpandedMaterials(order, { warehouseId: currentWarehouse?.id });
+      await loadExpandedMaterials(order, { warehouseId: order.warehouse_id || currentWarehouse?.id });
+    }
+  };
+
+  const copyOrderField = async (label: '订单号' | '客户名称', value: string) => {
+    const visit = screenVisitRef.current;
+    const isCurrent = () => screenActiveRef.current && screenVisitRef.current === visit;
+    try {
+      if (!(await Clipboard.setStringAsync(value))) throw new Error('剪贴板写入失败');
+      if (isCurrent()) alert.showSuccess(`${label}已复制`);
+    } catch (error) {
+      logger.error('复制订单字段失败:', error);
+      if (isCurrent()) alert.showError('复制失败，请稍后重试');
     }
   };
 
@@ -626,9 +653,8 @@ export default function OrdersScreen() {
       </View>
       {group.batches.map(batch => {
         const expanded = expandedBatchKeys.has(batch.key);
-        const match = searchType === 'batch' && !!searchText.trim() && batch.batch.toLowerCase().includes(searchText.trim().toLowerCase());
         return <View key={batch.key}>
-          <TouchableOpacity feedback="none" style={[styles.batchRow, match && styles.batchMatch]} accessibilityRole="button"
+          <TouchableOpacity feedback="none" style={styles.batchRow} accessibilityRole="button"
             accessibilityLabel={`批次 ${batch.batch || '未填写'}，生产日期 ${batch.productionDate || '未填写'}，数量 ${batch.quantity}，${expanded ? '收起' : '展开'}扫码记录`}
             accessibilityState={{ expanded }} onPress={() => setExpandedBatchKeys(previous => {
               const next = new Set(previous);
@@ -646,56 +672,83 @@ export default function OrdersScreen() {
     </View>
   );
 
-  const renderOrderItem = ({ item: order }: { item: Order }) => (
+  const renderOrderItem = ({ item: order }: { item: Order }) => {
+    const keyword = searchType === 'trace' ? searchText.trim().toLowerCase() : '';
+    const traceMatches = keyword ? order.traceMatches?.filter(match => match.traceNo.toLowerCase().includes(keyword)) : undefined;
+    const customerName = order.customer_name?.trim();
+    const toggleOrder = () => handleToggleOrder(order);
+    return (
       <View>
-        <AnimatedCard disablePressAnimation
-          onPress={() => handleToggleOrder(order)}
-        >
+        <AnimatedCard disablePressAnimation onPress={toggleOrder}>
           <View
             style={[styles.orderItem, expandedOrderId === order.id && styles.orderItemExpanded]}
           >
             <View style={styles.orderHeader}>
               <View style={styles.orderHeaderLeft}>
                 {expandedMaterialsLoadingId === order.id ? <ActivityIndicator size="small" color={theme.primary} /> : <Feather name={expandedOrderId === order.id ? "chevron-down" : "chevron-right"} size={18} color={theme.textSecondary} />}
-                <Text style={styles.orderNo} numberOfLines={1} ellipsizeMode="tail">
-                  {order.order_no}
-                </Text>
+                <TouchableOpacity style={styles.orderNoTarget} feedback="none"
+                  accessibilityRole="button" accessibilityLabel={`订单号，${order.order_no}`}
+                  accessibilityHint="点击展开或收起，长按复制"
+                  onPress={toggleOrder} onLongPress={() => copyOrderField('订单号', order.order_no)}>
+                  <Text style={styles.orderNo} numberOfLines={1} ellipsizeMode="tail">{order.order_no}</Text>
+                </TouchableOpacity>
               </View>
               <Text style={styles.orderDate}>{formatDate(order.created_at)}</Text>
             </View>
 
             <View style={styles.orderContent}>
-              <View style={styles.orderInfo}>
-                {order.customer_name ? (
+              {customerName ? (
+                <TouchableOpacity style={styles.orderInfo} feedback="none"
+                  accessibilityRole="button" accessibilityLabel={`客户名称，${customerName}`}
+                  accessibilityHint="点击展开或收起，长按复制"
+                  onPress={toggleOrder} onLongPress={() => copyOrderField('客户名称', customerName)}>
                   <Text style={styles.customerName} numberOfLines={1}>
-                    {order.operation_type === 'sales_return' ? `销售退货 · ${order.customer_name}` : order.customer_name}
+                    {order.operation_type === 'sales_return' ? `销售退货 · ${customerName}` : customerName}
                   </Text>
-                ) : (
-                  <Text style={styles.noCustomer} numberOfLines={1}>
-                    暂无客户名称
-                  </Text>
-                )}
-              </View>
+                </TouchableOpacity>
+              ) : (
+                <View style={styles.orderInfo}>
+                  <Text style={styles.noCustomer} numberOfLines={1}>暂无客户名称</Text>
+                </View>
+              )}
             </View>
           </View>
         </AnimatedCard>
 
         {<View>{expandedOrderId === order.id && expandedMaterialsLoadingId !== order.id && (
           <View testID="order-expanded-details" style={styles.materialsList}>
-            {expandedMaterials.length === 0 ? (
+            {traceMatches?.length ? (
+              <>
+                <Text style={styles.materialDetails}>匹配的追溯码</Text>
+                {traceMatches.map(match => (
+                  <View key={JSON.stringify([match.materialId, match.traceNo])} style={styles.materialItem}>
+                    <TouchableOpacity style={styles.materialMainInfo} feedback="none" accessibilityRole="button"
+                      accessibilityLabel={`查看扫码记录，追溯码：${match.traceNo}`}
+                      onPress={() => router.push('/detail', { id: match.materialId })}>
+                      <View style={styles.materialScanRow}>
+                        <Text style={styles.materialIdentity}>{`追溯码：${match.traceNo}`}</Text>
+                        <Feather name="chevron-right" size={14} color={theme.textMuted} />
+                      </View>
+                      <Text style={styles.materialDetails}>{match.model || '未知型号'} · 批次 {match.batch || '-'}</Text>
+                    </TouchableOpacity>
+                  </View>
+                ))}
+              </>
+            ) : expandedMaterialGroups.length === 0 ? (
               <View style={styles.noMaterials}>
-                <Text style={styles.noMaterialsText}>该订单暂无物料记录</Text>
+                <Text style={styles.noMaterialsText}>{batchKeyword ? '该订单暂无匹配批次' : '该订单暂无物料记录'}</Text>
               </View>
             ) : (
               <>
-                {searchType === 'batch' && !!searchText.trim() && <Text style={styles.materialDetails}>显示本单全部批次，匹配批次已标记</Text>}
+                {!!batchKeyword && <Text style={styles.materialDetails}>仅显示批次 {searchText.trim()}</Text>}
                 {expandedMaterialGroups.map(renderMaterialGroup)}
               </>
             )}
           </View>
         )}</View>}
       </View>
-  );
+    );
+  };
 
   const renderCurrentOrderCard = () => {
     if (!currentOrder) {
@@ -709,7 +762,7 @@ export default function OrdersScreen() {
             <View style={styles.orderHeader}>
               <View style={styles.orderHeaderLeft}>
                 <Feather name="file-text" size={18} color={theme.textSecondary} />
-                <Text style={styles.orderNo} numberOfLines={1} ellipsizeMode="tail">
+                <Text style={[styles.orderNo, styles.orderNoTarget]} numberOfLines={1} ellipsizeMode="tail">
                   {currentOrder.order_no}
                 </Text>
               </View>
@@ -831,13 +884,7 @@ export default function OrdersScreen() {
             <Feather name="search" size={18} color={theme.textMuted} style={styles.searchIcon} />
             <TextInput
               style={styles.searchInput}
-              placeholder={
-                searchType === 'batch'
-                  ? '搜索批次号...'
-                  : searchType === 'customer'
-                    ? '搜索客户名称...'
-                    : '搜索订单号...'
-              }
+              placeholder={ORDER_SEARCH_OPTIONS.find(option => option.key === searchType)?.placeholder}
               placeholderTextColor={theme.textMuted}
               value={searchText}
               onChangeText={handleSearchInput}
@@ -880,77 +927,25 @@ export default function OrdersScreen() {
 
           {timeFilter !== 'current' && (
             <View style={styles.filterRow}>
-              <TouchableOpacity
-                style={[
-                  styles.searchTypeBtn,
-                  searchType === 'order' && styles.searchTypeBtnActive,
-                ]}
-                activeOpacity={0.86}
-                onPress={() => handleSearchTypeChange('order')}
-              >
-                <FontAwesome6
-                  name="file-lines"
-                  size={12}
-                  color={searchType === 'order' ? theme.buttonPrimaryText : theme.textMuted}
-                  style={styles.searchTypeBtnIcon}
-                />
-                <Text
-                  style={[
-                    styles.searchTypeText,
-                    searchType === 'order' && styles.searchTypeTextActive,
-                  ]}
-                >
-                  订单号
-                </Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[
-                  styles.searchTypeBtn,
-                  searchType === 'customer' && styles.searchTypeBtnActive,
-                ]}
-                activeOpacity={0.86}
-                onPress={() => handleSearchTypeChange('customer')}
-              >
-                <FontAwesome6
-                  name="user"
-                  size={12}
-                  color={searchType === 'customer' ? theme.buttonPrimaryText : theme.textMuted}
-                  style={styles.searchTypeBtnIcon}
-                />
-                <Text
-                  style={[
-                    styles.searchTypeText,
-                    searchType === 'customer' && styles.searchTypeTextActive,
-                  ]}
-                >
-                  客户
-                </Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[
-                  styles.searchTypeBtn,
-                  searchType === 'batch' && styles.searchTypeBtnActive,
-                ]}
-                activeOpacity={0.86}
-                onPress={() => handleSearchTypeChange('batch')}
-              >
-                <FontAwesome6
-                  name="barcode"
-                  size={12}
-                  color={searchType === 'batch' ? theme.buttonPrimaryText : theme.textMuted}
-                  style={styles.searchTypeBtnIcon}
-                />
-                <Text
-                  style={[
-                    styles.searchTypeText,
-                    searchType === 'batch' && styles.searchTypeTextActive,
-                  ]}
-                >
-                  批次
-                </Text>
-              </TouchableOpacity>
+              {ORDER_SEARCH_OPTIONS.map(option => {
+                const selected = searchType === option.key;
+                return (
+                  <TouchableOpacity
+                    key={option.key}
+                    style={[styles.searchTypeBtn, selected && styles.searchTypeBtnActive]}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected }}
+                    activeOpacity={0.86}
+                    onPress={() => handleSearchTypeChange(option.key)}
+                  >
+                    <FontAwesome6 name={option.icon} size={12}
+                      color={selected ? theme.buttonPrimaryText : theme.textMuted} style={styles.searchTypeBtnIcon} />
+                    <Text numberOfLines={1} style={[styles.searchTypeText, selected && styles.searchTypeTextActive]}>
+                      {option.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
             </View>
           )}
         </View>
@@ -1009,7 +1004,7 @@ export default function OrdersScreen() {
                 <AppEmptyState
                   icon="file-text"
                   title={searchText ? '未找到匹配订单' : '暂无订单'}
-                  description={searchText ? '请尝试其他关键词' : '扫码出库后会自动生成订单'}
+                  description={batchKeyword ? '请核对完整批次号' : searchText ? '请尝试其他关键词' : '扫码出库后会自动生成订单'}
                   style={styles.emptyContainer}
                 />
               }

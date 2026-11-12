@@ -11,6 +11,7 @@ import InboundRecordsScreen from '../index';
 import InventoryRecordsScreen from '@/screens/inventory-records';
 import {
   getInboundRecordsByNo, getInventoryCheckRecordsByNo,
+  getInternalLabelSpecifications,
   updateInboundDocumentSyncStatus, updateInventoryCheckDocumentSyncStatus,
   type InboundRecord, type InventoryCheckRecord,
   getInboundDocumentSummaries,
@@ -19,6 +20,7 @@ import {
 
 let mockFocusCallback: (() => void | (() => void)) | undefined;
 let mockFocusCleanup: (() => void) | undefined;
+let mockRouteParams: { documentNo?: string; warehouseId?: string } = {};
 const mockAlert = {
   showConfirm: jest.fn((_title: string, _message: string, confirm: () => void) => confirm()),
   AlertComponent: null,
@@ -32,7 +34,10 @@ jest.mock('expo-router', () => ({
     return () => { mockFocusCleanup?.(); };
   }, [callback]),
 }));
-jest.mock('@/hooks/useSafeRouter', () => ({ useSafeRouter: () => ({ back: jest.fn() }) }));
+jest.mock('@/hooks/useSafeRouter', () => ({
+  useSafeRouter: () => ({ back: jest.fn() }),
+  useSafeSearchParams: () => mockRouteParams,
+}));
 jest.mock('@/hooks/useTheme', () => {
   const theme = {};
   return { useTheme: () => ({ theme, isDark: false }) };
@@ -57,6 +62,7 @@ jest.mock('@/utils/database', () => ({
   getAllWarehouses: jest.fn(async () => [{ id: 'W1', name: '仓库 A' }, { id: 'W2', name: '仓库 B' }]),
   getInboundDocumentSummaries: jest.fn(), getInventoryCheckDocumentSummaries: jest.fn(),
   getInboundRecordsByNo: jest.fn(async () => []), getInventoryCheckRecordsByNo: jest.fn(async () => []),
+  getInternalLabelSpecifications: jest.fn(async () => new Map<string, string>()),
   deleteInboundDocument: jest.fn(async () => undefined), deleteInboundRecord: jest.fn(async () => undefined),
   deleteInventoryCheckDocument: jest.fn(async () => undefined), deleteInventoryCheckRecord: jest.fn(async () => undefined),
   updateInboundDocumentSyncStatus: jest.fn(async () => undefined), updateInventoryCheckDocumentSyncStatus: jest.fn(async () => undefined),
@@ -102,6 +108,7 @@ const refresh = async (root: TestRenderer.ReactTestRenderer) => {
 beforeEach(() => {
   jest.useFakeTimers();
   jest.clearAllMocks();
+  mockRouteParams = {};
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 });
 afterEach(() => {
@@ -321,6 +328,112 @@ describe.each(variants)('$name document request ownership', variant => {
   });
 });
 
+describe.each(variants)('$name home document shortcut', variant => {
+  let root: TestRenderer.ReactTestRenderer;
+  const no = variant.name === 'inbound' ? 'II-A' : 'PD-A';
+  const target = document('A');
+  const mount = async (rows: Row[]) => {
+    jest.mocked(variant.query).mockResolvedValue(rows);
+    jest.mocked(variant.read).mockResolvedValue([]);
+    await act(async () => { root = TestRenderer.create(<variant.Screen />); });
+  };
+  const expanded = () => list(root).props.renderItem({ item: target });
+  const isExpanded = () => {
+    const body = expanded().props.children;
+    return JSON.stringify(body).includes('document-expanded-details');
+  };
+  afterEach(async () => { if (root) await act(async () => root.unmount()); });
+
+  it('opens the exact warehouse document and places it ahead of a long list without changing other row order', async () => {
+    mockRouteParams = { documentNo: no, warehouseId: 'W1' };
+    const sameNumberInOtherWarehouse = { ...target, warehouse_id: 'W2' };
+    const newer = Array.from({ length: 15 }, (_, i) => document(`NEW-${i}`));
+    await mount([sameNumberInOtherWarehouse, ...newer, target]);
+    expect(list(root).props.data).toEqual([target, sameNumberInOtherWarehouse, ...newer]);
+    expect(variant.read).toHaveBeenCalledTimes(1);
+    expect(variant.read).toHaveBeenCalledWith(no, 'W1');
+    expect(isExpanded()).toBe(true);
+    expect(root.root.findAllByType('Notice').filter(node => node.props.visible !== false)).toHaveLength(0);
+  });
+
+  it('lets the user collapse, refresh and switch filters without reopening the shortcut', async () => {
+    mockRouteParams = { documentNo: no, warehouseId: 'W1' };
+    await mount([document('B'), target]);
+    await act(async () => { expanded().props.onPress(); });
+    expect(isExpanded()).toBe(false);
+    await refresh(root);
+    expect(isExpanded()).toBe(false);
+    expect(variant.read).toHaveBeenCalledTimes(1);
+    await changeScope(root, variant.all, variant.scopeB);
+    expect(list(root).props.data).toEqual([document('B'), target]);
+    expect(isExpanded()).toBe(false);
+    expect(variant.read).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['deleted', 'missing-warehouse'] as const)('reports a %s target once and never opens another warehouse by number', async reason => {
+    mockRouteParams = { documentNo: no, ...(reason === 'deleted' ? { warehouseId: 'W1' } : {}) };
+    const other = { ...target, warehouse_id: 'W2' };
+    await mount([other]);
+    expect(list(root).props.data).toEqual([other]);
+    expect(variant.read).not.toHaveBeenCalled();
+    const notices = () => root.root.findAllByType('Notice').filter(node => node.props.visible !== false);
+    expect(notices()).toHaveLength(1);
+    expect(notices()[0].props.text).toContain('已删除或不存在');
+    await act(async () => { jest.runOnlyPendingTimers(); });
+    await refresh(root);
+    expect(notices()).toHaveLength(0);
+    expect(variant.read).not.toHaveBeenCalled();
+  });
+
+  it('keeps ordinary menu navigation in its original order with all documents collapsed', async () => {
+    await mount([document('B'), target]);
+    expect(list(root).props.data).toEqual([document('B'), target]);
+    expect(variant.read).not.toHaveBeenCalled();
+    expect(isExpanded()).toBe(false);
+  });
+
+  it('retries locating after a summary read failure instead of reporting a missing document', async () => {
+    mockRouteParams = { documentNo: no, warehouseId: 'W1' };
+    jest.mocked(variant.query).mockRejectedValueOnce(new Error('busy'));
+    await mount([target]);
+    expect(variant.read).not.toHaveBeenCalled();
+    expect(root.root.findByType('Notice').props.text).toContain('记录加载失败');
+    await refresh(root);
+    expect(variant.read).toHaveBeenCalledWith(no, 'W1');
+    expect(isExpanded()).toBe(true);
+  });
+
+  it('does not apply an unfinished shortcut after the user has changed the filter', async () => {
+    mockRouteParams = { documentNo: no, warehouseId: 'W1' };
+    const initial = deferred<Row[]>();
+    jest.mocked(variant.query).mockImplementationOnce(() => initial.promise);
+    await mount([target]);
+    await changeScope(root, variant.all, variant.scopeB);
+    await act(async () => { initial.resolve([target]); });
+    expect(variant.read).not.toHaveBeenCalled();
+    expect(isExpanded()).toBe(false);
+  });
+
+  it('ignores late target details after changing scope and allows a failed detail read to be retried by tapping', async () => {
+    mockRouteParams = { documentNo: no, warehouseId: 'W1' };
+    jest.mocked(variant.read).mockRejectedValueOnce(new Error('busy'));
+    await mount([target]);
+    expect(isExpanded()).toBe(false);
+    await act(async () => { expanded().props.onPress(); });
+    expect(isExpanded()).toBe(true);
+    expect(variant.read).toHaveBeenCalledTimes(2);
+    await act(async () => { expanded().props.onPress(); });
+    // A new visit with an in-flight target read must respect the existing page owner guard.
+    await act(async () => root.unmount());
+    const details = deferred<never[]>();
+    jest.mocked(variant.read).mockImplementationOnce(() => details.promise);
+    await mount([target]);
+    await changeScope(root, variant.all, variant.scopeB);
+    await act(async () => { details.resolve([]); });
+    expect(isExpanded()).toBe(false);
+  });
+});
+
 
 describe.each(variants)('$name repeat document sync', variant => {
   let root: TestRenderer.ReactTestRenderer;
@@ -345,6 +458,20 @@ describe.each(variants)('$name repeat document sync', variant => {
   };
   afterEach(async () => { if (root) await act(async () => { root.unmount(); }); });
 
+  if (variant.name === 'inventory') {
+    it('uses a registered specification when resyncing an older internal label count', async () => {
+      await mount();
+      const packageKey = 'HLS:ABC123456789';
+      const specification = '川土微,CA-IS2062VW,集成隔离电源,CAN隔离器,独立逻辑电源,封装:SOIC16-WB';
+      jest.mocked(getInventoryCheckRecordsByNo).mockResolvedValue([{ ...savedRow('隔离芯片', 40), package_key: packageKey }]);
+      jest.mocked(getInternalLabelSpecifications).mockResolvedValueOnce(new Map([[packageKey, specification]]));
+      await pressSync();
+      expect(getInternalLabelSpecifications).toHaveBeenCalledWith([packageKey]);
+      const sheets = jest.mocked(syncExcelToComputer).mock.calls[0][0];
+      expect(sheets.map(sheet => sheet.rows[0][sheet.headers.indexOf('型号')])).toEqual([specification, specification]);
+    });
+  }
+
   it.each(['pending', 'success', 'failed'] as const)('allows %s documents to sync again using fresh complete records and the same filename', async status => {
     await mount(status);
     expect(button().props.disabled).toBe(false);
@@ -362,6 +489,10 @@ describe.each(variants)('$name repeat document sync', variant => {
       ? buildInboundExportFileNameFromNo('仓库 A', no)
       : buildInventoryExportFileNameFromNo('仓库 A', 'complete', no);
     expect(calls.map(call => call[6])).toEqual([fileName, fileName]);
+    expect(calls.map(call => call[7])).toEqual([
+      { warehouse: { id: 'W1', name: '仓库 A' } },
+      { warehouse: { id: 'W1', name: '仓库 A' } },
+    ]);
     expect(calls[1][1]).toBe(variant.name === 'inbound' ? '/inbound' : '/inventory');
     expect(calls[1][0]).toEqual(variant.name === 'inbound' ? buildInboundSheets(rows) : buildInventorySheets(rows.map(row => ({ ...row, account_name: '账套 A' }))));
     expect(variant.update).toHaveBeenLastCalledWith(no, 'W1', 'success', fileName, undefined);

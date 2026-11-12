@@ -6,6 +6,17 @@ import {
   inspectQRCodeRule,
   type QRCodeRule,
 } from './database';
+import { isInternalLabelInput, parseInternalLabel } from './internalLabelCode';
+
+const isCompleteInternalLabel = (content: string): boolean => {
+  if (!isInternalLabelInput(content)) return false;
+  try {
+    parseInternalLabel(content);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 
 /** 没有单独配置规则时也能识别的常用分隔符。 */
@@ -80,6 +91,7 @@ export const shouldWaitForQRCodeContinuation = (
   rules: readonly QRCodeRule[]
 ): boolean => {
   if (!content.trim()) return false;
+  if (isInternalLabelInput(content)) return !isCompleteInternalLabel(content);
   const inspections = rules
     .filter(rule => rule.separator && (rule.fieldOrder?.length ?? 0) >= 2)
     .map(rule => ({ rule, inspection: inspectQRCodeRule(content, rule) }));
@@ -105,11 +117,12 @@ export const recoverConfirmedScannerContent = (
       !content.startsWith(confirmedNativeContent)) return content;
   const usableRules = rules.filter(rule => rule.isActive !== false && rule.separator &&
     (rule.fieldOrder?.length ?? 0) >= 2);
-  if (usableRules.length === 0) return content;
   try {
-    if (usableRules.some(rule => inspectQRCodeRule(content, rule).matched)) return content;
+    const matches = (value: string) => isInternalLabelInput(value)
+      ? isCompleteInternalLabel(value) : usableRules.some(rule => inspectQRCodeRule(value, rule).matched);
+    if (matches(content)) return content;
     const nextContent = content.slice(confirmedNativeContent.length);
-    return usableRules.some(rule => inspectQRCodeRule(nextContent, rule).matched) ? nextContent : content;
+    return matches(nextContent) ? nextContent : content;
   } catch {
     // 配置或原码异常仍交由正常解析入口报告，不猜测边界。
     return content;
@@ -126,6 +139,7 @@ export const isQRCode = (
   }
 
   const trimmed = content.trim();
+  if (isInternalLabelInput(trimmed)) return true;
 
   if (detectBracketFormat(trimmed)) {
     return true;

@@ -16,15 +16,20 @@ export const updateNotes = (manifest: unknown): string => {
   const value = (wrapper?.manifest || manifest) as { extra?: { warehouseUpdate?: { notes?: string } } } | undefined;
   return value?.extra?.warehouseUpdate?.notes || '';
 };
-type PendingState = { isUpdatePending: boolean; downloadedUpdate?: { type?: string; updateId?: string; createdAt?: Date; manifest?: unknown }; currentlyRunning?: { updateId?: string; createdAt?: Date } };
+type UpdateIdentity = { updateId?: string | null; createdAt?: Date | null };
+const isCurrentOrOlderUpdate = (candidate: UpdateIdentity, running: UpdateIdentity): boolean => {
+  if (candidate.updateId && candidate.updateId === running.updateId) return true;
+  return Boolean(candidate.createdAt && running.createdAt && candidate.createdAt.getTime() <= running.createdAt.getTime());
+};
+
+type PendingState = { isUpdatePending: boolean; downloadedUpdate?: { type?: string; updateId?: string; createdAt?: Date; manifest?: unknown }; currentlyRunning?: UpdateIdentity };
 export function getPendingOtaUpdate(state: PendingState) {
   const pending = state.downloadedUpdate;
   if (!state.isUpdatePending || !pending?.updateId || pending.type === 'rollback') return null;
-  const runningId = state.currentlyRunning?.updateId || Updates.updateId;
-  if (pending.updateId === runningId) return null;
-  const runningDate = state.currentlyRunning?.createdAt || Updates.createdAt;
-  if (pending.createdAt && runningDate && pending.createdAt.getTime() <= runningDate.getTime()) return null;
-  return pending;
+  return isCurrentOrOlderUpdate(pending, {
+    updateId: state.currentlyRunning?.updateId || Updates.updateId,
+    createdAt: state.currentlyRunning?.createdAt || Updates.createdAt,
+  }) ? null : pending;
 }
 let noticeQueue: Promise<unknown> = Promise.resolve();
 export function claimOtaNotice(kind: 'ready' | 'applied', id: string): Promise<boolean> {
@@ -58,10 +63,10 @@ export function downloadOtaUpdate(): Promise<'downloaded' | 'latest'> {
     checking = (async () => {
       const result = await Updates.checkForUpdateAsync();
       if (result.isAvailable) {
-        const id = (result.manifest as { id?: string } | undefined)?.id;
-        // A self-hosted server may return the currently running manifest again.
-        // Never re-fetch it or treat it as another pending update.
-        if (id && id === Updates.updateId) return 'latest' as const;
+        const manifest = result.manifest as { id?: string; createdAt?: string } | undefined;
+        const candidate = { updateId: manifest?.id, createdAt: manifest?.createdAt ? new Date(manifest.createdAt) : undefined };
+        // The native launch timestamp is available even with empty app storage.
+        if (isCurrentOrOlderUpdate(candidate, Updates)) return 'latest' as const;
         await Updates.fetchUpdateAsync(); return 'downloaded' as const;
       }
       if (Updates.runtimeVersion) {

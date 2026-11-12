@@ -603,6 +603,24 @@ const editSavedRule = async (rule: database.QRCodeRule) => {
     .some(text => text.props.children === rule.name))!.props.onPress(); });
 };
 
+it('lets the operator choose the fields already defined by this rule for package recognition', async () => {
+  const rule: database.QRCodeRule = { id: 'packaging', name: '包装规则', description: '', separator: '/',
+    fieldOrder: ['model', 'ignore:1', 'batch', 'quantity', 'sourceNo'], packagingFields: ['sourceNo'],
+    isActive: true, created_at: '', updated_at: '' };
+  await editSavedRule(rule);
+  await press('包装识别');
+  const options = root.root.findAllByType(TouchableOpacity).filter(item => item.props.accessibilityRole === 'checkbox');
+  expect(options.map(item => item.props.accessibilityLabel)).toEqual(['型号', '批次', '数量', '箱号']);
+  expect(button('箱号').props.accessibilityState.checked).toBe(true);
+  await press('型号');
+  await press('批次');
+  await press('完成设置');
+  await act(async () => { await root.root.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(database.updateRule).toHaveBeenCalledWith('packaging', expect.objectContaining({
+    packagingFields: ['sourceNo', 'model', 'batch'],
+  }));
+});
+
 it('saves SF and OS alternatives from the real editor and matches only the model beginning', async () => {
   await press('新增解析规则');
   await input('规则名称', 'SF与OS');

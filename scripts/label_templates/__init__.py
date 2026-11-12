@@ -9,6 +9,7 @@ from .wch import build_native_wch_label
 from .dongwei import build_native_dongwei_label
 from .rongpai import build_native_rongpai_label
 from .linearin import build_native_linearin_label
+from .renmao import build_native_renmao_label
 from .common import (
     NATIVE_LABEL_COPIES,
     NATIVE_LABEL_FIELD_HEADERS,
@@ -22,6 +23,7 @@ from .registry import (
     NATIVE_LABEL_TEMPLATE_DONGWEI,
     NATIVE_LABEL_TEMPLATE_RONGPAI,
     NATIVE_LABEL_TEMPLATE_LINEARIN,
+    NATIVE_LABEL_TEMPLATE_RENMAO,
     NATIVE_LABEL_TEMPLATE_BY_SUPPLIER,
     NATIVE_LABEL_TEMPLATE_GEEHY,
     NATIVE_LABEL_TEMPLATE_LEADCORE,
@@ -41,6 +43,7 @@ __all__ = [
     'NATIVE_LABEL_TEMPLATE_DONGWEI',
     'NATIVE_LABEL_TEMPLATE_RONGPAI',
     'NATIVE_LABEL_TEMPLATE_LINEARIN',
+    'NATIVE_LABEL_TEMPLATE_RENMAO',
     'NATIVE_LABEL_TEMPLATE_BY_SUPPLIER',
     'NATIVE_LABEL_TEMPLATE_GEEHY',
     'NATIVE_LABEL_TEMPLATE_LEADCORE',
@@ -53,6 +56,7 @@ __all__ = [
     'build_native_dongwei_label',
     'build_native_rongpai_label',
     'build_native_linearin_label',
+    'build_native_renmao_label',
     'build_native_label',
     'build_native_unpack_time_label',
     'build_native_text_bitmap',
