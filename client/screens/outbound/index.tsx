@@ -1780,6 +1780,8 @@ export default function PDAScanScreen() {
         return new Map<string, string>();
       })
       : new Map<string, string>();
+    // Only share lookups within this restore. A later restore must see binding edits.
+    const bindingLookups = new Map<string, Promise<string | null>>();
     // 加载全部数据用于聚合，显示时限制10行
     const materials = await Promise.all(
       list.slice().map(async (material) => {
@@ -1789,9 +1791,15 @@ export default function PDAScanScreen() {
         }
 
         try {
+          const key = JSON.stringify([item.model, item.version]);
+          let lookup = bindingLookups.get(key);
+          if (!lookup) {
+            lookup = getInventoryCodeByModel(item.model, item.version);
+            bindingLookups.set(key, lookup);
+          }
           return {
             ...item,
-            inventoryCode: ((await getInventoryCodeByModel(item.model, item.version)) || '').trim(),
+            inventoryCode: ((await lookup) || '').trim(),
           };
         } catch (error) {
           logger.warn('[loadOrderMaterials] 补齐存货编码失败:', {
@@ -2036,9 +2044,9 @@ export default function PDAScanScreen() {
             const isSwitchingOrder =
               !isSameOrder && normalizeOrderNoCandidate(activeOrderNo).length > 0;
             ensureCurrent();
-            // 新单已有 ERP 客户时直接显示；本地头记录只用于缺失客户的兼容回退。
+            // ERP 或缓存已有客户时直接显示；本地头记录仅用于缺失客户的兼容回退。
             // 后续 upsert 和历史物料恢复仍完整执行，未完成前不允许开始保存物料。
-            const existing = !fromCache && voucher.customerName.trim()
+            const existing = voucher.customerName.trim()
               ? null
               : await getOrder(normalizedOrderCode, matchedWarehouse.id);
             ensureCurrent();
@@ -2070,11 +2078,13 @@ export default function PDAScanScreen() {
                 ? AsyncStorage.setItem(STORAGE_KEYS.GLOBAL_WAREHOUSE, JSON.stringify(matchedWarehouse))
                   .then(() => ({ ok: true as const }), () => ({ ok: false as const }))
                 : Promise.resolve({ ok: true as const }),
-              upsertSaleDispatchOrder(normalizedOrderCode, nextCustomerName, {
+              // Cached metadata is only a preview. Persist once after the same
+              // in-flight live request verifies it; keep the last verified draft meanwhile.
+              fromCache ? Promise.resolve() : upsertSaleDispatchOrder(normalizedOrderCode, nextCustomerName, {
                 id: matchedWarehouse.id,
                 name: matchedWarehouse.name,
               }, voucher),
-              saveOutboundWorkDraft(
+              fromCache ? Promise.resolve() : saveOutboundWorkDraft(
                 normalizedOrderCode,
                 nextCustomerName,
                 matchedWarehouse,

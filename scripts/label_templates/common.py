@@ -86,6 +86,9 @@ def get_native_label_records(workbook):
         }
         if get_value(row, NATIVE_LABEL_SOURCE_HEADERS['source_qr']):
             record.update({key: get_value(row, header) for key, header in NATIVE_LABEL_SOURCE_HEADERS.items()})
+        field_count = get_value(row, '二维码段数')
+        if field_count:
+            record['qr_field_count'] = field_count
         missing_values = [
             label for label, key in NATIVE_LABEL_REQUIRED_VALUES if not record[key]
         ]

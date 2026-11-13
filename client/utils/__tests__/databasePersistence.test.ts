@@ -52,6 +52,20 @@ const receipt = { ...common, id: 'RECEIPT', inbound_no: 'II-TEST', scan_model: '
 const material = { ...common, id: 'OUT', order_no: 'IO-2026-09-10-01', model: 'DEMO', traceNo: 'T-ORIGINAL',
   operation_type: 'outbound' as const, raw_content: 'DEMO/LOT-A/2500/T-ORIGINAL', scanned_at: '2026-09-10T01:00:00Z' };
 
+const retiredPlaceholderTables = () => sqlite.prepare(
+  "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('规则占位字段', 'custom_fields') ORDER BY name",
+).all();
+const createLegacyPlaceholderTables = () => {
+  for (const table of ['规则占位字段', 'custom_fields']) {
+    sqlite.exec(`CREATE TABLE IF NOT EXISTS [${table}] (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, required INTEGER DEFAULT 0,
+      options TEXT, sort_order INTEGER DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+    sqlite.prepare(`INSERT OR REPLACE INTO [${table}]
+      (id, name, type, required, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run('old', 'Legacy placeholder', 'text', 0, 1, 'created', 'updated');
+  }
+};
+
 beforeAll(async () => {
   Object.defineProperty(Platform, 'OS', { configurable: true, value: 'android' });
   database = require('../database');
@@ -60,6 +74,16 @@ beforeAll(async () => {
 afterAll(() => {
   sqlite.close();
   if (originalPlatform) Object.defineProperty(Platform, 'OS', originalPlatform);
+});
+
+it('initializes new databases without the retired placeholder definitions and still reports configuration counts', async () => {
+  expect(retiredPlaceholderTables()).toEqual([]);
+  const stats = await database.getConfigStats();
+  expect(stats).toMatchObject({ customFields: 0, rules: expect.any(Number), warehouses: expect.any(Number) });
+  expect(stats.rules).toBeGreaterThan(0);
+  const backup = await database.exportBackupData();
+  expect(backup.customFields).toEqual([]);
+  expect(backup.stats?.customFields).toBe(0);
 });
 
 it('persists internal labels, checks their revision and keeps equal-quantity packs distinct across warehouses', async () => {
@@ -404,6 +428,10 @@ it('supports a full Dongwei box split without allocating a zero-quantity child',
   const split = await database.saveUnpackOperation(params);
   expect(await database.saveUnpackOperation(params)).toEqual(split);
   expect(split.shippedRecord).toMatchObject({ new_sourceNo: '1-4-1', new_quantity: '2000', package_supplier: supplier });
+  expect(split.shippedRecord).toMatchObject({
+    qr_field_count: 7,
+    source_qr: `${model};1009UN;PDFN3.3*3.3;70I0BH6770001;2000;G36PE01N;1-4-1;`,
+  });
   expect(split.shippedRecord.package_key).toBeTruthy();
   expect(split.remainingRecord).toMatchObject({ new_quantity: '0', new_traceNo: '' });
   expect(split.remainingRecord.new_sourceNo).toBeNull();
@@ -413,6 +441,146 @@ it('supports a full Dongwei box split without allocating a zero-quantity child',
   // Keep both audit rows for the task pair; only submission omits the empty remainder.
   expect(sheet.rows).toHaveLength(2);
   expect(sheet.rows[0][sheet.headers.indexOf('箱号')]).toBe('1-4-1');
+});
+
+const makeDongweiSplitFixture = async (
+  suffix: string,
+  options: { fieldCount: 6 | 7; trailingSeparator?: boolean; sourceNo?: string; omitRuleId?: boolean },
+) => {
+  const supplier = '苏州东微半导体股份有限公司';
+  const model = `SFS10R03UGNF${suffix ? '-' + suffix : ''}`;
+  const inventoryCode = `DONGWEI-SPLIT-${suffix || 'SIX-SAMPLE'}`;
+  const fieldOrder = ['model', 'version', 'package', 'batch', 'quantity', 'productionDate',
+    ...(options.fieldCount === 7 ? ['sourceNo'] : [])];
+  const ruleId = await database.addRule({
+    name: inventoryCode, description: '', separator: ';', isActive: true,
+    fieldOrder, packagingFields: options.fieldCount === 7 ? ['model', 'batch', 'sourceNo'] : [],
+    matchConditions: [{ fieldIndex: 0, operator: 'equals', keyword: model }],
+    ...(options.trailingSeparator ? { terminator: ';' } : {}),
+  });
+  await database.addInventoryBinding({ scan_model: model, version: 'SFS10R03UGN', inventory_code: inventoryCode, supplier });
+  const rule = (await database.getRuleById(ruleId))!;
+  const raw = [model, 'SFS10R03UGN', 'PDFN5*6', '75FAFL-444401', '5000', 'G23HD03N',
+    ...(options.fieldCount === 7 ? [options.sourceNo || ''] : [])].join(';') + (options.trailingSeparator ? ';' : '');
+  const fields = database.parseWithRule(raw, rule).standardFields;
+  const scan = { ...material, ...fields, id: `${inventoryCode}-MATERIAL`, order_no: `${inventoryCode}-ORDER`,
+    model, quantity: 5000, traceNo: '', sourceNo: options.sourceNo || '', inventory_code: inventoryCode,
+    raw_content: raw, rule_id: options.omitRuleId ? undefined : ruleId,
+    package_key: buildPackageKey(rule, fields, database.FIELD_LABELS) };
+  const params = { material: scan, createMaterial: { material: scan, customerName: '客户 A', warehouse },
+    shippedQuantity: 2000, remainingQuantity: 3000, newTraceNo: '', operationId: `${inventoryCode}-PAIR` };
+  return { supplier, rule, raw, scan, params };
+};
+
+it.each([false, true])('persists six-field Dongwei split codes without inventing box identities (trailing separator=%s)', async trailingSeparator => {
+  const fixture = await makeDongweiSplitFixture(trailingSeparator ? 'SIX-TERMINATED' : '', { fieldCount: 6, trailingSeparator });
+  expect(fixture.scan.package_key).toBeUndefined();
+  const split = await database.saveUnpackOperation(fixture.params);
+  expect(await database.saveUnpackOperation(fixture.params)).toEqual(split);
+  for (const [index, record] of [split.shippedRecord, split.remainingRecord].entries()) {
+    const quantity = index === 0 ? 2000 : 3000;
+    expect(record).toMatchObject({ qr_field_count: 6, new_quantity: String(quantity), sourceNo: '', new_traceNo: '' });
+    expect(record.source_qr).toBe(fixture.raw.replace(';5000;', `;${quantity};`));
+    expect(record.package_key).toBeFalsy();
+    expect(record.new_sourceNo).toBeFalsy();
+    expect(database.inspectQRCodeRule(record.source_qr!, fixture.rule)).toMatchObject({ matched: true });
+    expect(database.parseWithRule(record.source_qr!, fixture.rule).standardFields).toEqual({
+      model: fixture.scan.model, version: 'SFS10R03UGN', package: 'PDFN5*6', batch: '75FAFL-444401',
+      quantity: String(quantity), productionDate: 'G23HD03N',
+    });
+  }
+  await expect(database.checkMaterialExists(fixture.scan.order_no, fixture.scan.model, fixture.scan.batch,
+    '', '', '5000', warehouse.id)).resolves.toMatchObject({ material: null, isUnpacked: false });
+  await database.reinitializeDatabase();
+  const stored = await database.getUnpackPrintTaskRecords(split.pairId);
+  expect(stored.map(record => record.qr_field_count)).toEqual([6, 6]);
+  const sheet = buildUnpackLabelSheet(stored);
+  expect(sheet.rows.map(row => row[sheet.headers.indexOf('二维码段数')])).toEqual([6, 6]);
+  expect(sheet.rows.map(row => row[sheet.headers.indexOf('原始二维码')]))
+    .toEqual(stored.map(record => record.source_qr));
+});
+
+it('retains seven-field Dongwei rules with an empty box instead of treating them as six-field labels', async () => {
+  const fixture = await makeDongweiSplitFixture('SEVEN-EMPTY-BOX', { fieldCount: 7, sourceNo: '' });
+  expect(fixture.scan.package_key).toBeUndefined();
+  const split = await database.saveUnpackOperation(fixture.params);
+  for (const record of [split.shippedRecord, split.remainingRecord]) {
+    expect(record.qr_field_count).toBe(7);
+    expect(database.inspectQRCodeRule(record.source_qr!, fixture.rule).matched).toBe(true);
+    expect(database.parseWithRule(record.source_qr!, fixture.rule).standardFields.sourceNo).toBe('');
+    expect(record.package_key).toBeFalsy();
+    expect(record.new_sourceNo).toBeFalsy();
+  }
+});
+
+it('continues Dongwei box suffix allocation while persisting the seven-field child payloads', async () => {
+  const fixture = await makeDongweiSplitFixture('SEVEN-NUMBERED', { fieldCount: 7, sourceNo: '1-4', trailingSeparator: true });
+  const split = await database.saveUnpackOperation(fixture.params);
+  const records = await database.getUnpackPrintTaskRecords(split.pairId);
+  expect(records.map(record => record.new_sourceNo)).toEqual(['1-4-1', '1-4-2']);
+  for (const record of records) {
+    expect(record.qr_field_count).toBe(7);
+    expect(record.package_key).toBeTruthy();
+    expect(record.source_qr).toBe([fixture.scan.model, 'SFS10R03UGN', 'PDFN5*6', '75FAFL-444401',
+      record.new_quantity, 'G23HD03N', record.new_sourceNo, ''].join(';'));
+    expect(database.inspectQRCodeRule(record.source_qr!, fixture.rule).matched).toBe(true);
+    expect(buildPackageKey(fixture.rule, database.parseWithRule(record.source_qr!, fixture.rule).standardFields, database.FIELD_LABELS))
+      .toBe(record.package_key);
+  }
+  expect(await database.saveUnpackOperation(fixture.params)).toEqual(split);
+});
+
+it('recognizes an older six-field Dongwei scan without a stored rule ID from its original fields', async () => {
+  const fixture = await makeDongweiSplitFixture('SIX-LEGACY', { fieldCount: 6, omitRuleId: true });
+  const split = await database.saveUnpackOperation(fixture.params);
+  expect(split.shippedRecord).toMatchObject({ qr_field_count: 6,
+    source_qr: fixture.raw.replace(';5000;', ';2000;') });
+  expect(split.remainingRecord).toMatchObject({ qr_field_count: 6,
+    source_qr: fixture.raw.replace(';5000;', ';3000;') });
+});
+
+it('recognizes the six-field Dongwei preset only through a Dongwei binding when no configured rule matches', async () => {
+  const model = 'SFS10R03UGNF-SIX-PRESET';
+  const inventoryCode = 'DONGWEI-SIX-PRESET-INV';
+  await database.addInventoryBinding({ scan_model: model, version: 'SFS10R03UGN', inventory_code: inventoryCode,
+    supplier: '苏州东微半导体股份有限公司' });
+  const raw = `${model};SFS10R03UGN;PDFN5*6;75FAFL-444401;5000;G23HD03N`;
+  const rules = await database.getAllRules();
+  const matched = await database.detectRule(raw, rules);
+  expect(matched).toMatchObject({ id: 'builtin-dongwei-six-without-box' });
+  const fields = database.parseWithRule(raw, matched!).standardFields;
+  expect(fields).toMatchObject({ model, quantity: '5000', productionDate: 'G23HD03N' });
+  expect(fields).not.toHaveProperty('sourceNo');
+  const scan = { ...material, ...fields, id: 'DONGWEI-SIX-PRESET-MATERIAL', order_no: 'DONGWEI-SIX-PRESET-ORDER',
+    model, quantity: 5000, traceNo: '', sourceNo: '', inventory_code: inventoryCode, raw_content: raw, rule_id: matched!.id };
+  const split = await database.saveUnpackOperation({ material: scan,
+    createMaterial: { material: scan, customerName: '客户 A', warehouse },
+    shippedQuantity: 2000, remainingQuantity: 3000, newTraceNo: '', operationId: 'DONGWEI-SIX-PRESET-PAIR' });
+  expect(split.shippedRecord).toMatchObject({ qr_field_count: 6, source_qr: raw.replace(';5000;', ';2000;') });
+  await expect(database.detectRule(split.shippedRecord.source_qr!, rules))
+    .resolves.toMatchObject({ id: 'builtin-dongwei-six-without-box' });
+  await database.addInventoryBinding({ scan_model: 'FOREIGN-SIX-MODEL', version: 'SFS10R03UGN',
+    inventory_code: 'FOREIGN-SIX-INV', supplier: '其他供应商' });
+  await expect(database.detectRule(raw.replace(model, 'FOREIGN-SIX-MODEL'), rules)).resolves.toBeNull();
+  await expect(database.detectRule(raw.replace(model, 'UNBOUND-SIX-MODEL'), rules)).resolves.toBeNull();
+  // Explicit configuration remains authoritative even for the same supplier/layout.
+  const configuredRuleId = await database.addRule({ name: 'Dongwei explicit six preset override', description: '',
+    separator: ';', isActive: true,
+    fieldOrder: ['model', 'version', 'package', 'batch', 'quantity', 'productionDate'],
+    matchConditions: [{ fieldIndex: 0, operator: 'equals', keyword: model }] });
+  await expect(database.detectRule(raw, await database.getAllRules())).resolves.toMatchObject({ id: configuredRuleId });
+});
+
+it('does not choose a six-field preset from conflicting legacy inventory identities for the same version', async () => {
+  const model = 'DONGWEI-LEGACY-CONFLICT';
+  await database.addInventoryBinding({ scan_model: model, version: 'V1', inventory_code: 'DONGWEI-LEGACY-A',
+    supplier: '苏州东微半导体股份有限公司' });
+  // Simulate an older case-sensitive dictionary which predates the write guards.
+  sqlite.prepare(`INSERT INTO [物料绑定] (id, scan_model, version, inventory_code, supplier, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)`).run('DONGWEI-LEGACY-DUPLICATE', model.toLowerCase(), 'v1',
+    'DONGWEI-LEGACY-B', '苏州东微半导体股份有限公司', '2026-11-13');
+  await expect(database.detectRule(`${model};V1;PDFN5*6;LOT;5000;DATE`, []))
+    .resolves.toBeNull();
 });
 
 it('preserves manual display order across restart, editing, and configuration restore without changing detection', async () => {
@@ -531,6 +699,10 @@ it('round-trips local ignored fields and condition operators through SQLite and 
 });
 
 it('migrates stored legacy rules atomically, keeps metadata and is idempotent on restart', async () => {
+  createLegacyPlaceholderTables();
+  const definitions = () => ['规则占位字段', 'custom_fields'].map(table =>
+    sqlite.prepare(`SELECT * FROM [${table}] ORDER BY id`).all());
+  const previousDefinitions = definitions();
   const insert = sqlite.prepare(`INSERT INTO [扫码解析规则]
     (id,name,separator,field_order,custom_field_ids,field_prefixes,match_conditions,is_active,created_at,updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
@@ -544,6 +716,7 @@ it('migrates stored legacy rules atomically, keeps metadata and is idempotent on
   try {
     await expect(database.reinitializeDatabase()).rejects.toThrow('Simulated migration failure');
     expect(raw()).toEqual(before);
+    expect(definitions()).toEqual(previousDefinitions);
   } finally {
     mockMigrationFailureId = '';
     await database.reinitializeDatabase();
@@ -562,8 +735,10 @@ it('migrates stored legacy rules atomically, keeps metadata and is idempotent on
   });
   const migrated = raw();
   expect(migrated.every(row => row.custom_field_ids === '[]' && !String(row.field_order).includes('custom:'))).toBe(true);
+  expect(retiredPlaceholderTables()).toEqual([]);
   await database.reinitializeDatabase();
   expect(raw()).toEqual(migrated);
+  expect(retiredPlaceholderTables()).toEqual([]);
 });
 
 it('restores old backups and legacy add/update inputs as ignored segments without global definitions', async () => {
@@ -586,11 +761,44 @@ it('restores old backups and legacy add/update inputs as ignored segments withou
   const exported = await database.exportBackupData();
   expect(exported.rules.every(rule => rule.displayOrder === undefined)).toBe(true);
   expect(exported.customFields).toEqual([]);
+  expect(retiredPlaceholderTables()).toEqual([]);
+  expect(await database.getConfigStats()).toMatchObject({ customFields: 0, rules: 2 });
   expect(exported.rules.every(rule => !rule.fieldOrder.some(field => field.startsWith('custom:')))).toBe(true);
   const id = await database.addRule({ ...base, name: 'Legacy add input', fieldOrder: ['model', 'custom:absent', 'quantity'] });
   expect((await database.getRuleById(id))?.fieldOrder).toEqual(['model', 'ignore:1', 'quantity']);
   await database.updateRule(id, { fieldOrder: ['model', 'quantity'], customFieldIds: ['absent'] });
   expect((await database.getRuleById(id))?.fieldOrder).toEqual(['model', 'quantity', 'ignore:1']);
+});
+
+it('retires only placeholder definitions while preserving historical custom values across restart and configuration restore', async () => {
+  const values = { old: 'PO:historical value', other: 'unchanged' };
+  const outgoing = { ...material, id: 'RETIRED-DEFINITIONS-OUT', order_no: 'RETIRED-DEFINITIONS-OUT',
+    traceNo: 'RETIRED-DEFINITIONS-OUT-TRACE', quantity: 100, customFields: values };
+  await database.addMaterialWithOrder(outgoing, undefined, warehouse);
+  await database.addInboundRecordsBatch([{ ...receipt, id: 'RETIRED-DEFINITIONS-IN',
+    inbound_no: 'RETIRED-DEFINITIONS-IN', traceNo: 'RETIRED-DEFINITIONS-IN-TRACE', customFields: values }]);
+  const countId = await database.addInventoryCheckRecord({ ...common, check_no: 'RETIRED-DEFINITIONS-COUNT',
+    scan_model: 'DEMO', check_type: 'whole', check_date: '2026-11-13',
+    traceNo: 'RETIRED-DEFINITIONS-COUNT-TRACE', customFields: values });
+  const returned = await database.saveSalesReturnWithOrder({ material: { ...outgoing,
+    id: 'RETIRED-DEFINITIONS-RETURN', order_no: 'RETIRED-DEFINITIONS-RETURN',
+    customer_name: 'Historical customer', traceNo: 'RETIRED-DEFINITIONS-UNKNOWN-TRACE' }, requiredQuantity: 100 });
+  const records = [
+    ['出库明细', outgoing.id], ['入库记录', 'RETIRED-DEFINITIONS-IN'],
+    ['盘点记录', countId], ['销售退货记录', returned.id],
+  ];
+  const historicalValues = () => records.map(([table, id]) =>
+    sqlite.prepare(`SELECT customFields FROM [${table}] WHERE id = ?`).get(id));
+  const before = historicalValues();
+  expect(before).toEqual(records.map(() => ({ customFields: JSON.stringify(values) })));
+  createLegacyPlaceholderTables();
+  await database.reinitializeDatabase();
+  expect(retiredPlaceholderTables()).toEqual([]);
+  expect(historicalValues()).toEqual(before);
+  const backup = await database.exportBackupData();
+  expect(await database.importBackupData(backup)).toMatchObject({ success: true });
+  expect(historicalValues()).toEqual(before);
+  expect(retiredPlaceholderTables()).toEqual([]);
 });
 
 it('removes only retired ledger tables on upgrade and preserves scanned business fields', async () => {
@@ -800,6 +1008,23 @@ it('reports exact, generic and missing inventory bindings while keeping existing
   expect(await database.getInventoryCodeByModel('MATCH-DEMO', 'V2')).toBe('MATCH-GENERIC');
   expect(await database.getInventoryBindingMatchByModel('MATCH-MISSING', 'V2'))
     .toEqual({ inventoryCode: null, matchKind: 'none' });
+});
+
+it('accepts full database backups with or without the retired placeholder table', async () => {
+  expect(retiredPlaceholderTables()).toEqual([]);
+  await expect(database.validateRestoredDatabaseSchema(mockAdapter as unknown as SQLiteDatabase))
+    .resolves.toBeUndefined();
+  createLegacyPlaceholderTables();
+  try {
+    await expect(database.validateRestoredDatabaseSchema(mockAdapter as unknown as SQLiteDatabase))
+      .resolves.toBeUndefined();
+    await database.reinitializeDatabase();
+    expect(retiredPlaceholderTables()).toEqual([]);
+    await expect(database.validateRestoredDatabaseSchema(mockAdapter as unknown as SQLiteDatabase))
+      .resolves.toBeUndefined();
+  } finally {
+    sqlite.exec('DROP TABLE IF EXISTS [规则占位字段]; DROP TABLE IF EXISTS custom_fields');
+  }
 });
 
 it('accepts a valid older native backup without the optional print task table', async () => {

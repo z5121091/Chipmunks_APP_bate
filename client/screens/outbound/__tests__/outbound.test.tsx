@@ -1681,8 +1681,8 @@ it('starts the cached order live query while local restoration is still pending 
   jest.mocked(fetchSaleDispatchVoucher).mockResolvedValueOnce(voucher(100, secondNo));
   await scan(secondNo);
   jest.mocked(database.getMaterialsByOrder).mockResolvedValue([historical(3000)]);
-  let finishLocalRestore!: (value: null) => void;
-  jest.mocked(database.getOrder).mockImplementationOnce(() => new Promise(resolve => { finishLocalRestore = resolve; }));
+  let finishLocalRestore!: (value: database.MaterialRecord[]) => void;
+  jest.mocked(database.getMaterialsByOrder).mockImplementationOnce(() => new Promise(resolve => { finishLocalRestore = resolve; }));
   // Force the cache to win; live ERP still completes while local restoration waits.
   jest.mocked(fetchSaleDispatchVoucher).mockImplementationOnce(() =>
     new Promise(resolve => { setTimeout(() => resolve(voucher(4000)), 0); }));
@@ -1692,10 +1692,11 @@ it('starts the cached order live query while local restoration is still pending 
 
   expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(3);
   expect(jest.mocked(fetchSaleDispatchVoucher).mock.calls.at(-1)?.[2]).toEqual({ bypassCache: true });
-  expect(root.root.findByType(FlatList).props.data[0].requiredQuantity).toBe(100);
+  expect(root.root.findByType(FlatList).props.data[0].requiredQuantity).toBe(3000);
+  expect(root.root.findByType(WarehouseScanInput).props.processing).toBe(true);
   expect(feedbackOutboundOrderReady).not.toHaveBeenCalled();
 
-  await act(async () => { finishLocalRestore(null); });
+  await act(async () => { finishLocalRestore([historical(3000)]); });
   await tick();
   expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(3);
   expect(root.root.findByType(FlatList).props.data[0]).toMatchObject({
@@ -1709,8 +1710,10 @@ it('handles an early cached live-query rejection without accepting the old cache
   const secondNo = 'IO-2026-09-06-002';
   jest.mocked(fetchSaleDispatchVoucher).mockResolvedValueOnce(voucher(100, secondNo));
   await scan(secondNo);
-  let finishLocalRestore!: (value: null) => void;
-  jest.mocked(database.getOrder).mockImplementationOnce(() => new Promise(resolve => { finishLocalRestore = resolve; }));
+  const previousDraft = await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT);
+  const previousOrderWrites = jest.mocked(database.upsertOrder).mock.calls.length;
+  let finishLocalRestore!: (value: database.MaterialRecord[]) => void;
+  jest.mocked(database.getMaterialsByOrder).mockImplementationOnce(() => new Promise(resolve => { finishLocalRestore = resolve; }));
   // This case specifically exercises a cached result followed by failed verification.
   jest.mocked(fetchSaleDispatchVoucher).mockImplementationOnce(() =>
     new Promise((_, reject) => { setTimeout(() => reject(new Error('ERP temporarily unavailable')), 0); }));
@@ -1719,7 +1722,7 @@ it('handles an early cached live-query rejection without accepting the old cache
   await scan(no);
   expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(3);
   expect(feedbackOutboundOrderReady).not.toHaveBeenCalled();
-  await act(async () => { finishLocalRestore(null); });
+  await act(async () => { finishLocalRestore([historical(3000)]); });
   await tick();
   await scan('Model A/100');
 
@@ -1727,6 +1730,8 @@ it('handles an early cached live-query rejection without accepting the old cache
   expect(feedbackOutboundOrderReady).not.toHaveBeenCalled();
   expect(database.addMaterialWithOrder).not.toHaveBeenCalled();
   expect(feedbackError).toHaveBeenCalledWith('订单未核验，请重新扫描订单');
+  expect(database.upsertOrder).toHaveBeenCalledTimes(previousOrderWrites);
+  expect(await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT)).toBe(previousDraft);
 });
 
 it('does not apply a prefetched cached query when local restoration finishes after leaving the page', async () => {
@@ -1734,18 +1739,22 @@ it('does not apply a prefetched cached query when local restoration finishes aft
   const secondNo = 'IO-2026-09-06-002';
   jest.mocked(fetchSaleDispatchVoucher).mockResolvedValueOnce(voucher(100, secondNo));
   await scan(secondNo);
-  let finishLocalRestore!: (value: null) => void;
-  jest.mocked(database.getOrder).mockImplementationOnce(() => new Promise(resolve => { finishLocalRestore = resolve; }));
+  const previousDraft = await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT);
+  const previousOrderWrites = jest.mocked(database.upsertOrder).mock.calls.length;
+  let finishLocalRestore!: (value: database.MaterialRecord[]) => void;
+  jest.mocked(database.getMaterialsByOrder).mockImplementationOnce(() => new Promise(resolve => { finishLocalRestore = resolve; }));
   jest.mocked(fetchSaleDispatchVoucher).mockImplementationOnce(() =>
     new Promise(resolve => { setTimeout(() => resolve(voucher(4000)), 0); }));
   jest.mocked(feedbackOutboundOrderReady).mockClear();
   await scan(no);
 
   await act(async () => { mockScreenFocused = false; root.update(<PDAScanScreen />); });
-  await act(async () => { finishLocalRestore(null); });
+  await act(async () => { finishLocalRestore([historical(3000)]); });
   await tick();
   expect(feedbackOutboundOrderReady).not.toHaveBeenCalled();
-  expect(root.root.findByType(FlatList).props.data[0].requiredQuantity).toBe(100);
+  expect(root.root.findByType(FlatList).props.data[0].requiredQuantity).toBe(3000);
+  expect(database.upsertOrder).toHaveBeenCalledTimes(previousOrderWrites);
+  expect(await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT)).toBe(previousDraft);
 });
 
 it('does not restart verification freshness when a prefetched response waits beyond the verification window for local restoration', async () => {
@@ -1754,25 +1763,141 @@ it('does not restart verification freshness when a prefetched response waits bey
   jest.mocked(fetchSaleDispatchVoucher).mockResolvedValueOnce(voucher(100, secondNo));
   await scan(secondNo);
   const orderWritesBefore = jest.mocked(database.upsertOrder).mock.calls.length;
+  const previousDraft = await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT);
   jest.mocked(database.getMaterialsByOrder).mockResolvedValue([historical(3000)]);
-  let finishLocalRestore!: (value: null) => void;
-  jest.mocked(database.getOrder).mockImplementationOnce(() => new Promise(resolve => { finishLocalRestore = resolve; }));
+  let finishLocalRestore!: (value: database.MaterialRecord[]) => void;
+  jest.mocked(database.getMaterialsByOrder).mockImplementationOnce(() => new Promise(resolve => { finishLocalRestore = resolve; }));
   jest.mocked(fetchSaleDispatchVoucher).mockImplementationOnce(() =>
     new Promise(resolve => { setTimeout(() => resolve(voucher(3000)), 0); }));
   jest.mocked(feedbackOutboundOrderReady).mockClear();
   await scan(no);
   await tick(OUTBOUND_VERIFICATION_TTL_MS);
-  await act(async () => { finishLocalRestore(null); });
+  await act(async () => { finishLocalRestore([historical(3000)]); });
   await tick();
 
   expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(3);
-  // 缓存恢复阶段写一次；过期实时结果不能再应用或改写订单元数据。
-  expect(database.upsertOrder).toHaveBeenCalledTimes(orderWritesBefore + 1);
+  // 预览不落盘；过期实时结果不能改写订单元数据或最后已确认的草稿。
+  expect(database.upsertOrder).toHaveBeenCalledTimes(orderWritesBefore);
+  expect(await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT)).toBe(previousDraft);
   expect(feedbackOutboundOrderReady).not.toHaveBeenCalled();
   expect(feedbackOutboundOrderComplete).not.toHaveBeenCalled();
   expect(database.addMaterialWithOrder).not.toHaveBeenCalled();
   expect(feedbackError).toHaveBeenCalledWith('订单加载失败，请查看提示');
 });
+
+it.each(['IO-2026-11-12-01', 'IO-2026-11-12-001'])(
+  'previews cached %s without redundant header reads or writes and persists the live result once', async orderNo => {
+    const account = getErpAccountByOutboundOrderNo(orderNo)!;
+    const nextNo = `IO-2026-11-12-${'2'.padStart(account.sequenceLength, '0')}`;
+    jest.mocked(fetchSaleDispatchVoucher).mockResolvedValueOnce(voucher(3000, orderNo));
+    await scan(orderNo);
+    jest.mocked(fetchSaleDispatchVoucher).mockResolvedValueOnce(voucher(100, nextNo));
+    await scan(nextNo);
+    const confirmedDraft = await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT);
+    let finishVerification!: (value: ReturnType<typeof voucher>) => void;
+    jest.mocked(fetchSaleDispatchVoucher).mockClear().mockImplementationOnce(
+      () => new Promise(resolve => { finishVerification = resolve; }),
+    );
+    jest.mocked(database.getOrder).mockClear();
+    jest.mocked(database.upsertOrder).mockClear();
+    jest.mocked(AsyncStorage.multiSet).mockClear();
+    jest.mocked(feedbackOutboundOrderReady).mockClear();
+    jest.mocked(feedbackOutboundOrderComplete).mockClear();
+    const draftWrites = () => jest.mocked(AsyncStorage.multiSet).mock.calls.filter(([entries]) =>
+      entries.some(([key]) => key === STORAGE_KEYS.OUTBOUND_WORK_DRAFT));
+
+    await scan(orderNo);
+    expect(summaryValue('order')).toBe(orderNo);
+    expect(root.root.findByType(WarehouseScanInput).props.processing).toBe(true);
+    expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(1);
+    expect(database.getOrder).not.toHaveBeenCalled();
+    expect(database.upsertOrder).not.toHaveBeenCalled();
+    expect(draftWrites()).toHaveLength(0);
+    expect(await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT)).toBe(confirmedDraft);
+    expect(feedbackOutboundOrderReady).not.toHaveBeenCalled();
+    expect(feedbackOutboundOrderComplete).not.toHaveBeenCalled();
+
+    const fresh = { ...voucher(4000, orderNo), customerName: 'Refreshed customer' };
+    await act(async () => { finishVerification(fresh); });
+    await tick();
+    expect(database.getOrder).not.toHaveBeenCalled();
+    expect(database.upsertOrder).toHaveBeenCalledTimes(1);
+    expect(database.upsertOrder).toHaveBeenCalledWith(orderNo, fresh.customerName,
+      expect.objectContaining({ name: account.expectedWarehouseName }));
+    expect(draftWrites()).toHaveLength(1);
+    expect(JSON.parse((await AsyncStorage.getItem(STORAGE_KEYS.OUTBOUND_WORK_DRAFT))!))
+      .toMatchObject({ orderNo, customerName: fresh.customerName });
+    expect(root.root.findByType(WarehouseScanInput).props.processing).toBe(false);
+    expect(feedbackOutboundOrderReady).toHaveBeenCalledTimes(1);
+    expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(1);
+  },
+);
+
+it('shares missing-code lookups by model and version within a 30-record restore, then reloads binding edits', async () => {
+  const records = Array.from({ length: 30 }, (_, index) => ({
+    ...historical(100), id: `restore-${index}`, inventory_code: '', version: index % 2 ? 'V1' : 'V2',
+  }));
+  jest.mocked(database.getMaterialsByOrder).mockResolvedValue(records);
+  jest.mocked(database.getInventoryCodeByModel).mockClear().mockResolvedValue('A');
+  await scan(no);
+  expect(database.getInventoryCodeByModel).toHaveBeenCalledTimes(2);
+  expect(database.getInventoryCodeByModel).toHaveBeenCalledWith('Model A', 'V1');
+  expect(database.getInventoryCodeByModel).toHaveBeenCalledWith('Model A', 'V2');
+  expect(root.root.findByType(FlatList).props.data[0]).toMatchObject({
+    inventoryCode: 'A', scannedQuantity: 3000, status: 'complete',
+  });
+
+  jest.mocked(database.getInventoryCodeByModel).mockResolvedValue('B');
+  await scan(no);
+  expect(database.getInventoryCodeByModel).toHaveBeenCalledTimes(4);
+  expect(root.root.findByType(FlatList).props.data.find((item: { inventoryCode: string }) => item.inventoryCode === 'A'))
+    .toMatchObject({ scannedQuantity: 0 });
+  expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(1);
+});
+
+it.each([[3000, -4000, 500], [-3000, 4000, 1000]] as const)(
+  'restores the correct history when cached direction %s changes to live direction %s in the same warehouse',
+  async (cachedQuantity, liveQuantity, expectedScanned) => {
+    const outboundHistory = [historical(1000)];
+    const returnHistory: database.SalesReturnRecord[] = [{
+      ...historical(500), id: 'saved-return', operation_type: 'sales_return',
+      source_kind: 'trace_matched', source_material_ids: ['source-1'], returned_at: new Date().toISOString(),
+    }];
+    jest.mocked(database.getMaterialsByOrder).mockImplementation(async order => order === no ? outboundHistory : []);
+    jest.mocked(database.getSalesReturnsByOrder).mockImplementation(async order => order === no ? returnHistory : []);
+    jest.mocked(fetchSaleDispatchVoucher).mockResolvedValueOnce(voucher(cachedQuantity));
+    await scan(no);
+    const secondNo = 'IO-2026-09-06-002';
+    jest.mocked(fetchSaleDispatchVoucher).mockResolvedValueOnce(voucher(100, secondNo));
+    await scan(secondNo);
+    let finishVerification!: (value: ReturnType<typeof voucher>) => void;
+    jest.mocked(fetchSaleDispatchVoucher).mockClear().mockImplementationOnce(
+      () => new Promise(resolve => { finishVerification = resolve; }),
+    );
+    jest.mocked(database.getMaterialsByOrder).mockClear();
+    jest.mocked(database.getSalesReturnsByOrder).mockClear();
+    jest.mocked(feedbackOutboundOrderReady).mockClear();
+    jest.mocked(feedbackSalesReturnOrderReady).mockClear();
+    await scan(no);
+    expect(root.root.findByType(WarehouseScanInput).props.processing).toBe(true);
+    expect(feedbackOutboundOrderReady).not.toHaveBeenCalled();
+    expect(feedbackSalesReturnOrderReady).not.toHaveBeenCalled();
+    await act(async () => { finishVerification(voucher(liveQuantity)); });
+    await tick();
+
+    expect(database.getMaterialsByOrder).toHaveBeenCalledTimes(1);
+    expect(database.getSalesReturnsByOrder).toHaveBeenCalledTimes(1);
+    expect(root.root.findByType(FlatList).props.data[0]).toMatchObject({
+      requiredQuantity: Math.abs(liveQuantity), scannedQuantity: expectedScanned, status: 'partial',
+    });
+    expect(root.root.findByType(WarehouseScanInput).props.processing).toBe(false);
+    expect(liveQuantity < 0 ? feedbackSalesReturnOrderReady : feedbackOutboundOrderReady)
+      .toHaveBeenCalledWith('switched');
+    expect(fetchSaleDispatchVoucher).toHaveBeenCalledTimes(1);
+    expect(database.addMaterialWithOrder).not.toHaveBeenCalled();
+    expect(database.saveSalesReturnWithOrder).not.toHaveBeenCalled();
+  },
+);
 
 it('uses the 80 ms order debounce when scanning the next order after the first order is loaded', async () => {
   await scan(no);

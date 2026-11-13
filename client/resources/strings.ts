@@ -149,7 +149,6 @@ export const Str = {
   settingsVersion: '当前版本',
   settingsCheckUpdate: '检查更新',
   settingsParseRules: '解析规则',
-  settingsCustomFields: '占位字段',
   settingsDataSync: '电脑同步',
   settingsServerConfig: '同步服务配置',
   settingsClearCache: '清除缓存',

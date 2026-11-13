@@ -62,7 +62,7 @@ function jsProbe(db, mockTables) {
   return createJsBusinessProbe(Boolean(mockTables), mockTables || {}, () => ({
     getFirstAsync: async sql => db.prepare(sql.replace(/FROM (\w+) LIMIT 1/g,
       (_, logical) => `FROM [${tables[logical]}] LIMIT 1`)).get(),
-  }), (_label, operation) => operation(), { error: () => {} });
+  }), (_label, operation) => operation(), { error: () => { /* Probe results are checked by assertions below. */ } });
 }
 
 async function withFixture(run) {
@@ -152,6 +152,24 @@ test('every database table has an explicit backup classification, including both
   assert.equal(classification.system_config, 'configuration');
 });
 
+test('retired placeholder definitions are optional and do not affect business-data backup detection', () => withFixture(async db => {
+  assert.equal(tables.custom_fields, undefined, 'Retired definitions must not remain in the active schema');
+  assert.equal(classification.custom_fields, undefined);
+  assert.equal(createdSchemaTables.has('custom_fields'), false);
+  // Old databases can reach the native worker before the JS migration runs.
+  // Neither spelling of the obsolete definitions may trigger or block backup.
+  for (const name of ['custom_fields', '规则占位字段']) {
+    db.exec(`CREATE TABLE [${name}] (id TEXT)`);
+    db.prepare(`INSERT INTO [${name}] (id) VALUES (?)`).run('legacy-placeholder-definition');
+  }
+  assert.equal(hasNativeBusinessData(db), false);
+  assert.equal(await jsProbe(db)(), false);
+  assert.equal(await jsProbe(db, { custom_fields: [{ id: 'legacy-web-definition' }] })(), false);
+  db.prepare(`INSERT INTO [${tables.inventory_bindings}] (id) VALUES (?)`).run('real-material-binding');
+  assert.equal(hasNativeBusinessData(db), true);
+  assert.equal(await jsProbe(db)(), true);
+}));
+
 for (const logical of logicalTables) {
   test(`native, JS and Web backup guards detect a database containing only ${logical}`, () => withFixture(async db => {
     db.prepare(`INSERT INTO [${tables[logical]}] (id) VALUES (?)`).run('backup-regression-test');
@@ -191,6 +209,6 @@ test('JavaScript business-data SQL responds to new rows without a cached empty r
 test('JavaScript probe failures propagate instead of falsely treating valuable data as absent', async () => {
   const expected = new Error('database is locked');
   const probe = createJsBusinessProbe(false, {}, () => ({ getFirstAsync: async () => { throw expected; } }),
-    (_label, operation) => operation(), { error: () => {} });
+    (_label, operation) => operation(), { error: () => { /* This test asserts the expected rejection directly. */ } });
   await assert.rejects(probe, error => error === expected);
 });

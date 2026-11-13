@@ -18,6 +18,7 @@ import {
   isIgnoredRuleField, evaluateRuleConditions,
 } from './ruleConditions';
 import { migrateLegacyRuleFields } from './legacyRuleFields';
+import { DONGWEI_SUPPLIER, DONGWEI_SIX_RULE_ID, createDongweiSixFallbackRule, getDongweiRuleFieldCount } from './dongweiLabel';
 import { safeJsonParseNullable } from './json';
 import { logger } from './logger';
 import { bindingMatchesVersion, getBindingVersions, normalizeBindingVersions } from './bindingVersions';
@@ -76,7 +77,6 @@ const DATABASE_TABLE_NAMES = {
   sales_return_records: '销售退货记录',
   sales_return_allocations: '退货再出库关联',
   qr_code_rules: '扫码解析规则',
-  custom_fields: '规则占位字段',
   warehouses: '仓库',
   inventory_bindings: '物料绑定',
   inventory_binding_versions: '物料绑定版本',
@@ -101,7 +101,6 @@ const DATABASE_BACKUP_TABLE_CLASSIFICATION = {
   sales_return_records: 'business',
   sales_return_allocations: 'supporting',
   qr_code_rules: 'configuration',
-  custom_fields: 'configuration',
   warehouses: 'configuration',
   inventory_bindings: 'business',
   inventory_binding_versions: 'business',
@@ -306,72 +305,17 @@ export const AVAILABLE_FIELDS = [
   'sourceNo',
 ];
 
-// 判断是否为自定义字段
-export const isCustomField = (field: string): boolean => {
-  return field.startsWith('custom:');
-};
-
-// 获取自定义字段ID
-export const getCustomFieldId = (field: string): string => {
-  return field.replace('custom:', '');
-};
-
-// 创建自定义字段标识
-export const createCustomFieldKey = (fieldId: string): string => {
-  return `custom:${fieldId}`;
-};
-
-// 自定义字段定义接口
-export type CustomFieldType = 'text' | 'select';
-
-export interface CustomField {
+// Only validates old configuration JSON; no global placeholder definitions are stored.
+interface LegacyCustomField {
   id: string;
   name: string; // 字段名称（显示名称）
-  type: CustomFieldType; // 字段类型
+  type: 'text' | 'select'; // 旧配置中的字段类型
   required: boolean; // 是否必填
   options?: string[]; // 选择类型的选项
   sortOrder: number; // 排序顺序
   created_at: string;
   updated_at: string;
 }
-
-const CUSTOM_FIELD_TYPES = ['text', 'select'] as const;
-
-const isCustomFieldType = (value: unknown): value is CustomFieldType => {
-  return typeof value === 'string' && (CUSTOM_FIELD_TYPES as readonly string[]).includes(value);
-};
-
-type CustomFieldRow = {
-  id: string;
-  name: string;
-  type?: string | null;
-  required: number | boolean;
-  options?: string | null;
-  sort_order?: number | string | null;
-  sortOrder?: number | string | null;
-  created_at?: string | null;
-  updated_at?: string | null;
-};
-
-const normalizeCustomFieldRecord = (row: CustomFieldRow): CustomField => {
-  const normalizedType: CustomFieldType = row.type === 'select' ? 'select' : 'text';
-  const normalizedSortOrder = getBackupSortOrder(row as Record<string, unknown>);
-  const parsedOptions = safeJsonParseNullable<string[]>(row.options ?? null, 'database.safeJsonParseNullable') || undefined;
-
-  return {
-    id: row.id,
-    name: row.name,
-    type: normalizedType,
-    required: row.required === 1 || row.required === true,
-    options: normalizedType === 'select' ? parsedOptions : undefined,
-    sortOrder:
-      Number.isFinite(Number(normalizedSortOrder)) && Number(normalizedSortOrder) > 0
-        ? Number(normalizedSortOrder)
-        : 1,
-    created_at: row.created_at ?? '',
-    updated_at: row.updated_at ?? row.created_at ?? '',
-  };
-};
 
 // 物料记录接口（完整版，包含极海半导体所有字段）
 export interface MaterialRecord {
@@ -708,6 +652,7 @@ export interface UnpackRecord {
   root_package_key?: string | null;
   package_supplier?: string | null;
   source_qr?: string | null;
+  qr_field_count?: 6 | 7 | null;
   inventory_name?: string | null;
   specification?: string | null;
   // 标签类型：shipped=发货标签（拆出的部分），remaining=剩余标签（剩余的部分）
@@ -758,7 +703,7 @@ export interface BackupData {
   backupTime?: string;
   // 只包含配置数据，不包含业务数据
   rules: QRCodeRule[];
-  customFields: CustomField[];
+  customFields: LegacyCustomField[]; // Empty on export; accepted only for legacy JSON compatibility.
   warehouses: Warehouse[];
   outboundOrderRule?: OutboundOrderRuleConfig;
   outboundWarehouseOrderRules?: OutboundWarehouseSampleRuleMap;
@@ -865,7 +810,7 @@ const isQRCodeRuleShape = (value: unknown): value is QRCodeRule => {
   );
 };
 
-const isCustomFieldShape = (value: unknown): value is CustomField => {
+const isLegacyCustomFieldShape = (value: unknown): value is LegacyCustomField => {
   if (!isPlainObject(value)) {
     return false;
   }
@@ -934,7 +879,7 @@ export const isBackupDataShape = (value: unknown): value is BackupData => {
     Array.isArray(value.rules) &&
     value.rules.every((item) => isQRCodeRuleShape(item)) &&
     Array.isArray(value.customFields) &&
-    value.customFields.every((item) => isCustomFieldShape(item)) &&
+    value.customFields.every((item) => isLegacyCustomFieldShape(item)) &&
     Array.isArray(value.warehouses) &&
     value.warehouses.every((item) => isWarehouseShape(item)) &&
     (value.outboundOrderRule === undefined ||
@@ -1372,7 +1317,11 @@ const runSerializedDatabaseOperation = async <T>(
 const runExclusiveWriteTransaction = async <T>(
   database: SQLite.SQLiteDatabase,
   context: string,
-  task: (transactionDatabase: SQLite.SQLiteDatabase) => Promise<T>
+  task: (transactionDatabase: SQLite.SQLiteDatabase) => Promise<T>,
+  options?: {
+    skipWhen: (activeDatabase: SQLite.SQLiteDatabase) => Promise<boolean>;
+    skippedResult: T;
+  }
 ): Promise<T> => {
   return runWithTransientDatabaseRetry(
     context,
@@ -1380,6 +1329,10 @@ const runExclusiveWriteTransaction = async <T>(
       runSerializedDatabaseOperation(context, async () => {
         const activeDatabase = isWebPlatform ? database : getDb();
         await retryPendingCriticalWriteCheckpoint(activeDatabase, `[${context}] 写入前`);
+        // Evaluate no-op guards only after prior queued writes have finished.
+        // A read-only result must not create a transaction or count as a write,
+        // while any previously pending durability checkpoint is still retried.
+        if (options && await options.skipWhen(activeDatabase)) return options.skippedResult;
 
         let result: T;
         if (!isWebPlatform && typeof activeDatabase.withExclusiveTransactionAsync === 'function') {
@@ -1714,7 +1667,6 @@ const mockTables: Record<string, MockRow[]> = {
   internal_label_print_jobs: [],
   sales_return_records: [],
   sales_return_allocations: [],
-  custom_fields: [],
   system_config: [],
 };
 
@@ -3208,18 +3160,6 @@ const performDatabaseInitialization = async (
         updated_at TEXT NOT NULL
       );
 
-      -- 自定义字段表
-      CREATE TABLE IF NOT EXISTS custom_fields (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        type TEXT NOT NULL,
-        required INTEGER DEFAULT 0,
-        options TEXT,
-        sort_order INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
       -- 仓库表
       CREATE TABLE IF NOT EXISTS warehouses (
         id TEXT PRIMARY KEY,
@@ -3354,6 +3294,9 @@ const performDatabaseInitialization = async (
       await db.execAsync(`ALTER TABLE unpack_records ADD COLUMN ${column} TEXT`);
     }
   }
+  if (!unpackPackageColumns.some(item => item.name === 'qr_field_count')) {
+    await db.execAsync('ALTER TABLE unpack_records ADD COLUMN qr_field_count INTEGER');
+  }
   await db.execAsync(`
     CREATE INDEX IF NOT EXISTS idx_unpack_parent_package ON unpack_records (parent_package_key);
     CREATE INDEX IF NOT EXISTS idx_unpack_root_package ON unpack_records (root_package_key);
@@ -3372,6 +3315,9 @@ const performDatabaseInitialization = async (
         [JSON.stringify(rule.fieldOrder), JSON.stringify(rule.fieldPrefixes), '[]', rule.id],
       );
     }
+    // Retire both historical physical names only after every rule was migrated.
+    // DDL is part of this transaction: any failure preserves definitions and rules together.
+    await transaction.execAsync('DROP TABLE IF EXISTS "规则占位字段"; DROP TABLE IF EXISTS custom_fields;');
   });
   // 只移除已停用的派生台账，业务记录中的批次和日期字段继续保留。
   await db.execAsync('DROP TABLE IF EXISTS "批次库存流水"; DROP TABLE IF EXISTS batch_stock_events;');
@@ -3540,23 +3486,20 @@ export const reinitializeDatabase = async (): Promise<void> => {
 
 // ========== 订单相关函数 ==========
 
-const upsertOrderWithDatabase = async (
+type ExistingOrderHeader = {
+  id: string;
+  customer_name: string;
+  warehouse_id: string | null;
+  warehouse_name: string | null;
+};
+
+const readExistingOrderHeader = async (
   database: SQLite.SQLiteDatabase,
   orderNo: string,
-  customerName?: string,
   warehouse?: OrderWarehouseInfo
-): Promise<void> => {
-  type ExistingOrderRow = {
-    id: string;
-    customer_name: string;
-    warehouse_id: string | null;
-    warehouse_name: string | null;
-  };
-
-  let existingOrder: ExistingOrderRow | null = null;
-
+): Promise<ExistingOrderHeader | null> => {
   if (warehouse) {
-    existingOrder = await database.getFirstAsync<ExistingOrderRow>(
+    return database.getFirstAsync<ExistingOrderHeader>(
       `SELECT id, customer_name, warehouse_id, warehouse_name
        FROM orders
        WHERE order_no = ?
@@ -3565,14 +3508,28 @@ const upsertOrderWithDatabase = async (
        LIMIT 1`,
       [orderNo, warehouse.id, warehouse.id]
     );
-
-  } else {
-    existingOrder = await database.getFirstAsync<ExistingOrderRow>(
-      'SELECT id, customer_name, warehouse_id, warehouse_name FROM orders WHERE order_no = ? LIMIT 1',
-      [orderNo]
-    );
   }
+  return database.getFirstAsync<ExistingOrderHeader>(
+    'SELECT id, customer_name, warehouse_id, warehouse_name FROM orders WHERE order_no = ? LIMIT 1',
+    [orderNo]
+  );
+};
 
+const isOrderHeaderUnchanged = (
+  existingOrder: ExistingOrderHeader | null,
+  customerName?: string,
+  warehouse?: OrderWarehouseInfo,
+): boolean => Boolean(existingOrder &&
+  (customerName === undefined || customerName === existingOrder.customer_name) &&
+  (!warehouse || (warehouse.id === existingOrder.warehouse_id && warehouse.name === existingOrder.warehouse_name)));
+
+const upsertOrderWithDatabase = async (
+  database: SQLite.SQLiteDatabase,
+  orderNo: string,
+  customerName?: string,
+  warehouse?: OrderWarehouseInfo
+): Promise<void> => {
+  const existingOrder = await readExistingOrderHeader(database, orderNo, warehouse);
   if (existingOrder) {
     const customerChanged = customerName !== undefined && customerName !== existingOrder.customer_name;
     const warehouseChanged = warehouse && (
@@ -3680,6 +3637,11 @@ export const upsertOrder = async (
     const database = getDb();
     await runExclusiveWriteTransaction(database, 'upsertOrder', async (transactionDatabase) => {
       await upsertOrderWithDatabase(transactionDatabase, orderNo, customerName, warehouse);
+    }, {
+      skipWhen: async activeDatabase => isOrderHeaderUnchanged(
+        await readExistingOrderHeader(activeDatabase, orderNo, warehouse), customerName, warehouse
+      ),
+      skippedResult: undefined,
     });
   } catch (error) {
     logger.error('保存订单失败:', error);
@@ -6282,6 +6244,7 @@ type UnpackRecordInsert = {
   root_package_key?: string;
   package_supplier?: string;
   source_qr?: string;
+  qr_field_count?: 6 | 7;
   inventory_name?: string;
   specification?: string;
   label_type: 'shipped' | 'remaining';
@@ -6312,8 +6275,8 @@ const insertUnpackRecord = async (
       warehouse_id, warehouse_name, inventory_code, original_quantity, new_quantity,
       productionDate, traceNo, new_traceNo, sourceNo, label_type, pair_id, status,
       notes, unpacked_at, printed_at, created_at, updated_at,
-      new_sourceNo, package_key, parent_package_key, root_package_key, package_supplier, source_qr, inventory_name, specification
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      new_sourceNo, package_key, parent_package_key, root_package_key, package_supplier, source_qr, inventory_name, specification, qr_field_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       record.original_material_id,
@@ -6348,6 +6311,7 @@ const insertUnpackRecord = async (
       record.source_qr ?? null,
       record.inventory_name ?? null,
       record.specification ?? null,
+      record.qr_field_count ?? null,
     ]
   );
 
@@ -6375,6 +6339,7 @@ const insertUnpackRecord = async (
     root_package_key: record.root_package_key ?? null,
     package_supplier: record.package_supplier ?? null,
     ...(record.source_qr ? { source_qr: record.source_qr, inventory_name: record.inventory_name, specification: record.specification } : {}),
+    ...(record.qr_field_count ? { qr_field_count: record.qr_field_count } : {}),
     label_type: record.label_type,
     pair_id: record.pair_id,
     status: record.status,
@@ -6387,10 +6352,13 @@ const insertUnpackRecord = async (
 };
 
 const normalizeSavedUnpackRecord = (record: UnpackRecord): UnpackRecord => {
-  if (record.source_qr) return record;
-  // These columns are populated only for internal labels. Keep legacy retries
-  // shaped like the result of the original save.
+  // Preserve frozen supplier/internal payloads; old rows have no variant metadata.
   const normalized = { ...record };
+  if (normalized.qr_field_count == null) delete normalized.qr_field_count;
+  if (record.source_qr) return { ...normalized,
+    inventory_name: record.inventory_name ?? undefined,
+    specification: record.specification ?? undefined,
+  };
   delete normalized.source_qr;
   delete normalized.inventory_name;
   delete normalized.specification;
@@ -6581,7 +6549,7 @@ export const saveUnpackOperation = async (params: {
         const internalPackage = isInternalLabelPackageKey(currentMaterial.package_key);
         // Resolve the template from the same locked snapshot as the material and
         // child labels. A binding edit queued before this write must take effect.
-        const packageSupplier = currentMaterial.package_key && !internalPackage
+        const packageSupplier = !internalPackage
           ? await getSupplierForInventoryBindingWithDatabase(transactionDatabase, {
             scanModel: currentMaterial.model, version: currentMaterial.version,
             inventoryCode: currentMaterial.inventory_code,
@@ -6621,6 +6589,32 @@ export const saveUnpackOperation = async (params: {
         }
         if (shippedQuantity + remainingQuantity !== availableQuantity) {
           throw new Error('拆出数量与剩余数量之和必须等于当前可拆数量');
+        }
+
+        let dongwei: { rule: QRCodeRule; rules: QRCodeRule[]; fieldCount: 6 | 7; spans: QRCodeRuleValueSpan[] } | undefined;
+        if (!internalPackage && packageSupplier === DONGWEI_SUPPLIER) {
+          const raw = currentMaterial.raw_content || '';
+          const rules = (await transactionDatabase.getAllAsync<RuleRecordRow>('SELECT * FROM qr_code_rules'))
+            .map(normalizeRuleRecord).filter(rule => rule.isActive);
+          const storedRule = currentMaterial.rule_id
+            ? rules.find(rule => rule.id === currentMaterial.rule_id) : undefined;
+          if (currentMaterial.rule_id && !storedRule && currentMaterial.rule_id !== DONGWEI_SIX_RULE_ID) {
+            throw new Error('东微原解析规则已停用或删除，请重新扫码后拆包');
+          }
+          const rule = storedRule || await detectRule(raw, rules);
+          const fieldCount = rule && getDongweiRuleFieldCount(rule);
+          if (!rule || !fieldCount || !inspectQRCodeRule(raw, rule).matched) {
+            throw new Error('东微拆包须匹配原六段或七段解析规则，请核对原二维码');
+          }
+          const fields = parseWithRule(raw, rule).standardFields;
+          const expected = { model: currentMaterial.model, version: currentMaterial.version,
+            package: currentMaterial.package, batch: currentMaterial.batch, productionDate: currentMaterial.productionDate,
+            sourceNo: currentMaterial.sourceNo };
+          if (Object.entries(expected).some(([field, value]) => (fields[field] || '') !== (value || '')) ||
+              parseQuantity(fields.quantity) === null || currentMaterial.traceNo || trimmedNewTraceNo) {
+            throw new Error('东微原二维码与物料字段不一致，请重新扫码后拆包');
+          }
+          dongwei = { rule, rules, fieldCount, spans: getQRCodeRuleValueSpans(raw, rule) };
         }
 
         const splitLabels = internalPackage
@@ -6664,6 +6658,28 @@ export const saveUnpackOperation = async (params: {
         const nextMaterialTraceNo = remainingTraceNo || shippedTraceNo || sourceTraceNo;
         const remainingRecordTraceNo = remainingQuantity > 0 ? nextMaterialTraceNo : '';
 
+        const dongweiChild = async (quantity: number, sourceNo?: string): Promise<Partial<UnpackRecordInsert>> => {
+          if (!dongwei || quantity === 0) return {};
+          const edits = dongwei.spans.filter(span => span.field === 'quantity' ||
+            (span.field === 'sourceNo' && sourceNo !== undefined)).map(span => ({ ...span,
+              replacement: span.field === 'quantity' ? String(quantity) : sourceNo!,
+            })).sort((left, right) => right.start - left.start);
+          let sourceQr = currentMaterial.raw_content;
+          for (const edit of edits) sourceQr = sourceQr.slice(0, edit.start) + edit.replacement + sourceQr.slice(edit.end);
+          const selected = await detectRule(sourceQr, dongwei.rules);
+          if (!selected || selected.id !== dongwei.rule.id || !inspectQRCodeRule(sourceQr, dongwei.rule).matched) {
+            throw new Error('东微拆包后的二维码无法匹配原规则，请核对识别条件');
+          }
+          const fields = parseWithRule(sourceQr, dongwei.rule).standardFields;
+          if (parseQuantity(fields.quantity) !== quantity ||
+              (fields.sourceNo || '') !== (sourceNo ?? currentMaterial.sourceNo ?? '')) {
+            throw new Error('东微拆包标签的数量或箱号校验失败，本次未保存');
+          }
+          return { source_qr: sourceQr };
+        };
+        const shippedDongwei = await dongweiChild(shippedQuantity, splitLabels?.shipped.new_sourceNo);
+        const remainingDongwei = await dongweiChild(remainingQuantity, splitLabels?.remaining.new_sourceNo);
+
         const baseRecord = {
           original_material_id: params.material.id,
           order_no: currentMaterial.order_no,
@@ -6679,6 +6695,7 @@ export const saveUnpackOperation = async (params: {
           productionDate: currentMaterial.productionDate || '',
           sourceNo: currentMaterial.sourceNo || '',
           ...splitLabels?.shared,
+          ...(dongwei ? { qr_field_count: dongwei.fieldCount, package_supplier: DONGWEI_SUPPLIER } : {}),
           pair_id: pairId,
           status: 'pending' as const,
           notes,
@@ -6690,6 +6707,7 @@ export const saveUnpackOperation = async (params: {
           {
             ...baseRecord,
             ...splitLabels?.shipped,
+            ...shippedDongwei,
             traceNo: sourceTraceNo,
             new_traceNo: shippedTraceNo,
             new_quantity: shippedQuantity.toString(),
@@ -6707,6 +6725,7 @@ export const saveUnpackOperation = async (params: {
           {
             ...baseRecord,
             ...splitLabels?.remaining,
+            ...remainingDongwei,
             traceNo: remainingRecordTraceNo,
             new_traceNo: remainingTraceNo,
             new_quantity: remainingQuantity.toString(),
@@ -9640,219 +9659,6 @@ export const getRuleById = async (id: string): Promise<QRCodeRule | null> => {
   }
 };
 
-// ========== 自定义字段相关函数 ==========
-
-// 初始化默认自定义字段
-export const initDefaultCustomFields = async (): Promise<void> => {
-  // SQLite 已在 initDatabase 中创建表，无需额外初始化
-};
-
-// 获取所有自定义字段
-export const getAllCustomFields = async (): Promise<CustomField[]> => {
-  try {
-    const results = await runDatabaseReadWithRetry('getAllCustomFields', () =>
-      getDb().getAllAsync<CustomFieldRow>('SELECT * FROM custom_fields ORDER BY sort_order ASC')
-    );
-
-    return results.map(normalizeCustomFieldRecord);
-  } catch (error) {
-    logger.error('获取自定义字段列表失败:', error);
-    throw error;
-  }
-};
-
-// 添加自定义字段
-export const addCustomField = async (
-  field: Omit<CustomField, 'id' | 'created_at' | 'updated_at' | 'sortOrder'>
-): Promise<string> => {
-  try {
-    const normalizedName = field.name.trim();
-    if (!normalizedName) {
-      throw new Error('占位字段名称不能为空');
-    }
-    if (!isCustomFieldType(field.type)) {
-      throw new Error(`无效的自定义字段类型: ${String(field.type)}`);
-    }
-
-    const database = getDb();
-    const id = generateId();
-    const isoDateTime = getISODateTime();
-    const normalizedOptions = field.type === 'select' ? field.options : undefined;
-
-    await runExclusiveWriteTransaction(database, 'addCustomField', async (transactionDatabase) => {
-      const duplicate = await transactionDatabase.getFirstAsync<{ id: string }>(
-        'SELECT id FROM custom_fields WHERE TRIM(name) = ? COLLATE NOCASE LIMIT 1',
-        [normalizedName]
-      );
-      if (duplicate) {
-        throw new Error(`占位字段名称已存在：${normalizedName}`);
-      }
-      // 获取当前最大排序值
-      const maxResult = await transactionDatabase.getFirstAsync<{ max: number }>(
-        'SELECT MAX(sort_order) as max FROM custom_fields'
-      );
-      const maxSort = Number(maxResult?.max ?? 0) || 0;
-
-      await transactionDatabase.runAsync(
-        'INSERT INTO custom_fields (id, name, type, required, options, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [
-          id,
-          normalizedName,
-          field.type,
-          field.required ? 1 : 0,
-          normalizedOptions ? JSON.stringify(normalizedOptions) : null,
-          maxSort + 1,
-          isoDateTime,
-          isoDateTime,
-        ]
-      );
-    });
-
-    return id;
-  } catch (error) {
-    logger.error('添加自定义字段失败:', error);
-    throw error;
-  }
-};
-
-// 更新自定义字段
-export const updateCustomField = async (
-  id: string,
-  updates: Partial<CustomField>
-): Promise<void> => {
-  try {
-    const trimmedId = id.trim();
-    if (!trimmedId) {
-      throw new Error('占位字段 ID 不能为空');
-    }
-    const database = getDb();
-    const updateFields: string[] = [];
-    const values: SQLite.SQLiteBindValue[] = [];
-
-    if (typeof updates.name === 'string') {
-      const normalizedName = updates.name.trim();
-      if (!normalizedName) {
-        throw new Error('占位字段名称不能为空');
-      }
-      updateFields.push('name = ?');
-      values.push(normalizedName);
-    }
-
-    if (updates.type !== undefined) {
-      if (!isCustomFieldType(updates.type)) {
-        throw new Error(`无效的自定义字段类型: ${String(updates.type)}`);
-      }
-      updateFields.push('type = ?');
-      values.push(updates.type);
-
-      if (updates.type !== 'select' && updates.options === undefined) {
-        updateFields.push('options = ?');
-        values.push(null);
-      }
-    }
-
-    if (updates.required !== undefined) {
-      updateFields.push('required = ?');
-      values.push(updates.required ? 1 : 0);
-    }
-
-    if (updates.options !== undefined) {
-      updateFields.push('options = ?');
-      values.push(updates.options.length > 0 ? JSON.stringify(updates.options) : null);
-    }
-
-    if (updates.sortOrder !== undefined) {
-      const normalizedSortOrder = Number(updates.sortOrder);
-      if (!Number.isInteger(normalizedSortOrder) || normalizedSortOrder <= 0) {
-        throw new Error(`无效的自定义字段排序值: ${String(updates.sortOrder)}`);
-      }
-      updateFields.push('sort_order = ?');
-      values.push(normalizedSortOrder);
-    }
-
-    if (updateFields.length > 0) {
-      updateFields.push('updated_at = ?');
-      values.push(getISODateTime());
-      values.push(trimmedId);
-      await runExclusiveWriteTransaction(database, 'updateCustomField', async (transactionDatabase) => {
-        if (typeof updates.name === 'string') {
-          const duplicate = await transactionDatabase.getFirstAsync<{ id: string }>(
-            'SELECT id FROM custom_fields WHERE TRIM(name) = ? COLLATE NOCASE AND id != ? LIMIT 1',
-            [updates.name.trim(), trimmedId]
-          );
-          if (duplicate) {
-            throw new Error(`占位字段名称已存在：${updates.name.trim()}`);
-          }
-        }
-        await transactionDatabase.runAsync(
-          `UPDATE custom_fields SET ${updateFields.join(', ')} WHERE id = ?`,
-          values
-        );
-      });
-    }
-  } catch (error) {
-    logger.error('更新自定义字段失败:', error);
-    throw error;
-  }
-};
-
-// 删除自定义字段
-export const deleteCustomField = async (id: string): Promise<void> => {
-  try {
-    // 参数验证
-    if (!id || typeof id !== 'string' || id.trim() === '') {
-      logger.warn('[deleteCustomField] 无效的 id:', id);
-      return;
-    }
-
-    const database = getDb();
-    const trimmedId = id.trim();
-    const customFieldKey = createCustomFieldKey(trimmedId);
-
-    await runExclusiveWriteTransaction(database, 'deleteCustomField', async (transactionDatabase) => {
-      const rules = await transactionDatabase.getAllAsync<RuleRecordRow>('SELECT * FROM qr_code_rules');
-      const referencedRules = rules
-        .map((rawRule) => normalizeRuleRecord(rawRule))
-        .filter(
-          (rule) =>
-            rule.fieldOrder.includes(customFieldKey) ||
-            (rule.customFieldIds || []).includes(trimmedId)
-        );
-
-      if (referencedRules.length > 0) {
-        throw new Error(
-          `该占位字段仍被解析规则使用：${referencedRules
-            .map((rule) => rule.name)
-            .join('、')}。请先在这些规则中替换或移除该占位字段`
-        );
-      }
-
-      await transactionDatabase.runAsync('DELETE FROM custom_fields WHERE id = ?', [trimmedId]);
-    });
-  } catch (error) {
-    logger.error('[deleteCustomField] 删除自定义字段失败:', error);
-    throw error;
-  }
-};
-
-// 重新排序自定义字段
-export const reorderCustomFields = async (fieldIds: string[]): Promise<void> => {
-  const database = getDb();
-  try {
-    await runExclusiveWriteTransaction(database, 'reorderCustomFields', async (transactionDatabase) => {
-      for (let i = 0; i < fieldIds.length; i++) {
-        await transactionDatabase.runAsync('UPDATE custom_fields SET sort_order = ? WHERE id = ?', [
-          i + 1,
-          fieldIds[i],
-        ]);
-      }
-    });
-  } catch (error) {
-    logger.error('重新排序自定义字段失败:', error);
-    throw error;
-  }
-};
-
 // ========== 二维码解析相关函数（逻辑部分，不涉及存储） ==========
 
 const splitByBracketPair = (
@@ -10329,7 +10135,17 @@ export const detectRule = async (
       throw new QRCodeRuleConflictError(analysis.conflictingRules.map((rule) => rule.name));
     }
 
-    return analysis.selectedRule;
+    if (analysis.selectedRule) return analysis.selectedRule;
+    // The six-field preset is supplier-gated and never outranks configured rules.
+    const fallback = createDongweiSixFallbackRule(content);
+    if (!fallback || (!isWebPlatform && !db)) return null;
+    const fields = parseWithRule(content, fallback).standardFields;
+    const bindings = await getInventoryBindingsForModel(getDb(), fields.model);
+    const exact = bindings.filter(binding => bindingMatchesVersion(binding, fields.version));
+    const matching = exact.length ? exact : bindings.filter(binding => getBindingVersions(binding).length === 0);
+    const codes = new Set(matching.map(binding => binding.inventory_code.trim().toUpperCase()));
+    return codes.size === 1 && !codes.has('') && matching.every(binding => binding.supplier?.trim() === DONGWEI_SUPPLIER)
+      ? fallback : null;
   } catch (error) {
     if (error instanceof QRCodeRuleConflictError) {
       throw error;
@@ -10494,8 +10310,7 @@ export const importBackupData = async (
     const currentStats = await getConfigStats();
     const hasConfigData =
       (currentStats.warehouses ?? 0) > 0 ||
-      currentStats.rules > 0 ||
-      currentStats.customFields > 0;
+      currentStats.rules > 0;
 
     // 2. 统一在事务里替换配置，避免删旧后导入失败留下半套配置
     if (hasConfigData) {
@@ -10535,7 +10350,6 @@ export const importBackupData = async (
     await runExclusiveWriteTransaction(database, 'importBackupData', async (transactionDatabase) => {
       // 物料绑定由独立的 Excel 导入/导出管理，配置恢复不得清空或覆盖现有绑定。
       await transactionDatabase.runAsync('DELETE FROM qr_code_rules');
-      await transactionDatabase.runAsync('DELETE FROM custom_fields');
 
       if (referencedWarehouseIds.length > 0) {
         await transactionDatabase.runAsync(
@@ -10762,9 +10576,6 @@ export const getConfigStats = async (): Promise<{
     const rules = await database.getFirstAsync<{ count: number }>(
       'SELECT COUNT(*) as count FROM qr_code_rules'
     );
-    const customFields = await database.getFirstAsync<{ count: number }>(
-      'SELECT COUNT(*) as count FROM custom_fields'
-    );
     const warehouses = await database.getFirstAsync<{ count: number }>(
       'SELECT COUNT(*) as count FROM warehouses'
     );
@@ -10774,7 +10585,7 @@ export const getConfigStats = async (): Promise<{
 
     return {
       rules: rules?.count || 0,
-      customFields: customFields?.count || 0,
+      customFields: 0, // Legacy response shape; the definition table is retired.
       warehouses: warehouses?.count || 0,
       inventoryBindings: inventoryBindings?.count || 0,
     };
@@ -10845,7 +10656,6 @@ const RESTORE_SCHEMA_REQUIREMENTS: Record<string, string[]> = {
   orders: ['id', 'order_no', 'created_at'],
   materials: ['id', 'order_no', 'quantity', 'scanned_at'],
   qr_code_rules: ['id', 'name', 'separator', 'field_order', 'is_active'],
-  custom_fields: ['id', 'name', 'type', 'required', 'sort_order'],
   warehouses: ['id', 'name', 'is_default', 'created_at'],
   inventory_bindings: ['id', 'scan_model', 'inventory_code', 'created_at'],
   inventory_binding_versions: ['binding_id', 'version'],

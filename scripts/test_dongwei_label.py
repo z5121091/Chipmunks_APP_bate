@@ -9,6 +9,7 @@ from openpyxl import Workbook
 from PIL import Image
 
 from scripts import label_templates
+from scripts import label_sync_server as server
 from scripts.label_templates import apm, boya, dongwei, union, wch
 from scripts.label_templates.common import (
     NATIVE_LABEL_FONT_SIZE_PIXELS,
@@ -18,6 +19,7 @@ from scripts.label_templates.common import (
 
 SUPPLIER = '苏州东微半导体股份有限公司'
 SAMPLE_QR = 'SFS10R09UNNF;1009UN;PDFN3.3*3.3;70I0BH6770001;2000;G36PE01N;1-4;'
+SIX_FIELD_QR = 'SFS10R03UGNF;SFS10R03UGN;PDFN5*6;75FAFL-444401;5000;G23HD03N'
 QR_FIELDS = ('model', 'version', 'package', 'batch', 'quantity', 'production_date', 'source_no')
 VISIBLE_FIELDS = ('model', 'version', 'package', 'batch', 'production_date', 'quantity', 'source_no')
 FIELD_NAMES = {
@@ -259,6 +261,187 @@ class DongweiLabelTest(unittest.TestCase):
                            (0, 0, quiet, side), (side - quiet, 0, side, side)):
                 self.assertIsNone(qr_crop.crop(bounds).getbbox())
             self.assertEqual(commands.count(b'PRINT 1,2\r\n'), 1)
+
+
+class DongweiSixFieldLabelTest(unittest.TestCase):
+    def record(self, **changes):
+        record = make_record(model='SFS10R03UGNF', version='SFS10R03UGN', package='PDFN5*6',
+                             batch='75FAFL-444401', quantity='5000', production_date='G23HD03N',
+                             source_no='', qr_field_count=6)
+        record.update(changes)
+        return record
+
+    def assert_six_visible_rows(self, captured, record):
+        self.assertNotIn('Box:', [item[2] for item in captured['text']])
+        self.assertIn('Green', [item[2] for item in captured['text']])
+        captions = [caption for key, caption, _name in dongwei._ROWS if key != 'source_no']
+        self.assertEqual([item[2] for item in captured['text'] if item[2] in captions], captions)
+        for index, key in enumerate(VISIBLE_FIELDS[:-1]):
+            item = [item for item in captured['text'] if item[0] == 176 and item[1] == 132 + index * 36]
+            self.assertEqual([value[2] for value in item], [record[key] or '-'])
+
+    def test_six_field_generation_does_not_append_box_or_move_existing_layout(self):
+        record = self.record()
+        commands, captured = capture_label(record)
+        self.assertEqual(captured['payload'], SIX_FIELD_QR)
+        self.assertEqual(len(captured['payload'].split(';')), 6)
+        self.assert_six_visible_rows(captured, record)
+        self.assertTrue(commands.startswith(b'SIZE 100 mm,50 mm\r\nGAP 3 mm,0 mm\r\n'))
+        self.assertEqual(commands.count(b'PRINT 1,2\r\n'), 1)
+        self.assertEqual(captured['images'][0][1], (28, 14))
+
+    def test_six_reprint_preserves_exact_original_with_or_without_terminator(self):
+        for raw in (SIX_FIELD_QR, SIX_FIELD_QR + ';', SIX_FIELD_QR.replace(';5000;', ';05000;')):
+            with self.subTest(raw=raw):
+                _commands, captured = capture_label(self.record(), source_qr=raw)
+                self.assertEqual(captured['payload'], raw)
+                self.assertNotIn('Box:', [item[2] for item in captured['text']])
+        old_client_record = self.record()
+        del old_client_record['qr_field_count']
+        _commands, captured = capture_label(old_client_record, source_qr=SIX_FIELD_QR)
+        self.assertEqual(captured['payload'], SIX_FIELD_QR)
+        self.assertNotIn('Box:', [item[2] for item in captured['text']])
+
+    def test_saved_split_source_is_used_without_an_explicit_reprint_argument(self):
+        for quantity in ('2000', '3000'):
+            raw = SIX_FIELD_QR.replace(';5000;', f';{quantity};')
+            record = self.record(quantity=quantity, source_qr=raw)
+            with self.subTest(quantity=quantity):
+                _commands, captured = capture_label(record)
+                self.assertEqual(captured['payload'], raw)
+                self.assert_six_visible_rows(captured, record)
+
+    def test_seven_field_source_snapshot_keeps_box_and_existing_qr(self):
+        record = make_record(qr_field_count=7, source_qr=SAMPLE_QR)
+        _commands, captured = capture_label(record)
+        self.assertEqual(captured['payload'], SAMPLE_QR)
+        self.assertIn('Box:', [item[2] for item in captured['text']])
+        self.assertIn('1-4', [item[2] for item in captured['text']])
+
+    def test_metadata_disambiguates_six_terminator_from_empty_seventh_field(self):
+        raw = SIX_FIELD_QR + ';'
+        for count, has_box in ((6, False), (7, True), (None, True)):
+            with self.subTest(count=count):
+                record = self.record(qr_field_count=count)
+                _commands, captured = capture_label(record, source_qr=raw)
+                self.assertEqual(captured['payload'], raw)
+                self.assertEqual('Box:' in [item[2] for item in captured['text']], has_box)
+
+    def test_empty_final_date_is_a_field_not_a_terminator_when_count_is_known(self):
+        record = self.record(production_date='')
+        raw = SIX_FIELD_QR.rsplit(';', 1)[0] + ';'
+        for source in (raw, raw + ';'):
+            with self.subTest(source=source):
+                _commands, captured = capture_label(record, source_qr=source)
+                self.assertEqual(captured['payload'], source)
+                self.assert_six_visible_rows(captured, record)
+
+    def test_six_fields_do_not_silently_discard_a_populated_box(self):
+        for source in (None, SIX_FIELD_QR):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, '不能包含箱号'):
+                capture_label(self.record(source_no='BOX-DO-NOT-DROP'), source_qr=source)
+
+    def test_six_fields_still_compare_every_value_to_the_parsed_record(self):
+        for key in QR_FIELDS[:-1]:
+            value = '4999' if key == 'quantity' else 'OTHER'
+            with self.subTest(field=key), self.assertRaisesRegex(ValueError, FIELD_NAMES[key]):
+                capture_label(self.record(**{key: value}), source_qr=SIX_FIELD_QR)
+        for record, raw in ((self.record(qr_field_count=7), SIX_FIELD_QR),
+                            (self.record(), SIX_FIELD_QR + ';EXTRA;'),
+                            (self.record(), SIX_FIELD_QR + ';;')):
+            with self.subTest(record=record, raw=raw), self.assertRaisesRegex(ValueError, '六个或七个字段'):
+                capture_label(record, source_qr=raw)
+
+    def test_invalid_field_counts_fail_safely_and_explicit_source_keeps_api_precedence(self):
+        for value in (True, False, 0, 5, 8, 6.5, '6;7', '06', {}, []):
+            with self.subTest(count=value), self.assertRaisesRegex(ValueError, '段数须为6或7'):
+                capture_label(self.record(qr_field_count=value), source_qr=SIX_FIELD_QR)
+        _commands, captured = capture_label(self.record(source_qr=SIX_FIELD_QR + ';'), source_qr=SIX_FIELD_QR)
+        self.assertEqual(captured['payload'], SIX_FIELD_QR)
+
+    def test_excel_split_metadata_is_read_without_adding_a_supplier(self):
+        workbook = Workbook()
+        workbook.active.append(['供应商', '型号', '版本号', '封装', '批次', '标签数量',
+                                '生产日期', '箱号', '追溯码', '原始二维码', '二维码段数'])
+        for quantity in (2000, 3000):
+            workbook.active.append([SUPPLIER, 'SFS10R03UGNF', 'SFS10R03UGN', 'PDFN5*6',
+                                    '75FAFL-444401', quantity, 'G23HD03N', '', '',
+                                    SIX_FIELD_QR.replace(';5000;', f';{quantity};'), 6])
+        records = label_templates.get_native_label_records(workbook)
+        for record in records:
+            self.assertEqual(record['qr_field_count'], '6')
+            self.assertIs(label_templates.get_native_label_template(record), label_templates.NATIVE_LABEL_TEMPLATE_DONGWEI)
+            _commands, captured = capture_label(record)
+            self.assertEqual(captured['payload'], record['source_qr'])
+            self.assertNotIn('Box:', [item[2] for item in captured['text']])
+
+    def test_server_normalization_keeps_count_and_reports_invalid_metadata(self):
+        record = self.record(source_qr=SIX_FIELD_QR)
+        self.assertEqual(server.normalize_reprint_record(record)['qr_field_count'], 6)
+        for value in ('6', 6.0):
+            self.assertEqual(server.normalize_reprint_record(dict(record, qr_field_count=value))['qr_field_count'], 6)
+        for value in (True, {}, 'private-invalid-count'):
+            with self.subTest(count=value), patch.object(server, 'send_raw_tspl_to_printer') as send:
+                result = server.submit_native_label_reprint({
+                    'print_job_id': f'INVALID-COUNT-{type(value).__name__}',
+                    'reprint_session_id': server.LABEL_REPRINT_SESSION_ID,
+                    'record': dict(record, qr_field_count=value),
+                })
+                self.assertFalse(result['success'])
+                self.assertEqual(result['code'], 'INVALID_LABEL_CONTENT')
+                self.assertIn('段数须为6或7', result['message'])
+                self.assertNotIn('private-invalid-count', result['message'])
+                send.assert_not_called()
+
+    def test_six_unpacked_labels_follow_durable_print_path_and_keep_five_total_copies(self):
+        captured_payloads = []
+
+        def capture_qr(payload, *args, **kwargs):
+            captured_payloads.append(payload)
+            return build_reprint_qr_image(payload, *args, **kwargs)
+
+        records = [self.record(quantity=str(quantity), source_qr=SIX_FIELD_QR.replace(';5000;', f';{quantity};'),
+                               label_type=label_type) for quantity, label_type in ((2000, '发货标签'), (3000, '剩余标签'))]
+        with patch.object(server, 'load_native_print_job', return_value=None), \
+                patch.object(server, 'save_native_print_history') as save, \
+                patch.object(server, 'send_raw_tspl_to_printer', return_value=42) as send, \
+                patch.object(server, 'log'), \
+                patch.object(server, 'build_native_unpack_time_label', return_value=b'TIME\r\nPRINT 1,1\r\n') as time_label, \
+                patch.object(dongwei, 'build_reprint_qr_image', side_effect=capture_qr):
+            result = server.submit_native_unpack_labels(records, 'DONGWEI-SIX-SPLIT')
+        self.assertEqual(captured_payloads, [record['source_qr'] for record in records])
+        self.assertEqual(result['physical_label_count'], 5)
+        self.assertEqual(result['printed_count'], 2)
+        self.assertEqual(result['time_label_count'], 1)
+        self.assertEqual(send.call_args.args[1].count(b'PRINT 1,2\r\n'), 2)
+        self.assertEqual(save.call_count, 2)
+        time_label.assert_called_once()
+
+    def test_six_actual_bitmap_keeps_qr_quiet_zone_and_layout_inside_paper(self):
+        for quantity in ('2000', '3000', '5000'):
+            raw = SIX_FIELD_QR.replace(';5000;', f';{quantity};')
+            qr_images = []
+
+            def capture_qr(*args, **kwargs):
+                qr = build_reprint_qr_image(*args, **kwargs)
+                qr_images.append(qr)
+                return qr
+
+            with self.subTest(quantity=quantity), patch.object(dongwei, 'build_reprint_qr_image', side_effect=capture_qr):
+                commands = label_templates.build_native_label(
+                    self.record(quantity=quantity, source_qr=raw), label_templates.NATIVE_LABEL_TEMPLATE_DONGWEI)
+            [qr] = qr_images
+            bitmap = re.search(rb'BITMAP 0,0,100,400,0,', commands)
+            self.assertIsNotNone(bitmap)
+            raster = Image.frombytes('1', (800, 400), bytes(byte ^ 255 for byte in commands[bitmap.end():bitmap.end() + 40000]))
+            self.assertEqual(raster.crop((qr.x, qr.y, qr.quiet_right, qr.quiet_bottom)).tobytes(), qr.image.tobytes())
+            self.assertGreaterEqual(qr.x, 560)
+            self.assertLessEqual(qr.quiet_right, 792)
+            self.assertGreaterEqual(qr.y, 8)
+            self.assertLessEqual(qr.quiet_bottom, 260)
+            # The omitted seventh row must be blank, while the six rows above
+            # retain the same baseline and the QR never overlaps that column.
+            self.assertIsNone(raster.crop((0, 348, 560, 400)).getbbox())
 
 
 if __name__ == '__main__':

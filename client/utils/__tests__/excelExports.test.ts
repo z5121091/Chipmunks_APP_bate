@@ -131,6 +131,25 @@ describe('business Excel schemas', () => {
     );
   });
 
+  it('carries the Dongwei QR shape and saved child payload without changing legacy label records', () => {
+    const sixQr = 'SFS10R03UGNF;SFS10R03UGN;PDFN5*6;75FAFL-444401;2000;G23HD03N';
+    const sevenQr = sixQr + ';1-4-1;';
+    const sheet = buildUnpackLabelSheet([
+      { model: 'SFS10R03UGNF', supplier: '苏州东微半导体股份有限公司', new_quantity: 2000,
+        source_qr: sixQr, qr_field_count: 6, sourceNo: '' },
+      { model: 'SFS10R03UGNF', supplier: '苏州东微半导体股份有限公司', new_quantity: 2000,
+        source_qr: sevenQr, qr_field_count: 7, sourceNo: '1-4', new_sourceNo: '1-4-1' },
+      { model: 'LEGACY', supplier: '珠海领芯科技有限公司', new_quantity: 10, sourceNo: 'OLD-BOX' },
+    ]);
+    expect(sheet.headers.filter(header => header === '二维码段数')).toHaveLength(1);
+    expect(sheet.rows.map(row => getCell(sheet.headers, row, '二维码段数'))).toEqual([6, 7, '']);
+    expect(sheet.rows.map(row => getCell(sheet.headers, row, '原始二维码'))).toEqual([sixQr, sevenQr, '']);
+    expect(sheet.rows.map(row => getCell(sheet.headers, row, EXCEL_HEADERS.sourceNo))).toEqual(['', '1-4-1', 'OLD-BOX']);
+    const legacySheet = buildUnpackLabelSheet([{ model: 'LEGACY', new_quantity: 10 }]);
+    expect(legacySheet.headers).not.toContain('二维码段数');
+    expect(legacySheet.headers).not.toContain('原始二维码');
+  });
+
   it('exports one inventory workbook with detail and ERP difference worksheets', () => {
     const sheets = buildInventorySheets([
       {

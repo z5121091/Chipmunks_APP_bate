@@ -604,12 +604,6 @@ const getBaseStyles = (theme: Theme) => {
       color: theme.textMuted,
       marginTop: Spacing.sm,
     },
-    customFieldsSection: {
-      marginTop: Spacing.lg,
-      paddingTop: Spacing.md,
-      borderTopWidth: BorderWidth.normal,
-      borderTopColor: theme.border,
-    },
     modalFooter: {
       flexDirection: 'row',
       paddingHorizontal: Spacing.xl,

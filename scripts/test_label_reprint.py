@@ -51,6 +51,7 @@ class EphemeralReprintTest(unittest.TestCase):
         self.assertEqual(result['version'], 'V1.0')
         self.assertEqual(result['labelReprintApiVersion'], 1)
         self.assertEqual(result['labelReprintSessionId'], server.LABEL_REPRINT_SESSION_ID)
+        self.assertEqual(result['dongweiLabelFieldCounts'], [6, 7])
         self.assertEqual(set(result['labelReprintSuppliers']), set(label_templates.NATIVE_LABEL_TEMPLATE_BY_SUPPLIER))
 
     def test_reprint_mount_disables_upload_processing_and_request_file_logs(self):

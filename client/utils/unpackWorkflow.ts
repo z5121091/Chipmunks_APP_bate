@@ -11,6 +11,8 @@ import { safeJsonParseNullable } from '@/utils/json';
 import { buildUnpackLabelSheet } from '@/utils/labelExport';
 import { internalLabelPackageKey, isInternalLabelPackageKey } from '@/utils/internalLabelCode';
 import { parseQuantity } from '@/utils/quantity';
+import { DONGWEI_SUPPLIER } from '@/utils/dongweiLabel';
+import { assertDongweiSixPrintSupported, DongweiPrintCompatibilityError } from '@/utils/dongweiPrintCompatibility';
 
 const NATIVE_LABEL_PRINT_MODE = 'native_tsc_supplier_v2';
 
@@ -76,6 +78,7 @@ export const loadLabelSyncConfig = async (): Promise<SyncConfig> => {
 };
 
 export const getUnpackSyncFailureMessage = (error: unknown): string => {
+  if (error instanceof DongweiPrintCompatibilityError) return error.message;
   const errorName =
     typeof error === 'object' && error !== null && 'name' in error
       ? String((error as { name?: unknown }).name || '')
@@ -140,6 +143,9 @@ export const submitUnpackRecordsToComputer = async (
   }
   const config = syncConfig || (await loadLabelSyncConfig());
   const enrichedRecords = await enrichUnpackRecordsWithSuppliers(printableRecords);
+  if (enrichedRecords.some(record => record.supplier === DONGWEI_SUPPLIER && record.qr_field_count === 6)) {
+    await assertDongweiSixPrintSupported(config);
+  }
   const labelSheet = buildUnpackLabelSheet(enrichedRecords, '标签数据');
   const nameSuffix = records[0]?.order_no || '拆包标签';
   const result = await syncExcelToComputer(

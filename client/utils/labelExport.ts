@@ -18,6 +18,7 @@ export interface UnpackLabelExportRecord {
   inventory_name?: string | null;
   specification?: string | null;
   source_qr?: string | null;
+  qr_field_count?: 6 | 7 | null;
   model?: string;
   version?: string;
   package?: string;
@@ -69,6 +70,9 @@ export const buildUnpackLabelSheet = (
         { header: '原始二维码', value: (record: UnpackLabelExportRecord) => record.source_qr || '' },
         { header: '存货名称', value: (record: UnpackLabelExportRecord) => record.inventory_name || '' },
         { header: '规格型号', value: (record: UnpackLabelExportRecord) => record.specification || '' },
+      ] : []),
+      ...(records.some(record => record.qr_field_count != null) ? [
+        { header: '二维码段数', value: (record: UnpackLabelExportRecord) => record.qr_field_count ?? '' },
       ] : []),
       { header: EXCEL_HEADERS.unpackTime, value: (record) => formatTime(record.unpacked_at) },
     ],

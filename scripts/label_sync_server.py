@@ -44,6 +44,7 @@ try:
         get_native_label_template,
     )
     from .label_templates.internal import is_internal_label_qr, normalize_internal_label_record
+    from .label_templates.dongwei import DONGWEI_LABEL_FIELD_COUNTS, normalize_dongwei_field_count
 except ImportError:
     from sync_notifications import BusinessNotificationDispatcher
     from sync_export_folders import WAREHOUSE_ARCHIVE_API_VERSION, ensure_warehouse_folders, get_document_save_path
@@ -60,6 +61,7 @@ except ImportError:
         get_native_label_template,
     )
     from label_templates.internal import is_internal_label_qr, normalize_internal_label_record
+    from label_templates.dongwei import DONGWEI_LABEL_FIELD_COUNTS, normalize_dongwei_field_count
 
 # ==================== 配置 ====================
 SYNC_SERVICE_ID = 'palm-warehouse-sync'
@@ -856,6 +858,9 @@ def get_safe_reprint_template_error(error):
             '沁恒标签二维码内容过长，无法完整放入标签',
             '盈力标签二维码内容过长，无法放入右下角',
             '东微原始二维码须包含完整的七个字段',
+            '东微原始二维码须包含完整的六个或七个字段',
+            '东微二维码段数须为6或7，请核对原码和解析规则',
+            '东微六段标签不能包含箱号，请核对原码和解析规则',
             '东微标签数量须为有效的正整数',
             '东微标签缺少型号',
             '先积原始二维码须包含完整的六个字段（支持换行或逗号分隔）',
@@ -970,6 +975,10 @@ def normalize_reprint_record(record):
     # TSPL commands. CR/LF are valid payload bytes, not instruction separators.
     validate_reprint_characters(source_qr, '原始二维码', allow_line_breaks=True)
     normalized['source_qr'] = source_qr
+    if normalized['supplier'].strip() == '苏州东微半导体股份有限公司':
+        field_count = normalize_dongwei_field_count(record.get('qr_field_count'))
+        if field_count is not None:
+            normalized['qr_field_count'] = field_count
     return normalized
 
 
@@ -1294,6 +1303,7 @@ class Health:
             'labelReprintSessionId': LABEL_REPRINT_SESSION_ID,
             'labelReprintInternal': True,
             'labelReprintInternalCreateSingle': True,
+            'dongweiLabelFieldCounts': list(DONGWEI_LABEL_FIELD_COUNTS),
             'warehouseArchiveApiVersion': WAREHOUSE_ARCHIVE_API_VERSION,
             'labelReprintSuppliers': sorted(NATIVE_LABEL_TEMPLATE_BY_SUPPLIER),
             'maxUploadBytes': MAX_UPLOAD_BYTES,

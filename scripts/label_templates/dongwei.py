@@ -27,6 +27,19 @@ _LABEL_X = 28
 _VALUE_X = 176
 _FIRST_ROW_Y = 132
 _ROW_STEP = 36
+DONGWEI_LABEL_FIELD_COUNTS = (6, 7)
+
+
+def normalize_dongwei_field_count(value):
+    """A count snapshot disambiguates a terminator from an empty seventh field."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError('东微二维码段数须为6或7，请核对原码和解析规则')
+    text = get_excel_cell_text(value)
+    if text not in (str(count) for count in DONGWEI_LABEL_FIELD_COUNTS):
+        raise ValueError('东微二维码段数须为6或7，请核对原码和解析规则')
+    return int(text)
 
 
 def _safe_field(value, field_name):
@@ -54,24 +67,36 @@ def _quantity(value):
 
 def _field_values(record, source_qr=None):
     parsed = {key: _safe_field(record.get(key), _FIELD_NAMES[key]) for key in _QR_FIELDS}
+    field_count = normalize_dongwei_field_count(record.get('qr_field_count'))
     if not parsed['model']:
         raise ValueError('东微标签缺少型号')
     parsed_quantity = _quantity(parsed['quantity'])
     if source_qr is None:
         parsed['quantity'] = format(parsed_quantity, 'f').split('.')[0]
+        if field_count == 6:
+            if parsed['source_no']:
+                raise ValueError('东微六段标签不能包含箱号，请核对原码和解析规则')
+            del parsed['source_no']
         return parsed
 
     payload = get_native_qr_payload('', source_qr)
     fields = payload.split(';')
-    if len(fields) == 8 and not fields[-1].strip():
+    # Old tasks default to seven fields. New tasks always snapshot the count,
+    # so a six-field terminator and a seven-field empty box are not guessed.
+    if field_count is None:
+        field_count = 6 if len(fields) == 6 else 7
+    if len(fields) == field_count + 1 and not fields[-1].strip():
         fields.pop()
-    if len(fields) != len(_QR_FIELDS):
-        raise ValueError('东微原始二维码须包含完整的七个字段')
+    if len(fields) != field_count:
+        raise ValueError('东微原始二维码须包含完整的六个或七个字段')
+    if field_count == 6 and parsed['source_no']:
+        raise ValueError('东微六段标签不能包含箱号，请核对原码和解析规则')
+    qr_fields = _QR_FIELDS[:field_count]
     original = {
         key: _safe_field(value, _FIELD_NAMES[key])
-        for key, value in zip(_QR_FIELDS, fields)
+        for key, value in zip(qr_fields, fields)
     }
-    for key in _QR_FIELDS:
+    for key in qr_fields:
         matches = (
             _quantity(original[key]) == parsed_quantity
             if key == 'quantity' else original[key] == parsed[key]
@@ -82,13 +107,20 @@ def _field_values(record, source_qr=None):
 
 
 def build_native_dongwei_label(record, _template=None, copies=NATIVE_LABEL_COPIES, source_qr=None):
-    """Build the 100x50 mm Oriental Semi label with the supplier's field order."""
+    """Build the six- or seven-field 100x50 mm Oriental Semi label."""
+    saved_source = record.get('source_qr')
+    if source_qr is None:
+        source_qr = None if saved_source in (None, '') else saved_source
     values = _field_values(record, source_qr)
-    payload = ';'.join(values[key] for key in _QR_FIELDS) + ';'
+    has_box = 'source_no' in values
+    qr_fields = _QR_FIELDS if has_box else _QR_FIELDS[:-1]
+    payload = ';'.join(values[key] for key in qr_fields) + (';' if has_box else '')
     payload = get_native_qr_payload(payload, source_qr)
 
     text_items = []
     for index, (key, caption, name) in enumerate(_ROWS):
+        if key == 'source_no' and not has_box:
+            continue
         y = _FIRST_ROW_Y + index * _ROW_STEP
         value = values[key] or '-'
         # Leave the Green marking beside the model, and reserve the QR column.

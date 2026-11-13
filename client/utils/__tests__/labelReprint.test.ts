@@ -12,6 +12,7 @@ import {
   submitLabelReprint,
   type LabelReprintTask,
 } from '../labelReprint';
+import { DONGWEI_SUPPLIER } from '../dongweiLabel';
 
 jest.mock('@react-native-async-storage/async-storage', () => ({
   __esModule: true,
@@ -41,6 +42,7 @@ const response = (payload: unknown, status = 200): Response => ({
 const health = (session = 'session-1', suppliers = [supplier]) => ({
   status:'ok', serviceId:'palm-warehouse-sync', labelReprintApiVersion:1,
   labelReprintSessionId:session, labelReprintSuppliers:suppliers,
+  dongweiLabelFieldCounts: [6, 7],
 });
 const success = (task:LabelReprintTask, duplicate = false) => ({
   success:true, state:'submitted', jobId:task.id, copies:task.internalAction === 'create' ? 1 : 2, duplicate,
@@ -88,6 +90,7 @@ describe('label reprint reads and original content', () => {
     expect(task).toMatchObject({model:'CH334U',version:'31317.TB',quantity:250,supplier,sourceQr:raw,status:'pending'});
     expect(task.record.source_qr).toBe(raw);
     expect(task.record.supplier).not.toBe(rule.supplierName);
+    expect(task.record).not.toHaveProperty('qr_field_count');
     expect(Object.isFrozen(task.record)).toBe(true);
     expect(detectRule).toHaveBeenCalledWith(raw);
     expect(mockFetch).not.toHaveBeenCalled();
@@ -218,6 +221,79 @@ describe('label reprint reads and original content', () => {
     expect(() => resolveLabelReprintSupplier('CH334U',[binding('31317.TB'),binding('another','另一个供应商')]))
       .toThrow('对应多个供应商');
     expect(resolveLabelReprintSupplier(' ch334u ',[binding('v1'),binding('v2'),binding('v3','')])).toBe(supplier);
+  });
+});
+
+describe('Dongwei six-field and seven-field reprints', () => {
+  const sixFields = ['model', 'version', 'package', 'batch', 'quantity', 'productionDate'];
+  const sixRaw = 'SFS10R03UGNF;SFS10R03UGN;PDFN5*6;75FAFL-444401;5000;G23HD03N';
+  beforeEach(() => {
+    jest.mocked(getAllInventoryBindings).mockResolvedValue([{
+      ...binding('SFS10R03UGN', DONGWEI_SUPPLIER), scan_model: 'SFS10R03UGNF',
+    }]);
+    jest.mocked(parseWithRule).mockImplementation(jest.requireActual<typeof import('../database')>('../database').parseWithRule);
+  });
+
+  it.each([
+    [6, sixRaw], [6, `${sixRaw};`], [7, `${sixRaw};BOX;`], [7, `${sixRaw};`],
+  ] as const)('preserves %i-field source and its explicit layout metadata: %s', async (count, source) => {
+    jest.mocked(detectRule).mockResolvedValue({
+      ...rule, separator: ';', terminator: ';',
+      fieldOrder: count === 6 ? sixFields : [...sixFields, 'sourceNo'],
+    });
+    const task = await prepareLabelReprint(source);
+    expect(task.record).toMatchObject({
+      supplier: DONGWEI_SUPPLIER, model: 'SFS10R03UGNF', quantity: 5000,
+      trace_no: '', source_no: count === 7 && source.includes('BOX') ? 'BOX' : '',
+      source_qr: source, qr_field_count: count,
+    });
+    const corrected = await applyLabelQuantityCorrection(task, 1500);
+    expect(corrected.record.qr_field_count).toBe(count);
+    expect(corrected.record.source_qr).toBe(source.replace(';5000;', ';1500;'));
+    expect(corrected.record.source_no).toBe(task.record.source_no);
+    expect(corrected.record.trace_no).toBe('');
+    expect(Object.isFrozen(corrected.record)).toBe(true);
+  });
+
+  it('sends the six-field variant in the print request', async () => {
+    jest.mocked(detectRule).mockResolvedValue({ ...rule, separator: ';', fieldOrder: sixFields });
+    const task = await prepareLabelReprint(sixRaw);
+    mockFetch.mockResolvedValueOnce(response(health('session-1', [DONGWEI_SUPPLIER])))
+      .mockResolvedValueOnce(response(success(task)));
+    expect((await submitLabelReprint(task, { syncConfig: config })).status).toBe('submitted');
+    expect(JSON.parse(mockFetch.mock.calls[1][1].body).record).toEqual(task.record);
+    expect(task.record.qr_field_count).toBe(6);
+  });
+
+  it('blocks a six-field print on an older helper without POST and allows retry after updating it', async () => {
+    jest.mocked(detectRule).mockResolvedValue({ ...rule, separator: ';', fieldOrder: sixFields });
+    const task = await prepareLabelReprint(sixRaw);
+    mockFetch.mockResolvedValueOnce(response({ ...health('session-1', [DONGWEI_SUPPLIER]), dongweiLabelFieldCounts: undefined }));
+    const failed = await submitLabelReprint(task, { syncConfig: config });
+    expect(failed).toMatchObject({ status: 'failed', errorCode: 'UNSUPPORTED_HELPER', resultUnknown: false,
+      lastError: expect.stringContaining('请更新电脑端同步助手') });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    mockFetch.mockResolvedValueOnce(response(health('session-1', [DONGWEI_SUPPLIER])))
+      .mockResolvedValueOnce(response(success(task)));
+    expect((await submitLabelReprint(failed, { syncConfig: config })).status).toBe('submitted');
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps seven-field reprinting compatible with the existing helper without the new capability', async () => {
+    jest.mocked(detectRule).mockResolvedValue({ ...rule, separator: ';', fieldOrder: [...sixFields, 'sourceNo'] });
+    const task = await prepareLabelReprint(`${sixRaw};BOX;`);
+    mockFetch.mockResolvedValueOnce(response({ ...health('session-1', [DONGWEI_SUPPLIER]), dongweiLabelFieldCounts: undefined }))
+      .mockResolvedValueOnce(response(success(task)));
+    expect((await submitLabelReprint(task, { syncConfig: config })).status).toBe('submitted');
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a nonstandard Dongwei field order without creating a print task', async () => {
+    jest.mocked(detectRule).mockResolvedValue({ ...rule, separator: ';',
+      fieldOrder: ['model', 'package', 'version', 'batch', 'quantity', 'productionDate'] });
+    await expect(prepareLabelReprint(sixRaw)).rejects.toMatchObject({ title: '东微标签格式不支持' });
+    expect(generateId).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });
 

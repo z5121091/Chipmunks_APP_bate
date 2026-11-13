@@ -1,8 +1,9 @@
 import { getSupplierForInventoryBinding, requireActiveInternalLabel, type UnpackRecord } from '../database';
 import { syncExcelToComputer } from '../excel';
-import { submitUnpackRecordsToComputer, syncUnpackRecordsToComputer } from '../unpackWorkflow';
+import { getUnpackSyncFailureMessage, submitUnpackRecordsToComputer, syncUnpackRecordsToComputer } from '../unpackWorkflow';
 import { buildInternalLabel, internalLabelPackageKey } from '../internalLabelCode';
 import { buildUnpackLabelSheet } from '../labelExport';
+import { assertDongweiSixPrintSupported, DongweiPrintCompatibilityError } from '../dongweiPrintCompatibility';
 
 jest.mock('@react-native-async-storage/async-storage', () => ({
   __esModule: true,
@@ -18,6 +19,9 @@ jest.mock('../excel', () => ({
   formatSyncErrorMessage: (message: string) => message,
 }));
 jest.mock('../labelExport', () => ({ buildUnpackLabelSheet: jest.fn(() => ({ headers: [], rows: [] })) }));
+jest.mock('../dongweiPrintCompatibility', () => ({
+  ...jest.requireActual('../dongweiPrintCompatibility'), assertDongweiSixPrintSupported: jest.fn(),
+}));
 
 const records = [
   { id: 's1', pair_id: 'pair-1', order_no: 'ORDER-1', model: 'CH334U', version: '', inventory_code: 'INV-1' },
@@ -28,6 +32,7 @@ const config = { ip: '127.0.0.1', port: '8080' };
 describe('unpack native submission response', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.mocked(assertDongweiSixPrintSupported).mockResolvedValue(undefined);
     jest.mocked(getSupplierForInventoryBinding).mockResolvedValue('南京沁恒微电子股份有限公司');
     jest.mocked(syncExcelToComputer).mockResolvedValue({
       success: true, nativePrint: true, nativePrintJobId: 'pair-1', fileName: 'label.xlsx',
@@ -46,6 +51,35 @@ describe('unpack native submission response', () => {
 
   it('preserves the legacy file name API', async () => {
     await expect(syncUnpackRecordsToComputer(records, config)).resolves.toBe('label.xlsx');
+  });
+
+  it('checks helper capability before sending six-field Dongwei split snapshots', async () => {
+    const sixRecords = records.map(record => ({ ...record, qr_field_count: 6 as const,
+      package_supplier: '苏州东微半导体股份有限公司' }));
+    await expect(submitUnpackRecordsToComputer(sixRecords, config)).resolves.toMatchObject({ status: 'submitted' });
+    expect(assertDongweiSixPrintSupported).toHaveBeenCalledWith(config);
+    expect(syncExcelToComputer).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not send six-field split data to an old helper that would rebuild seven fields', async () => {
+    jest.mocked(assertDongweiSixPrintSupported).mockRejectedValue(new Error('请更新电脑端同步助手'));
+    const sixRecords = records.map(record => ({ ...record, qr_field_count: 6 as const,
+      package_supplier: '苏州东微半导体股份有限公司' }));
+    await expect(submitUnpackRecordsToComputer(sixRecords, config)).rejects.toThrow('请更新电脑端同步助手');
+    expect(syncExcelToComputer).not.toHaveBeenCalled();
+    expect(buildUnpackLabelSheet).not.toHaveBeenCalled();
+  });
+
+  it('keeps seven-field Dongwei split tasks compatible without the new capability request', async () => {
+    const sevenRecords = records.map(record => ({ ...record, qr_field_count: 7 as const,
+      package_supplier: '苏州东微半导体股份有限公司' }));
+    await expect(submitUnpackRecordsToComputer(sevenRecords, config)).resolves.toMatchObject({ status: 'submitted' });
+    expect(assertDongweiSixPrintSupported).not.toHaveBeenCalled();
+  });
+
+  it('shows the actionable old-helper compatibility message to the operator', () => {
+    const message = '请更新电脑端同步助手，当前版本不支持东微六段无箱号标签。本次未提交打印。';
+    expect(getUnpackSyncFailureMessage(new DongweiPrintCompatibilityError(message, 'UNSUPPORTED_HELPER'))).toBe(message);
   });
 
   it('passes review confirmation only when the caller explicitly sets it', async () => {

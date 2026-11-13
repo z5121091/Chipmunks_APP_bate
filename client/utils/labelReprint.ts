@@ -26,6 +26,8 @@ import { assertRuleSupplierForScan, RuleSupplierValidationError } from '@/utils/
 import { nextLabelTraceNo, rewriteLabelQrQuantity } from '@/utils/labelQrQuantity';
 import { buildInternalLabel, isInternalLabelInput, type InternalLabelPackage } from '@/utils/internalLabelCode';
 import { logger } from '@/utils/logger';
+import { DONGWEI_SUPPLIER, getDongweiRuleFieldCount } from '@/utils/dongweiLabel';
+import { assertDongweiSixPrintSupported, DongweiPrintCompatibilityError } from '@/utils/dongweiPrintCompatibility';
 
 export interface LabelReprintRecord {
   model: string;
@@ -38,6 +40,7 @@ export interface LabelReprintRecord {
   supplier: string;
   package: string;
   source_qr: string;
+  qr_field_count?: 6 | 7;
   inventory_code?: string;
   inventory_name?: string;
   specification?: string;
@@ -213,6 +216,13 @@ export const prepareLabelReprint = async (raw: string): Promise<LabelReprintTask
     );
   }
   const supplier = resolveLabelReprintSupplier(model, await getAllInventoryBindings());
+  const dongweiFieldCount = supplier === DONGWEI_SUPPLIER ? getDongweiRuleFieldCount(rule) : undefined;
+  if (supplier === DONGWEI_SUPPLIER && dongweiFieldCount === undefined) {
+    throw new LabelReprintValidationError(
+      '东微标签格式不支持',
+      '东微补打须使用分号分隔的六段或七段标准字段顺序，请核对解析规则。本次未打印。'
+    );
+  }
   try {
     await assertRuleSupplierForScan({ rule, materialSupplier: supplier });
   } catch (error) {
@@ -233,6 +243,7 @@ export const prepareLabelReprint = async (raw: string): Promise<LabelReprintTask
     package: fields.package || '',
     // Reprinting preserves the actual scanned QR, including its separator/endings.
     source_qr: raw,
+    ...(dongweiFieldCount === undefined ? {} : { qr_field_count: dongweiFieldCount }),
   });
   const now = new Date().toISOString();
   return {
@@ -503,6 +514,10 @@ const performSubmission = async (
         `供应商「${task.supplier}」没有可用标签模板，本次未打印。`, 'NO_TEMPLATE', false
       );
     }
+    if (task.supplier === DONGWEI_SUPPLIER && task.record.qr_field_count === 6) {
+      await assertDongweiSixPrintSupported(config, health.payload);
+      checkActive(options);
+    }
     if (original.reprintSessionId && original.reprintSessionId !== sessionId && !options.retryConfirmed) {
       throw new LabelReprintSubmissionError(
         '同步助手已重新启动，原任务结果无法确认。请先核对标签是否已出纸，再使用核对后重试。',
@@ -558,6 +573,8 @@ const performSubmission = async (
   } catch (error) {
     const failure = error instanceof LabelReprintSubmissionError
       ? error
+      : error instanceof DongweiPrintCompatibilityError
+      ? new LabelReprintSubmissionError(error.message, error.code)
       : new LabelReprintSubmissionError(task.internalPackageId && error instanceof Error
         ? error.message : '标签补打提交失败，请检查同步助手后重试。', 'SUBMISSION_FAILED');
     return {
