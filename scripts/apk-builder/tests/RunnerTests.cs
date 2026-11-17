@@ -171,11 +171,14 @@ internal static class RunnerTests
                     "The diagnostic omitted task-owned process cleanup results.");
                 Assert(fault.WaitCount == 2, "Both output streams must be checked even if stdout timed out.");
 
-                File.Delete(f.Apk); // Deliver a new APK, rather than relying on the two-second freshness tolerance.
+                // Match the real builder's unique output name. Windows can retain the
+                // previous creation time if the same name is deleted and recreated quickly.
+                f.Apk = Path.Combine(f.DirectoryPath, "掌上仓库 后续测试.apk");
                 f.SetScript(SuccessScript);
                 BuildResult next = Finish(f.Runner.StartAsync(BuildMode.Build));
-                Assert(next.State == BuildState.Succeeded && String.IsNullOrEmpty(next.WarningMessage) && String.IsNullOrEmpty(next.ErrorMessage),
-                    "The prior task's output warning/hash requirement leaked into a normal legacy APK task.");
+                Assert(next.State == BuildState.Succeeded && next.ArtifactPath == f.Apk &&
+                    String.IsNullOrEmpty(next.WarningMessage) && String.IsNullOrEmpty(next.ErrorMessage),
+                    next.ErrorMessage ?? next.WarningMessage ?? "A normal legacy APK task did not deliver its new artifact.");
                 Assert(fault.WaitCount == 4, "The next task did not independently wait for both output streams.");
                 Assert(!File.ReadAllText(next.LogPath).Contains(result.WarningMessage), "The previous task's EOF warning contaminated the next log.");
             }
