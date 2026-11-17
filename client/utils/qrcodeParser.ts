@@ -31,6 +31,7 @@ const COMMON_SEPARATORS = [
   '#',
   ';',
   ':',
+  '%',
   '\t',
   '\n',
   '\r',

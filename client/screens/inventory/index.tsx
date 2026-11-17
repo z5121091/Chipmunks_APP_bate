@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { AppModal as Modal } from '@/components/AppModal';
 import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
@@ -7,12 +8,11 @@ import { usePreventRemove } from 'expo-router/react-navigation';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderRadius, Spacing, Typography } from '@/constants/theme';
-import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
 import { Screen } from '@/components/Screen';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
+import { AppModalViewport } from '@/components/AppModalViewport';
 import { AppFormField } from '@/components/AppFormField';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { AggregatedRecordItem } from '@/components/AggregatedRecordItem';
 import {
@@ -45,6 +45,7 @@ import {
 } from '@/utils/database';
 import { isQRCode, recoverConfirmedScannerContent, shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
 import { buildPackageKey, packageFieldValue } from '@/utils/packageRecognition';
+import { assertRuleSupplierForScan } from '@/utils/ruleSupplierValidation';
 import { fetchCurrentStockByInventoryCode } from '@/utils/erpCurrentStock';
 import { assertInternalLabelStockMatches, internalLabelPackageKey, INTERNAL_LABEL_RULE_ID, INTERNAL_LABEL_RULE_NAME, isInternalLabelInput, isInternalLabelPackageKey } from '@/utils/internalLabelCode';
 import { parseQuantity } from '@/utils/quantity';
@@ -157,40 +158,40 @@ const getInventoryWarehouseForAccount = (account: ErpAccountConfig): Warehouse =
 const getDraftScopeKey = (accountKey: ErpAccountKey, warehouseId: string): string =>
   `${accountKey}::${warehouseId}`;
 
+const createQuantityModalStyles = (theme: ReturnType<typeof useTheme>['theme']) => ({
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    justifyContent: 'center' as const,
+    alignItems: 'center' as const,
+    paddingHorizontal: Spacing.md,
+  },
+  editOverlay: {
+    paddingVertical: Spacing.md,
+  },
+  quantityField: {
+    marginBottom: 0,
+  },
+  quantityActions: {
+    marginTop: 0,
+  },
+  textInput: {
+    height: 44,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: BorderRadius.md,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+    fontSize: Typography.body.fontSize,
+    color: theme.textPrimary,
+    backgroundColor: theme.backgroundTertiary,
+  },
+});
+
 export default function InventoryScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
-  const quantityModalStyles = useMemo(
-    () => ({
-      modalOverlay: {
-        flex: 1,
-        backgroundColor: 'rgba(0,0,0,0.45)',
-        justifyContent: 'center' as const,
-        alignItems: 'center' as const,
-        paddingHorizontal: Spacing.md,
-      },
-      modalContent: {
-        width: '100%' as const,
-        maxWidth: APP_MODAL_MAX_WIDTH,
-      },
-      modalBody: {
-        paddingVertical: Spacing.sm,
-        justifyContent: 'center' as const,
-      },
-      textInput: {
-        height: 44,
-        borderWidth: 1,
-        borderColor: theme.border,
-        borderRadius: BorderRadius.md,
-        paddingHorizontal: Spacing.md,
-        paddingVertical: Spacing.sm,
-        fontSize: Typography.body.fontSize,
-        color: theme.textPrimary,
-        backgroundColor: theme.backgroundTertiary,
-      },
-    }),
-    [theme]
-  );
+  const styles = useResponsiveStyles(theme, createStyles);
+  const quantityModalStyles = useResponsiveStyles(theme, createQuantityModalStyles);
   const router = useSafeRouter();
   const { showToast, ToastContainer } = useToast({ persistentErrors: true });
   const alert = useCustomAlert({ persistentErrors: true });
@@ -446,10 +447,6 @@ export default function InventoryScreen() {
   // Cover scan parsing, queued scans, persistence and final reconciliation on every exit path.
   usePreventRemove(saving || scanBusy || Boolean(inputValue.trim()), blockBackDuringWork);
 
-  useEffect(() => {
-    scannerFocusBlockedRef.current = quantityModalVisible || saveConfirmVisible || saving || switchingAccount || alert.visible;
-  }, [alert.visible, quantityModalVisible, saveConfirmVisible, saving, switchingAccount]);
-
   const focusScannerInput = useCallback((delay = 0) => {
     if (screenActiveRef.current && !scannerFocusBlockedRef.current) inputRef.current?.focus(delay);
   }, []);
@@ -482,10 +479,10 @@ export default function InventoryScreen() {
   );
 
   useEffect(() => {
-    if (!quantityModalVisible && !saving && !switchingAccount) {
-      focusScannerInput(80);
-    }
-  }, [focusScannerInput, quantityModalVisible, saving, switchingAccount]);
+    const scannerFocusBlocked = quantityModalVisible || saveConfirmVisible || saving || switchingAccount || alert.visible;
+    scannerFocusBlockedRef.current = scannerFocusBlocked;
+    if (!scannerFocusBlocked) focusScannerInput(80);
+  }, [focusScannerInput, alert.visible, quantityModalVisible, saveConfirmVisible, saving, switchingAccount]);
 
   // 展开状态管理（用 ref 同步，避免 renderAggregatedRecord 频繁重建）
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
@@ -756,6 +753,10 @@ export default function InventoryScreen() {
           feedbackNotBound();
           return;
         }
+
+        // 与出入库保持一致：只校验规则显式关联的供应商，内部标签使用独立登记校验。
+        if (!internal) await assertRuleSupplierForScan({ rule, inventoryCode });
+        if (!isCurrent()) return;
 
         if (internal && internal.accountKey !== selectedAccount.key) {
           const result = await fetchCurrentStockByInventoryCode(selectedAccount, internal.inventoryCode);
@@ -1212,7 +1213,6 @@ export default function InventoryScreen() {
   const closeSaveConfirmation = () => {
     saveConfirmRef.current = false;
     setSaveConfirmVisible(false);
-    focusScannerInput();
   };
 
   // 清空记录
@@ -1649,15 +1649,12 @@ export default function InventoryScreen() {
           animationType="fade"
           onRequestClose={handleCancelQuantity}
         >
-          <View style={quantityModalStyles.modalOverlay}>
+          <AppModalViewport style={[quantityModalStyles.modalOverlay, quantityModalStyles.editOverlay]}>
             <AppModalCard
               title="修改实盘数量"
               subtitle={editingRecord ? `用于修正 ${editingRecord.model} 的实际数量` : undefined}
               onClose={handleCancelQuantity}
-              style={quantityModalStyles.modalContent}
-              bodyStyle={quantityModalStyles.modalBody}
-              size="compact"
-              stretchBody
+              size="auto"
               footer={
                 <AppModalActions
                   secondaryLabel="取消"
@@ -1666,11 +1663,12 @@ export default function InventoryScreen() {
                   onPrimaryPress={handleConfirmQuantity}
                   primaryDisabled={saving}
                   secondaryDisabled={saving}
+                  containerStyle={quantityModalStyles.quantityActions}
                 />
               }
             >
               {editingRecord && (
-                <AppFormField label="实际数量">
+                <AppFormField label="实际数量" style={quantityModalStyles.quantityField}>
                   <TextInput
                     ref={quantityInputRef}
                     style={quantityModalStyles.textInput}
@@ -1687,29 +1685,27 @@ export default function InventoryScreen() {
                 </AppFormField>
               )}
             </AppModalCard>
-          </View>
+          </AppModalViewport>
         </Modal>
 
         {<Modal visible={Boolean(saveConfirmVisible) && (true)} transparent animationType="fade" onRequestClose={closeSaveConfirmation}>{saveConfirmVisible ? <>
-          <View style={quantityModalStyles.modalOverlay}>
-            <AppModalCard title="完成盘点" subtitle={`${selectedAccount.name} · ${currentWarehouse.name}`} size="compact"
+          <AppModalViewport style={[quantityModalStyles.modalOverlay, quantityModalStyles.editOverlay]}>
+            <AppModalCard title="完成盘点" subtitle={`${selectedAccount.name} · ${currentWarehouse.name}`} size="auto"
               onClose={closeSaveConfirmation}
-              footer={<AppModalActions secondaryLabel="取消" onSecondaryPress={closeSaveConfirmation}
+              footer={<AppModalActions containerStyle={quantityModalStyles.quantityActions} secondaryLabel="取消" onSecondaryPress={closeSaveConfirmation}
                 primaryLabel="确认完成" onPrimaryPress={() => {
                   if (!saveConfirmRef.current) return;
                   closeSaveConfirmation();
                   void performSaveInventory();
                 }} />}>
-              <KeyboardAwareFormScrollView>
                 <Text style={[Typography.dialogNote, { color: theme.textPrimary }]}>
                   核对 ERP 库存后保存本次盘点明细和差异。
                 </Text>
                 <Text style={[Typography.dialogNote, { color: theme.textMuted, marginTop: Spacing.sm }]}>
                   仅保存本次扫描的盘点记录；未扫描物料不受影响。
                 </Text>
-              </KeyboardAwareFormScrollView>
             </AppModalCard>
-          </View>
+          </AppModalViewport>
         </> : null}</Modal>}
         {alert.AlertComponent}
         <ToastContainer />

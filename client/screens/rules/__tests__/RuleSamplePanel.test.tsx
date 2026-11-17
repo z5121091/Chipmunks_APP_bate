@@ -88,6 +88,35 @@ it('supports backtracking, dismissing mid-flow, and editing the second or third 
   expect(latest().fieldOrder).toEqual(['model', 'batch', 'quantity']);
 });
 
+it('offers percent splitting and maps ten data segments without inventing an eleventh field for the ending', async () => {
+  const sample = 'NSI6801EB-DSWFR%H20B55%2634%1000%SOW6%NSI2636068%F%NSI2636068X39%S%NSI6801EB-DSWFRC%';
+  await act(async () => { root = TestRenderer.create(<Harness sample={sample} />); });
+  await press('拆分并逐段分配');
+  expect(picker().props.title).toBe('确认分隔符');
+  expect(picker().props.options).toEqual([{ value: '%', label: '% · 10段（推荐）', disabled: false }]);
+  await choose('%');
+  const fields = ['model', '__ignore__', '__ignore__', 'quantity', '__ignore__', '__ignore__', '__ignore__', '__ignore__', '__ignore__', '__ignore__'];
+  for (let index = 0; index < fields.length; index++) {
+    expect(picker().props.title).toBe(`第${index + 1} / 10段`);
+    expect(picker().props.detail).toBe(sample.split('%')[index]);
+    await choose(fields[index]);
+  }
+  expect(latest().separator).toBe('%');
+  expect(latest().fieldOrder).toHaveLength(10);
+  expect(parseWithRule(sample, latest()).standardFields).toEqual({ model: 'NSI6801EB-DSWFR', quantity: '1000' });
+  expect(root.root.findAllByType(RuleOptionPicker).filter(node => node.props.visible !== false)).toHaveLength(0);
+});
+
+it('preserves an empty middle segment and a configured empty last field while mapping percent labels', async () => {
+  const initial = { ...base, separator: '%', fieldOrder: ['model', 'ignore:1', 'quantity', 'sourceNo'] };
+  await act(async () => { root = TestRenderer.create(<Harness sample="MODEL%%100%" initial={initial} />); });
+  await press('设置第4段字段');
+  expect(picker().props.detail).toBe('');
+  await choose('sourceNo');
+  expect(latest().fieldOrder).toEqual(initial.fieldOrder);
+  expect(parseWithRule('MODEL%%100%', latest()).standardFields).toEqual({ model: 'MODEL', quantity: '100', sourceNo: '' });
+});
+
 it('includes a manually configured separator and keeps empty middle segments and ignored identifiers', async () => {
   const initial = { ...base, separator: '~', fieldOrder: ['model', 'ignore:8', 'quantity'] };
   await act(async () => { root = TestRenderer.create(<Harness sample="MODEL~~100" initial={initial} />); });

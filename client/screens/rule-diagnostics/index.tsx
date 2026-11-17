@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionCollapse } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -34,7 +35,7 @@ const BINDING_LABELS = { exact: '精确绑定', generic: '通用版本绑定', n
 export default function RuleDiagnosticsScreen() {
   const { theme, isDark } = useTheme();
   const reduced = useAppMotion();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const router = useSafeRouter();
   const navigation = useNavigation<NativeStackNavigationProp<ParamListBase>>();
   const params = useSafeSearchParams<{ expectedRuleId?: string }>();

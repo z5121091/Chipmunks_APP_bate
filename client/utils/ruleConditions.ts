@@ -146,7 +146,7 @@ export const suggestRuleSeparators = (content: string, configured: readonly stri
   const labels: Record<string, string> = { '\r\n': '回车换行', '\r': '回车', '\n': '换行', '\t': '制表符',
     '\x1D': 'GS', '\x1E': 'RS', ' ': '空格', '{}': '{…}', '()': '(…)', '[]': '[…]', '<>': '<…>' };
   const brackets = ['{}', '()', '[]', '<>'];
-  const separators = [...brackets, '\r\n', '\n', '\r', '\t', '\x1D', '\x1E', '||', '|', ';', '&', '#', '*', '/', ',', ':', ' ', ...configured];
+  const separators = [...brackets, '\r\n', '\n', '\r', '\t', '\x1D', '\x1E', '||', '|', ';', '&', '#', '*', '/', ',', ':', '%', ' ', ...configured];
   // 候选项只表示可能的格式，型号或规格里的标点也可能被拆开。
   return [...new Set(separators)].flatMap((value, priority) => {
     if (!value) return [];

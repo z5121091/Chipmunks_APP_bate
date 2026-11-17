@@ -42,6 +42,7 @@ scripts/visual-label-assistant/ui-preview.png
 
 # Local build outputs and private runtime data
 output/
+scripts/.sync-build-temp/
 *.exe
 *.apk
 *.aab

@@ -1,9 +1,12 @@
 import TestRenderer, { act } from 'react-test-renderer';
-import { BackHandler, FlatList, TextInput, TouchableOpacity } from 'react-native';
+import { BackHandler, FlatList, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import InventoryScreen from '../index';
+import { AppModalCard } from '@/components/AppModalCard';
+import { AppModalActions } from '@/components/AppModalActions';
+import { MotionSurface } from '@/components/AppMotion';
 import { feedbackSuccess, feedbackConfirm } from '@/utils/feedback';
-import { addInventoryCheckRecordsBatch, generateCheckNo, getActiveRules, getInternalLabelSpecifications, getInventoryCodeByModel, requireActiveInternalLabel, updateInventoryCheckDocumentSyncStatus } from '@/utils/database';
+import { addInventoryCheckRecordsBatch, detectRule, generateCheckNo, getActiveRules, getInternalLabelSpecifications, getInventoryBindingByCode, getInventoryCodeByModel, getInventorySupplierById, requireActiveInternalLabel, updateInventoryCheckDocumentSyncStatus, type QRCodeRule } from '@/utils/database';
 import { buildInternalLabel, internalLabelPackageKey, parseInternalLabel } from '@/utils/internalLabelCode';
 import { shouldWaitForQRCodeContinuation } from '@/utils/qrcodeParser';
 import { reconcileInventoryRecords } from '@/utils/inventoryReconciliation';
@@ -12,6 +15,7 @@ import { STORAGE_KEYS } from '@/constants/config';
 
 const mockToast = jest.fn();
 const mockAlert = { visible: false, showConfirm: jest.fn() };
+const mockScannerFocus = jest.fn();
 const mockRouter = { back: jest.fn() };
 let mockFocusCallback: () => (() => void) | void;
 let mockFocusCleanup: (() => void) | void;
@@ -31,15 +35,20 @@ jest.mock('expo-router/react-navigation', () => ({ usePreventRemove: (prevent: b
   mockBlockedRouteRemove = callback;
 } }));
 jest.mock('@/hooks/useSafeRouter', () => ({ useSafeRouter: () => mockRouter }));
-jest.mock('@/hooks/useTheme', () => { const theme = {}; return { useTheme: () => ({ theme, isDark: false }) }; });
+jest.mock('@/hooks/useTheme', () => {
+  const { Colors } = require('@/constants/theme');
+  return { useTheme: () => ({ theme: Colors.light, isDark: false }) };
+});
 jest.mock('../styles', () => ({ createStyles: () => ({}) }));
 jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
-jest.mock('@/components/WarehouseScanInput', () => ({ WarehouseScanInput: 'ScanInput' }));
+jest.mock('@/components/WarehouseScanInput', () => {
+  const React = require('react') as typeof import('react');
+  return { WarehouseScanInput: (props: import('@/components/WarehouseScanInput').WarehouseScanInputProps) => {
+    React.useImperativeHandle(props.inputRef, () => ({ focus: mockScannerFocus, clear: () => undefined }));
+    return React.createElement('ScanInput', props);
+  } };
+});
 jest.mock('@/components/CustomAlert', () => ({ useCustomAlert: () => mockAlert }));
-jest.mock('@/components/AppModalCard', () => ({ AppModalCard: 'ModalCard' }));
-jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'ModalActions' }));
-jest.mock('@/components/AppFormField', () => ({ AppFormField: 'FormField' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'KeyboardForm' }));
 jest.mock('@/components/AppEmptyState', () => ({ AppEmptyState: 'Empty' }));
 jest.mock('@/components/AggregatedRecordItem', () => ({ AggregatedRecordItem: 'Record' }));
 jest.mock('@/components/UiRedesign', () => ({ UiPageHeader: 'Header', UiSafeBottomBar: 'Bottom', UiToolbarButton: 'Toolbar', UiWorkflowSummary: 'Summary' }));
@@ -50,7 +59,7 @@ jest.mock('@/utils/excel', () => ({ syncExcelToComputer: jest.fn(), formatSyncEr
 jest.mock('@/utils/inventoryReconciliation', () => ({ reconcileInventoryRecords: jest.fn(), getInventoryCodeLookupKey: (text: string) => text }));
 jest.mock('@/utils/qrcodeParser', () => ({ recoverConfirmedScannerContent: (code: string) => code, isQRCode: () => true, shouldWaitForQRCodeContinuation: jest.fn(() => false) }));
 jest.mock('@/utils/feedback', () => ({
-  feedbackSuccess: jest.fn(), feedbackError: jest.fn(), feedbackWarning: jest.fn(), feedbackClear: jest.fn(),
+  feedbackSuccess: jest.fn(), feedbackError: jest.fn(), feedbackWarning: jest.fn(), feedbackClear: jest.fn(), feedbackCancel: jest.fn(),
   feedbackClearFailed: jest.fn(), feedbackDuplicate: jest.fn(), feedbackConfirm: jest.fn(), feedbackInventoryComplete: jest.fn(),
   feedbackNotBound: jest.fn(), feedbackDeleted: jest.fn(), useFeedbackCleanup: jest.fn(),
 }));
@@ -58,6 +67,7 @@ jest.mock('@/utils/database', () => ({
   getActiveRules: jest.fn(async () => [{}]), detectRule: jest.fn(async () => ({ id: 'R', name: '规则' })),
   parseWithRule: (code: string) => ({ standardFields: { model: 'MODEL', quantity: '10', traceNo: code }, customFields: {} }),
   getInventoryCodeByModel: jest.fn(async () => 'INV'), generateId: () => 'record-1',
+  getInventorySupplierById: jest.fn(), getInventoryBindingByCode: jest.fn(),
   requireActiveInternalLabel: jest.fn(),
   getInternalLabelSpecifications: jest.fn(async () => new Map()),
   addInventoryCheckRecordsBatch: jest.fn(), generateCheckNo: jest.fn(), updateInventoryCheckDocumentSyncStatus: jest.fn(),
@@ -65,6 +75,10 @@ jest.mock('@/utils/database', () => ({
 
 const DRAFT_KEY = 'inventory_check_records_by_erp_account_v1';
 const SCOPE = 'shanghai-chipmunk::erp-account:shanghai-chipmunk';
+const supplierRule: QRCodeRule = {
+  id: 'R', name: '规则', description: '', separator: '/', fieldOrder: ['model', 'quantity', 'traceNo'],
+  supplierId: 'SUPPLIER-A', isActive: true, created_at: '', updated_at: '',
+};
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(done => { resolve = done; });
@@ -76,11 +90,14 @@ const scan = async (code = 'MODEL/10/TRACE') => {
   await act(async () => { root.root.findByType('ScanInput' as never).props.onSubmitEditing(); });
 };
 const records = () => root.root.findByType(FlatList).props.data;
+const modalCard = (title: string) => root.root.findAllByType(AppModalCard).find(card => card.props.title === title);
 
 beforeEach(async () => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
   jest.clearAllMocks();
+  jest.mocked(getInventorySupplierById).mockReset().mockResolvedValue({ id: 'SUPPLIER-A', name: '供应商A', binding_count: 1, created_at: '' });
+  jest.mocked(getInventoryBindingByCode).mockReset().mockResolvedValue({ id: 'B', scan_model: 'MODEL', inventory_code: 'INV', supplier: '供应商A', created_at: '' });
   mockPreventRemove = false;
   jest.spyOn(BackHandler, 'addEventListener').mockImplementation((_event, callback) => {
     mockHardwareBack = callback;
@@ -105,7 +122,7 @@ const openSaveConfirmation = async () => {
 const confirmSave = async () => {
   await openSaveConfirmation();
   await act(async () => {
-    root.root.findAllByType('ModalCard' as never).find(card => card.props.title === '完成盘点')!.props.footer.props.onPrimaryPress();
+    modalCard('完成盘点')!.findByType(AppModalActions).props.onPrimaryPress();
     expect(mockHardwareBack()).toBe(true);
   });
 };
@@ -151,6 +168,56 @@ it('counts equal-quantity internal packs separately, groups by stock code and re
   expect(detail.props.children[0].props.numberOfLines).toBeUndefined();
   expect(mockToast).toHaveBeenCalledWith('本盘点单已扫过此包装', 'warning');
   expect(getInventoryCodeByModel).not.toHaveBeenCalled();
+  expect(getInventorySupplierById).not.toHaveBeenCalled();
+  expect(getInventoryBindingByCode).not.toHaveBeenCalled();
+});
+
+it.each(['same', 'unknown', 'unlinked'] as const)('preserves %s supplier compatibility before persisting an inventory scan', async mode => {
+  jest.mocked(detectRule).mockResolvedValueOnce(mode === 'unlinked' ? { ...supplierRule, supplierId: undefined } : supplierRule);
+  if (mode === 'unknown') jest.mocked(getInventoryBindingByCode).mockResolvedValueOnce(null);
+  await act(async () => { root = TestRenderer.create(<InventoryScreen />); });
+  await scan();
+  expect(records()).toHaveLength(1);
+  expect(feedbackSuccess).toHaveBeenCalledTimes(1);
+  expect(JSON.parse((await AsyncStorage.getItem(DRAFT_KEY))!)[SCOPE]).toHaveLength(1);
+  if (mode === 'unlinked') {
+    expect(getInventorySupplierById).not.toHaveBeenCalled();
+    expect(getInventoryBindingByCode).not.toHaveBeenCalled();
+  } else {
+    expect(getInventorySupplierById).toHaveBeenCalledWith('SUPPLIER-A');
+    expect(getInventoryBindingByCode).toHaveBeenCalledWith('INV');
+  }
+});
+
+it.each(['mismatched', 'missing'] as const)('rejects a %s explicitly linked supplier without writing a count draft', async mode => {
+  jest.mocked(detectRule).mockResolvedValueOnce(supplierRule);
+  if (mode === 'missing') jest.mocked(getInventorySupplierById).mockResolvedValueOnce(null);
+  else jest.mocked(getInventoryBindingByCode).mockResolvedValueOnce({
+    id: 'B', scan_model: 'MODEL', inventory_code: 'INV', supplier: '供应商B', created_at: '',
+  });
+  await act(async () => { root = TestRenderer.create(<InventoryScreen />); });
+  await scan();
+  expect(records()).toEqual([]);
+  expect(feedbackSuccess).not.toHaveBeenCalled();
+  expect(await AsyncStorage.getItem(DRAFT_KEY)).toBeNull();
+  expect(mockToast).toHaveBeenCalledWith(expect.stringContaining(mode === 'missing' ? '关联的供应商已不存在' : '物料绑定中的供应商：供应商B'), 'error');
+});
+
+it('does not save or acknowledge supplier validation from an earlier visit after re-entry', async () => {
+  const supplier = deferred<Awaited<ReturnType<typeof getInventorySupplierById>>>();
+  jest.mocked(detectRule).mockResolvedValueOnce(supplierRule);
+  jest.mocked(getInventorySupplierById).mockReturnValueOnce(supplier.promise);
+  await act(async () => { root = TestRenderer.create(<InventoryScreen />); });
+  await scan('OLD/10/TRACE');
+  expect(getInventorySupplierById).toHaveBeenCalledTimes(1);
+  await act(async () => { mockFocusCleanup?.(); mockFocusCleanup = mockFocusCallback(); });
+  await act(async () => { supplier.resolve({ id: 'SUPPLIER-A', name: '供应商A', binding_count: 1, created_at: '' }); });
+  expect(records()).toEqual([]);
+  expect(await AsyncStorage.getItem(DRAFT_KEY)).toBeNull();
+  expect(feedbackSuccess).not.toHaveBeenCalled();
+  await scan('NEW/10/TRACE');
+  expect(records()[0].records[0].traceCode).toBe('NEW/10/TRACE');
+  expect(feedbackSuccess).toHaveBeenCalledTimes(1);
 });
 
 it('recovers the specification from the local label registry for an older inventory draft', async () => {
@@ -190,7 +257,7 @@ it('blocks header, hardware and native route removal throughout ERP, DB, draft c
   jest.mocked(updateInventoryCheckDocumentSyncStatus).mockReturnValueOnce(status.promise);
   await confirmSave();
   await act(async () => { await jest.advanceTimersByTimeAsync(220); });
-  expect(root.root.findAllByType('ModalCard' as never).some(card => card.props.title === '完成盘点')).toBe(false);
+  expect(modalCard('完成盘点')).toBeUndefined();
   await expectNavigationBlocked();
   await act(async () => { reconciliation.resolve(result); });
   expect(addInventoryCheckRecordsBatch).toHaveBeenCalledTimes(1);
@@ -211,14 +278,26 @@ it('blocks header, hardware and native route removal throughout ERP, DB, draft c
   expect(mockRouter.back).toHaveBeenCalledTimes(1);
 });
 
-it('canceling completion leaves draft intact and allows normal back without ERP work', async () => {
+it('canceling completion restores scanner focus and leaves the draft intact without ERP work', async () => {
   await act(async () => { root = TestRenderer.create(<InventoryScreen />); });
   await scan();
   await act(async () => { await jest.advanceTimersByTimeAsync(1); });
   await openSaveConfirmation();
+  const confirmation = modalCard('完成盘点')!;
+  expect(confirmation.props.size).toBe('auto');
+  expect(confirmation.props.stretchBody).toBeUndefined();
+  expect(confirmation.findAllByType(ScrollView)).toHaveLength(1);
+  const body = confirmation.findAllByType(View).find(view => view.props.testID === 'app-modal-card-body')!;
+  expect(StyleSheet.flatten(body.props.style).flex).toBeUndefined();
+  const actions = confirmation.findByType(AppModalActions);
+  expect(StyleSheet.flatten(actions.props.containerStyle).marginTop).toBe(0);
+  expect(root.root.findByType('ScanInput' as never).props.autoFocus).toBe(false);
+  mockScannerFocus.mockClear();
   await act(async () => {
-    root.root.findAllByType('ModalCard' as never).find(card => card.props.title === '完成盘点')!.props.footer.props.onSecondaryPress();
+    modalCard('完成盘点')!.findByType(AppModalActions).props.onSecondaryPress();
   });
+  expect(root.root.findByType('ScanInput' as never).props.autoFocus).toBe(true);
+  expect(mockScannerFocus).toHaveBeenCalled();
   expect(reconcileInventoryRecords).not.toHaveBeenCalled();
   expect(records()).toHaveLength(1);
   expect(mockPreventRemove).toBe(false);
@@ -338,10 +417,7 @@ it('keeps scanning disabled until the initial draft has been restored', async ()
   expect(root.root.findByType('ScanInput' as never).props.editable).toBe(true);
 });
 
-it('keeps the original actual quantity and editor open if saving a quantity adjustment fails', async () => {
-  await act(async () => { root = TestRenderer.create(<InventoryScreen />); });
-  await scan();
-  await act(async () => { await jest.advanceTimersByTimeAsync(1); });
+const openActualQuantityEditor = async () => {
   const list = root.root.findByType(FlatList);
   const group = list.props.data[0];
   let row!: TestRenderer.ReactTestRenderer;
@@ -350,14 +426,70 @@ it('keeps the original actual quantity and editor open if saving a quantity adju
   let detail!: TestRenderer.ReactTestRenderer;
   await act(async () => { detail = TestRenderer.create(renderer(group.records[0])); });
   await act(async () => { detail.root.findByType(TouchableOpacity).props.onPress(); });
-  await act(async () => { root.root.findByType(TextInput).props.onChangeText('7'); });
-  jest.spyOn(AsyncStorage, 'setItem').mockRejectedValueOnce(new Error('disk full'));
-  await act(async () => { await root.root.findByType('ModalCard' as never).props.footer.props.onPrimaryPress(); });
+  await act(async () => { detail.unmount(); row.unmount(); });
+};
+
+it.each([[320, 480, 1.3], [360, 640, 1]])('keeps the actual quantity editor compact on a %i dp PDA', async (width, height, fontScale) => {
+  jest.spyOn(require('react-native'), 'useWindowDimensions').mockReturnValue({ width, height, scale: 1, fontScale });
+  await act(async () => { root = TestRenderer.create(<InventoryScreen />); });
+  await scan();
+  await act(async () => { await jest.advanceTimersByTimeAsync(1); });
+  await openActualQuantityEditor();
+  const card = modalCard('修改实盘数量')!;
+  const surface = card.findByType(MotionSurface);
+  const viewport = root.root.findAllByType(View).find(node => node.props.testID === 'app-modal-viewport')!;
+  const section = (name: 'header' | 'body' | 'footer') => card.findAllByType(View)
+    .find(node => node.props.testID === `app-modal-card-${name}`)!;
+  const measure = async (node: TestRenderer.ReactTestInstance, measuredHeight: number) => {
+    await act(async () => { node.props.onLayout({ nativeEvent: { layout: { height: measuredHeight } } }); });
+  };
+  await measure(section('header'), 112);
+  await measure(section('footer'), 76);
+  await measure(viewport, height - 40);
+  expect(StyleSheet.flatten(surface.props.style)).toMatchObject({ width: width - 40, maxHeight: height - 40 });
+  expect(StyleSheet.flatten(surface.props.style).height).toBeUndefined();
+  expect(StyleSheet.flatten(section('body').props.style).flex).toBeUndefined();
+  expect(card.findByType(ScrollView).props.scrollEnabled).toBe(false);
+  const actions = section('footer').findByType(AppModalActions);
+  expect(StyleSheet.flatten(actions.props.containerStyle)).toMatchObject({ marginTop: 0 });
+  expect(actions.findAllByType(Text).map(node => node.props.children)).toEqual(['取消', '保存']);
+
+  const input = card.findByType(TextInput);
+  await act(async () => { input.props.onChangeText('7'); });
+  await measure(viewport, 180);
+  expect(card.findByType(ScrollView).props.scrollEnabled).toBe(true);
+  expect(StyleSheet.flatten(section('body').props.style).height).toBeUndefined();
+  expect(card.findByType(TextInput)).toBe(input);
+  expect(input.props.value).toBe('7');
+  await measure(viewport, height - 40);
+  expect(card.findByType(ScrollView).props.scrollEnabled).toBe(false);
+
+  await act(async () => { actions.props.onSecondaryPress(); });
+  await act(async () => { await jest.advanceTimersByTimeAsync(220); });
   expect(records()[0].records[0].actualQuantity).toBe(10);
-  expect(root.root.findByType('ModalCard' as never).props.title).toBe('修改实盘数量');
+  expect(modalCard('修改实盘数量')).toBeUndefined();
+  await openActualQuantityEditor();
+  const saveCard = modalCard('修改实盘数量')!;
+  expect(saveCard.findByType(TextInput).props.value).toBe('10');
+  await act(async () => { saveCard.findByType(TextInput).props.onChangeText('7'); });
+  await act(async () => { await saveCard.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(records()[0].records[0].actualQuantity).toBe(7);
+  expect(JSON.parse((await AsyncStorage.getItem(DRAFT_KEY))!)[SCOPE][0].actualQuantity).toBe(7);
+});
+
+it('keeps the original actual quantity and editor open if saving a quantity adjustment fails', async () => {
+  await act(async () => { root = TestRenderer.create(<InventoryScreen />); });
+  await scan();
+  await act(async () => { await jest.advanceTimersByTimeAsync(1); });
+  await openActualQuantityEditor();
+  const card = modalCard('修改实盘数量')!;
+  await act(async () => { card.findByType(TextInput).props.onChangeText('7'); });
+  jest.spyOn(AsyncStorage, 'setItem').mockRejectedValueOnce(new Error('disk full'));
+  await act(async () => { await card.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(records()[0].records[0].actualQuantity).toBe(10);
+  expect(modalCard('修改实盘数量')).toBe(card);
   expect(feedbackConfirm).not.toHaveBeenCalled();
   expect(mockToast).toHaveBeenCalledWith(expect.stringContaining('原数量未修改'), 'error');
-  await act(async () => { detail.unmount(); row.unmount(); });
 });
 
 it('submits a complete label after the 500ms quiet window without Enter', async () => {

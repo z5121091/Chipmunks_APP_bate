@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Keyboard, KeyboardAvoidingView, Platform, ScrollView, Text, View, type ViewStyle } from 'react-native';
+import { Keyboard, ScrollView, Text, View, useWindowDimensions, type ViewStyle } from 'react-native';
 import { AppModal } from '@/components/AppModal';
 import { AppModalCard } from '@/components/AppModalCard';
 import { UiInput, UiToolbarButton } from '@/components/UiRedesign';
@@ -23,6 +23,7 @@ const getQuantity = (value: string) => {
 };
 
 export function InternalLabelForm({ styles, overlayPadding, modalHeight, onClose, onPrint }: Props) {
+  const { fontScale } = useWindowDimensions();
   const [accountKey, setAccountKey] = useState<ErpAccountKey>(
     (ERP_ACCOUNTS.find(isErpAccountAvailable) ?? ERP_ACCOUNTS[0]).key,
   );
@@ -37,6 +38,7 @@ export function InternalLabelForm({ styles, overlayPadding, modalHeight, onClose
   const [error, setError] = useState('');
   const [existing, setExisting] = useState(false);
   const [viewportHeight, setViewportHeight] = useState(0);
+  const [contentHeight, setContentHeight] = useState<number>();
   const mountedRef = useRef(true);
   const queryingRef = useRef(false);
   const printingRef = useRef(false);
@@ -52,6 +54,9 @@ export function InternalLabelForm({ styles, overlayPadding, modalHeight, onClose
   const stockValid = Number.isSafeInteger(stock?.quantity) && (stock?.quantity ?? 0) > 0;
   const canPrint = stockValid && quantities.every((quantity) => quantity > 0) && allocated === stock?.quantity;
   const busy = querying || printing;
+  // Give the longer explicit override a full row instead of shrinking its label.
+  const stackFooterActions = existing || fontScale > 1.15;
+  const footerActionStyle = [styles.correctionAction, stackFooterActions && styles.stackedCorrectionAction];
 
   function selectStock(value: InternalLabelStock | null) {
     setStock(value);
@@ -116,21 +121,24 @@ export function InternalLabelForm({ styles, overlayPadding, modalHeight, onClose
 
   return (
     <AppModal transparent visible animationType="fade" onShow={() => setScannerReady(true)} onRequestClose={close}>
-      <KeyboardAvoidingView style={[styles.modalOverlay, overlayPadding]} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-        <View style={styles.modalViewport} onLayout={({ nativeEvent }) => {
+      <View testID="internal-label-overlay" style={[styles.modalOverlay, overlayPadding]}>
+        <View style={styles.modalViewport} testID="internal-label-viewport" onLayout={({ nativeEvent }) => {
           if (nativeEvent.layout.height > 0) setViewportHeight(nativeEvent.layout.height);
         }}>
-          <AppModalCard title="新建内部标签" size="auto" stretchBody bodyStyle={styles.modalBody}
-            style={{ height: Math.min(modalHeight, viewportHeight || modalHeight) }} onClose={printing ? undefined : close}
-            footer={<View style={styles.correctionActions}>
+          <AppModalCard title="新建内部标签" size="list" stretchBody scrollMode="body" bodyStyle={styles.modalBody}
+            bodyContentHeight={contentHeight} style={{ maxHeight: Math.min(modalHeight, viewportHeight || modalHeight) }}
+            onClose={printing ? undefined : close}
+            footer={<View style={[styles.correctionActions, stackFooterActions && styles.stackedCorrectionActions]}>
               <UiToolbarButton label="取消" disabled={printing} onPress={close}
-                containerStyle={styles.correctionAction} style={styles.boundedAction} />
+                containerStyle={footerActionStyle} style={styles.boundedAction} />
               <UiToolbarButton label={existing ? '确认另建并打印' : '确认打印'} icon="printer" primary loading={printing}
                 disabled={busy || !canPrint} onPress={() => { void print(); }}
-                containerStyle={styles.correctionAction} style={styles.boundedAction} />
+                containerStyle={footerActionStyle} style={styles.boundedAction} />
             </View>}>
             <ScrollView style={styles.taskScroll} contentContainerStyle={styles.correctionContent}
-              keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator>
+              onContentSizeChange={(_width, height) => setContentHeight(height)}
+              testID="internal-label-form" keyboardShouldPersistTaps="handled" scrollEnabled
+              showsVerticalScrollIndicator keyboardDismissMode="on-drag">
               <Text style={styles.formLabel}>ERP 账套</Text>
               <View style={styles.correctionActions}>
                 {ERP_ACCOUNTS.map((account) => (
@@ -211,7 +219,7 @@ export function InternalLabelForm({ styles, overlayPadding, modalHeight, onClose
             </ScrollView>
           </AppModalCard>
         </View>
-      </KeyboardAvoidingView>
+      </View>
     </AppModal>
   );
 }

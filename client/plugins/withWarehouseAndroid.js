@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const motionTiming = require('../constants/motionTiming.json');
+const withWarehouseKeyboard = require('./withWarehouseKeyboard');
 const {
   withAppBuildGradle,
   withDangerousMod,
@@ -35,6 +36,7 @@ function writeMotionResources(androidRoot) {
 }
 
 module.exports = function withWarehouseAndroid(config) {
+  config = withWarehouseKeyboard(config);
   config = withAppBuildGradle(config, (config) => {
     let source = config.modResults.contents;
     if (source.includes('// warehouse-release-signing')) return config;

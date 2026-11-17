@@ -1,5 +1,9 @@
 # Expo App + Express.js
 
+## 本项目 UI 修改约束（必读）
+
+修改界面、按钮、弹窗或共用样式前，先阅读 [UI 修改与验收清单](docs/development/ui-change-checklist.md)。这是针对本项目曾反复出现的按钮过大、外层宽度错位、窗口尺寸缓存和弹窗遮挡问题的固定约束；完成后按清单报告实际验证范围。
+
 ## 目录结构规范（严格遵循）
 
 当前仓库是一个 monorepo（基于 pnpm 的 workspace）

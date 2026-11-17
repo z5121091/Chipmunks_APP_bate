@@ -11,7 +11,7 @@ using System.Windows.Forms;
 namespace Chipmunks.ApkBuilder
 {
     // Infrequent maintenance actions stay out of the main build workflow.
-    internal sealed class BuildToolsWindow : Form
+    internal sealed class BuildToolsWindow : BrandedForm
     {
         private readonly string repository;
         private readonly string kind;
@@ -413,7 +413,7 @@ namespace Chipmunks.ApkBuilder
         {
             internal SmoothGrid() { DoubleBuffered = true; }
         }
-        private sealed class CleanupReview : Form
+        private sealed class CleanupReview : BrandedForm
         {
             internal CleanupReview(string listing, int count, long bytes)
             {

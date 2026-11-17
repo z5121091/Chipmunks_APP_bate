@@ -10,9 +10,9 @@ import { AnimatedButton } from '@/components/AnimatedButton';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
+import { AppModalViewport } from '@/components/AppModalViewport';
 import { AppFormField } from '@/components/AppFormField';
 import { AppToggleRow } from '@/components/AppToggleRow';
-import { KeyboardAwareModalContainer } from '@/components/KeyboardAwareForm';
 import { createStyles } from './styles';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { logger } from '@/utils/logger';
@@ -323,13 +323,13 @@ export default function WarehouseManagementScreen() {
           if (!saving) setModalVisible(false);
         }}
       >
-        <View style={styles.modalOverlay}>
-          <KeyboardAwareModalContainer cardStyle={styles.modalCardFrame}>
+        <AppModalViewport style={styles.modalOverlay}>
             <AppModalCard
               title={editingWarehouse ? '编辑仓库' : '添加仓库'}
               onClose={saving ? undefined : () => setModalVisible(false)}
               style={styles.modalContent}
               bodyStyle={styles.modalBody}
+              size="auto"
               footer={
                 <AppModalActions
                   containerStyle={styles.modalActions}
@@ -378,8 +378,7 @@ export default function WarehouseManagementScreen() {
                 }}
               />
             </AppModalCard>
-          </KeyboardAwareModalContainer>
-        </View>
+        </AppModalViewport>
       </Modal>
 
       {/* 全局提示组件 */}

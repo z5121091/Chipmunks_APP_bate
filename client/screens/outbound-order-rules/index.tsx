@@ -1,13 +1,12 @@
 import { MotionContent } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { FlatList, Text, TextInput, View } from 'react-native';
+import { FlatList, Text, TextInput, View, ScrollView } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { AppModalActions } from '@/components/AppModalActions';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { Screen } from '@/components/Screen';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
@@ -325,7 +324,7 @@ export default function OutboundOrderRulesScreen() {
 
   if (activeWarehouse) {
     return (
-      <MotionContent contentKey={activeWarehouse ? 'editor' : 'list'} direction="fade" style={{ flex: 1 }}><Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
+      <MotionContent contentKey={activeWarehouse ? 'editor' : 'list'} direction="fade" style={{ flex: 1 }}><Screen disableAutoScroll backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
         <View style={[styles.editorScreen, { paddingTop: insets.top }]}>
           <View style={styles.header}>
             <TouchableOpacity
@@ -339,8 +338,11 @@ export default function OutboundOrderRulesScreen() {
             <Text style={styles.title}>编辑订单号样例</Text>
           </View>
 
-          <KeyboardAwareFormScrollView
+          <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
+            testID="outbound-order-rule-editor-scroll"
+            style={styles.editorScroll}
             contentContainerStyle={[
+              { flexGrow: 1 },
               styles.editorContent,
               { paddingBottom: insets.bottom + 100 },
             ]}
@@ -388,7 +390,7 @@ export default function OutboundOrderRulesScreen() {
               primaryDisabled={saving || !activeParseResult.rule}
               containerStyle={styles.editorActions}
             />
-          </KeyboardAwareFormScrollView>
+          </ScrollView>
         </View>
         {alert.AlertComponent}
       </Screen></MotionContent>

@@ -35,6 +35,7 @@ class MainApplication : Application(), ReactApplication {
       ReleaseLevel.STABLE
     }
     loadReactNative(this)
+    WarehouseKeyboardPolicy.install(reactHost)
     ApplicationLifecycleDispatcher.onApplicationCreate(this)
     AutoDatabaseBackupScheduler.schedule(this)
   }

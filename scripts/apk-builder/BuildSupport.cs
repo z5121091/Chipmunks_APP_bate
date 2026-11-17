@@ -114,7 +114,8 @@ namespace Chipmunks.ApkBuilder
             "client/version.json", "client/update-server.json", "client/tsconfig.json" };
         private static readonly string[] SyncInputs = { "scripts/label_sync_server.py", "scripts/label_templates", "scripts/assets", "scripts/icon.ico",
             "scripts/sync_export_folders.py", "scripts/sync_log_window.py", "scripts/sync_notifications.py", "scripts/sync_connection_qr.py",
-            "scripts/sync_pairing_settings.py", "scripts/sync-build-requirements.txt", "scripts/build.ps1" };
+            "scripts/sync_pairing_settings.py", "scripts/sync_window_icon.py", "scripts/sync_assets.py", "scripts/build_sync_embedded_assets.py",
+            "scripts/sync-build-requirements.txt", "scripts/build.ps1" };
         private static readonly HashSet<string> IgnoredDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
             "build", ".gradle", ".cxx", "node_modules", ".git", ".expo", "__pycache__", "__tests__", "testFixtures"
         };

@@ -193,9 +193,6 @@ export const createStyles = (theme: Theme) => {
       width: '100%',
       maxWidth: APP_MODAL_MAX_WIDTH,
     },
-    modalBodyContent: {
-      paddingBottom: Spacing.md,
-    },
     formInput: {
       backgroundColor: theme.backgroundTertiary,
       borderRadius: BorderRadius.lg,

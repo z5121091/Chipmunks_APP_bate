@@ -481,6 +481,50 @@ class AutoDatabaseBackupWorker(
     val remoteFileName: String
   )
 
+  private data class DatabaseSchemaEntry(
+    val type: String,
+    val name: String,
+    val tableName: String,
+    val sql: String?
+  )
+
+  private fun readDatabaseSchema(database: SQLiteDatabase): List<DatabaseSchemaEntry> {
+    val schema = mutableListOf<DatabaseSchemaEntry>()
+    database.rawQuery(
+      "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name, tbl_name",
+      null
+    ).use { cursor ->
+      while (cursor.moveToNext()) {
+        schema.add(DatabaseSchemaEntry(
+          type = cursor.getString(0),
+          name = cursor.getString(1),
+          tableName = cursor.getString(2),
+          sql = if (cursor.isNull(3)) null else cursor.getString(3)
+        ))
+      }
+    }
+    return schema
+  }
+
+  private fun validateDatabaseSnapshot(
+    backupFile: File,
+    expectedSchema: List<DatabaseSchemaEntry>
+  ) {
+    SQLiteDatabase.openDatabase(backupFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
+      .use { snapshot ->
+        snapshot.rawQuery("PRAGMA integrity_check", null).use { cursor ->
+          if (!cursor.moveToFirst() || cursor.getString(0).trim().lowercase(Locale.US) != "ok" ||
+            cursor.moveToNext()) {
+            throw IllegalStateException("SQLite snapshot integrity validation failed")
+          }
+        }
+        if (readDatabaseSchema(snapshot) != expectedSchema) {
+          // Concurrent schema changes are retried rather than publishing an ambiguous snapshot.
+          throw IllegalStateException("SQLite snapshot schema validation failed")
+        }
+      }
+  }
+
   private fun createDatabaseSnapshot(
     databaseFile: File,
     backupFileName: String
@@ -497,12 +541,14 @@ class AutoDatabaseBackupWorker(
     try {
       SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
         .use { database ->
+          val expectedSchema = readDatabaseSchema(database)
           database.execSQL("VACUUM INTO '$escapedPath'")
-        }
 
-      if (!backupFile.exists() || backupFile.length() <= 0L) {
-        throw IllegalStateException("SQLite did not create a valid database snapshot")
-      }
+          if (!backupFile.exists() || backupFile.length() <= 0L) {
+            throw IllegalStateException("SQLite did not create a valid database snapshot")
+          }
+          validateDatabaseSnapshot(backupFile, expectedSchema)
+        }
     } catch (error: Exception) {
       backupFile.delete()
       throw error

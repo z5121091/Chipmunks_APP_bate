@@ -1,8 +1,13 @@
 import datetime
 import os
-import sys
 from dataclasses import dataclass
 from functools import lru_cache
+from io import BytesIO
+
+try:
+    from ..sync_assets import read_sync_asset
+except ImportError:
+    from sync_assets import read_sync_asset
 
 
 NATIVE_LABEL_COPIES = 2
@@ -165,6 +170,8 @@ def build_reprint_qr_image(
     center_x=None,
     error_correction='L',
     keep_symbol_position=False,
+    *,
+    mask_pattern=7,
 ):
     """Draw one exact QR matrix in memory, using whole dots and a four-module border.
 
@@ -197,7 +204,7 @@ def build_reprint_qr_image(
     correction_levels = {'L': ERROR_CORRECT_L, 'H': ERROR_CORRECT_H}
     if error_correction not in correction_levels:
         raise ValueError('二维码纠错等级无效')
-    qr = qrcode.QRCode(error_correction=correction_levels[error_correction], mask_pattern=7, border=4)
+    qr = qrcode.QRCode(error_correction=correction_levels[error_correction], mask_pattern=mask_pattern, border=4)
     qr.add_data(payload.encode('ascii'))
     try:
         qr.make(fit=True)
@@ -233,7 +240,7 @@ def build_reprint_qr_image(
         if keep_symbol_position:
             return build_reprint_qr_image(
                 payload, target_symbol_dots, bounds, preferred_x, preferred_y,
-                center_x=center_x, error_correction=error_correction,
+                center_x=center_x, error_correction=error_correction, mask_pattern=mask_pattern,
             )
         raise ValueError('原始二维码内容过长，无法完整放入当前标签模板')
 
@@ -334,13 +341,6 @@ def get_native_centered_text_x(
     return max(0, (NATIVE_LABEL_WIDTH_DOTS - int(text_width + 0.999)) // 2)
 
 
-def _resource_path(relative_path):
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    scripts_directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(scripts_directory, relative_path)
-
-
 def get_native_image_mask(asset_name, target_width, target_height=None):
     cache_key = (asset_name, target_width, target_height)
     cached_image = _IMAGE_CACHE.get(cache_key)
@@ -352,11 +352,13 @@ def get_native_image_mask(asset_name, target_width, target_height=None):
     except ImportError as error:
         raise RuntimeError('缺少 Pillow，无法生成标签图片') from error
 
-    image_path = _resource_path(os.path.join('assets', asset_name))
-    if not os.path.isfile(image_path):
-        raise RuntimeError(f'未找到标签图片文件：{image_path}')
+    image_name = f'assets/{asset_name}'
+    try:
+        image_bytes = read_sync_asset(image_name)
+    except OSError as error:
+        raise RuntimeError(f'未找到标签图片文件：{image_name}') from error
 
-    with Image.open(image_path) as source_image:
+    with Image.open(BytesIO(image_bytes)) as source_image:
         rgba_image = source_image.convert('RGBA')
         white_background = Image.new('RGBA', rgba_image.size, (255, 255, 255, 255))
         white_background.alpha_composite(rgba_image)

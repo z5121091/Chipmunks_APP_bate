@@ -2,13 +2,13 @@ import { MotionChevron } from '@/components/AppMotion';
 import { MotionCollapse, MotionContent } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { ActivityIndicator, Linking, Platform, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Linking, Platform, StyleSheet, Text, TextInput, View, ScrollView } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { useTheme } from '@/hooks/useTheme';
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { getSyncConnectionSnapshot, subscribeSyncConnection, refreshSyncConnection, saveSyncConnectionConfig } from '@/utils/syncConnection';
 import { getSyncConfigError, normalizeSyncConfig } from '@/utils/heartbeat';
@@ -25,6 +25,7 @@ export default function SettingsToolsScreen() {
   const mode = section === 'nas' || section === 'background' ? section : 'sync';
   const title = mode === 'sync' ? '同步助手' : mode === 'nas' ? 'NAS 备份诊断' : '电池优化与后台权限';
   const { theme, isDark } = useTheme();
+  const styles = useResponsiveStyles(theme, createStyles);
   const router = useSafeRouter();
   const snapshot = useSyncExternalStore(subscribeSyncConnection, getSyncConnectionSnapshot, getSyncConnectionSnapshot);
   const [config, setConfig] = useState<SyncConfig>(() => snapshot.config || { ip: '', port: NETWORK_CONFIG.DEFAULT_PORT });
@@ -151,7 +152,7 @@ export default function SettingsToolsScreen() {
       }}><Feather name="arrow-left" size={22} color={theme.textPrimary} /></TouchableOpacity>
       <Text style={[styles.title, textStyle]}>{title}</Text>
     </View>
-    <KeyboardAwareFormScrollView contentContainerStyle={[styles.content, mode === 'nas' && styles.nasContent]} keyboardShouldPersistTaps="handled" bottomOffset={Spacing.xl}>
+    <ScrollView keyboardDismissMode="on-drag" contentContainerStyle={[{ flexGrow: 1 }, styles.content, mode === 'nas' && styles.nasContent]} keyboardShouldPersistTaps="handled">
       {!!error && <Text accessibilityRole="alert" style={[styles.paragraph, { color: theme.error }]}>{error}</Text>}
       {mode === 'sync' && <View style={[styles.connectionCard, { backgroundColor: theme.backgroundElevated, borderColor: theme.border }]}>
         <View style={[styles.connectionHeading, { borderBottomColor: theme.border }]}>
@@ -229,19 +230,20 @@ export default function SettingsToolsScreen() {
         <ActionButton label={Platform.OS === 'android' ? '打开电池优化设置' : '打开应用设置'} onPress={() => void openBatterySettings()} />
         <Text style={[styles.paragraph, mutedStyle]}>不同设备的设置名称可能不同。开启情况请以系统设置为准；后台任务的实际结果可在 NAS 备份诊断中查看。</Text>
       </>}
-    </KeyboardAwareFormScrollView>
+    </ScrollView>
     </>}
     </MotionContent>
   </Screen>;
 }
 function ActionButton({ label, onPress, disabled = false }: { label: string; onPress: () => void; disabled?: boolean }) {
   const { theme } = useTheme();
+  const styles = useResponsiveStyles(theme, createStyles);
   return <TouchableOpacity accessibilityRole="button" onPress={onPress} disabled={disabled}
     style={[styles.button, { backgroundColor: theme.primary, opacity: disabled ? 0.5 : 1 }]}>
     <Text style={[styles.buttonText, { color: theme.buttonPrimaryText }]}>{label}</Text>
   </TouchableOpacity>;
 }
-const styles = StyleSheet.create({
+const createStyles = () => StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', padding: Spacing.sm, borderBottomWidth: StyleSheet.hairlineWidth },
   back: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center', marginRight: 8 },
   title: { ...Typography.h4, flexShrink: 1 },

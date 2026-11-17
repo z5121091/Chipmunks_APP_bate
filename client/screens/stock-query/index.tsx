@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionContent } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useMemo, useRef, useState } from 'react';
@@ -69,7 +70,7 @@ const parseStockScan = async (content: string, rules: readonly QRCodeRule[]): Pr
 
 export default function StockQueryScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const router = useSafeRouter();
   const inputRef = useRef<WarehouseScanInputHandle>(null);
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);

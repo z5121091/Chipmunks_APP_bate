@@ -16,12 +16,16 @@ let mockMigrationFailureId = '';
 let mockOrderWriteFailureId = '';
 let mockOutboxWriteFailure = false;
 let mockBeforeExclusiveTransaction: (() => void) | undefined;
+let mockSupplierAssignmentFailure = false;
 const mockAdapter = {
   closeAsync: async () => { /* Keep the in-memory fixture alive across simulated app restarts. */ },
   execAsync: async (sql: string) => { sqlite.exec(sql); },
   getAllAsync: async <T,>(sql: string, params: string[] = []) => sqlite.prepare(sql).all(...params) as T[],
   getFirstAsync: async <T,>(sql: string, params: string[] = []) => (sqlite.prepare(sql).get(...params) || null) as T | null,
   runAsync: async (sql: string, params: string[] = []) => {
+    if (mockSupplierAssignmentFailure && /UPDATE (?:\[物料绑定\]|inventory_bindings) SET supplier = \?/i.test(sql)) {
+      throw new Error('Simulated supplier assignment failure');
+    }
     if (mockOutboxWriteFailure && sql.includes('INSERT OR IGNORE INTO [拆包打印任务]')) {
       throw new Error('Simulated outbox write failure');
     }
@@ -1608,4 +1612,81 @@ it('matches complete batch numbers literally in outbound and sales return histor
   expect(await search('  exact_%  ')).toHaveLength(2);
   expect(await search('exact_%', b.id)).toEqual([]);
   expect(await search('exact_')).toEqual([]);
+});
+
+
+it('filters and paginates only unassigned suppliers while preserving model/code/extra-version search', async () => {
+  const prefix = 'UNASSIGNED-SUPPLIER-';
+  const ids: string[] = [];
+  for (const [suffix, supplier] of [['NULL', undefined], ['EMPTY', ''], ['SPACE', ''], ['ASSIGNED', 'Existing supplier']] as const) {
+    ids.push(await database.addInventoryBinding({ scan_model: `${prefix}${suffix}`, inventory_code: `${prefix}CODE-${suffix}`,
+      versions: suffix === 'NULL' ? ['PRIMARY', 'Unassigned-extra-alias'] : ['PRIMARY'], supplier }));
+  }
+  sqlite.prepare('UPDATE [物料绑定] SET supplier = ? WHERE id = ?').run('', ids[1]);
+  sqlite.prepare('UPDATE [物料绑定] SET supplier = ? WHERE id = ?').run(' \t\n\u3000', ids[2]);
+  const query = (page: number) => database.getInventoryBindingsPage({
+    supplierStatus: 'unassigned', keyword: prefix, page, pageSize: 1,
+  });
+  const first = await query(1);
+  const second = await query(2);
+  const last = await query(99);
+  expect(first).toMatchObject({ total: 3, page: 1, pageSize: 1 });
+  expect(second).toMatchObject({ total: 3, page: 2 });
+  expect(last).toMatchObject({ total: 3, page: 3 });
+  expect(new Set([...first.items, ...second.items, ...last.items].map(item => item.id))).toEqual(new Set(ids.slice(0, 3)));
+  expect((await database.getInventoryBindingsPage({ supplierStatus: 'unassigned', keyword: 'Unassigned-extra-alias' })).items)
+    .toEqual([expect.objectContaining({ id: ids[0], versions: ['PRIMARY', 'Unassigned-extra-alias'] })]);
+  expect((await database.getInventoryBindingsPage({ supplierStatus: 'unassigned', keyword: `${prefix}CODE-SPACE` })).items)
+    .toEqual([expect.objectContaining({ id: ids[2] })]);
+  expect((await database.getInventoryBindingsPage({ supplierStatus: 'unassigned', keyword: `${prefix}CODE-ASSIGNED` })).total).toBe(0);
+  expect((await database.getInventoryBindingsPage({ keyword: prefix })).total).toBe(4);
+});
+
+it('assigns only an empty supplier and preserves binding identity, all versions and historical rows', async () => {
+  const id = await database.addInventoryBinding({ scan_model: 'SUPPLIER-ONLY-PRESERVE', inventory_code: 'SUPPLIER-ONLY-CODE',
+    versions: ['V1', 'V2', 'V3'], description: 'Keep original description' });
+  const supplierId = await database.addInventorySupplier('Assigned catalogue supplier');
+  const rowBefore = sqlite.prepare('SELECT * FROM [物料绑定] WHERE id = ?').get(id);
+  const aliasesBefore = sqlite.prepare('SELECT * FROM [物料绑定版本] WHERE binding_id = ? ORDER BY rowid').all(id);
+  const historyBefore = sqlite.prepare('SELECT * FROM [出库明细] ORDER BY id').all();
+  await database.assignInventoryBindingSupplier(id, supplierId);
+  expect(sqlite.prepare('SELECT * FROM [物料绑定] WHERE id = ?').get(id))
+    .toEqual({ ...rowBefore, supplier: 'Assigned catalogue supplier' });
+  expect(sqlite.prepare('SELECT * FROM [物料绑定版本] WHERE binding_id = ? ORDER BY rowid').all(id)).toEqual(aliasesBefore);
+  expect(sqlite.prepare('SELECT * FROM [出库明细] ORDER BY id').all()).toEqual(historyBefore);
+  expect((await database.getInventoryBindingsPage({ supplierStatus: 'unassigned', keyword: 'SUPPLIER-ONLY-CODE' })).total).toBe(0);
+  expect((await database.getInventorySuppliers()).find(item => item.id === supplierId)?.binding_count).toBe(1);
+  await expect(database.assignInventoryBindingSupplier(id, supplierId)).rejects.toThrow('已分配');
+});
+
+it('rejects stale/deleted assignment targets and rolls back write failures without changing aliases', async () => {
+  const id = await database.addInventoryBinding({ scan_model: 'SUPPLIER-STALE', inventory_code: 'SUPPLIER-STALE-CODE', versions: ['V1', 'V2'] });
+  const supplierId = await database.addInventorySupplier('Supplier stale validation');
+  const aliasesBefore = sqlite.prepare('SELECT * FROM [物料绑定版本] WHERE binding_id = ? ORDER BY rowid').all(id);
+  await expect(database.assignInventoryBindingSupplier(id, 'MISSING-SUPPLIER')).rejects.toThrow('已不存在');
+  expect((await database.getInventoryBindingByCode('SUPPLIER-STALE-CODE'))?.supplier).toBeUndefined();
+  mockSupplierAssignmentFailure = true;
+  try { await expect(database.assignInventoryBindingSupplier(id, supplierId)).rejects.toThrow('Simulated supplier assignment failure'); }
+  finally { mockSupplierAssignmentFailure = false; }
+  expect((await database.getInventoryBindingByCode('SUPPLIER-STALE-CODE'))?.supplier).toBeUndefined();
+  expect(sqlite.prepare('SELECT * FROM [物料绑定版本] WHERE binding_id = ? ORDER BY rowid').all(id)).toEqual(aliasesBefore);
+  mockBeforeExclusiveTransaction = () => {
+    sqlite.prepare('UPDATE [物料绑定] SET supplier = ? WHERE id = ?').run('Assigned concurrently', id);
+  };
+  await expect(database.assignInventoryBindingSupplier(id, supplierId)).rejects.toThrow('已分配');
+  expect((await database.getInventoryBindingByCode('SUPPLIER-STALE-CODE'))?.supplier).toBe('Assigned concurrently');
+  await database.deleteInventoryBinding(id);
+  await expect(database.assignInventoryBindingSupplier(id, supplierId)).rejects.toThrow('已不存在');
+});
+
+it('serializes competing assignments so exactly one supplier wins without overwriting', async () => {
+  const id = await database.addInventoryBinding({ scan_model: 'SUPPLIER-RACE', inventory_code: 'SUPPLIER-RACE-CODE' });
+  const a = await database.addInventorySupplier('Supplier race A');
+  const b = await database.addInventorySupplier('Supplier race B');
+  const results = await Promise.allSettled([
+    database.assignInventoryBindingSupplier(id, a), database.assignInventoryBindingSupplier(id, b),
+  ]);
+  expect(results.filter(item => item.status === 'fulfilled')).toHaveLength(1);
+  expect(results.filter(item => item.status === 'rejected')).toHaveLength(1);
+  expect((await database.getInventoryBindingByCode('SUPPLIER-RACE-CODE'))?.supplier).toBe('Supplier race A');
 });

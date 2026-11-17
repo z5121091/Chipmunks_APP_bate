@@ -1,5 +1,5 @@
 import { Dimensions } from 'react-native';
-import { rs, rf, getDeviceInfo } from '@/utils/responsive';
+import { scaleControlSize, rf, getDeviceInfo } from '@/utils/responsive';
 
 import {
   LightColors,
@@ -113,58 +113,52 @@ export const Colors = {
 
 // 边框宽度常量 - 使用函数动态获取
 export const getBorderWidth = () => ({
-  thin: Math.max(1, rs(1)),
-  normal: Math.max(1, rs(1.5)),
-  thick: Math.max(1.5, rs(2)),
+  thin: Math.max(1, scaleControlSize(1)),
+  normal: Math.max(1, scaleControlSize(1.5)),
+  thick: Math.max(1.5, scaleControlSize(2)),
 });
-
-// 判断是否为小屏幕PDA（4寸屏等）
-const isSmallScreen = (() => {
-  const { width } = Dimensions.get('window');
-  return width <= 410;
-})();
 
 // 间距常量 - 使用函数动态获取，小屏幕适当缩小
 export const getSpacing = () => {
-  const scale = isSmallScreen ? 0.9 : 1;
+  const scale = Dimensions.get('window').width <= 410 ? 0.9 : 1;
   return {
-    xs: rs(6 * scale),
-    sm: rs(10 * scale),
-    md: rs(16 * scale),
-    lg: rs(20 * scale),
-    xl: rs(24 * scale),
-    "2xl": rs(30 * scale),
-    "3xl": rs(38 * scale),
-    "4xl": rs(48 * scale),
-    "5xl": rs(58 * scale),
-    "6xl": rs(72 * scale),
+    xs: scaleControlSize(6 * scale),
+    sm: scaleControlSize(10 * scale),
+    md: scaleControlSize(16 * scale),
+    lg: scaleControlSize(20 * scale),
+    xl: scaleControlSize(24 * scale),
+    "2xl": scaleControlSize(30 * scale),
+    "3xl": scaleControlSize(38 * scale),
+    "4xl": scaleControlSize(48 * scale),
+    "5xl": scaleControlSize(58 * scale),
+    "6xl": scaleControlSize(72 * scale),
   };
 };
 
 // 圆角常量 - 使用函数动态获取
 export const getBorderRadius = () => ({
-  xs: rs(4),
-  sm: rs(8),
-  md: rs(12),
-  lg: rs(18),
-  xl: rs(24),
-  "2xl": rs(28),
-  "3xl": rs(34),
-  "4xl": rs(40),
+  xs: scaleControlSize(4),
+  sm: scaleControlSize(8),
+  md: scaleControlSize(12),
+  lg: scaleControlSize(18),
+  xl: scaleControlSize(24),
+  "2xl": scaleControlSize(28),
+  "3xl": scaleControlSize(34),
+  "4xl": scaleControlSize(40),
   full: 9999,
 });
 
 // 图标尺寸 - 使用函数动态获取
 export const getIconSize = () => ({
-  xs: rs(12),
-  sm: rs(14),
-  md: rs(16),
-  lg: rs(20),
-  xl: rs(24),
-  "2xl": rs(28),
-  "3xl": rs(32),
-  "4xl": rs(36),
-  "5xl": rs(40),
+  xs: scaleControlSize(12),
+  sm: scaleControlSize(14),
+  md: scaleControlSize(16),
+  lg: scaleControlSize(20),
+  xl: scaleControlSize(24),
+  "2xl": scaleControlSize(28),
+  "3xl": scaleControlSize(32),
+  "4xl": scaleControlSize(36),
+  "5xl": scaleControlSize(40),
 });
 
 // 排版常量 - 使用函数动态获取
@@ -326,42 +320,28 @@ export const getTypography = () => ({
   },
 });
 
-// 为了兼容现有代码，导出静态版本（但会在首次访问时计算）
-// 注意：这些值在模块加载时计算，不会响应屏幕变化
-// 新代码应该使用 getSpacing()、getBorderRadius() 等函数
+// Read the current width when accessed; preserve object identity until the width/density changes.
+// Consumers cache StyleSheet snapshots through useResponsiveStyles, never at module load.
+function responsiveTokens<T extends object>(create: () => T): T {
+  let key = '';
+  let cached: T;
+  return new Proxy({} as T, {
+    get(_, prop) {
+      const { width, scale } = Dimensions.get('window');
+      const nextKey = `${width}:${scale}`;
+      if (!cached || key !== nextKey) {
+        cached = create();
+        key = nextKey;
+      }
+      return cached[prop as keyof T];
+    },
+  });
+}
 
-let _spacing: ReturnType<typeof getSpacing> | null = null;
-let _borderRadius: ReturnType<typeof getBorderRadius> | null = null;
-let _borderWidth: ReturnType<typeof getBorderWidth> | null = null;
-let _typography: ReturnType<typeof getTypography> | null = null;
-
-export const Spacing = new Proxy({} as ReturnType<typeof getSpacing>, {
-  get(_, prop) {
-    if (!_spacing) _spacing = getSpacing();
-    return _spacing[prop as keyof typeof _spacing];
-  }
-});
-
-export const BorderRadius = new Proxy({} as ReturnType<typeof getBorderRadius>, {
-  get(_, prop) {
-    if (!_borderRadius) _borderRadius = getBorderRadius();
-    return _borderRadius[prop as keyof typeof _borderRadius];
-  }
-});
-
-export const BorderWidth = new Proxy({} as ReturnType<typeof getBorderWidth>, {
-  get(_, prop) {
-    if (!_borderWidth) _borderWidth = getBorderWidth();
-    return _borderWidth[prop as keyof typeof _borderWidth];
-  }
-});
-
-export const Typography = new Proxy({} as ReturnType<typeof getTypography>, {
-  get(_, prop) {
-    if (!_typography) _typography = getTypography();
-    return _typography[prop as keyof typeof _typography];
-  }
-});
+export const Spacing = responsiveTokens(getSpacing);
+export const BorderRadius = responsiveTokens(getBorderRadius);
+export const BorderWidth = responsiveTokens(getBorderWidth);
+export const Typography = responsiveTokens(getTypography);
 
 // 公共业务组件的稳定尺寸和排版。页面组件应优先引用这里，避免另起一套字号与高度。
 export const AppComponentTokens = {
@@ -378,15 +358,15 @@ export const AppComponentTokens = {
     listIconSmall: 34,
   },
   typography: {
-    button: Typography.smallMedium,
-    dialogAction: Typography.dialogAction,
-    dialogNote: Typography.dialogNote,
-    formHint: Typography.formHint,
-    formLabel: Typography.formLabel,
-    input: Typography.small,
-    tag: Typography.labelSmall,
-    title: Typography.smallMedium,
-    subtitle: Typography.caption,
+    get button() { return Typography.smallMedium; },
+    get dialogAction() { return Typography.dialogAction; },
+    get dialogNote() { return Typography.dialogNote; },
+    get formHint() { return Typography.formHint; },
+    get formLabel() { return Typography.formLabel; },
+    get input() { return Typography.small; },
+    get tag() { return Typography.labelSmall; },
+    get title() { return Typography.smallMedium; },
+    get subtitle() { return Typography.caption; },
   },
 } as const;
 

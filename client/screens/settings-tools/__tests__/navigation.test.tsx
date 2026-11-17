@@ -1,5 +1,5 @@
 import TestRenderer, { act } from 'react-test-renderer';
-import { Text, TextInput, TouchableOpacity, Linking, StyleSheet, View } from 'react-native';
+import { Text, TextInput, TouchableOpacity, Linking, StyleSheet, View, ScrollView } from 'react-native';
 import SettingsToolsScreen from '../index';
 import { readBackupDiagnostic } from '@/utils/backupDiagnostic';
 import { saveSyncConnectionConfig } from '@/utils/syncConnection';
@@ -20,7 +20,6 @@ jest.mock('@/components/SyncPairingCamera', () => ({ SyncPairingCamera: 'Camera'
 jest.mock('@/utils/syncPairing', () => ({
   ...jest.requireActual('@/utils/syncPairing'), verifySyncPairingConnection: jest.fn(async () => undefined),
 }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'Scroll' }));
 jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon' }));
 jest.mock('expo-intent-launcher', () => ({ startActivityAsync: jest.fn(async () => { throw Error('unsupported'); }) }));
 jest.mock('@/utils/syncConnection', () => ({
@@ -116,7 +115,7 @@ it('shows complete failures before expanding diagnostics and permits refresh aft
   expect(root.root.findAllByType(Text).some(node => node.props.children === '完整后台信息')).toBe(false);
   await press('查看详细诊断');
   expect(root.root.findAllByType(Text).some(node => node.props.children === '完整后台信息')).toBe(true);
-  expect(StyleSheet.flatten(root.root.findByType('Scroll').props.contentContainerStyle)).toMatchObject({ width: '100%', maxWidth: 448 });
+  expect(StyleSheet.flatten(root.root.findByType(ScrollView).props.contentContainerStyle)).toMatchObject({ width: '100%', maxWidth: 448 });
   const fileName = root.root.findAllByType(Text).find(node => node.props.children === mockLongDiagnosticValue);
   expect(fileName?.props.selectable).toBe(true);
   expect(fileName?.props.numberOfLines).toBeUndefined();

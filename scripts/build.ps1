@@ -98,6 +98,7 @@ try {
     if (-not $versionMatch.Success) { throw 'Cannot read SYNC_VERSION from sync source. No version was changed.' }
     $version = $versionMatch.Groups[1].Value; Write-Host "SYNC VERSION: $version"
     $iconPath = Join-Path $PSScriptRoot 'icon.ico'
+    if (-not [IO.File]::Exists($iconPath)) { throw 'Missing sync application icon: scripts/icon.ico. The previous executable was preserved.' }
     $assetsPath = Assert-SyncDirectory (Join-Path $PSScriptRoot 'assets')
     if (-not [IO.Directory]::Exists($assetsPath)) { throw 'Missing sync label asset directory: scripts/assets.' }
     foreach ($assetName in @('geehy-logo.png', 'boya-logo.png', 'pb-logo.png', 'union-logo.png', 'esd-warning.png', 'keep-dry.png', 'wch-logo.png', 'dongwei-logo.png', 'rongpai-logo.png', 'linearin-logo.png', 'renmao-logo.png')) {
@@ -109,14 +110,18 @@ try {
     $runRoot = Join-Path $temporaryRoot ($stamp + '_' + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($runRoot) | Out-Null
     [IO.File]::WriteAllText((Join-Path $runRoot '.chipmunks-sync-build-run'), 'chipmunks-sync-build-v1')
+    $assetBuilder = Join-Path $PSScriptRoot 'build_sync_embedded_assets.py'
+    $embeddedAssets = Join-Path $runRoot 'embedded_sync_assets.py'
+    $global:LASTEXITCODE = 0
+    & $python $assetBuilder --assets $assetsPath --icon $iconPath --output $embeddedAssets
+    if ($LASTEXITCODE -ne 0 -or -not [IO.File]::Exists($embeddedAssets)) {
+        throw 'Could not generate embedded sync image resources. The previous sync executable was preserved.'
+    }
     $packagedDir = Join-Path $runRoot 'dist'
     $pyInstallerArgs = @('--noconfirm', '--onefile', '--windowed', '--log-level', 'WARN',
         '--hidden-import', 'win32print', '--hidden-import', 'pywintypes', '--collect-all', 'qrcode',
         '--name', $appName, '--distpath', $packagedDir, '--workpath', (Join-Path $runRoot 'work'),
-        '--specpath', (Join-Path $runRoot 'spec'))
-    if ([IO.File]::Exists($iconPath)) { $pyInstallerArgs += @('--icon', $iconPath, '--add-data', "$iconPath;.") }
-    else { Write-Host '[WARN] Missing icon.ico; the default executable icon will be used.' }
-    $pyInstallerArgs += @('--add-data', "$assetsPath;assets", $source)
+        '--specpath', (Join-Path $runRoot 'spec'), '--paths', $runRoot, '--icon', $iconPath, $source)
 
     Write-Host '[3/4] Packaging sync executable with PyInstaller...'
     $global:LASTEXITCODE = 0
@@ -124,7 +129,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed (exit $LASTEXITCODE). The previous sync executable was preserved." }
     Write-Host '[4/4] Verifying and saving sync executable...'
     $packagedExe = Join-Path $packagedDir "$appName.exe"
-    Assert-SyncExecutable $packagedExe; $hash = Get-SyncHash $packagedExe
+    Assert-SyncExecutable $packagedExe
+    $global:LASTEXITCODE = 0
+    & $python $assetBuilder --verify-exe $packagedExe --assets $assetsPath --icon $iconPath
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Embedded sync image resource verification failed. The previous sync executable was preserved.'
+    }
+    $hash = Get-SyncHash $packagedExe
     $dist = Assert-SyncDirectory (Join-Path $PSScriptRoot 'dist')
     [IO.Directory]::CreateDirectory($dist) | Out-Null
     # Publish one stable filename. Stage and recovery files stay outside the delivery folder.

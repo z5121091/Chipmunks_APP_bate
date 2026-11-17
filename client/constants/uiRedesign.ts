@@ -9,19 +9,19 @@ import { withAlpha } from '@/utils/colors';
 
 export const UI_REDESIGN_TOKENS = {
   radius: {
-    card: BorderRadius.sm,
-    control: BorderRadius.sm,
-    pill: BorderRadius.full,
+    get card() { return BorderRadius.sm; },
+    get control() { return BorderRadius.sm; },
+    get pill() { return BorderRadius.full; },
   },
   border: {
-    width: BorderWidth.normal,
-    thin: BorderWidth.thin,
+    get width() { return BorderWidth.normal; },
+    get thin() { return BorderWidth.thin; },
   },
   spacing: {
-    pageX: Spacing.sm,
-    sectionGap: Spacing.sm,
-    itemX: Spacing.md,
-    itemY: Spacing.sm,
+    get pageX() { return Spacing.sm; },
+    get sectionGap() { return Spacing.sm; },
+    get itemX() { return Spacing.md; },
+    get itemY() { return Spacing.sm; },
   },
   size: AppComponentTokens.size,
   typography: AppComponentTokens.typography,

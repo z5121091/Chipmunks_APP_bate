@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionChevron } from '@/components/AppMotion';
 import { MotionCollapse } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
@@ -205,7 +206,7 @@ const INBOUND_RECORD_SIGNATURE_FIELDS = [
 
 export default function InboundScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const alert = useCustomAlert({ persistentErrors: true });
   const router = useSafeRouter();
   // 弹窗与路由 Hook 返回对象会随渲染更新；扫码回调通过 Ref 获取最新实例，避免高频扫码链路反复重建。

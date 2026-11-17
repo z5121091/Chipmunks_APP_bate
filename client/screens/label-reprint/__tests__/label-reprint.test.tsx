@@ -1,5 +1,5 @@
 import TestRenderer, { act } from 'react-test-renderer';
-import { Animated, Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Animated, KeyboardAvoidingView, Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { AppModalCard } from '@/components/AppModalCard';
 import { Spacing } from '@/constants/theme';
 import {
@@ -196,6 +196,48 @@ describe('label reprint page visit', () => {
     expect(root.root.findByType(AppModalCard).props.title).toBe('补打标签任务');
   });
 
+  it('uses a plain overlay and preserves a long internal package form through ordinary viewport resizing', async () => {
+    const stock: InternalLabelStock = { accountKey: 'shanghai-chipmunk', warehouseCode: '001', warehouseName: '无锡总仓',
+      inventoryCode: 'RES.01120042.00', inventoryName: '贴片电阻', specification: '长规格型号，'.repeat(30), quantity: 120 };
+    jest.mocked(queryInternalLabelStock).mockResolvedValueOnce([stock]);
+    windowDimensionsSpy.mockReturnValue({ width: 320, height: 640, scale: 1, fontScale: 1.3 });
+    await act(async () => { root.update(<LabelReprintScreen />); });
+    await act(async () => { buttons('新建内部标签')[0].props.onPress(); });
+    await act(async () => { root.root.findByType(Modal).props.onShow(); });
+    await act(async () => { stockScanner().props.onSubmitEditing({ nativeEvent: { text: stock.inventoryCode } }); });
+    await act(async () => { buttons('按包分配')[0].props.onPress(); });
+    const input = (index: number) => root.root.findAllByType('Input' as unknown as React.ElementType)
+      .find(node => node.props.accessibilityLabel === `第 ${index} 包数量`)!;
+    for (let index = 1; index <= 12; index += 1) {
+      if (index > 1) await act(async () => { buttons('添加一包')[0].props.onPress(); });
+      await act(async () => { input(index).props.onChangeText('10'); });
+    }
+    const originalLastInput = input(12);
+    const originalScanner = stockScanner();
+    expect(root.root.findAllByType(KeyboardAvoidingView)).toHaveLength(0);
+    const overlay = root.root.findAllByType(View).find(node => node.props.testID === 'internal-label-overlay')!;
+    expect(overlay).toBeDefined();
+    expect(overlay.props.behavior).toBeUndefined();
+    const card = root.root.findByType(AppModalCard);
+    expect(card.props.scrollMode).toBe('body');
+    expect(card.findAllByType(ScrollView)).toHaveLength(1);
+    const body = card.findAllByType(ScrollView)[0];
+    expect(body.props.testID).toBe('internal-label-form');
+    expect(StyleSheet.flatten(body.props.style)).toMatchObject({ flex: 1, minHeight: 0 });
+    expect(body.props).toMatchObject({ scrollEnabled: true, keyboardDismissMode: 'on-drag', showsVerticalScrollIndicator: true });
+    expect(body.findAllByType('Button' as unknown as React.ElementType).some(node => node.props.label === '确认打印')).toBe(false);
+    expect(text()).toContain('本次建标 12 包，共打印 12 张');
+    expect(buttons('确认打印')[0].props.disabled).toBe(false);
+    const viewport = root.root.findByProps({ testID: 'internal-label-viewport' });
+    await act(async () => { viewport.props.onLayout({ nativeEvent: { layout: { height: 240 } } }); });
+    expect(root.root.findByType(AppModalCard).props.style.maxHeight).toBe(240);
+    expect(input(12)).toBe(originalLastInput);
+    expect(input(12).props.value).toBe('10');
+    expect(stockScanner()).toBe(originalScanner);
+    expect(stockScanner().props.autoFocus).toBe(false);
+    expect(buttons('确认打印')[0].props.disabled).toBe(false);
+  });
+
   it('passes an existing-stock override only after the separate explicit confirmation', async () => {
     const stock: InternalLabelStock = { accountKey: 'shanghai-chipmunk', warehouseCode: '001', warehouseName: '无锡总仓',
       inventoryCode: 'RES.01120042.00', inventoryName: '贴片电阻', specification: '0402', quantity: 100 };
@@ -207,8 +249,23 @@ describe('label reprint page visit', () => {
     await act(async () => { stockScanner().props.onSubmitEditing({ nativeEvent: { text: stock.inventoryCode } }); });
     await act(async () => { buttons('确认打印')[0].props.onPress(); });
     expect(createInternalLabelTasks).not.toHaveBeenCalled();
+    const footer = root.root.findByType(AppModalCard).props.footer;
+    expect(StyleSheet.flatten(footer.props.style).flexDirection).toBe('column');
+    expect(StyleSheet.flatten(buttons('确认另建并打印')[0].props.containerStyle))
+      .toMatchObject({ flex: 0, flexBasis: 'auto', alignSelf: 'stretch', minWidth: 0 });
     await act(async () => { buttons('确认另建并打印')[0].props.onPress(); });
     expect(createInternalLabelTasks).toHaveBeenCalledWith(stock, [100], { allowExistingStock: true });
+  });
+
+  it('uses full-width footer actions for larger system text without enlarging the modal', async () => {
+    windowDimensionsSpy.mockReturnValue({ width: 320, height: 640, scale: 1, fontScale: 1.3 });
+    await act(async () => { root.update(<LabelReprintScreen />); });
+    await act(async () => { buttons('新建内部标签')[0].props.onPress(); });
+    const card = root.root.findByType(AppModalCard);
+    expect(StyleSheet.flatten(card.props.footer.props.style).flexDirection).toBe('column');
+    expect(StyleSheet.flatten(buttons('确认打印')[0].props.containerStyle).flex).toBe(0);
+    // Do not give the footer its own scroll view or a viewport-sized button width.
+    expect(StyleSheet.flatten(buttons('确认打印')[0].props.style)).toMatchObject({ width: '100%', minWidth: 0 });
   });
 
   it('does not choose the first row or print when a main-warehouse lookup is ambiguous', async () => {
@@ -223,14 +280,17 @@ describe('label reprint page visit', () => {
     expect(createInternalLabelTasks).not.toHaveBeenCalled();
   });
 
-  it('shows the actual old two-copy receipt and explains a legacy create retry did not print again', async () => {
+  it('keeps the legacy no-repeat-print notice and shows a compact internal task summary', async () => {
     const legacy = task('OLD-CREATE', { internalPackageId: 'OLDPACKAGE001', internalAction: 'create' });
     jest.mocked(prepareLabelReprint).mockResolvedValueOnce(legacy);
     jest.mocked(submitLabelReprint).mockResolvedValueOnce({ ...legacy, status: 'submitted', printedCopies: 2,
       lastMessage: '该旧任务此前已按两张提交，本次未重复打印，请核对已有标签' });
     await scan('OLD-CREATE');
     expect(text()).toContain('本次未重复打印');
-    expect(text()).toContain('2 张');
+    expect(text()).toContain('最近标签任务');
+    const latestReceipt = root.root.findByProps({ testID: 'label-reprint-latest-task' });
+    expect(latestReceipt.findAllByType(Text).map(node => node.props.children))
+      .toEqual(['OLD-CREATE', '250 PCS', '—', '已提交同步助手']);
     expect(submitLabelReprint).toHaveBeenCalledTimes(1);
   });
 
@@ -246,6 +306,7 @@ describe('label reprint page visit', () => {
     expect(activateInternalLabelCorrection).not.toHaveBeenCalled();
     await act(async () => { buttons('确认换贴')[0].props.onPress(); });
     const alert = root.root.findByType('Alert' as unknown as React.ElementType);
+    expect(alert.props.message).toContain('包号：P001');
     await act(async () => { alert.props.buttons.find((button: { text: string }) => button.text === '已换贴，启用新版').onPress(); });
     expect(activateInternalLabelCorrection).toHaveBeenCalledWith(expect.objectContaining({ id: replacement.id, status: 'submitted' }));
     expect(text()).toContain('已换贴，新标签已启用');
@@ -360,34 +421,47 @@ describe('label reprint page visit', () => {
     await assertRealButtonBounds(buttons('确认打印')[0].props);
   });
 
-  it('keeps quantity confirmation outside the scroll area when the keyboard reduces the modal viewport', async () => {
+  it('sizes the quantity form to its contents and lets the whole card scroll in a short window', async () => {
     await openQuantityDialog();
-    const viewport = root.root.findByProps({ testID: 'label-quantity-viewport' });
+    expect(root.root.findAllByType(KeyboardAvoidingView)).toHaveLength(0);
+    await act(async () => { quantityInput().props.onChangeText('350'); });
+    const originalInput = quantityInput();
+    const viewport = root.root.findByProps({ testID: 'app-modal-viewport' });
     await act(async () => { viewport.props.onLayout({ nativeEvent: { layout: { height: 240 } } }); });
     const card = root.root.findByType(AppModalCard);
-    expect(card.props.style.height).toBe(240);
-    expect(card.props.stretchBody).toBe(true);
+    expect(card.props.style.height).toBeUndefined();
+    expect(card.props.stretchBody).toBeUndefined();
+    expect(card.props.scrollMode).toBeUndefined();
+    expect(card.findAllByType(ScrollView)).toHaveLength(1);
+    const scroll = card.findByType(ScrollView);
+    expect(scroll.props.testID).toBe('app-modal-card-scroll');
+    await act(async () => { scroll.props.onContentSizeChange(280, 370); });
+    expect(scroll.props.scrollEnabled).toBe(true);
     const form = card.findByProps({ testID: 'label-quantity-form' });
-    expect(StyleSheet.flatten(form.props.style)).toMatchObject({ flex: 1, minHeight: 0 });
+    expect(StyleSheet.flatten(form.props.style).flex).toBeUndefined();
+    expect(form.findAllByType(ScrollView)).toHaveLength(0);
+    expect(quantityInput()).toBe(originalInput);
+    expect(quantityInput().props.value).toBe('350');
     expect(form.findAllByType('Button' as unknown as React.ElementType)).toHaveLength(0);
     expect(buttons('取消')).toHaveLength(1);
     expect(buttons('确认打印')).toHaveLength(1);
     await act(async () => { viewport.props.onLayout({ nativeEvent: { layout: { height: 0 } } }); });
-    expect(root.root.findByType(AppModalCard).props.style.height).toBe(240);
+    const surface = card.findAllByType(View).find(node => StyleSheet.flatten(node.props.style)?.overflow === 'hidden')!;
+    expect(StyleSheet.flatten(surface.props.style).maxHeight).toBe(0);
   });
 
-  it('sizes the next label form independently of the keyboard-reduced correction viewport', async () => {
+  it('sizes the next label form independently of the previous correction viewport', async () => {
     await openQuantityDialog();
-    const viewport = root.root.findByProps({ testID: 'label-quantity-viewport' });
+    const viewport = root.root.findByProps({ testID: 'app-modal-viewport' });
     await act(async () => { viewport.props.onLayout({ nativeEvent: { layout: { height: 240 } } }); });
-    expect(root.root.findByType(AppModalCard).props.style.height).toBe(240);
+    expect(root.root.findByType(AppModalCard).props.style.height).toBeUndefined();
 
     await act(async () => { buttons('取消')[0].props.onPress(); });
     await act(async () => { await jest.advanceTimersByTimeAsync(220); });
     await act(async () => { buttons('新建内部标签')[0].props.onPress(); });
     const newLabelCard = root.root.findByType(AppModalCard);
     expect(newLabelCard.props.title).toBe('新建内部标签');
-    expect(newLabelCard.props.style.height).toBeCloseTo(393.6);
+    expect(newLabelCard.props.style.maxHeight).toBeCloseTo(393.6);
   });
 
   it('consumes one input only once across stability timer and Enter, and allows a deliberate rescan', async () => {
@@ -502,6 +576,7 @@ describe('label reprint page visit', () => {
     await act(async () => { buttons('核对后重试')[0].props.onPress(); });
     const alert = root.root.findByType('Alert' as unknown as React.ElementType);
     expect(alert.props.visible).toBe(true);
+    expect(alert.props.message).toContain('同步助手未连接');
     await act(async () => {
       alert.props.buttons.find((button: { text: string }) => button.text === '核对并提交').onPress();
       alert.props.onClose();
@@ -520,6 +595,35 @@ describe('label reprint page visit', () => {
     await scan('CH334U');
     expect(buttons('核对后重试')).toHaveLength(0);
     expect(text()).toContain('本次未打印');
+    await act(async () => { buttons('查看原因')[0].props.onPress(); });
+    expect(root.root.findByType('Alert' as unknown as React.ElementType).props.message).toContain('没有对应模板，本次未打印');
+  });
+
+  it('shows only code, specification, quantity and status in completed task cards', async () => {
+    const supplierTask = task('CH334U', { inventoryCode: 'IC.QINHENG.001' });
+    const internalTask = task('RES.01120042.00', {
+      internalPackageId: 'OLDPACKAGE001', internalAction: 'create',
+      record: { ...task('RES.01120042.00').record, inventory_code: 'RES.01120042.00', specification: '12KΩ，±1%，0402' },
+    });
+    jest.mocked(prepareLabelReprint).mockResolvedValueOnce(supplierTask).mockResolvedValueOnce(internalTask);
+    await scan('CH334U');
+    expect(text()).toContain('最近补打结果');
+    expect(root.root.findByProps({ testID: 'label-reprint-latest-task' }).findAllByType(Text).map(node => node.props.children))
+      .toEqual(['IC.QINHENG.001', '250 PCS', 'CH334U', '已提交同步助手']);
+    await scan('RES.01120042.00');
+    expect(text()).toContain('最近标签任务');
+    const latestReceipt = root.root.findByProps({ testID: 'label-reprint-latest-task' });
+    expect(latestReceipt.findAllByType(Text).map(node => node.props.children))
+      .toEqual(['RES.01120042.00', '250 PCS', '12KΩ，±1%，0402', '已提交同步助手']);
+    await act(async () => { buttons('打印任务')[0].props.onPress(); });
+
+    const list = root.root.findByType(AppModalCard).findByProps({ testID: 'label-reprint-task-list' });
+    const labels = list.findAllByType(Text).map(node => node.props.children);
+    expect(labels.slice(1)).toEqual([
+      'RES.01120042.00', '250 PCS', '12KΩ，±1%，0402', '已提交同步助手',
+      'IC.QINHENG.001', '250 PCS', 'CH334U', '已提交同步助手',
+    ]);
+    expect(list.findAllByType('Button' as unknown as React.ElementType)).toHaveLength(0);
   });
 
   it.each([0, 3, 8])('keeps the close action outside the scrollable body with %i task receipts on a small PDA', async (count) => {
@@ -535,13 +639,28 @@ describe('label reprint page visit', () => {
     expect(renderedCard).toBeDefined();
     expect(StyleSheet.flatten(renderedCard!.props.style)?.height).toBeCloseTo(393.6);
     const taskScroll = card.findByProps({ testID: 'label-reprint-task-list' });
+    const header = card.findAllByType(View).find(node => node.props.testID === 'app-modal-card-header')!;
+    const footer = card.findAllByType(View).find(node => node.props.testID === 'app-modal-card-footer')!;
+    await act(async () => {
+      header.props.onLayout({ nativeEvent: { layout: { height: 100 } } });
+      footer.props.onLayout({ nativeEvent: { layout: { height: 70 } } });
+      taskScroll.props.onContentSizeChange(280, count === 0 ? 70 : 800);
+    });
+    const sized = StyleSheet.flatten(renderedCard!.props.style);
+    if (count === 0) expect(sized.height).toBeLessThan(300);
+    else expect(sized.height).toBeCloseTo(393.6);
     expect(StyleSheet.flatten(taskScroll.props.style)).toMatchObject({ flex: 1, minHeight: 0 });
     expect(taskScroll.props.showsVerticalScrollIndicator).toBe(true);
     expect(taskScroll.findAllByType('Button' as unknown as React.ElementType)
       .filter((node) => node.props.label === '稍后')).toHaveLength(0);
     expect(card.props.stretchBody).toBe(true);
     expect(card.props.bodyStyle).toMatchObject({ flexShrink: 1, minHeight: 0 });
+    expect(card.props.scrollMode).toBe('body');
     expect(card.findAllByType(ScrollView)).toHaveLength(1);
+    expect(card.findAllByProps({ testID: 'app-modal-card-scroll' })).toHaveLength(0);
+    expect(StyleSheet.flatten(card.findByProps({ testID: 'app-modal-card-body-frame' }).props.style))
+      .toMatchObject({ flex: 1, minHeight: 0 });
+    expect(taskScroll.props).toMatchObject({ scrollEnabled: true, keyboardDismissMode: 'on-drag' });
     expect(buttons('稍后')).toHaveLength(1);
     if (count > 0) {
       expect(taskScroll.findAllByType(Text).filter((node) =>
@@ -557,23 +676,27 @@ describe('label reprint page visit', () => {
     expect(submitLabelReprint).toHaveBeenCalledTimes(submitCount);
   });
 
-  it('shrinks the card to the visible modal viewport while leaving the footer outside the task list', async () => {
+  it('uses a plain task overlay and bounds the card to the actual window while keeping the footer outside the list', async () => {
     await act(async () => { buttons('打印任务')[0].props.onPress(); });
     await act(async () => { await jest.advanceTimersByTimeAsync(220); });
+    expect(root.root.findAllByType(KeyboardAvoidingView)).toHaveLength(0);
+    const overlay = root.root.findAllByType(View).find(node => node.props.testID === 'label-reprint-task-overlay')!;
+    expect(overlay).toBeDefined();
+    expect(overlay.props.behavior).toBeUndefined();
     const viewport = root.root.findByProps({ testID: 'label-reprint-task-viewport' });
     await act(async () => { viewport.props.onLayout({ nativeEvent: { layout: { height: 300 } } }); });
-    expect(root.root.findByType(AppModalCard).props.style).toEqual({ height: 300 });
+    expect(root.root.findByType(AppModalCard).props.style).toEqual({ maxHeight: 300 });
     expect(buttons('稍后')).toHaveLength(1);
     await act(async () => { viewport.props.onLayout({ nativeEvent: { layout: { height: 436 } } }); });
-    expect(root.root.findByType(AppModalCard).props.style.height).toBeCloseTo(393.6);
+    expect(root.root.findByType(AppModalCard).props.style.maxHeight).toBeCloseTo(393.6);
 
     // A zero-height transient layout must not hide the controls while the modal mounts.
     await act(async () => { viewport.props.onLayout({ nativeEvent: { layout: { height: 0 } } }); });
-    expect(root.root.findByType(AppModalCard).props.style.height).toBeCloseTo(393.6);
+    expect(root.root.findByType(AppModalCard).props.style.maxHeight).toBeCloseTo(393.6);
     windowDimensionsSpy.mockReturnValue({ width: 320, height: 240, scale: 1, fontScale: 1 });
     await act(async () => { root.update(<LabelReprintScreen />); });
     // The safe-area padding also bounds the card before the next native layout event arrives.
-    expect(root.root.findByType(AppModalCard).props.style.height)
+    expect(root.root.findByType(AppModalCard).props.style.maxHeight)
       .toBe(240 - Math.max(Spacing.md, 24) - Math.max(Spacing.md, 20));
   });
 

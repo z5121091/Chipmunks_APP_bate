@@ -3,14 +3,36 @@ jest.mock(
   () => require('@react-native-async-storage/async-storage/jest/async-storage-mock')
 );
 
-import { detectRule, parseWithRule, type QRCodeRule } from '../database';
-import { isQRCode } from '../qrcodeParser';
+import { detectRule, inspectQRCodeRule, parseWithRule, type QRCodeRule } from '../database';
+import { isQRCode, shouldWaitForQRCodeContinuation } from '../qrcodeParser';
 import { sanitizeStructuredScannerInput } from '../scannerInput';
 import { parseQuantity } from '../quantity';
 import { migrateLegacyRuleFields } from '../legacyRuleFields';
 import { decodeRuleTerminator, displayRuleTerminator, stripRuleTerminator } from '../ruleTerminator';
 
 describe('二维码规则解析', () => {
+  it.each(['', '%'])('parses ten percent-separated data fields without treating the trailing delimiter as data (%j)', async terminator => {
+    const raw = 'NSI6801EB-DSWFR%H20B55%2634%1000%SOW6%NSI2636068%F%NSI2636068X39%S%NSI6801EB-DSWFRC%';
+    // A test-only mapping: unknown supplier field meanings remain ignored.
+    const rule: QRCodeRule = {
+      id: 'percent-ten', name: 'Percent separator regression', description: '', separator: '%', terminator,
+      fieldOrder: ['model', 'ignore:1', 'ignore:2', 'quantity', 'ignore:3', 'ignore:4', 'ignore:5', 'ignore:6', 'ignore:7', 'ignore:8'],
+      isActive: true, created_at: '', updated_at: '',
+    };
+    const normalized = sanitizeStructuredScannerInput(`${raw}\r\n`);
+    expect(normalized).toBe(`${raw}\r\n`);
+    expect(isQRCode(normalized)).toBe(true);
+    expect(isQRCode(normalized, [rule])).toBe(true);
+    expect(inspectQRCodeRule(normalized, rule)).toMatchObject({ matched: true, parts: raw.slice(0, -1).split('%') });
+    await expect(detectRule(normalized, [rule])).resolves.toBe(rule);
+    expect(parseWithRule(normalized, rule)).toEqual({
+      standardFields: { model: 'NSI6801EB-DSWFR', quantity: '1000' }, customFields: {},
+    });
+    expect(shouldWaitForQRCodeContinuation(normalized, [rule])).toBe(false);
+    expect(shouldWaitForQRCodeContinuation('NSI6801EB-DSWFR%H20B55%2634%', [rule])).toBe(true);
+    await expect(detectRule(normalized, [{ ...rule, fieldOrder: rule.fieldOrder.slice(0, 9) }])).resolves.toBeNull();
+  });
+
   it('decodes the photographed ICW label as six space-separated fields without a terminator', async () => {
     const content = '08-Feb-26 ICW1117A50S3G SOT223 CP GQ06160 2500';
     const rule: QRCodeRule = {

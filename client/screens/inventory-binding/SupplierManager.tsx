@@ -1,25 +1,28 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { AppModal as Modal } from '@/components/AppModal';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import { Keyboard, Text, TextInput, View } from 'react-native';
+import { Keyboard, Text, TextInput, View, FlatList } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { AppFormField } from '@/components/AppFormField';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
+import { AppModalViewport } from '@/components/AppModalViewport';
 import { useCustomAlert } from '@/components/CustomAlert';
-import { KeyboardAwareFormFlatList } from '@/components/KeyboardAwareForm';
 import { UiToolbarButton } from '@/components/UiRedesign';
 import { useTheme } from '@/hooks/useTheme';
 import {
   addInventorySupplier,
   deleteInventorySupplier,
   getInventorySuppliers,
+  getInventoryBindingsPage,
   InventorySupplier,
 } from '@/utils/database';
 import { logger } from '@/utils/logger';
 import { createStyles } from './styles';
 import { MotionContent, MotionPresence } from '@/components/AppMotion';
+import { UnassignedSupplierBindings } from './UnassignedSupplierBindings';
 
 interface SupplierManagerProps {
   visible?: boolean;
@@ -30,13 +33,14 @@ interface SupplierManagerProps {
   onSelect: (name: string, id?: string) => void;
   onDeleted: (name: string) => void;
   onClose: () => void;
+  onAssigned?: (bindingId: string, supplierName: string) => void;
 }
 
 const nameKey = (name: string) => name.trim().toUpperCase();
 
-export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, embedded = false, closeRef, visible = true }: SupplierManagerProps) {
+export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, onAssigned, embedded = false, closeRef, visible = true }: SupplierManagerProps) {
   const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const alert = useCustomAlert();
   const [managing, setManaging] = useState(mode === 'manage');
   const [suppliers, setSuppliers] = useState<InventorySupplier[]>([]);
@@ -45,15 +49,24 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [listContentHeight, setListContentHeight] = useState<number>();
   const busyRef = useRef(false);
   const activeRef = useRef(true);
   const requestRef = useRef(0);
+  const visibleRef = useRef(visible);
+  useLayoutEffect(() => { visibleRef.current = visible; }, [visible]);
+  const [unassignedOpen, setUnassignedOpen] = useState(false);
+  const unassignedCloseRef = useRef<(() => void) | null>(null);
+  const [unassignedCount, setUnassignedCount] = useState<number | null>(null);
+  const [countFailed, setCountFailed] = useState(false);
+  const countRequest = useRef(0);
   const [visibleMode, setVisibleMode] = useState(visible ? mode : null);
   if (visibleMode !== (visible ? mode : null)) {
     setVisibleMode(visible ? mode : null);
     if (visible) {
       setManaging(mode === 'manage'); setKeyword(''); setNewName('');
       setLoading(true); setLoadFailed(false);
+      setUnassignedOpen(false); setUnassignedCount(null); setCountFailed(false);
     }
   }
 
@@ -78,6 +91,20 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
     await loadSuppliers();
   };
 
+  const isActive = useCallback(() => activeRef.current && visibleRef.current, []);
+  const loadUnassignedCount = useCallback(async () => {
+    const id = ++countRequest.current;
+    try {
+      const result = await getInventoryBindingsPage({ page: 1, pageSize: 1, supplierStatus: 'unassigned' });
+      if (isActive() && id === countRequest.current) {
+        setUnassignedCount(result.total); setCountFailed(false);
+      }
+    } catch (error) {
+      logger.error('读取未绑定供应商的物料数量失败:', error);
+      if (isActive() && id === countRequest.current) { setCountFailed(true); setUnassignedCount(null); }
+    }
+  }, [isActive]);
+
   useEffect(() => {
     if (!visible) return;
     activeRef.current = true;
@@ -85,19 +112,37 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
     return () => {
       activeRef.current = false;
       requestRef.current += 1;
+      countRequest.current += 1;
     };
   }, [loadSuppliers, visible, mode]);
+
+  useEffect(() => {
+    if (!visible || !managing) return;
+    let current = true;
+    void Promise.resolve().then(() => { if (current) void loadUnassignedCount(); });
+    return () => { current = false; };
+  }, [visible, managing, loadUnassignedCount]);
+
+  const returnToManagement = useCallback(() => {
+    Keyboard.dismiss(); setUnassignedOpen(false);
+  }, []);
+  const bindingAssigned = useCallback((bindingId: string, supplierName: string) => {
+    if (!isActive()) return;
+    onAssigned?.(bindingId, supplierName);
+    void loadSuppliers(); void loadUnassignedCount();
+  }, [isActive, onAssigned, loadSuppliers, loadUnassignedCount]);
 
   const close = useCallback(() => {
     if (busyRef.current) return;
     Keyboard.dismiss();
+    if (unassignedOpen) { unassignedCloseRef.current?.(); return; }
     if (managing && mode === 'select') {
       setKeyword('');
       setManaging(false);
       return;
     }
     onClose();
-  }, [managing, mode, onClose]);
+  }, [managing, mode, onClose, unassignedOpen]);
   useLayoutEffect(() => {
     if (!closeRef) return;
     closeRef.current = close;
@@ -170,15 +215,19 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
   };
 
   const content = (
-        <View style={styles.modalOverlay}>
-          <AppModalCard
+        <AppModalViewport style={styles.modalOverlay}>
+          {unassignedOpen ? <UnassignedSupplierBindings closeRef={unassignedCloseRef} suppliers={suppliers}
+            suppliersLoading={loading} suppliersFailed={loadFailed} onReloadSuppliers={refreshSuppliers}
+            isActive={isActive} onBack={returnToManagement} onAssigned={bindingAssigned} /> : <AppModalCard
             title={managing ? '维护供应商' : '选择供应商'}
             subtitle={managing ? '物料和解析规则共用供应商名录，导入物料的新名称也会自动加入' : '选择后返回当前表单，也可以不设置供应商'}
             onClose={busy ? undefined : close}
             style={styles.modalContent}
             bodyStyle={styles.supplierBody}
-            size="largeForm"
+            size="list"
+            bodyContentHeight={listContentHeight}
             stretchBody
+            scrollMode="body"
             footer={
               <AppModalActions
                 containerStyle={styles.modalActions}
@@ -191,8 +240,9 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
               />
             }
           >
-            <MotionContent contentKey={managing} direction={managing ? 'forward' : 'back'} style={{ flex: 1 }}><KeyboardAwareFormFlatList
+            <MotionContent contentKey={managing} direction={managing ? 'forward' : 'back'} style={{ flex: 1 }}><FlatList keyboardDismissMode="on-drag"
               style={styles.supplierList}
+              onContentSizeChange={(_width, height) => setListContentHeight(height)}
               data={loading || loadFailed ? [] : filteredSuppliers}
               keyExtractor={item => item.id}
               keyboardShouldPersistTaps="handled"
@@ -201,6 +251,14 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
                 <View style={styles.supplierListHeader}>
                   {managing ? (
                     <>
+                      <TouchableOpacity accessibilityRole="button" accessibilityLabel="查看未绑定供应商的物料"
+                        disabled={busy} style={styles.unassignedEntry} onPress={() => {
+                          if (!busyRef.current) { Keyboard.dismiss(); setUnassignedOpen(true); }
+                        }}>
+                        <Text style={styles.unassignedEntryTitle}>未绑定供应商的物料</Text>
+                        <Text style={styles.supplierHint}>{unassignedCount === null ? countFailed ? '点击查看' : '读取中' : `${unassignedCount} 条`}</Text>
+                        <Feather name="chevron-right" size={16} color={theme.textMuted} />
+                      </TouchableOpacity>
                       <AppFormField label="新增供应商">
                         <View style={styles.supplierAddRow}>
                           <TextInput
@@ -271,8 +329,8 @@ export function SupplierManager({ mode, value, onSelect, onDeleted, onClose, emb
                 </View>
               }
             /></MotionContent>
-          </AppModalCard>
-        </View>
+          </AppModalCard>}
+        </AppModalViewport>
   );
   return (
     <>

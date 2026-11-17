@@ -28,6 +28,7 @@ import { buildInternalLabel, isInternalLabelInput, type InternalLabelPackage } f
 import { logger } from '@/utils/logger';
 import { DONGWEI_SUPPLIER, getDongweiRuleFieldCount } from '@/utils/dongweiLabel';
 import { assertDongweiSixPrintSupported, DongweiPrintCompatibilityError } from '@/utils/dongweiPrintCompatibility';
+import { resolveInboundInventoryCodeFromBindings } from '@/utils/inboundRecords';
 
 export interface LabelReprintRecord {
   model: string;
@@ -63,6 +64,8 @@ export interface LabelReprintTask {
   lastMessage: string;
   attemptCount: number;
   record: Readonly<LabelReprintRecord>;
+  /** Display snapshot from the material binding, separate from the print payload. */
+  inventoryCode?: string;
   reprintSessionId?: string;
   errorCode?: string;
   retryAllowed?: boolean;
@@ -215,7 +218,8 @@ export const prepareLabelReprint = async (raw: string): Promise<LabelReprintTask
       '未读到有效的型号或数量，本次未打印。请核对二维码。'
     );
   }
-  const supplier = resolveLabelReprintSupplier(model, await getAllInventoryBindings());
+  const bindings = await getAllInventoryBindings();
+  const supplier = resolveLabelReprintSupplier(model, bindings);
   const dongweiFieldCount = supplier === DONGWEI_SUPPLIER ? getDongweiRuleFieldCount(rule) : undefined;
   if (supplier === DONGWEI_SUPPLIER && dongweiFieldCount === undefined) {
     throw new LabelReprintValidationError(
@@ -263,6 +267,7 @@ export const prepareLabelReprint = async (raw: string): Promise<LabelReprintTask
     lastMessage: '',
     attemptCount: 0,
     record,
+    inventoryCode: resolveInboundInventoryCodeFromBindings(bindings, model, record.version) || undefined,
     quantityEditContext: {
       rule: JSON.parse(JSON.stringify(rule)) as QRCodeRule,
       fields: Object.freeze({ ...fields }),

@@ -1,11 +1,13 @@
 import TestRenderer, { act } from 'react-test-renderer';
-import { ActivityIndicator, ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
+import { ActivityIndicator, Dimensions, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useTheme } from '@/hooks/useTheme';
 import { Colors, Typography } from '@/constants/theme';
 import { AppFormField } from '../AppFormField';
 import { AppPillToast } from '../AppPillToast';
 import { CustomAlert } from '../CustomAlert';
-import { UiListItem, UiPageHeader } from '../UiRedesign';
+import { UiListItem, UiPageHeader, UiToolbarButton } from '../UiRedesign';
+import { AnimatedButton } from '../AnimatedButton';
+import { UiSwitch, UiSwitchVisual } from '../UiSwitch';
 
 jest.mock('@/hooks/useTheme', () => ({ useTheme: jest.fn() }));
 jest.mock('@/utils/feedback', () => ({
@@ -43,6 +45,37 @@ describe('shared UI visual contracts', () => {
   beforeEach(() => {
     Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
     setTheme('light');
+  });
+
+  it('bounds toolbar padding in a fixed-width modal when a small window grows to tablet size', async () => {
+    const originalWindow = Dimensions.get('window');
+    const originalScreen = Dimensions.get('screen');
+    let root: TestRenderer.ReactTestRenderer | undefined;
+    const resize = (width: number, height: number) => {
+      const viewport = { width, height, scale: 1, fontScale: 1.3 };
+      Dimensions.set({ window: viewport, screen: viewport });
+    };
+    try {
+      resize(320, 640);
+      const outer = { flex: 1, minWidth: 0 };
+      await act(async () => {
+        root = TestRenderer.create(<UiToolbarButton label="确认另建并打印" icon="printer" onPress={jest.fn()} containerStyle={outer} />);
+      });
+      const narrow = StyleSheet.flatten(root!.root.findByType(AnimatedButton).props.style).paddingHorizontal;
+      await act(async () => { resize(1024, 1366); });
+      const button = root!.root.findByType(AnimatedButton);
+      const wide = StyleSheet.flatten(button.props.style);
+      expect(wide.paddingHorizontal).toBeGreaterThanOrEqual(narrow);
+      expect(wide.paddingHorizontal).toBeLessThanOrEqual(16);
+      expect(wide.height).toBe(44);
+      expect(button.props.containerStyle).toBe(outer);
+      expect(root!.root.findAllByType(Text).some(node => node.props.children === '确认另建并打印')).toBe(true);
+      await act(async () => { resize(320, 640); });
+      expect(StyleSheet.flatten(root!.root.findByType(AnimatedButton).props.style).paddingHorizontal).toBe(narrow);
+    } finally {
+      if (root) await act(async () => { root!.unmount(); });
+      Dimensions.set({ window: originalWindow, screen: originalScreen });
+    }
   });
 
   it('keeps feedback text legible in light and dark themes', async () => {
@@ -166,6 +199,7 @@ describe('shared UI visual contracts', () => {
         backgroundColor: Colors.light.tagGray, alignItems: 'flex-start' });
       expect(thumb()).toMatchObject({ width: 28, height: 28, borderRadius: 14, backgroundColor: Colors.light.white });
       expect(control().props.accessibilityState).toEqual({ checked: false, disabled: false });
+      expect(control().props['aria-checked']).toBe(false);
       await act(async () => { control().props.onPress(); });
       expect(change).toHaveBeenCalledTimes(1);
       expect(change).toHaveBeenLastCalledWith(true);
@@ -173,6 +207,44 @@ describe('shared UI visual contracts', () => {
       await act(async () => { root!.update(content(true)); });
       expect(track()).toMatchObject({ backgroundColor: Colors.dark.success, alignItems: 'flex-end' });
       expect(thumb().backgroundColor).toBe(Colors.dark.white);
+      expect(control().props.accessibilityState.checked).toBe(true);
+      expect(control().props['aria-checked']).toBe(true);
+      await act(async () => { control().props.onPress(); });
+      expect(change).toHaveBeenCalledTimes(2);
+      expect(change).toHaveBeenLastCalledWith(false);
+      await act(async () => { root!.update(content(true, true)); });
+      expect(control().props['aria-disabled']).toBe(true);
+      await act(async () => { control().props.onPress(); });
+      expect(change).toHaveBeenCalledTimes(2);
+    } finally {
+      if (root) await act(async () => { root!.unmount(); });
+    }
+  });
+
+  it.each(['light', 'dark'] as const)('keeps the compact %s switch easy to touch and toggles once without a nested visual action', async scheme => {
+    setTheme(scheme);
+    const change = jest.fn();
+    let root: TestRenderer.ReactTestRenderer | undefined;
+    const content = (value: boolean, disabled = false) => <UiSwitch size="compact" value={value}
+      onValueChange={change} accessibilityLabel="启用规则测试" disabled={disabled} />;
+    const control = () => root!.root.findAll(node => node.props.accessibilityRole === 'switch' &&
+      typeof node.props.onPress === 'function').at(-1)!;
+    const track = () => StyleSheet.flatten(root!.root.findByProps({ testID: 'ui-switch-track' }).props.style);
+    try {
+      await act(async () => { root = TestRenderer.create(content(false)); });
+      const visual = root!.root.findByType(UiSwitchVisual).findAllByType(View)[0];
+      expect(visual.props.pointerEvents).toBe('none');
+      expect(StyleSheet.flatten(visual.props.style)).toMatchObject({ width: 52, height: 44, flexShrink: 0 });
+      expect(track()).toMatchObject({ width: 48, height: 28, borderRadius: 14,
+        backgroundColor: Colors[scheme].tagGray, alignItems: 'flex-start' });
+      expect(StyleSheet.flatten(root!.root.findByProps({ testID: 'ui-switch-thumb' }).props.style))
+        .toMatchObject({ width: 22, height: 22, borderRadius: 11, backgroundColor: Colors[scheme].white });
+      expect(control().props.accessibilityState).toEqual({ checked: false, disabled: false });
+      await act(async () => { control().props.onPress(); });
+      expect(change).toHaveBeenCalledTimes(1);
+      expect(change).toHaveBeenLastCalledWith(true);
+      await act(async () => { root!.update(content(true)); });
+      expect(track()).toMatchObject({ backgroundColor: Colors[scheme].success, alignItems: 'flex-end' });
       expect(control().props.accessibilityState.checked).toBe(true);
       await act(async () => { control().props.onPress(); });
       expect(change).toHaveBeenCalledTimes(2);

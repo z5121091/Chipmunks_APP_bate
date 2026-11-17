@@ -28,6 +28,7 @@ function New-SyncFixture {
     [IO.Directory]::CreateDirectory((Join-Path $project 'scripts/assets')) | Out-Null
     [IO.Directory]::CreateDirectory((Join-Path $project 'scripts/dist')) | Out-Null
     [IO.File]::Copy($sourceScript, (Join-Path $project 'scripts/build.ps1'))
+    [IO.File]::Copy((Join-Path $PSScriptRoot 'icon.ico'), (Join-Path $project 'scripts/icon.ico'))
     [IO.File]::WriteAllText((Join-Path $project 'scripts/label_sync_server.py'), "SYNC_VERSION = 'V1.0'`r`n", $utf8)
     [IO.File]::WriteAllText((Join-Path $project "scripts/dist/$appName.exe"), 'previous verified helper - never run', $utf8)
     foreach ($asset in @('geehy-logo.png','boya-logo.png','pb-logo.png','union-logo.png','esd-warning.png','keep-dry.png','wch-logo.png','dongwei-logo.png','rongpai-logo.png','linearin-logo.png','renmao-logo.png')) {
@@ -52,11 +53,48 @@ if ($env:SYNC_TEST_REAL_PYTHON) {
     if ($LASTEXITCODE -ne 0) { throw 'Native Python UTF-8 probe failed.' }
 }
 $arguments = @($args)
+if ([IO.Path]::GetFileName($arguments[0]) -eq 'build_sync_embedded_assets.py') {
+    $assetIndex = [Array]::IndexOf($arguments, '--assets')
+    $iconIndex = [Array]::IndexOf($arguments, '--icon')
+    if ($assetIndex -lt 0 -or $arguments[$assetIndex + 1] -ne (Join-Path $PSScriptRoot 'assets') -or
+        $iconIndex -lt 0 -or $arguments[$iconIndex + 1] -ne (Join-Path $PSScriptRoot 'icon.ico')) {
+        throw 'Embedding does not use the original image resources.'
+    }
+    $outputIndex = [Array]::IndexOf($arguments, '--output')
+    $verifyIndex = [Array]::IndexOf($arguments, '--verify-exe')
+    $global:LASTEXITCODE = 0
+    if ($outputIndex -ge 0 -and $verifyIndex -lt 0) {
+        if ($env:SYNC_TEST_MODE -eq 'embed-assets-failure') { $global:LASTEXITCODE = 11; return }
+        $outputPath = $arguments[$outputIndex + 1]
+        if ([IO.Path]::GetFileName($outputPath) -ne 'embedded_sync_assets.py' -or
+            -not [IO.File]::Exists((Join-Path (Split-Path $outputPath -Parent) '.chipmunks-sync-build-run'))) {
+            throw 'Embedded module was generated outside the owned build run.'
+        }
+        [IO.File]::WriteAllText($outputPath, 'ASSETS = {}')
+    } elseif ($verifyIndex -ge 0 -and $outputIndex -lt 0) {
+        $candidate = $arguments[$verifyIndex + 1]
+        $candidateRun = Split-Path (Split-Path $candidate -Parent) -Parent
+        if (-not [IO.File]::Exists($candidate) -or
+            -not [IO.File]::Exists((Join-Path $candidateRun 'embedded_sync_assets.py'))) {
+            throw 'Verification did not inspect the staged package.'
+        }
+        if ($env:SYNC_TEST_MODE -eq 'verify-assets-failure') { $global:LASTEXITCODE = 12; return }
+        Write-Output 'FIXTURE EMBEDDED ASSETS VERIFIED'
+    } else { throw 'Wrong embedding or verification arguments.' }
+    return
+}
 $distIndex = [Array]::IndexOf($arguments, '--distpath')
 $nameIndex = [Array]::IndexOf($arguments, '--name')
 if ($arguments.Count -lt 4 -or $arguments[0] -ne '-m' -or $arguments[1] -ne 'PyInstaller' -or $distIndex -lt 0 -or $nameIndex -lt 0) { throw 'Wrong PyInstaller arguments.' }
 $dist = $arguments[$distIndex + 1]
 $name = $arguments[$nameIndex + 1]
+$sourcePathIndex = [Array]::IndexOf($arguments, '--paths')
+$iconIndex = [Array]::IndexOf($arguments, '--icon')
+if ($sourcePathIndex -lt 0 -or $arguments[$sourcePathIndex + 1] -ne (Split-Path $dist -Parent) -or
+    -not [IO.File]::Exists((Join-Path $arguments[$sourcePathIndex + 1] 'embedded_sync_assets.py')) -or
+    $arguments -contains '--add-data' -or $iconIndex -lt 0 -or $arguments[$iconIndex + 1] -ne (Join-Path $PSScriptRoot 'icon.ico')) {
+    throw 'PyInstaller must embed the generated module and retain the PE icon without loose image data.'
+}
 [IO.Directory]::CreateDirectory($dist) | Out-Null
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'python-started.txt'), $dist)
 if ($env:SYNC_TEST_MODE -eq 'cancel') { Start-Sleep -Seconds 40 }
@@ -175,6 +213,7 @@ try {
     Test-SyncBridge 'Repeated builds publish one fixed EXE with current task, PE, hash and version verification' {
         $p = New-SyncFixture 'success'; $sourceHash = Get-TestHash (Join-Path $p 'scripts/label_sync_server.py')
         $r = Invoke-SyncFixture $p; Assert-SyncTest ($r.exitCode -eq 0 -and $r.output.Contains('BUILD SUCCEEDED')) $r.output
+        Assert-SyncTest ($r.output.Contains('FIXTURE EMBEDDED ASSETS VERIFIED')) 'Publication skipped embedded image verification.'
         $delivery = Get-Delivery $r; Assert-SyncTest ([IO.Path]::IsPathRooted($delivery) -and [IO.File]::Exists($delivery)) 'Delivery path invalid.'
         Assert-SingleDelivery $p $delivery
         $verification = [IO.File]::ReadAllText($delivery + '.verification.json') | ConvertFrom-Json
@@ -201,6 +240,18 @@ try {
         $r = Invoke-SyncFixture $p '' 'failure'
         Assert-SyncTest ($r.exitCode -ne 0 -and $r.output.Contains('exit 9') -and -not $r.output.Contains('BUILD SUCCEEDED')) $r.output
         Assert-OldPreserved $p $old
+    }
+    Test-SyncBridge 'Embedding and archive verification failures preserve the previous EXE' {
+        foreach ($mode in @('embed-assets-failure', 'verify-assets-failure')) {
+            $p = New-SyncFixture $mode; $old = Get-TestHash (Join-Path $p "scripts/dist/$appName.exe")
+            $r = Invoke-SyncFixture $p '' $mode
+            $expected = if ($mode -eq 'embed-assets-failure') { 'Could not generate embedded sync image resources.' } else { 'Embedded sync image resource verification failed.' }
+            Assert-SyncTest ($r.exitCode -ne 0 -and $r.output.Contains($expected)) $r.output
+            Assert-OldPreserved $p $old
+            if ($mode -eq 'embed-assets-failure') {
+                Assert-SyncTest (-not [IO.File]::Exists((Join-Path $p 'scripts/python-started.txt'))) 'Failed generator reached packaging.'
+            }
+        }
     }
     Test-SyncBridge 'Missing, empty and invalid PE outputs are rejected before publication' {
         foreach ($mode in @('missing','empty','invalid-mz','invalid-pe','invalid-offset')) {
@@ -242,9 +293,10 @@ try {
         $retry = Invoke-SyncFixture $p '-PrepareOnly'; Assert-SyncTest ($retry.exitCode -eq 0) 'Failure retained build lock.'
     }
     Test-SyncBridge 'Missing resources and unreadable version fail without packaging' {
-        foreach ($case in @('asset','version')) {
+        foreach ($case in @('asset','version','icon')) {
             $p = New-SyncFixture ('input-' + $case)
             if ($case -eq 'asset') { [IO.File]::Delete((Join-Path $p 'scripts/assets/dongwei-logo.png')) }
+            elseif ($case -eq 'icon') { [IO.File]::Delete((Join-Path $p 'scripts/icon.ico')) }
             else { [IO.File]::WriteAllText((Join-Path $p 'scripts/label_sync_server.py'),'# no version') }
             $r = Invoke-SyncFixture $p
             Assert-SyncTest ($r.exitCode -ne 0 -and -not [IO.File]::Exists((Join-Path $p 'scripts/python-started.txt'))) 'Invalid input reached packaging.'

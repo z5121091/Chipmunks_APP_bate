@@ -2,8 +2,6 @@
 import gc
 import ipaddress
 import json
-import os
-import sys
 import threading
 
 from PIL import Image, ImageTk
@@ -11,8 +9,10 @@ import qrcode
 
 try:
     from .sync_pairing_settings import read_pairing_settings
+    from .sync_window_icon import apply_sync_window_icon
 except ImportError:
     from sync_pairing_settings import read_pairing_settings
+    from sync_window_icon import apply_sync_window_icon
 
 QR_IMAGE_SIZE = 300
 QR_WINDOW_WIDTH = 360
@@ -93,11 +93,7 @@ class ConnectionQrView:
         root.geometry(f'{QR_WINDOW_WIDTH}x{QR_WINDOW_HEIGHT}')
         root.minsize(QR_WINDOW_WIDTH, QR_WINDOW_HEIGHT)
         root.maxsize(QR_WINDOW_WIDTH, QR_WINDOW_HEIGHT)
-        try:
-            base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-            root.iconbitmap(default=os.path.join(base, 'icon.ico'))
-        except (OSError, tk.TclError):
-            pass
+        apply_sync_window_icon(root)
         frame = tk.Frame(root, background='#f0f4f8', padx=20, pady=8)
         frame.pack(fill='both', expand=True)
         def label(text='', **kwargs):

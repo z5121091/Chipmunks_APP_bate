@@ -23,6 +23,7 @@ import { safeJsonParseNullable } from './json';
 import { logger } from './logger';
 import { bindingMatchesVersion, getBindingVersions, normalizeBindingVersions } from './bindingVersions';
 import { getDatabaseBackupDateString, sanitizeBackupFileName } from './backupNaming';
+import { createValidatedDatabaseSnapshot } from './sqliteSnapshot';
 import {
   isOutboundOrderRuleConfig,
   loadOutboundOrderRule,
@@ -77,6 +78,7 @@ const DATABASE_TABLE_NAMES = {
   sales_return_records: '销售退货记录',
   sales_return_allocations: '退货再出库关联',
   qr_code_rules: '扫码解析规则',
+  qr_rule_folders: '解析规则文件夹',
   warehouses: '仓库',
   inventory_bindings: '物料绑定',
   inventory_binding_versions: '物料绑定版本',
@@ -101,6 +103,7 @@ const DATABASE_BACKUP_TABLE_CLASSIFICATION = {
   sales_return_records: 'business',
   sales_return_allocations: 'supporting',
   qr_code_rules: 'configuration',
+  qr_rule_folders: 'configuration',
   warehouses: 'configuration',
   inventory_bindings: 'business',
   inventory_binding_versions: 'business',
@@ -244,6 +247,8 @@ export interface QRCodeRule {
   description: string; // 规则描述
   // 仅控制“解析规则”列表的展示顺序，绝不参与扫码规则匹配优先级。
   displayOrder?: number;
+  // Presentation-only organization, independent from supplier and scan matching.
+  folderId?: string;
   separator: string; // 分隔符，如 "/"、","、"*"等
   terminator?: string; // 整条扫码内容的可选结束符，只移除末尾完整匹配的一次
   fieldOrder: string[]; // 标准字段或 ignore:N；旧 custom:字段ID 在读取/恢复时自动转换
@@ -255,6 +260,14 @@ export interface QRCodeRule {
   matchConditions?: MatchCondition[]; // 识别条件（可选，用于区分相同分隔符和字段数的规则）
   packagingFields?: string[]; // 空数组表示关闭组合包装识别
   conditionMode?: RuleConditionMode; // 缺失时保持历史“全部满足”；混合模式为全部组 AND 任意组。
+  created_at: string;
+  updated_at: string;
+}
+
+export interface QRCodeRuleFolder {
+  id: string;
+  name: string;
+  displayOrder?: number;
   created_at: string;
   updated_at: string;
 }
@@ -703,6 +716,7 @@ export interface BackupData {
   backupTime?: string;
   // 只包含配置数据，不包含业务数据
   rules: QRCodeRule[];
+  ruleFolders?: QRCodeRuleFolder[];
   customFields: LegacyCustomField[]; // Empty on export; accepted only for legacy JSON compatibility.
   warehouses: Warehouse[];
   outboundOrderRule?: OutboundOrderRuleConfig;
@@ -803,12 +817,19 @@ const isQRCodeRuleShape = (value: unknown): value is QRCodeRule => {
     (value.fieldPrefixes === undefined || isStringRecord(value.fieldPrefixes)) &&
     (value.supplierName === undefined || typeof value.supplierName === 'string') &&
     (value.supplierId === undefined || typeof value.supplierId === 'string') &&
+    (value.folderId === undefined || typeof value.folderId === 'string') &&
     (value.conditionMode === undefined || isRuleConditionMode(value.conditionMode)) &&
     (value.matchConditions === undefined ||
       (Array.isArray(value.matchConditions) &&
         value.matchConditions.every((item) => isMatchConditionShape(item))))
   );
 };
+
+const isRuleFolderShape = (value: unknown): value is QRCodeRuleFolder =>
+  isPlainObject(value) && typeof value.id === 'string' && typeof value.name === 'string' &&
+  typeof value.created_at === 'string' && typeof value.updated_at === 'string' &&
+  (value.displayOrder === undefined || (typeof value.displayOrder === 'number' &&
+    Number.isSafeInteger(value.displayOrder) && value.displayOrder > 0));
 
 const isLegacyCustomFieldShape = (value: unknown): value is LegacyCustomField => {
   if (!isPlainObject(value)) {
@@ -878,6 +899,7 @@ export const isBackupDataShape = (value: unknown): value is BackupData => {
     (value.backupTime === undefined || typeof value.backupTime === 'string') &&
     Array.isArray(value.rules) &&
     value.rules.every((item) => isQRCodeRuleShape(item)) &&
+    (value.ruleFolders === undefined || (Array.isArray(value.ruleFolders) && value.ruleFolders.every(isRuleFolderShape))) &&
     Array.isArray(value.customFields) &&
     value.customFields.every((item) => isLegacyCustomFieldShape(item)) &&
     Array.isArray(value.warehouses) &&
@@ -950,6 +972,7 @@ type RuleRecordRow = {
   field_prefixes?: string | null;
   terminator?: string | null;
   display_order?: number | string | null;
+  folder_id?: string | null;
   is_active: number | boolean;
   supplier_name?: string | null;
   supplier_id?: string | null;
@@ -1009,6 +1032,7 @@ const normalizeRuleRecord = (record: RuleRecordRow): QRCodeRule => {
     name: record.name,
     description: record.description || '',
     displayOrder: getRuleDisplayOrder(record.display_order),
+    ...(record.folder_id ? { folderId: record.folder_id } : {}),
     separator: record.separator,
     terminator: record.terminator || '',
     fieldOrder,
@@ -1659,6 +1683,7 @@ const mockTables: Record<string, MockRow[]> = {
   inventory_binding_versions: [],
   inventory_suppliers: [],
   qr_code_rules: [],
+  qr_rule_folders: [],
   inbound_records: [],
   inventory_check_records: [],
   unpack_records: [],
@@ -2341,7 +2366,7 @@ const createMockDatabase = (): SQLite.SQLiteDatabase => {
       }
 
       if (sql.trim().startsWith('DELETE')) {
-        const match = sql.match(/DELETE FROM (\w+) WHERE (.*)/);
+        const match = normalizeSqlText(sql).match(/^DELETE FROM (\w+)(?: WHERE (.*))?$/);
         if (match) {
           const tableName = match[1];
           const whereClause = match[2];
@@ -3141,6 +3166,14 @@ const performDatabaseInitialization = async (
         UNIQUE (return_id, material_id, pair_id)
       );
 
+      CREATE TABLE IF NOT EXISTS qr_rule_folders (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        display_order INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS qr_code_rules (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -3156,6 +3189,7 @@ const performDatabaseInitialization = async (
         field_prefixes TEXT,
         terminator TEXT NOT NULL DEFAULT '',
         display_order INTEGER,
+        folder_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -3272,6 +3306,10 @@ const performDatabaseInitialization = async (
   if (!ruleColumns.some(column => column.name === 'display_order')) {
     await db.execAsync('ALTER TABLE qr_code_rules ADD COLUMN display_order INTEGER');
   }
+  if (!ruleColumns.some(column => column.name === 'folder_id')) {
+    await db.execAsync('ALTER TABLE qr_code_rules ADD COLUMN folder_id TEXT');
+  }
+  await db.execAsync('CREATE INDEX IF NOT EXISTS idx_qr_code_rules_folder ON qr_code_rules (folder_id)');
   if (!ruleColumns.some(column => column.name === 'condition_mode')) {
     await db.execAsync("ALTER TABLE qr_code_rules ADD COLUMN condition_mode TEXT NOT NULL DEFAULT 'all'");
   }
@@ -7572,27 +7610,38 @@ const hydrateInboundRecordRows = async (rows: InboundRecordRow[]): Promise<Inbou
 };
 
 // 分页获取物料绑定
+// Match String.trim() for imported blank supplier cells, including tabs/newlines/full-width spaces.
+const INVENTORY_SUPPLIER_WHITESPACE = ' \t\n\r\v\f\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff';
 export const getInventoryBindingsPage = async ({
   page = 1,
   pageSize = 10,
   keyword = '',
+  supplierStatus,
 }: {
   page?: number;
   pageSize?: number;
   keyword?: string;
+  supplierStatus?: 'unassigned';
 }): Promise<InventoryBindingPageResult> => {
   try {
     const normalizedPageSize = Math.max(1, Math.floor(pageSize));
     if (isWebPlatform) {
       const key = keyword.trim().toUpperCase();
-      const all = (await getAllInventoryBindings()).filter(binding => !key || [
+      const all = (await getAllInventoryBindings()).filter(binding =>
+        (supplierStatus !== 'unassigned' || !binding.supplier?.trim()) && (!key || [
         binding.scan_model, binding.inventory_code, binding.supplier ?? '', ...getBindingVersions(binding),
-      ].some(value => value.toUpperCase().includes(key)));
+      ].some(value => value.toUpperCase().includes(key))));
       const safePage = Math.min(Math.max(1, Math.floor(page)), Math.max(1, Math.ceil(all.length / normalizedPageSize)));
       return { items: all.slice((safePage - 1) * normalizedPageSize, safePage * normalizedPageSize),
         total: all.length, page: safePage, pageSize: normalizedPageSize };
     }
-    const { whereClause, params } = buildInventoryBindingSearchClause(keyword);
+    const search = buildInventoryBindingSearchClause(keyword);
+    const whereClause = supplierStatus === 'unassigned'
+      ? `WHERE TRIM(COALESCE(supplier, ''), ?) = ''${search.whereClause
+        ? ` AND (${search.whereClause.replace(/^WHERE\s+/i, '')})` : ''}`
+      : search.whereClause;
+    const params = supplierStatus === 'unassigned'
+      ? [INVENTORY_SUPPLIER_WHITESPACE, ...search.params] : search.params;
 
     const totalResult = await runDatabaseReadWithRetry('getInventoryBindingsPage.total', () =>
       getDb().getFirstAsync<{ count: number }>(
@@ -7620,6 +7669,34 @@ export const getInventoryBindingsPage = async ({
     };
   } catch (error) {
     logger.error('分页获取物料绑定失败:', error);
+    throw error;
+  }
+};
+
+/** Assign just the missing supplier; never replay a stale editor snapshot over binding identity/versions. */
+export const assignInventoryBindingSupplier = async (bindingId: string, supplierId: string): Promise<void> => {
+  try {
+    const normalizedBindingId = typeof bindingId === 'string' ? bindingId.trim() : '';
+    const normalizedSupplierId = typeof supplierId === 'string' ? supplierId.trim() : '';
+    if (!normalizedBindingId) throw new Error('未找到要分配供应商的物料绑定，请刷新列表');
+    if (!normalizedSupplierId) throw new Error('请选择要分配的供应商');
+    await runExclusiveWriteTransaction(getDb(), 'assignInventoryBindingSupplier', async database => {
+      const binding = await database.getFirstAsync<Pick<InventoryBinding, 'id' | 'supplier'>>(
+        'SELECT id, supplier FROM inventory_bindings WHERE id = ?', [normalizedBindingId],
+      );
+      if (!binding) throw new Error('该物料绑定已不存在，请刷新列表');
+      if (binding.supplier?.trim()) throw new Error('该物料已分配供应商，请刷新列表后查看');
+      const supplier = await database.getFirstAsync<Pick<InventorySupplier, 'id' | 'name'>>(
+        'SELECT id, name FROM inventory_suppliers WHERE id = ?', [normalizedSupplierId],
+      );
+      if (!supplier?.name.trim()) throw new Error('所选供应商已不存在，请重新选择');
+      const result = await database.runAsync(
+        'UPDATE inventory_bindings SET supplier = ? WHERE id = ?', [supplier.name, normalizedBindingId],
+      );
+      if (result.changes !== 1) throw new Error('物料绑定已发生变化，请刷新列表后重试');
+    });
+  } catch (error) {
+    logger.error('分配物料供应商失败:', error);
     throw error;
   }
 };
@@ -9393,6 +9470,128 @@ const assertValidQRCodeRuleConfiguration = (
   });
 };
 
+type RuleFolderRow = {
+  id: string; name: string; display_order?: number | null; created_at: string; updated_at: string;
+};
+
+const normalizeRuleFolderRecord = (row: RuleFolderRow): QRCodeRuleFolder => ({
+  id: row.id, name: row.name, displayOrder: getRuleDisplayOrder(row.display_order),
+  created_at: row.created_at, updated_at: row.updated_at,
+});
+
+const sortRuleFoldersForDisplay = (folders: QRCodeRuleFolder[]): QRCodeRuleFolder[] => folders.slice().sort((a, b) =>
+  (getRuleDisplayOrder(a.displayOrder) ?? Number.MAX_SAFE_INTEGER) -
+    (getRuleDisplayOrder(b.displayOrder) ?? Number.MAX_SAFE_INTEGER) ||
+  a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
+
+const normalizeRuleFolderName = (name: string): string => {
+  if (typeof name !== 'string' || !name.trim()) throw new Error('请输入文件夹名称');
+  const trimmed = name.trim();
+  if (normalizeQRCodeRuleName(trimmed) === '未分组') throw new Error('“未分组”是保留名称，请选择其他文件夹名称');
+  if (Array.from(trimmed).length > 60) throw new Error('文件夹名称不能超过60个字符');
+  if (Array.from(trimmed).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) {
+    throw new Error('文件夹名称不能包含控制字符');
+  }
+  return trimmed;
+};
+
+const assertUniqueRuleFolderName = (folders: readonly QRCodeRuleFolder[], name: string, excludedId?: string): void => {
+  if (folders.some(folder => folder.id !== excludedId && normalizeQRCodeRuleName(folder.name) === normalizeQRCodeRuleName(name))) {
+    throw new Error(`文件夹“${name}”已存在，请使用不同名称`);
+  }
+};
+
+const resolveRuleFolderWithDatabase = async (
+  database: SQLite.SQLiteDatabase, folderId: string | null | undefined,
+): Promise<string | null> => {
+  if (folderId != null && typeof folderId !== 'string') throw new Error('文件夹归属无效，请重新选择');
+  const id = folderId?.trim() || null;
+  if (id && !await database.getFirstAsync('SELECT id FROM qr_rule_folders WHERE id = ? LIMIT 1', [id])) {
+    throw new Error('文件夹不存在或已被删除，请重新选择');
+  }
+  return id;
+};
+
+const writeRuleFolders = async <T,>(context: string, task: (database: SQLite.SQLiteDatabase) => Promise<T>): Promise<T> => {
+  try {
+    return await runExclusiveWriteTransaction(getDb(), context, task);
+  } catch (error) {
+    logger.error(`[${context}] 规则文件夹操作失败:`, error);
+    throw error;
+  }
+};
+
+export const getAllRuleFolders = async (): Promise<QRCodeRuleFolder[]> => {
+  try {
+    const rows = await runDatabaseReadWithRetry('getAllRuleFolders', () =>
+      getDb().getAllAsync<RuleFolderRow>('SELECT * FROM qr_rule_folders'));
+    return sortRuleFoldersForDisplay(rows.map(normalizeRuleFolderRecord));
+  } catch (error) {
+    logger.error('读取规则文件夹失败:', error);
+    throw error;
+  }
+};
+
+export const addRuleFolder = async (name: string): Promise<string> => {
+  const normalizedName = normalizeRuleFolderName(name);
+  return writeRuleFolders('addRuleFolder', async database => {
+    const rows = await database.getAllAsync<RuleFolderRow>('SELECT * FROM qr_rule_folders');
+    const folders = sortRuleFoldersForDisplay(rows.map(normalizeRuleFolderRecord));
+    assertUniqueRuleFolderName(folders, normalizedName);
+    const id = generateId();
+    const now = getISODateTime();
+    await database.runAsync(
+      'INSERT INTO qr_rule_folders (id, name, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      [id, normalizedName, (Math.max(0, ...folders.map(folder => folder.displayOrder ?? 0))) + 1, now, now]);
+    return id;
+  });
+};
+
+export const renameRuleFolder = async (id: string, name: string): Promise<void> => {
+  const normalizedName = normalizeRuleFolderName(name);
+  return writeRuleFolders('renameRuleFolder', async database => {
+    const rows = await database.getAllAsync<RuleFolderRow>('SELECT * FROM qr_rule_folders');
+    const folders = rows.map(normalizeRuleFolderRecord);
+    if (!folders.some(folder => folder.id === id)) throw new Error('文件夹不存在或已被删除');
+    assertUniqueRuleFolderName(folders, normalizedName, id);
+    await database.runAsync('UPDATE qr_rule_folders SET name = ?, updated_at = ? WHERE id = ?', [normalizedName, getISODateTime(), id]);
+  });
+};
+
+export const deleteRuleFolder = async (id: string): Promise<void> => writeRuleFolders('deleteRuleFolder', async database => {
+  await resolveRuleFolderWithDatabase(database, id);
+  if (!id.trim()) throw new Error('请选择要解散的文件夹');
+  // Unfile rules atomically; never delete or modify their parsing/supplier configuration.
+  await database.runAsync('UPDATE qr_code_rules SET folder_id = ? WHERE folder_id = ?', [null, id.trim()]);
+  await database.runAsync('DELETE FROM qr_rule_folders WHERE id = ?', [id.trim()]);
+});
+
+export const moveRulesToFolder = async (ids: string[], folderId: string | null): Promise<void> => {
+  if (!Array.isArray(ids) || !ids.length || ids.some(id => typeof id !== 'string' || !id.trim()) ||
+      new Set(ids).size !== ids.length) throw new Error('请选择有效且不重复的解析规则');
+  return writeRuleFolders('moveRulesToFolder', async database => {
+    const targetId = await resolveRuleFolderWithDatabase(database, folderId);
+    const rows = await database.getAllAsync<{ id: string }>('SELECT id FROM qr_code_rules');
+    const currentIds = new Set(rows.map(row => row.id));
+    if (ids.some(id => !currentIds.has(id))) throw new Error('规则列表已变化，请重新选择');
+    for (const id of ids) await database.runAsync('UPDATE qr_code_rules SET folder_id = ? WHERE id = ?', [targetId, id]);
+  });
+};
+
+export const setRuleFoldersDisplayOrder = async (orderedIds: string[]): Promise<void> => {
+  const ids = orderedIds.slice();
+  return writeRuleFolders('setRuleFoldersDisplayOrder', async database => {
+    const rows = await database.getAllAsync<{ id: string }>('SELECT id FROM qr_rule_folders');
+    const currentIds = new Set(rows.map(row => row.id));
+    if (new Set(ids).size !== ids.length || ids.length !== currentIds.size || ids.some(id => !currentIds.has(id))) {
+      throw new Error('文件夹列表已变化，请取消排序后重新调整');
+    }
+    for (let index = 0; index < ids.length; index++) {
+      await database.runAsync('UPDATE qr_rule_folders SET display_order = ? WHERE id = ?', [index + 1, ids[index]]);
+    }
+  });
+};
+
 // 获取所有规则
 export const getAllRules = async (): Promise<QRCodeRule[]> => {
   try {
@@ -9473,6 +9672,7 @@ export const addRule = async (
       assertValidQRCodeRuleConfiguration(rule);
       await assertUniqueQRCodeRuleName(transactionDatabase, rule.name);
       const supplier = await resolveRuleSupplierWithDatabase(transactionDatabase, rule);
+      const folderId = await resolveRuleFolderWithDatabase(transactionDatabase, rule.folderId);
       const currentRows = await transactionDatabase.getAllAsync<RuleRecordRow>('SELECT * FROM qr_code_rules');
       const currentRules = sortRulesForDisplay(currentRows.map(normalizeRuleRecord));
       // 新建规则置顶，保留旧列表的相对顺序；只调整展示序号，不修改识别优先级或更新时间。
@@ -9485,8 +9685,8 @@ export const addRule = async (
       await transactionDatabase.runAsync(
         `INSERT INTO qr_code_rules (
           id, name, description, separator, field_order, custom_field_ids, is_active,
-          supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at, condition_mode, supplier_id, display_order, packaging_fields
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at, condition_mode, supplier_id, display_order, packaging_fields, folder_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
           rule.name,
@@ -9505,6 +9705,7 @@ export const addRule = async (
           supplier.supplierId || null,
           1,
           rule.packagingFields?.length ? JSON.stringify(rule.packagingFields) : null,
+          folderId,
         ]
       );
     });
@@ -9567,6 +9768,8 @@ export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Prom
         if (typeof value !== 'string') throw new Error('供应商名称必须为文本');
       } else if (key === 'supplierId') {
         if (typeof value !== 'string') throw new Error('供应商关联无效，请重新选择供应商');
+      } else if (key === 'folderId') {
+        if (typeof value !== 'string') throw new Error('文件夹归属无效，请重新选择');
       } else if (key === 'id' || key === 'created_at' || key === 'updated_at') {
         return;
       } else {
@@ -9583,7 +9786,8 @@ export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Prom
 
     const hasSupplierUpdate = Object.prototype.hasOwnProperty.call(updates, 'supplierId') ||
       Object.prototype.hasOwnProperty.call(updates, 'supplierName');
-    if (updateFields.length > 0 || hasSupplierUpdate) {
+    const hasFolderUpdate = updates.folderId !== undefined;
+    if (updateFields.length > 0 || hasSupplierUpdate || hasFolderUpdate) {
       await runExclusiveWriteTransaction(database, 'updateRule', async (transactionDatabase) => {
         const rawRule = await transactionDatabase.getFirstAsync<RuleRecordRow>(
           'SELECT * FROM qr_code_rules WHERE id = ? LIMIT 1',
@@ -9594,6 +9798,11 @@ export const updateRule = async (id: string, updates: Partial<QRCodeRule>): Prom
         }
         const currentRule = normalizeRuleRecord(rawRule);
         const mergedRule: QRCodeRule = { ...currentRule, ...updates, id: currentRule.id };
+        if (hasFolderUpdate) {
+          const folderId = await resolveRuleFolderWithDatabase(transactionDatabase, updates.folderId);
+          updateFields.push('folder_id = ?');
+          values.push(folderId);
+        }
         if (hasSupplierUpdate) {
           // Clearing an explicit association also clears its old name snapshot unless supplied anew.
           if (Object.prototype.hasOwnProperty.call(updates, 'supplierId') && !updates.supplierId &&
@@ -10196,20 +10405,27 @@ export const parseWithRule = (
 export const exportBackupData = async (): Promise<BackupData> => {
   try {
     const [
-      rules,
+      organization,
       warehouses,
       outboundOrderRule,
       outboundWarehouseOrderRules,
       savedSyncConfig,
       savedSoundEnabled,
     ] = await Promise.all([
-      getAllRules(),
+      runDatabaseReadWithRetry('exportRuleOrganization', () => runSerializedDatabaseOperation('exportRuleOrganization', async () => {
+        const database = getDb();
+        const ruleRows = await database.getAllAsync<RuleRecordRow>('SELECT * FROM qr_code_rules');
+        const folderRows = await database.getAllAsync<RuleFolderRow>('SELECT * FROM qr_rule_folders');
+        return { rules: sortRulesForDisplay(ruleRows.map(normalizeRuleRecord)),
+          ruleFolders: sortRuleFoldersForDisplay(folderRows.map(normalizeRuleFolderRecord)) };
+      })),
       getAllWarehouses(),
       loadOutboundOrderRule(),
       loadOutboundWarehouseOrderRules(),
       AsyncStorage.getItem(STORAGE_KEYS.SYNC_CONFIG),
       AsyncStorage.getItem(STORAGE_KEYS.SOUND_ENABLED),
     ]);
+    const { rules, ruleFolders } = organization;
 
     const syncConfig = safeJsonParseNullable<SyncConfig>(
       savedSyncConfig,
@@ -10229,6 +10445,7 @@ export const exportBackupData = async (): Promise<BackupData> => {
       backupTime: getISODateTime(),
       // 只导出配置数据
       rules,
+      ruleFolders,
       customFields: [], // Retained only as an empty compatibility field in configuration backups.
       warehouses,
       outboundOrderRule,
@@ -10278,6 +10495,20 @@ export const importBackupData = async (
     const uniqueRuleNames = makeQRCodeRuleNamesUnique(migratedRules);
     backup = { ...backup, rules: uniqueRuleNames.rules, customFields: [] };
 
+    // Old backups contain no folder metadata. New references must be complete before replacing anything.
+    const backupFolders = backup.ruleFolders ?? [];
+    const folderIds = new Set<string>();
+    const folderNames = new Set<string>();
+    for (const folder of backupFolders) {
+      const name = normalizeRuleFolderName(folder.name);
+      const normalizedName = normalizeQRCodeRuleName(name);
+      if (!folder.id.trim() || folder.id !== folder.id.trim() || folderIds.has(folder.id) || folderNames.has(normalizedName)) {
+        throw new Error('备份中存在无效或重复的规则文件夹');
+      }
+      folderIds.add(folder.id);
+      folderNames.add(normalizedName);
+    }
+
     const ruleIds = new Set<string>();
     backup.rules.forEach((rule) => {
       const id = rule.id.trim();
@@ -10286,6 +10517,9 @@ export const importBackupData = async (
       }
       ruleIds.add(id);
       assertValidQRCodeRuleConfiguration(rule);
+      if (rule.folderId && !folderIds.has(rule.folderId)) {
+        throw new Error(`备份中解析规则“${rule.name}”引用的文件夹缺失，无法安全恢复`);
+      }
       if (rule.supplierId?.trim() && !rule.supplierName?.trim()) {
         throw new Error(`备份中解析规则“${rule.name}”缺少关联的供应商名称，无法安全恢复关联`);
       }
@@ -10350,6 +10584,13 @@ export const importBackupData = async (
     await runExclusiveWriteTransaction(database, 'importBackupData', async (transactionDatabase) => {
       // 物料绑定由独立的 Excel 导入/导出管理，配置恢复不得清空或覆盖现有绑定。
       await transactionDatabase.runAsync('DELETE FROM qr_code_rules');
+      await transactionDatabase.runAsync('DELETE FROM qr_rule_folders');
+      for (const [index, folder] of backupFolders.entries()) {
+        await transactionDatabase.runAsync(
+          'INSERT INTO qr_rule_folders (id, name, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+          [folder.id, folder.name.trim(), getRuleDisplayOrder(folder.displayOrder) ?? index + 1,
+            folder.created_at || getISODateTime(), folder.updated_at || getISODateTime()]);
+      }
 
       if (referencedWarehouseIds.length > 0) {
         await transactionDatabase.runAsync(
@@ -10409,8 +10650,8 @@ export const importBackupData = async (
             await transactionDatabase.runAsync(
               `INSERT INTO qr_code_rules (
                 id, name, description, separator, field_order, custom_field_ids,
-                is_active, supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at, display_order, condition_mode, supplier_id, packaging_fields
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                is_active, supplier_name, match_conditions, field_prefixes, terminator, created_at, updated_at, display_order, condition_mode, supplier_id, packaging_fields, folder_id
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 rule.id,
                 rule.name,
@@ -10429,6 +10670,7 @@ export const importBackupData = async (
                 rule.conditionMode ?? 'all',
                 supplierId,
                 rule.packagingFields?.length ? JSON.stringify(rule.packagingFields) : null,
+                rule.folderId || null,
               ]
             );
           } catch (e) {
@@ -10656,6 +10898,7 @@ const RESTORE_SCHEMA_REQUIREMENTS: Record<string, string[]> = {
   orders: ['id', 'order_no', 'created_at'],
   materials: ['id', 'order_no', 'quantity', 'scanned_at'],
   qr_code_rules: ['id', 'name', 'separator', 'field_order', 'is_active'],
+  qr_rule_folders: ['id', 'name', 'display_order', 'created_at', 'updated_at'],
   warehouses: ['id', 'name', 'is_default', 'created_at'],
   inventory_bindings: ['id', 'scan_model', 'inventory_code', 'created_at'],
   inventory_binding_versions: ['binding_id', 'version'],
@@ -10698,7 +10941,7 @@ const RESTORE_REQUIRED_TABLES = new Set(
   Object.keys(RESTORE_SCHEMA_REQUIREMENTS).filter(tableName =>
     ![
       'unpack_print_tasks', 'sales_return_records', 'sales_return_allocations', 'inventory_suppliers',
-      'inventory_binding_versions', 'internal_label_packages', 'internal_label_print_jobs',
+      'inventory_binding_versions', 'internal_label_packages', 'internal_label_print_jobs', 'qr_rule_folders',
     ].includes(tableName))
 );
 const INTERNAL_LABEL_REFERENCE_TABLES = new Set(['materials', 'inbound_records', 'unpack_records', 'inventory_check_records', 'sales_return_records']);
@@ -10791,6 +11034,21 @@ export const validateRestoredDatabaseSchema = async (
         `SELECT 1 FROM ${tableName} WHERE package_key GLOB ? LIMIT 1`, [internalLabelPackageKey('*')]
       )) {
       throw new Error('备份含内部标签作业记录，但缺少包装登记和打印任务，请选择完整数据库备份');
+    }
+  }
+  const ruleColumns = await schemaDatabase.getAllAsync<{ name: string }>('PRAGMA table_info(qr_code_rules)');
+  if (ruleColumns.some(column => column.name === 'folder_id')) {
+    const references = await schemaDatabase.getAllAsync<{ folder_id: string }>(
+      "SELECT folder_id FROM qr_code_rules WHERE folder_id IS NOT NULL AND TRIM(folder_id) != ''");
+    if (references.length) {
+      const folderTable = await schemaDatabase.getFirstAsync<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", [getPhysicalDatabaseTableName('qr_rule_folders')]);
+      if (!folderTable) throw new Error('备份含规则文件夹归属，但缺少文件夹定义，请选择完整数据库备份');
+      const folders = await schemaDatabase.getAllAsync<{ id: string }>('SELECT id FROM qr_rule_folders');
+      const folderIds = new Set(folders.map(folder => folder.id));
+      if (references.some(reference => !folderIds.has(reference.folder_id))) {
+        throw new Error('备份中的解析规则引用了不存在的文件夹，请选择完整数据库备份');
+      }
     }
   }
 };
@@ -11014,11 +11272,9 @@ export const exportDatabaseFile = async (): Promise<{
           );
           const backupFilePath = `${backupDir}/${backupFileName}`;
 
-          // 复制数据库文件到备份目录
-          await FS.copyAsync({
-            from: dbFilePath,
-            to: backupFilePath,
-          });
+          // Build a separate compact snapshot, validate it, then publish it.
+          // Keep the existing write/checkpoint gate; never VACUUM or replace the live database.
+          await createValidatedDatabaseSnapshot(database, dbFilePath, backupFilePath);
 
           return {
             success: true,

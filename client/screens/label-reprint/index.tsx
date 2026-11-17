@@ -1,11 +1,13 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { AppModal as Modal } from '@/components/AppModal';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Keyboard, KeyboardAvoidingView, Platform, ScrollView, Text, View, useWindowDimensions,
+import { Keyboard, ScrollView, Text, View, useWindowDimensions,
   type NativeSyntheticEvent, type TextInputSubmitEditingEventData } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { AppModalCard } from '@/components/AppModalCard';
+import { AppModalViewport } from '@/components/AppModalViewport';
 import { CustomAlert, type AlertButtonType } from '@/components/CustomAlert';
 import { Screen } from '@/components/Screen';
 import { UiInput, UiToolbarButton } from '@/components/UiRedesign';
@@ -25,7 +27,6 @@ import {
   cancelScanSubmit, resolvePendingScannerSubmit, resolveScannerChangeAfterSubmit,
   resolveScannerTextAfterConsumedPrefix, scheduleScanSubmit,
 } from '@/utils/scannerInput';
-import { formatDateTime } from '@/utils/time';
 import { InternalLabelForm } from './InternalLabelForm';
 import { createStyles } from './styles';
 
@@ -47,14 +48,20 @@ const getTaskStatusLabel = (task: LabelReprintTask) => {
   return task.retryAllowed === false ? '本次未打印' : '失败待处理';
 };
 
+const describeTaskLabel = (task: LabelReprintTask) => [
+  task.record.specification?.trim() || task.model,
+  task.internalPackageId ? `包号：${task.internalPackageId}` : task.batch ? `批次：${task.batch}` : '',
+  task.internalPackageId ? '' : task.traceNo ? `追溯码：${task.traceNo}` : task.boxNo ? `箱号：${task.boxNo}` : '',
+].filter(Boolean).join('\n');
+
 export default function LabelReprintScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const { width: windowWidth, height: windowHeight, fontScale } = useWindowDimensions();
   const showHeaderActionIcons = windowWidth >= 300 * Math.max(1, fontScale);
   const insets = useSafeAreaInsets();
   const [taskViewportHeight, setTaskViewportHeight] = useState(0);
-  const [correctionViewportHeight, setCorrectionViewportHeight] = useState(0);
+  const [taskContentHeight, setTaskContentHeight] = useState<number>();
   const taskOverlayPadding = {
     paddingTop: Math.max(Spacing.md, insets.top),
     paddingBottom: Math.max(Spacing.md, insets.bottom),
@@ -65,7 +72,6 @@ export default function LabelReprintScreen() {
     windowHeight - taskOverlayPadding.paddingTop - taskOverlayPadding.paddingBottom,
   ));
   const taskModalHeight = Math.min(modalHeightLimit, taskViewportHeight || windowHeight);
-  const correctionModalHeight = Math.min(modalHeightLimit, correctionViewportHeight || windowHeight);
   const scannerRef = useRef<WarehouseScanInputHandle>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeRef = useRef(false);
@@ -129,6 +135,7 @@ export default function LabelReprintScreen() {
     setProcessing(false);
     setTasks([]);
     setTaskViewportHeight(0);
+    setTaskContentHeight(undefined);
     setShowTasks(false);
     setShowInternalForm(false);
     setNotice(null);
@@ -222,7 +229,6 @@ export default function LabelReprintScreen() {
       if (correctingQuantity) {
         clearScannerInput();
         modalOpenRef.current = true;
-        setCorrectionViewportHeight(0);
         setCorrectionTask(prepared);
         setQuantityInput('');
         setQuantityError('');
@@ -545,50 +551,53 @@ export default function LabelReprintScreen() {
   ] : [{ text: '知道了', onPress: closeNotice }];
 
   const latestTask = tasks[0];
-  const renderTask = (task: LabelReprintTask, inModal = false) => (
-    <View key={task.id} style={styles.card}>
-      <View style={styles.cardHeading}>
-        <Text style={styles.model}>{task.model}</Text>
-        <Text style={styles.quantity}>{task.quantity} · {getLabelPrintCopies(task)} 张</Text>
+  const taskStatusColor = (task: LabelReprintTask) => {
+    if (task.internalCanceled) return theme.textMuted;
+    if (task.status === 'submitted') return theme.success;
+    if (task.status === 'failed') return theme.error;
+    return theme.textSecondary;
+  };
+  const renderTaskReceipt = (task: LabelReprintTask, showActions = false) => {
+    const inventoryCode = task.record.inventory_code?.trim() || task.inventoryCode || (task.internalPackageId ? task.model : '');
+    const specification = task.record.specification?.trim() || (task.internalPackageId ? '' : task.model);
+    const canRetry = !task.internalCanceled && (task.status === 'failed' || task.status === 'pending') && task.retryAllowed !== false;
+    const canCancelReplacement = task.status !== 'submitting' && needsInternalLabelReplacement(task);
+    const canActivateReplacement = task.status === 'submitted' && canCancelReplacement;
+    const showError = Boolean(task.lastError) && !canRetry;
+    const actionProps = { compact: true, disabled: processing, containerStyle: styles.taskActionSlot, style: styles.taskActionButton };
+
+    return (
+      <View key={task.id} testID={showActions ? undefined : 'label-reprint-latest-task'} style={[styles.card, styles.taskCard]}>
+        <View style={styles.taskRow}>
+          <Text style={[styles.model, styles.taskText]} numberOfLines={1}
+            accessibilityLabel={`存货编码：${inventoryCode || '未记录'}`}>{inventoryCode || '—'}</Text>
+          <Text style={styles.quantity} accessibilityLabel={`数量：${task.quantity}`}>{`${task.quantity} PCS`}</Text>
+        </View>
+        <View style={styles.taskRow}>
+          <Text style={[styles.detail, styles.taskText]} numberOfLines={2}
+            accessibilityLabel={`规格型号：${specification || '未记录'}`}>{specification || '—'}</Text>
+          <Text style={[styles.status, styles.taskStatus, { color: taskStatusColor(task) }]}>{getTaskStatusLabel(task)}</Text>
+        </View>
+        {showActions && (canRetry || canCancelReplacement || showError) ? <View style={styles.taskActions}>
+          {canRetry ? <UiToolbarButton {...actionProps} label={task.status === 'pending' ? '核对后提交' : '核对后重试'}
+            onPress={() => setNotice({ title: '重试标签任务', retryTask: task,
+              message: [describeTaskLabel(task), task.lastError,
+                `请先核对${getLabelPrintCopies(task) === 1 ? '一' : '两'}张标签是否已出纸。确认仍需补打后，将重新提交原任务。`,
+              ].filter(Boolean).join('\n') })} /> : null}
+          {canActivateReplacement ? <UiToolbarButton {...actionProps} label="确认换贴"
+            onPress={() => setNotice({ title: '确认内部标签已换贴',
+              message: `${describeTaskLabel(task)}\n核对两张新标签已打印，实物上的旧标签已换下。确认后新标签生效，旧版二维码作废。`,
+              internalChange: { task, action: 'activate' } })} /> : null}
+          {canCancelReplacement ? <UiToolbarButton {...actionProps} label="取消换贴"
+            onPress={() => setNotice({ title: '取消内部标签换贴',
+              message: `${describeTaskLabel(task)}\n原标签继续有效。请废弃此任务已打印的新标签。`,
+              internalChange: { task, action: 'cancel' } })} /> : null}
+          {showError ? <UiToolbarButton {...actionProps} label="查看原因"
+            onPress={() => setNotice({ title: getTaskStatusLabel(task), message: `${describeTaskLabel(task)}\n${task.lastError}` })} /> : null}
+        </View> : null}
       </View>
-      {task.internalPackageId ? <>
-        <Text style={styles.detail}>{task.internalAction === 'create' ? '新建内部标签' : '内部标签'}</Text>
-        <Text style={styles.trace}>包号：{task.internalPackageId}</Text>
-      </> : <>
-        <Text style={styles.detail}>{task.supplier}</Text>
-        <Text style={styles.detail}>批次：{task.batch || '—'}</Text>
-        <Text style={styles.trace}>{task.traceNo
-          ? `追溯码：${task.traceNo}`
-          : task.boxNo ? `箱号：${task.boxNo}` : '追溯码：—'}</Text>
-      </>}
-      <View style={styles.statusRow}>
-        <Text style={[styles.status, { color: task.internalCanceled ? theme.textMuted :
-          task.status === 'submitted' ? theme.success : task.status === 'failed' ? theme.error : theme.textSecondary }]}>
-          {getTaskStatusLabel(task)}
-        </Text>
-        <Text style={styles.time}>{formatDateTime(task.updatedAt)}</Text>
-      </View>
-      {inModal && task.lastError ? <Text style={[styles.detail, { color: theme.error }]}>{task.lastError}</Text> : null}
-      {inModal && !task.internalCanceled && (task.status === 'failed' || task.status === 'pending') && task.retryAllowed !== false ? (
-        <UiToolbarButton label={task.status === 'pending' ? '核对后提交' : '核对后重试'} icon="printer" compact disabled={processing}
-          style={styles.retryButton} onPress={() => {
-            setNotice({ title: '重试标签任务', message: `请先核对 ${task.model} 的${getLabelPrintCopies(task) === 1 ? '一' : '两'}张标签是否已出纸。确认仍需补打后，将重新提交原任务。`, retryTask: task });
-          }} />
-      ) : null}
-      {inModal && task.status === 'submitted' && needsInternalLabelReplacement(task) ? (
-        <UiToolbarButton label="确认换贴" icon="check" compact disabled={processing} style={styles.retryButton}
-          onPress={() => setNotice({ title: '确认内部标签已换贴',
-            message: '核对两张新标签已打印，实物上的旧标签已换下。确认后新标签生效，旧版二维码作废。',
-            internalChange: { task, action: 'activate' } })} />
-      ) : null}
-      {inModal && task.status !== 'submitting' && needsInternalLabelReplacement(task) ? (
-        <UiToolbarButton label="取消换贴" icon="x" compact disabled={processing} style={styles.retryButton}
-          onPress={() => setNotice({ title: '取消内部标签换贴',
-            message: '原标签继续有效。请废弃此任务已打印的新标签。',
-            internalChange: { task, action: 'cancel' } })} />
-      ) : null}
-    </View>
-  );
+    );
+  };
 
   const reprintScannerEnabled = !showTasks && !showInternalForm && !notice && !correctionTask;
 
@@ -628,7 +637,7 @@ export default function LabelReprintScreen() {
           <Text accessibilityLiveRegion="polite" style={[styles.feedback, { color: feedbackIsError ? theme.error : theme.success }]}>{feedback}</Text>
         </View>
         <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-          {latestTask ? <><Text style={styles.sectionTitle}>{latestTask.internalPackageId ? '最近标签任务' : '最近补打结果'}</Text>{renderTask(latestTask)}</> : (
+          {latestTask ? <><Text style={styles.sectionTitle}>{latestTask.internalPackageId ? '最近标签任务' : '最近补打结果'}</Text>{renderTaskReceipt(latestTask)}</> : (
             <View style={styles.empty}>
               <Feather name="maximize" size={30} color={theme.textMuted} />
               <Text style={styles.emptyTitle}>等待扫码</Text>
@@ -640,15 +649,9 @@ export default function LabelReprintScreen() {
       {showInternalForm ? <InternalLabelForm styles={styles} overlayPadding={taskOverlayPadding} modalHeight={modalHeightLimit}
         onClose={closeInternalForm} onPrint={printInternalLabels} /> : null}
       {<Modal transparent visible={Boolean(correctionTask) && (true)} animationType="fade" onRequestClose={closeQuantityCorrection}>{correctionTask ? <>
-          <KeyboardAvoidingView style={[styles.modalOverlay, taskOverlayPadding]}
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-            <View style={styles.modalViewport} testID="label-quantity-viewport"
-              onLayout={({ nativeEvent }) => {
-                const height = nativeEvent.layout.height;
-                if (height > 0) setCorrectionViewportHeight(height);
-              }}>
+          <AppModalViewport style={[styles.modalOverlay, taskOverlayPadding]}>
               <AppModalCard title="修改标签数量" subtitle="确认后打印两张相同标签"
-                size="auto" stretchBody style={{ height: correctionModalHeight }} bodyStyle={styles.modalBody}
+                size="auto" style={{ maxHeight: modalHeightLimit }}
                 onClose={processing ? undefined : closeQuantityCorrection}
                 footer={<View style={styles.correctionActions}>
                   <UiToolbarButton label="取消" disabled={processing} onPress={closeQuantityCorrection}
@@ -657,8 +660,7 @@ export default function LabelReprintScreen() {
                     onPress={() => { void confirmQuantityCorrection(); }}
                     containerStyle={styles.correctionAction} style={styles.boundedAction} />
                 </View>}>
-                <ScrollView style={styles.taskScroll} contentContainerStyle={styles.correctionContent}
-                  testID="label-quantity-form" keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator>
+                <View style={styles.correctionContent} testID="label-quantity-form">
                   <Text style={styles.model}>{correctionTask.model}</Text>
                   <Text style={styles.detail}>原数量：{correctionTask.quantity}</Text>
                   <Text style={styles.detail}>{correctionTask.internalPackageId
@@ -680,33 +682,33 @@ export default function LabelReprintScreen() {
                   <Text style={styles.modalHint}>可大于原数量；只修改标签，不改变库存和订单记录。</Text>
                   {correctionTask.internalPackageId ? <Text style={styles.modalHint}>数量有变更时包号保持不变，换贴后请在打印任务中确认启用新标签。</Text>
                     : correctionTask.traceNo ? <Text style={styles.modalHint}>追溯码按当前标签递增，重复扫描同一张旧标签会生成相同的新码。</Text> : null}
-                </ScrollView>
+                </View>
               </AppModalCard>
-            </View>
-          </KeyboardAvoidingView>
+          </AppModalViewport>
         </> : null}</Modal>}
       {<Modal transparent visible={Boolean(showTasks && !notice) && (true)} animationType="fade" onRequestClose={closeTasks}>{showTasks && !notice ? <>
-          <KeyboardAvoidingView style={[styles.modalOverlay, taskOverlayPadding]}
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+          <View testID="label-reprint-task-overlay" style={[styles.modalOverlay, taskOverlayPadding]}>
             <View style={styles.modalViewport} testID="label-reprint-task-viewport"
               onLayout={({ nativeEvent }) => {
                 const height = nativeEvent.layout.height;
                 if (height > 0) setTaskViewportHeight(height);
               }}>
               <AppModalCard title="补打标签任务" subtitle="任务回执由同步助手提供，请核对标签是否实际出纸"
-                size="auto" stretchBody style={{ height: taskModalHeight }} bodyStyle={styles.modalBody}
+                size="list" stretchBody scrollMode="body" bodyContentHeight={taskContentHeight}
+                style={{ maxHeight: taskModalHeight }} bodyStyle={styles.modalBody}
                 onClose={processing ? undefined : closeTasks} footer={<UiToolbarButton label="稍后" disabled={processing} onPress={closeTasks} />}>
                 <ScrollView style={styles.taskScroll} contentContainerStyle={styles.taskList}
                   testID="label-reprint-task-list" keyboardShouldPersistTaps="handled"
-                  showsVerticalScrollIndicator>
+                  onContentSizeChange={(_width, height) => setTaskContentHeight(height)}
+                  scrollEnabled showsVerticalScrollIndicator keyboardDismissMode="on-drag">
                   <Text style={styles.modalHint}>{tasks.some((task) => task.internalAction)
                     ? '内部标签建标和换贴任务可在重新打开页面后继续处理' : '仅显示本次页面内的任务，离开页面后清空'}</Text>
-                  {tasks.map((task) => renderTask(task, true))}
-                  {tasks.length === 0 ? <View style={styles.empty}><Text style={styles.emptyTitle}>暂无补打任务</Text></View> : null}
+                  {tasks.map(task => renderTaskReceipt(task, true))}
+                  {tasks.length === 0 ? <View style={styles.taskEmpty}><Text style={styles.emptyTitle}>暂无补打任务</Text></View> : null}
                 </ScrollView>
               </AppModalCard>
             </View>
-          </KeyboardAvoidingView>
+          </View>
         </> : null}</Modal>}
       <CustomAlert visible={Boolean(notice)} title={notice?.title || ''} message={notice?.message}
         icon="warning" buttons={noticeButtons} onClose={closeNotice} />

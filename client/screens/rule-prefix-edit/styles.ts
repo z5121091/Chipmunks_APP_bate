@@ -277,6 +277,10 @@ export const createStyles = (theme: Theme) =>
       paddingTop: Spacing.md,
       paddingBottom: Spacing.sm,
     },
+    editorScroll: {
+      flex: 1,
+      minHeight: 0,
+    },
     editorScrollContent: {
       padding: Spacing.md,
       paddingTop: 0,

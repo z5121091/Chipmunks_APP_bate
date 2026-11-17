@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { useMemo } from 'react';
 import { ScrollView, Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
@@ -21,7 +22,7 @@ export default function DocumentManagementScreen() {
   const { theme, isDark } = useTheme();
   const router = useSafeRouter();
   const alert = useCustomAlert();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
 
   const cards = useMemo<DocumentCard[]>(
     () => [

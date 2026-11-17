@@ -21,7 +21,6 @@ jest.mock('@/components/AppEmptyState', () => ({ AppEmptyState: 'Empty' }));
 jest.mock('@/components/AppModalCard', () => ({ AppModalCard: 'Card' }));
 jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'Actions' }));
 jest.mock('@/components/AppFormField', () => ({ AppFormField: 'Field' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormFlatList: require('react-native').FlatList }));
 jest.mock('@/components/UiRedesign', () => ({ UiToolbarButton: 'Tool' }));
 jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon' }));
 jest.mock('@/utils/logger', () => ({ logger: { error: jest.fn() } }));
@@ -29,7 +28,10 @@ jest.mock('@/components/CustomAlert', () => {
   const alert = { showConfirm: jest.fn(), showError: jest.fn(), showSuccess: jest.fn(), showWarning: jest.fn(), AlertComponent: null };
   return { useCustomAlert: () => alert };
 });
-jest.mock('@/utils/database', () => ({ getInventorySuppliers: jest.fn(), addInventorySupplier: jest.fn(), deleteInventorySupplier: jest.fn() }));
+jest.mock('@/utils/database', () => ({
+  getInventorySuppliers: jest.fn(), addInventorySupplier: jest.fn(), deleteInventorySupplier: jest.fn(),
+  getInventoryBindingsPage: jest.fn(), assignInventoryBindingSupplier: jest.fn(),
+}));
 
 const suppliers: database.InventorySupplier[] = [
   { id: 'supplier-1', name: '极海科技', binding_count: 3, created_at: '2026-10-16 10:00:00' },
@@ -85,8 +87,238 @@ beforeEach(() => {
   jest.mocked(database.getInventorySuppliers).mockResolvedValue(suppliers);
   jest.mocked(database.addInventorySupplier).mockResolvedValue('new-supplier');
   jest.mocked(database.deleteInventorySupplier).mockResolvedValue(undefined);
+  jest.mocked(database.getInventoryBindingsPage).mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 10 });
+  jest.mocked(database.assignInventoryBindingSupplier).mockResolvedValue(undefined);
 });
 afterEach(async () => { if (root) { await act(async () => { root!.unmount(); }); root = undefined; } });
+
+const unassignedBinding: database.InventoryBinding = {
+  id: 'unassigned-1', scan_model: 'APM32F003F6P6', inventory_code: 'IC.UNASSIGNED.01',
+  version: 'V1', versions: ['V1', 'V2'], supplier: '', description: '保留原描述', created_at: '2026-11-14 10:00:00',
+};
+function mockUnassignedRows(initial: database.InventoryBinding[] = [unassignedBinding]) {
+  let rows = [...initial];
+  jest.mocked(database.getInventoryBindingsPage).mockImplementation(async options => {
+    const pageSize = options.pageSize ?? 10;
+    const filtered = rows.filter(row => !options.keyword ||
+      [row.scan_model, row.inventory_code, ...(row.versions ?? [])].some(value => value.includes(options.keyword!)));
+    const page = Math.min(options.page ?? 1, Math.max(1, Math.ceil(filtered.length / pageSize)));
+    return { items: filtered.slice((page - 1) * pageSize, page * pageSize), total: filtered.length, page, pageSize };
+  });
+  jest.mocked(database.assignInventoryBindingSupplier).mockImplementation(async id => { rows = rows.filter(row => row.id !== id); });
+}
+async function openUnassigned() {
+  await press('查看未绑定供应商的物料');
+  expect(card().props.title).toBe('未绑定供应商的物料');
+}
+
+it('opens unassigned materials and returns through every level within the same parent modal', async () => {
+  mockUnassignedRows();
+  const closeRef = { current: null as (() => void) | null };
+  await act(async () => {
+    root = TestRenderer.create(<SupplierManager embedded closeRef={closeRef} mode="select" value="原表单供应商"
+      onSelect={onSelect} onDeleted={onDeleted} onClose={onClose} />);
+  });
+  await pressFooter('onSecondaryPress');
+  await type('供应商名称', '尚未添加的草稿');
+  await openUnassigned();
+  expect(database.getInventoryBindingsPage).toHaveBeenLastCalledWith(expect.objectContaining({ supplierStatus: 'unassigned', page: 1 }));
+  await press(`分配供应商 ${unassignedBinding.inventory_code}`);
+  expect(card().props.title).toBe('分配供应商');
+  expect(root!.root.findAllByType(Modal)).toHaveLength(0);
+  await act(async () => { closeRef.current?.(); });
+  expect(card().props.title).toBe('未绑定供应商的物料');
+  await act(async () => { closeRef.current?.(); });
+  expect(card().props.title).toBe('维护供应商');
+  expect(input('供应商名称').props.value).toBe('尚未添加的草稿');
+  await act(async () => { closeRef.current?.(); });
+  expect(card().props.title).toBe('选择供应商');
+  expect(onClose).not.toHaveBeenCalled();
+  expect(onSelect).not.toHaveBeenCalled();
+  expect(database.assignInventoryBindingSupplier).not.toHaveBeenCalled();
+  await act(async () => { closeRef.current?.(); });
+  expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+it('assigns only after confirmation, refreshes the unassigned list and notifies separately from form selection', async () => {
+  mockUnassignedRows();
+  const onAssigned = jest.fn();
+  await act(async () => {
+    root = TestRenderer.create(<SupplierManager mode="manage" value="原表单供应商"
+      onSelect={onSelect} onDeleted={onDeleted} onClose={onClose} onAssigned={onAssigned} />);
+  });
+  await openUnassigned();
+  await press(`分配供应商 ${unassignedBinding.inventory_code}`);
+  expect(footer().props.primaryLabel).toBe('保存分配');
+  expect(footer().props.primaryDisabled).toBe(true);
+  await press(`分配给供应商 ${suppliers[1].name}`);
+  expect(database.assignInventoryBindingSupplier).not.toHaveBeenCalled();
+  expect(onAssigned).not.toHaveBeenCalled();
+  await pressFooter('onPrimaryPress');
+  expect(database.assignInventoryBindingSupplier).toHaveBeenCalledWith(unassignedBinding.id, suppliers[1].id);
+  expect(onAssigned).toHaveBeenCalledWith(unassignedBinding.id, suppliers[1].name);
+  expect(onSelect).not.toHaveBeenCalled();
+  expect(onClose).not.toHaveBeenCalled();
+  expect(card().props.title).toBe('未绑定供应商的物料');
+  expect(button(`分配供应商 ${unassignedBinding.inventory_code}`)).toBeUndefined();
+  expect(database.getInventorySuppliers).toHaveBeenCalledTimes(2);
+  await pressFooter('onPrimaryPress');
+  expect(card().props.title).toBe('维护供应商');
+});
+
+it('lets an intentionally unassigned material remain unchanged when backing out of supplier choice', async () => {
+  mockUnassignedRows();
+  await mount('manage');
+  await openUnassigned();
+  await press(`分配供应商 ${unassignedBinding.inventory_code}`);
+  await press(`分配给供应商 ${suppliers[0].name}`);
+  expect(footer().props.secondaryLabel).toBe('返回物料');
+  await pressFooter('onSecondaryPress');
+  expect(card().props.title).toBe('未绑定供应商的物料');
+  expect(button(`分配供应商 ${unassignedBinding.inventory_code}`)).toBeDefined();
+  expect(database.assignInventoryBindingSupplier).not.toHaveBeenCalled();
+  await act(async () => { root!.root.findByType(Modal).props.onRequestClose(); });
+  expect(card().props.title).toBe('维护供应商');
+  expect(onClose).not.toHaveBeenCalled();
+});
+
+it('prevents repeated assignment and every close route while the save is pending', async () => {
+  mockUnassignedRows();
+  const pending = deferred<void>();
+  jest.mocked(database.assignInventoryBindingSupplier).mockReturnValueOnce(pending.promise);
+  await mount('manage');
+  await openUnassigned();
+  await press(`分配供应商 ${unassignedBinding.inventory_code}`);
+  await press(`分配给供应商 ${suppliers[0].name}`);
+  const save = footer().props.onPrimaryPress;
+  await act(async () => { save(); save(); });
+  expect(database.assignInventoryBindingSupplier).toHaveBeenCalledTimes(1);
+  expect(card().props.onClose).toBeUndefined();
+  expect(footer().props.primaryDisabled).toBe(true);
+  expect(footer().props.secondaryDisabled).toBe(true);
+  await act(async () => { root!.root.findByType(Modal).props.onRequestClose(); footer().props.onSecondaryPress?.(); });
+  expect(card().props.title).toBe('分配供应商');
+  expect(onClose).not.toHaveBeenCalled();
+  await act(async () => { pending.resolve(); });
+  expect(card().props.title).toBe('未绑定供应商的物料');
+});
+
+it('keeps the failed assignment and chosen supplier available for retry instead of silently dropping the material', async () => {
+  mockUnassignedRows();
+  const onAssigned = jest.fn();
+  jest.mocked(database.assignInventoryBindingSupplier).mockRejectedValueOnce(new Error('该物料已被另一操作分配供应商'));
+  await act(async () => {
+    root = TestRenderer.create(<SupplierManager mode="manage" value="" onSelect={onSelect}
+      onDeleted={onDeleted} onClose={onClose} onAssigned={onAssigned} />);
+  });
+  await openUnassigned();
+  await press(`分配供应商 ${unassignedBinding.inventory_code}`);
+  await press(`分配给供应商 ${suppliers[0].name}`);
+  await pressFooter('onPrimaryPress');
+  expect(card().props.title).toBe('分配供应商');
+  expect(onAssigned).not.toHaveBeenCalled();
+  expect(footer().props.primaryDisabled).toBe(false);
+  expect(root!.root.findAllByType(Text).some(node => String(node.props.children).includes('该物料已被另一操作分配供应商'))).toBe(true);
+  await pressFooter('onPrimaryPress');
+  expect(database.assignInventoryBindingSupplier).toHaveBeenCalledTimes(2);
+  expect(onAssigned).toHaveBeenCalledTimes(1);
+});
+
+it('refreshes the material list after a concurrent-assignment rejection instead of offering the stale row again', async () => {
+  mockUnassignedRows();
+  const onAssigned = jest.fn();
+  jest.mocked(database.assignInventoryBindingSupplier).mockImplementationOnce(async () => {
+    // The database now excludes this row because another operation assigned it.
+    jest.mocked(database.getInventoryBindingsPage).mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 10 });
+    throw new Error('该物料已被另一操作分配供应商');
+  });
+  await act(async () => {
+    root = TestRenderer.create(<SupplierManager mode="manage" value="" onSelect={onSelect}
+      onDeleted={onDeleted} onClose={onClose} onAssigned={onAssigned} />);
+  });
+  await openUnassigned();
+  await press(`分配供应商 ${unassignedBinding.inventory_code}`);
+  await press(`分配给供应商 ${suppliers[0].name}`);
+  await pressFooter('onPrimaryPress');
+  expect(card().props.title).toBe('分配供应商');
+  const readsBeforeBack = jest.mocked(database.getInventoryBindingsPage).mock.calls.length;
+  await pressFooter('onSecondaryPress');
+  expect(database.getInventoryBindingsPage).toHaveBeenCalledTimes(readsBeforeBack + 1);
+  expect(database.getInventoryBindingsPage).toHaveBeenLastCalledWith({ page: 1, pageSize: 10, keyword: '', supplierStatus: 'unassigned' });
+  expect(card().props.title).toBe('未绑定供应商的物料');
+  expect(button(`分配供应商 ${unassignedBinding.inventory_code}`)).toBeUndefined();
+  expect(onAssigned).not.toHaveBeenCalled();
+  expect(onSelect).not.toHaveBeenCalled();
+});
+
+it('does not read supplier counts or unassigned materials while the manager is hidden', async () => {
+  await act(async () => {
+    root = TestRenderer.create(<SupplierManager visible={false} mode="manage" value=""
+      onSelect={onSelect} onDeleted={onDeleted} onClose={onClose} />);
+  });
+  expect(database.getInventorySuppliers).not.toHaveBeenCalled();
+  expect(database.getInventoryBindingsPage).not.toHaveBeenCalled();
+  await act(async () => {
+    root!.update(<SupplierManager visible mode="manage" value=""
+      onSelect={onSelect} onDeleted={onDeleted} onClose={onClose} />);
+  });
+  expect(database.getInventorySuppliers).toHaveBeenCalledTimes(1);
+  expect(database.getInventoryBindingsPage).toHaveBeenCalledWith(expect.objectContaining({ supplierStatus: 'unassigned' }));
+});
+
+it('ignores a successful assignment that finishes after the manager is hidden', async () => {
+  mockUnassignedRows();
+  const pending = deferred<void>();
+  jest.mocked(database.assignInventoryBindingSupplier).mockReturnValueOnce(pending.promise);
+  const onAssigned = jest.fn();
+  const props = { mode: 'manage' as const, value: '', onSelect, onDeleted, onClose, onAssigned };
+  await act(async () => { root = TestRenderer.create(<SupplierManager {...props} visible />); });
+  await openUnassigned();
+  await press(`分配供应商 ${unassignedBinding.inventory_code}`);
+  await press(`分配给供应商 ${suppliers[0].name}`);
+  await pressFooter('onPrimaryPress');
+  await act(async () => { root!.update(<SupplierManager {...props} visible={false} />); });
+  await act(async () => { pending.resolve(); });
+  expect(onAssigned).not.toHaveBeenCalled();
+  expect(onSelect).not.toHaveBeenCalled();
+});
+
+it('searches extra versions and paginates unassigned materials without changing their supplier', async () => {
+  mockUnassignedRows(Array.from({ length: 11 }, (_, index) => ({
+    ...unassignedBinding, id: `binding-${index}`, inventory_code: `IC.CODE.${index}`, scan_model: `MODEL-${index}`,
+  })));
+  await mount('manage');
+  await openUnassigned();
+  expect(button('分配供应商 IC.CODE.0')).toBeDefined();
+  expect(button('分配供应商 IC.CODE.10')).toBeUndefined();
+  await pressTool('下一页');
+  expect(database.getInventoryBindingsPage).toHaveBeenLastCalledWith(expect.objectContaining({ page: 2, supplierStatus: 'unassigned' }));
+  expect(button('分配供应商 IC.CODE.10')).toBeDefined();
+  await type('搜索未绑定供应商的物料', ' V2 ');
+  await pressTool('查询');
+  expect(database.getInventoryBindingsPage).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1, keyword: 'V2', supplierStatus: 'unassigned' }));
+  expect(button('分配供应商 IC.CODE.0')).toBeDefined();
+  expect(database.assignInventoryBindingSupplier).not.toHaveBeenCalled();
+});
+
+it('does not restore a late old material list after leaving and reopening that level', async () => {
+  const oldList = deferred<database.InventoryBindingPageResult>();
+  const current = { ...unassignedBinding, id: 'current', inventory_code: 'IC.CURRENT', scan_model: 'CURRENT' };
+  let materialLoads = 0;
+  jest.mocked(database.getInventoryBindingsPage).mockImplementation(options => {
+    const result = { items: [current], total: 1, page: 1, pageSize: options.pageSize ?? 10 };
+    return options.pageSize !== 1 && materialLoads++ === 0 ? oldList.promise : Promise.resolve(result);
+  });
+  await mount('manage');
+  await openUnassigned();
+  await act(async () => { card().props.onClose(); });
+  expect(card().props.title).toBe('维护供应商');
+  await openUnassigned();
+  expect(button('分配供应商 IC.CURRENT')).toBeDefined();
+  await act(async () => { oldList.resolve({ items: [unassignedBinding], total: 1, page: 1, pageSize: 10 }); });
+  expect(button('分配供应商 IC.CURRENT')).toBeDefined();
+  expect(button(`分配供应商 ${unassignedBinding.inventory_code}`)).toBeUndefined();
+});
 
 it('loads only when mounted and does not reload for search or switching between select and manage', async () => {
   expect(database.getInventorySuppliers).not.toHaveBeenCalled();

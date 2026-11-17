@@ -28,7 +28,6 @@ jest.mock('@/components/AppModalCard', () => ({
 }));
 jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'Actions' }));
 jest.mock('@/components/AppFormField', () => ({ AppFormField: 'Field' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'Scroll' }));
 jest.mock('@/components/UiRedesign', () => ({ UiToolbarButton: 'Tool', UiInput: 'Input' }));
 jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon' }));
 jest.mock('@/utils/logger', () => ({ logger: { error: jest.fn() } }));
@@ -153,6 +152,31 @@ it('allows saving without a supplier', async () => {
   await fillBinding();
   await act(async () => { root.root.findByType(AppModalActions).props.onPrimaryPress(); });
   expect(database.addInventoryBinding).toHaveBeenCalledWith(expect.objectContaining({ supplier: '' }));
+});
+
+it.each([
+  ['the same material', binding.id, '已补充分配的供应商'],
+  ['a different material', 'another-binding-id', binding.supplier],
+])('preserves editing fields and synchronizes only %s when assigning through maintenance', async (_case, assignedId, expectedSupplier) => {
+  for (const label of [binding.scan_model, '编辑']) {
+    await act(async () => {
+      root.root.findAllByType(TouchableOpacity).find(button =>
+        button.findAllByType(Text).some(text => text.props.children === label))!.props.onPress();
+    });
+  }
+  await fillBinding('DRAFT-MODEL', 'DRAFT-CODE');
+  await openSupplierSelection();
+  const panel = () => root.root.findAllByType(SupplierManager).find(node => node.props.visible !== false)!;
+  jest.mocked(database.getInventoryBindingsPage).mockClear();
+  await act(async () => { panel().props.onAssigned(assignedId, '已补充分配的供应商'); });
+  expect(database.getInventoryBindingsPage).toHaveBeenCalledWith({ page: 1, pageSize: 10, keyword: '' });
+  expect(panel().props.visible).toBe(true);
+  expect(panel().props.value).toBe(expectedSupplier);
+  await act(async () => { panel().props.onClose(); });
+  await act(async () => { root.root.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(database.updateInventoryBinding).toHaveBeenCalledWith(binding.id, {
+    ...expectedBinding, scan_model: 'DRAFT-MODEL', inventory_code: 'DRAFT-CODE', supplier: expectedSupplier,
+  });
 });
 
 it('shows the actual binding validation failure and keeps the form for correction', async () => {

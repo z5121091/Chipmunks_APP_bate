@@ -4,6 +4,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Linking, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 import { getScanGuideSize, isQrInsideScanGuide } from '@/utils/scanGuide';
 
@@ -32,6 +33,7 @@ export function SyncPairingCamera({ onScan, onClose, onError }: { onScan: (value
     return () => cancelAnimationFrame(frame);
   }, [window.width, window.height, permission?.granted, measurePreview]);
   const { theme } = useTheme();
+  const styles = useResponsiveStyles(theme, createStyles);
   return <View style={[styles.container, { backgroundColor: theme.backgroundRoot }]}>
     <TouchableOpacity accessibilityRole="button" accessibilityLabel="关闭相机" onPress={onClose} style={styles.close}>
       <Feather name="arrow-left" size={22} color={theme.textPrimary} /><Text style={{ color: theme.textPrimary }}>扫描电脑连接二维码</Text>
@@ -73,7 +75,7 @@ export function SyncPairingCamera({ onScan, onClose, onError }: { onScan: (value
     <Text style={[styles.hint, { color: theme.textSecondary }]}>将电脑端二维码完整放入框内，识别后自动连接</Text>
   </View>;
 }
-const styles = StyleSheet.create({
+const createStyles = () => StyleSheet.create({
   container: { flex: 1 }, close: { flexDirection: 'row', alignItems: 'center', gap: 12, minHeight: 52, padding: 12 },
   preview: { flex: 1, marginHorizontal: 16, marginTop: 8, borderWidth: 1, borderRadius: UI_REDESIGN_TOKENS.radius.control, overflow: 'hidden', backgroundColor: '#000000' },
   overlay: { zIndex: 2 },

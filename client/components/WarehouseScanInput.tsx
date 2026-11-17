@@ -6,8 +6,10 @@ import { ActivityIndicator, AppState, Platform, StyleSheet, TextInput, View, typ
 import { Feather } from '@expo/vector-icons';
 import { BorderRadius, BorderWidth, Spacing, Typography } from '@/constants/theme';
 import { useTheme } from '@/hooks/useTheme';
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 
 type FeatherIconName = ComponentProps<typeof Feather>['name'];
+const ANDROID_FOCUS_RETRY_MS = 160;
 
 export interface WarehouseScanInputHandle {
   focus: (delay?: number) => void;
@@ -59,6 +61,7 @@ export function WarehouseScanInput({
   ...props
 }: WarehouseScanInputProps) {
   const { theme } = useTheme();
+  const styles = useResponsiveStyles(theme, createStyles);
   const disabled = actionDisabled || processing;
   const scannerRef = useRef<TextInput>(null);
   const focusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -68,6 +71,7 @@ export function WarehouseScanInput({
   const canFocus = isFocused && autoFocus && canEdit && (focusInModal || !overlayActive);
   const canFocusRef = useRef(false);
   const windowFocusedRef = useRef(true);
+  const nativeFocusConfirmedRef = useRef(false);
   // 原生 clear 与 JS 回调异步执行。按事件序号过滤旧快照，避免清空后被写回。
   // 不按文本去重：不同包装可以有完全相同的二维码。
   const latestChangeCountRef = useRef(-1);
@@ -92,16 +96,32 @@ export function WarehouseScanInput({
     if (focusTimer.current !== null) clearTimeout(focusTimer.current);
     focusTimer.current = null;
   }, []);
+  const canRequestFocus = useCallback(() => (
+    canFocusRef.current && windowFocusedRef.current &&
+    (!AppState.currentState || AppState.currentState === 'active')
+  ), []);
   const focusScanner = useCallback((delay = 0) => {
-    if (!canFocusRef.current || !windowFocusedRef.current || focusTimer.current !== null) return;
+    if (!canRequestFocus() || focusTimer.current !== null) return;
     focusTimer.current = setTimeout(() => {
       focusTimer.current = null;
       // 延迟执行前再检查一次，等待期间可能已经打开弹窗或切换页面。
-      if (!canFocusRef.current || !windowFocusedRef.current) return;
-      if (AppState.currentState && AppState.currentState !== 'active') return;
-      if (!scannerRef.current?.isFocused()) scannerRef.current?.focus();
+      const input = scannerRef.current;
+      if (!canRequestFocus() || !input) return;
+      if (!input.isFocused()) {
+        nativeFocusConfirmedRef.current = false;
+        input.focus();
+      }
+      if (Platform.OS !== 'android' || nativeFocusConfirmedRef.current) return;
+      // RN 的 isFocused() 在发送命令时就会更新。首次恢复没收到原生焦点事件，
+      // 例如输入框刚解除禁用或窗口刚关闭时，等布局稳定后只补发一次。
+      focusTimer.current = setTimeout(() => {
+        focusTimer.current = null;
+        if (!canRequestFocus() || nativeFocusConfirmedRef.current || input !== scannerRef.current) return;
+        if (input.isFocused()) input.blur();
+        input.focus();
+      }, ANDROID_FOCUS_RETRY_MS);
     }, delay);
-  }, []);
+  }, [canRequestFocus]);
 
   useImperativeHandle(inputRef, () => ({
     focus: focusScanner,
@@ -125,6 +145,7 @@ export function WarehouseScanInput({
     if (canFocus) focusScanner();
     else {
       earlySubmitsRef.current = [];
+      nativeFocusConfirmedRef.current = false;
       cancelFocus();
       if (scannerRef.current?.isFocused()) scannerRef.current.blur();
     }
@@ -135,9 +156,15 @@ export function WarehouseScanInput({
   }, [canFocus, cancelFocus, focusScanner]);
 
   useEffect(() => {
+    let previousAppState = AppState.currentState;
     const subscription = AppState.addEventListener('change', state => {
-      if (state === 'active') focusScanner();
-      else cancelFocus();
+      const resumed = state === 'active' && previousAppState !== 'active';
+      previousAppState = state;
+      if (state === 'active') {
+        // 上一轮退到后台的窗口失焦不能一直阻止恢复；如仍被遮挡，后续 blur 会取消请求。
+        if (resumed) windowFocusedRef.current = true;
+        focusScanner();
+      } else cancelFocus();
     });
     // Android Activity window events do not describe the window of a native Modal.
     const tracksActivityWindow = Platform.OS === 'android' && !focusInModal;
@@ -211,6 +238,7 @@ export function WarehouseScanInput({
           }
         }}
         onFocus={event => {
+          nativeFocusConfirmedRef.current = true;
           cancelFocus();
           onFocus?.(event);
         }}
@@ -219,6 +247,7 @@ export function WarehouseScanInput({
           focusScanner();
         }}
         onBlur={event => {
+          nativeFocusConfirmedRef.current = false;
           onBlur?.(event);
           focusScanner();
         }}
@@ -275,7 +304,7 @@ export function WarehouseScanInput({
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = () => StyleSheet.create({
   container: {
     minHeight: 48,
     flexDirection: 'row',

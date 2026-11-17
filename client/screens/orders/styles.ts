@@ -5,8 +5,8 @@ import { rf } from '@/utils/responsive';
 import { withAlpha } from '@/utils/colors';
 import { UI_REDESIGN_TOKENS } from '@/constants/uiRedesign';
 
-export const createStyles = (theme: Theme) => {
-  const { width, height } = Dimensions.get('window');
+export const createStyles = (theme: Theme, viewport = Dimensions.get('window')) => {
+  const { width, height } = viewport;
   const isCompactScreen = width <= 390 || height <= 760;
 
   return StyleSheet.create({

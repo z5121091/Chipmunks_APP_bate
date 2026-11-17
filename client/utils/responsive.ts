@@ -46,23 +46,28 @@ export const rs = (size: number): number => {
   return PixelRatio.roundToNearestPixel(size * scale);
 };
 
+/** Control spacing must not grow with a tablet canvas or shrink when the keyboard opens.
+ * Keep rs/wp/hp for actual geometry; use this bounded width scale for UI tokens. */
+export const scaleControlSize = (size: number): number => {
+  const { width } = Dimensions.get('window');
+  return PixelRatio.roundToNearestPixel(size * Math.min(width / BASE_WIDTH, 1.15));
+};
+
 /**
  * 字体大小
  * 保留 rf API 兼容旧代码，但只做设备档位级别的温和缩放。
  * Text/TextInput 默认仍会跟随系统字体缩放设置，避免破坏 Android 可访问性。
  */
 export const rf = (fontSize: number): number => {
-  const { screenWidth, screenHeight } = getScreenDimensions();
-  const shortSide = Math.min(screenWidth, screenHeight);
-  const longSide = Math.max(screenWidth, screenHeight);
+  const { screenWidth } = getScreenDimensions();
 
   let scale = 1;
 
-  if (shortSide < 360) {
+  if (screenWidth < 360) {
     scale = 0.94;
-  } else if (shortSide < BASE_WIDTH) {
+  } else if (screenWidth < BASE_WIDTH) {
     scale = 0.97;
-  } else if (shortSide >= 430 && longSide >= 820) {
+  } else if (screenWidth >= 430) {
     scale = 1.06;
   }
 

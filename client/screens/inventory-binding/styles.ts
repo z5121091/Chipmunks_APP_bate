@@ -4,8 +4,8 @@ import { Spacing, BorderRadius, BorderWidth, Theme } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
 import { rf } from '@/utils/responsive';
 
-export const createStyles = (theme: Theme) => {
-  const { width, height } = Dimensions.get('window');
+export const createStyles = (theme: Theme, viewport = Dimensions.get('window')) => {
+  const { width, height } = viewport;
   const isCompactScreen = width <= 390 || height <= 760;
 
   return StyleSheet.create({
@@ -429,5 +429,30 @@ export const createStyles = (theme: Theme) => {
     modalActions: {
       marginTop: 0,
     },
+    unassignedEntry: {
+      minHeight: 48,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: Spacing.xs,
+      paddingHorizontal: Spacing.sm,
+      paddingVertical: Spacing.xs,
+      borderRadius: BorderRadius.md,
+      borderWidth: BorderWidth.thin,
+      borderColor: theme.border,
+      backgroundColor: theme.backgroundTertiary,
+    },
+    unassignedEntryTitle: { flex: 1, minWidth: 0, fontSize: rf(13), fontWeight: '700', color: theme.textPrimary },
+    unassignedBody: { minHeight: 0, gap: Spacing.xs },
+    unassignedItem: {
+      flexDirection: 'row', alignItems: 'center', gap: Spacing.xs,
+      paddingVertical: Spacing.sm, borderBottomWidth: BorderWidth.thin, borderBottomColor: theme.borderLight,
+    },
+    unassignedSummary: { gap: 2, paddingVertical: Spacing.xs },
+    unassignedModel: { fontSize: rf(14), lineHeight: rf(21), fontWeight: '700', color: theme.textPrimary },
+    unassignedDetail: { fontSize: rf(12), lineHeight: rf(18), color: theme.textSecondary },
+    unassignedError: { fontSize: rf(12), lineHeight: rf(18), color: theme.error },
+    unassignedPagination: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.xs },
+    unassignedPageAction: { flexGrow: 0, flexShrink: 0 },
+    unassignedPageButton: { width: 'auto', minWidth: 64, paddingHorizontal: 8 },
   });
 };

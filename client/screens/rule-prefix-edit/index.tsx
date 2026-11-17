@@ -1,13 +1,12 @@
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { AppModal as Modal } from '@/components/AppModal';
 import { useCallback, useMemo, useState } from 'react';
-import { FlatList, Text, TextInput, View } from 'react-native';
+import { FlatList, Text, TextInput, View, ScrollView } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalHeader } from '@/components/AppModalHeader';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { Screen } from '@/components/Screen';
 import { useCustomAlert } from '@/components/CustomAlert';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
@@ -376,7 +375,7 @@ export default function RulePrefixEditScreen() {
         presentationStyle="fullScreen"
         onRequestClose={handleCloseEditor}
       >
-        <Screen backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
+        <Screen disableAutoScroll backgroundColor={theme.backgroundRoot} statusBarStyle={isDark ? 'light' : 'dark'}>
           <View style={[styles.editorScreen, { paddingTop: insets.top }]}>
             <View style={styles.editorHeader}>
               <AppModalHeader
@@ -386,10 +385,10 @@ export default function RulePrefixEditScreen() {
               />
             </View>
 
-            <KeyboardAwareFormScrollView
-              contentContainerStyle={styles.editorScrollContent}
-              bottomOffset={Math.max(insets.bottom, 24) + 110}
-              extraScrollHeight={20}
+            <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
+              testID="rule-prefix-editor-scroll"
+              style={styles.editorScroll}
+              contentContainerStyle={[{ flexGrow: 1 }, styles.editorScrollContent]}
             >
               {activeField && (
                 <>
@@ -446,7 +445,7 @@ export default function RulePrefixEditScreen() {
                   </View>
                 </>
               )}
-            </KeyboardAwareFormScrollView>
+            </ScrollView>
 
             <View style={[styles.editorFooter, { paddingBottom: Math.max(insets.bottom, 16) }]}>
               <AppModalActions

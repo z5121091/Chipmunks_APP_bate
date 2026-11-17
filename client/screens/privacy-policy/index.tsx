@@ -1,5 +1,6 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
-import { createElement, useEffect, useMemo, useState } from 'react';
+import { createElement, useEffect, useState } from 'react';
 import { ActivityIndicator, AppState, Linking, Platform, StyleSheet, Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -19,7 +20,7 @@ import { MIN_TOUCH_TARGET } from '@/utils/responsive';
 
 export default function PrivacyPolicyScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
   const [loadFailed, setLoadFailed] = useState(false);

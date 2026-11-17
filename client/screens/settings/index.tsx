@@ -3,12 +3,11 @@ import { UiPageHeader } from '@/components/UiRedesign';
 import { MotionCollapse } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { AppModal as Modal } from '@/components/AppModal';
-import { useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { View, Text, useWindowDimensions, Platform, FlatList, Linking, InteractionManager } from 'react-native';
+import { AppState, View, Text, useWindowDimensions, Platform, Linking, InteractionManager, ScrollView } from 'react-native';
 import { useFocusEffect, useNavigation } from 'expo-router';
 import { useIsFocused } from 'expo-router/react-navigation';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import * as Updates from 'expo-updates';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
@@ -28,6 +27,8 @@ import { useTheme } from '@/hooks/useTheme';
 import { Screen } from '@/components/Screen';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
+import { AppModalViewport } from '@/components/AppModalViewport';
+import { ApkUpdateDialog, DraftArchiveDialog, type ApkInstallStage } from './SettingsDialogs';
 import { UiListItem, UiListSection } from '@/components/UiRedesign';
 import { createStyles } from './styles';
 import { AnimatedButton } from '@/components/AnimatedButton';
@@ -35,7 +36,7 @@ import { Spacing } from '@/constants/theme';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { Feather } from '@expo/vector-icons';
 import { useCustomAlert } from '@/components/CustomAlert';
-import { rs } from '@/utils/responsive';
+import { scaleControlSize } from '@/utils/responsive';
 import {
   APP_VERSION,
   ANDROID_PACKAGE,
@@ -59,7 +60,13 @@ import {
   subscribeSyncConnection,
 } from '@/utils/syncConnection';
 import { NETWORK_CONFIG, SyncConfig } from '@/constants/config';
-import { parseAuthFromUrl, base64Encode, compareVersions, getUpdateServer } from '@/utils/update';
+import { compareVersions, getUpdateServer } from '@/utils/update';
+import { ApkUpdateManifestError, fetchApkUpdateManifest, resolveApkDownloadUrls } from '@/utils/apkUpdateRoutes';
+import { ApkDownloadError, downloadApkFromRoutes } from '@/utils/apkUpdateDownload';
+import {
+  clearInstalledApkCache, getApkCacheDownloadUri, readCachedApk, rememberDownloadedApk, type ApkCacheTarget,
+} from '@/utils/apkUpdateCache';
+import { artifactFromDownload, probeApkUpdateArtifact, readInstalledApkVersionCode } from '@/utils/apkUpdateArtifact';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { useToast } from '@/utils/toast';
 import {
@@ -75,6 +82,7 @@ import { backendJsonRequest, buildErpProxyPath } from '@/utils/backendApi';
 import {
   ERP_ACCOUNTS,
   isErpAccountAvailable,
+  type ErpAccountConfig,
   type ErpAccountKey,
 } from '@/utils/erpAccounts';
 import { formatUserFacingErrorMessage } from '@/utils/userFacingError';
@@ -90,8 +98,6 @@ const isSyncConfig = (value: unknown): value is SyncConfig => {
     ((value as SyncConfig).pairingKey === undefined || typeof (value as SyncConfig).pairingKey === 'string')
   );
 };
-
-const UPDATE_RETRY_DELAYS = [1000, 2000, 4000];
 
 type SettingsGroupId = 'system' | 'erp' | 'rules' | 'backup' | 'about';
 
@@ -132,66 +138,12 @@ type ErpHealthResponse = {
 
 const ERP_HEALTH_PATH = buildErpProxyPath('/api/erp/health');
 const ERP_AUTO_CHECK_TTL_MS = 5 * 60 * 1000;
+const ERP_HEALTH_CHECK_TIMEOUT_MS = 8_000;
 let cachedErpConnectionStates: ErpConnectionStates | null = null;
 let lastErpConnectionCheckAt = 0;
-let erpConnectionCheckInFlight: Promise<ErpConnectionStates> | null = null;
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const getUpdateRequestErrorMessage = (error: unknown): string => {
   return formatUserFacingErrorMessage(error, '检查更新失败，请稍后重试');
-};
-
-const withUpdateCacheBuster = (url: string): string => {
-  const separator = url.includes('?') ? '&' : '?';
-  return `${url}${separator}t=${Date.now()}`;
-};
-
-const normalizeUpdateDownloadUrl = (
-  downloadUrl: unknown,
-  downloadBaseUrl: string
-): string | null => {
-  if (typeof downloadUrl !== 'string' || !downloadUrl.trim()) {
-    return null;
-  }
-
-  try {
-    const resolvedUrl = new URL(downloadUrl.trim(), `${downloadBaseUrl.replace(/\/+$/, '')}/`);
-    if (!['http:', 'https:'].includes(resolvedUrl.protocol)) {
-      return null;
-    }
-
-    return resolvedUrl.toString();
-  } catch (error) {
-    logger.warn('[checkForUpdate] version.json 下载地址无效，已跳过:', error);
-    return null;
-  }
-};
-
-const resolveUpdateDownloadUrls = (
-  downloadUrl: unknown,
-  downloadUrls: unknown,
-  downloadBaseUrl: string
-): string[] => {
-  const fallbackUrl = `${downloadBaseUrl.replace(/\/+$/, '')}/app-release.apk`;
-  const candidates = [
-    ...(Array.isArray(downloadUrls) ? downloadUrls : []),
-    downloadUrl,
-    fallbackUrl,
-  ];
-  const seen = new Set<string>();
-  const resolvedUrls: string[] = [];
-
-  for (const candidate of candidates) {
-    const resolvedUrl = normalizeUpdateDownloadUrl(candidate, downloadBaseUrl);
-
-    if (resolvedUrl && !seen.has(resolvedUrl)) {
-      seen.add(resolvedUrl);
-      resolvedUrls.push(resolvedUrl);
-    }
-  }
-
-  return resolvedUrls.length > 0 ? resolvedUrls : [fallbackUrl];
 };
 
 const backupDatabaseToNasForUpdate = async (stage: string) => {
@@ -245,9 +197,8 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
   const showSettingsLoadError = alert.showError;
   const { ToastContainer } = useToast();
 
-  // 使用 useWindowDimensions 替代 Dimensions.addEventListener，
-  // 避免键盘弹出/收起时触发不必要的重渲染和样式重建导致滚动卡顿
-  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+  // 窗口及像素密度变化都必须使包含响应式 token 的样式快照失效。
+  const { width: screenWidth, height: screenHeight, scale: screenScale } = useWindowDimensions();
 
   useEffect(() => {
     // 延迟初始化声音设置，避免阻塞页面渲染
@@ -262,8 +213,10 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
 
   // 根据屏幕尺寸动态创建样式
   const styles = useMemo(
-    () => createStyles(theme, screenWidth, screenHeight, undefined),
-    [theme, screenWidth, screenHeight]
+    () => createStyles(theme, screenWidth, screenHeight),
+    // createStyles reads pixel density via Dimensions for token rounding; it is an indirect dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [theme, screenWidth, screenHeight, screenScale]
   );
 
   // 配置统计
@@ -285,7 +238,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
   const [erpConnectionStates, setErpConnectionStates] = useState<
     Record<ErpAccountKey, ErpConnectionState>
   >(() =>
-    Object.fromEntries(
+    cachedErpConnectionStates ?? Object.fromEntries(
       ERP_ACCOUNTS.map((account) => [
         account.key,
         isErpAccountAvailable(account)
@@ -294,6 +247,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
       ])
     ) as Record<ErpAccountKey, ErpConnectionState>
   );
+  const erpCheckController = useRef<AbortController | null>(null);
 
   // 数据库恢复后的重启提示弹窗
   const [showRestartModal, setShowRestartModal] = useState(false);
@@ -320,13 +274,18 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
   // 在线更新相关状态
   const [updateModalVisible, setUpdateModalVisible] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const checkingUpdateRef = useRef(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloading, setDownloading] = useState(false);
+  const downloadingRef = useRef(false);
+  const [cachedApkReady, setCachedApkReady] = useState(false);
+  const [apkInstallStage, setApkInstallStage] = useState<ApkInstallStage>('checking');
   const [updateInfo, setUpdateInfo] = useState<{
     version: string;
     downloadUrls: string[];
     changelog: string;
     forceUpdate: boolean;
+    cacheTarget: ApkCacheTarget;
   } | null>(null);
 
   // 加载数据
@@ -374,9 +333,11 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
 
   const checkErpConnections = useCallback(
     async (options: { force?: boolean } = {}): Promise<void> => {
+      if (erpCheckController.current) return;
       if (
         !options.force &&
         cachedErpConnectionStates &&
+        !Object.values(cachedErpConnectionStates).some(state => state.status === 'error') &&
         Date.now() - lastErpConnectionCheckAt < ERP_AUTO_CHECK_TTL_MS
       ) {
         setErpConnectionStates(cachedErpConnectionStates);
@@ -394,10 +355,10 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
         ) as ErpConnectionStates
       );
 
-      if (!erpConnectionCheckInFlight) {
-        const checkTask = (async (): Promise<ErpConnectionStates> => {
-          const entries = await Promise.all(
-            ERP_ACCOUNTS.map(async (account): Promise<[ErpAccountKey, ErpConnectionState]> => {
+      const controller = new AbortController();
+      erpCheckController.current = controller;
+      try {
+        const checkAccount = async (account: ErpAccountConfig): Promise<[ErpAccountKey, ErpConnectionState]> => {
           if (!isErpAccountAvailable(account)) {
             return [account.key, { message: '账套尚未开放', status: 'unavailable' }];
           }
@@ -407,6 +368,9 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
               baseUrl: account.backendBaseUrl,
               erpAccountKey: account.key,
               method: 'GET',
+              signal: controller.signal,
+              timeoutMs: ERP_HEALTH_CHECK_TIMEOUT_MS,
+              settleOnAbort: true,
             });
             if (health.accountKey && health.accountKey !== account.key) {
               throw new Error(
@@ -517,7 +481,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
               },
             ];
           } catch (error) {
-            logger.warn(`[ERP对接] ${account.name} 健康检查失败:`, error);
+            if (!controller.signal.aborted) logger.warn(`[ERP对接] ${account.name} 健康检查失败:`, error);
             return [
               account.key,
               {
@@ -526,35 +490,41 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
               },
             ];
           }
-            })
-          );
-
-          return Object.fromEntries(entries) as ErpConnectionStates;
-        })();
-        erpConnectionCheckInFlight = checkTask;
-        const clearCurrentCheck = () => {
-          if (erpConnectionCheckInFlight === checkTask) {
-            erpConnectionCheckInFlight = null;
-          }
         };
-        void checkTask.then(clearCurrentCheck, clearCurrentCheck);
-      }
+        const entries = await Promise.all(ERP_ACCOUNTS.map(checkAccount));
 
-      const activeCheck = erpConnectionCheckInFlight;
-      if (!activeCheck) {
-        return;
+        if (erpCheckController.current !== controller || controller.signal.aborted) return;
+        const nextStates = Object.fromEntries(entries) as ErpConnectionStates;
+        cachedErpConnectionStates = nextStates;
+        lastErpConnectionCheckAt = Date.now();
+        setErpConnectionStates(nextStates);
+      } finally {
+        if (erpCheckController.current === controller) erpCheckController.current = null;
       }
-      const nextStates = await activeCheck;
-      cachedErpConnectionStates = nextStates;
-      lastErpConnectionCheckAt = Date.now();
-      setErpConnectionStates(nextStates);
     },
     []
   );
 
-  const handleManualErpCheck = useCallback(() => {
-    void checkErpConnections({ force: true });
-  }, [checkErpConnections]);
+  useFocusEffect(useCallback(() => {
+    if (updatesOnly) return;
+    const cancelCheck = () => {
+      const controller = erpCheckController.current;
+      erpCheckController.current = null;
+      controller?.abort();
+      return Boolean(controller);
+    };
+    let lastAppState = AppState.currentState ?? 'active';
+    if (lastAppState === 'active') void checkErpConnections();
+    const subscription = AppState.addEventListener('change', nextState => {
+      const resumed = nextState === 'active' && lastAppState !== 'active';
+      lastAppState = nextState;
+      if (resumed) void checkErpConnections({ force: cancelCheck() });
+    });
+    return () => {
+      subscription.remove();
+      cancelCheck();
+    };
+  }, [checkErpConnections, updatesOnly]));
 
   // 切换声音开关
   const toggleSound = useCallback((value: boolean) => {
@@ -573,102 +543,36 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
         void loadAutoBackupStatus().catch((error) => {
           logger.error('[设置] 加载自动备份状态失败:', error);
         });
-        void checkErpConnections();
       });
       return () => {
         active = false;
         task.cancel();
       };
-    }, [checkErpConnections, loadAutoBackupStatus, loadData, showSettingsLoadError])
+    }, [loadAutoBackupStatus, loadData, showSettingsLoadError])
   );
 
   // ==================== 在线更新功能 ====================
 
   // 检查更新
   const checkForUpdate = async () => {
-    if (checkingUpdate) return;
-
+    if (checkingUpdateRef.current || downloadingRef.current) return;
+    checkingUpdateRef.current = true;
     setCheckingUpdate(true);
     setDownloadProgress(0);
     try {
-      const baseUrl = (await getUpdateServer()).trim().replace(/\/+$/, '');
-
-      // 解析URL中的认证信息
-      const authInfo = parseAuthFromUrl(baseUrl);
-      const requestBaseUrl = (authInfo?.baseUrl || baseUrl).replace(/\/+$/, '');
-      const versionUrl = `${requestBaseUrl}/version.json`;
-      const headers: Record<string, string> = {
-        Accept: 'application/json',
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache',
-      };
-
-      // 如果URL包含认证信息，添加Authorization头
-      if (authInfo) {
-        const authString = `${authInfo.username}:${authInfo.password}`;
-        const authBase64 = base64Encode(authString);
-        headers['Authorization'] = `Basic ${authBase64}`;
-      }
-
-      let response: Response | null = null;
-      let lastErrorMessage = '';
-
-      // 覆盖安装或首次安装后，Android 网络栈偶尔会在刚启动时短暂失败，多次退避重试避免用户重启手机。
-      for (let attempt = 0; attempt < UPDATE_RETRY_DELAYS.length; attempt += 1) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-        const requestUrl = withUpdateCacheBuster(versionUrl);
-
-        try {
-          response = await fetch(requestUrl, {
-            method: 'GET',
-            headers,
-            signal: controller.signal,
+      // An installer result (including cancel) cannot prove installation. Only
+      // the version embedded in the running native APK may retire cached files.
+      if (Platform.OS === 'android') {
+        const installedCode = readInstalledApkVersionCode();
+        if (installedCode !== undefined) {
+          await clearInstalledApkCache(ANDROID_PACKAGE, installedCode).catch(() => {
+            logger.warn('[update] 已安装APK缓存清理暂未完成');
           });
-          lastErrorMessage = '';
-          break;
-        } catch (error) {
-          lastErrorMessage = getUpdateRequestErrorMessage(error);
-          logger.warn(
-            `[checkForUpdate] 第 ${attempt + 1} 次请求失败:`,
-            lastErrorMessage,
-            requestUrl
-          );
-          if (attempt < UPDATE_RETRY_DELAYS.length - 1) {
-            await sleep(UPDATE_RETRY_DELAYS[attempt]);
-          }
-        } finally {
-          clearTimeout(timeoutId);
         }
       }
-
-      if (!response) {
-        throw new Error(lastErrorMessage || '更新服务器无响应');
-      }
-
-      if (!response.ok) {
-        let errorMessage = `无法连接到更新服务器 (${response.status})`;
-
-        if (response.status === 401) {
-          errorMessage = '认证失败，请检查服务器地址中的用户名和密码是否正确';
-        } else if (response.status === 403) {
-          errorMessage = '禁止访问，请检查服务器权限设置';
-        } else if (response.status === 404) {
-          errorMessage = '更新文件不存在，请检查服务器地址是否正确';
-        } else {
-          errorMessage = `无法连接到更新服务器 (${response.status})，请检查网络和服务器地址`;
-        }
-
-        alert.showError(`${errorMessage}。请检查网络连接后重试。`);
-        return;
-      }
-
-      const data = await response.json();
-
-      if (data.androidPackage !== ANDROID_PACKAGE) {
-        alert.showWarning('NAS 上的更新清单不是当前正式版。请先上传包含正确包名的 version.json 和对应 APK，再检查更新。');
-        return;
-      }
+      // Keep the persistent NAS backup destination unchanged; APK routing is read-only.
+      const baseUrl = (await getUpdateServer()).trim().replace(/\/+$/, '');
+      const { data, manifestBaseUrl } = await fetchApkUpdateManifest(baseUrl, { androidPackage: ANDROID_PACKAGE });
 
       // 比较版本号
       const currentVersion = APP_VERSION.replace(/^V/, '');
@@ -677,7 +581,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
       const isNewVersion = compareVersions(latestVersion, currentVersion) > 0;
 
       if (isNewVersion) {
-        if (!Number.isInteger(data.versionCode) || data.versionCode <= ANDROID_VERSION_CODE) {
+        if (typeof data.versionCode !== 'number' || !Number.isInteger(data.versionCode) || data.versionCode <= ANDROID_VERSION_CODE) {
           alert.showWarning('NAS 上的安装编号未高于当前版本，请核对 version.json 和 APK 后重试。');
           return;
         }
@@ -694,28 +598,44 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
           changelogText = data.changelog;
         }
 
+        const downloadUrls = resolveApkDownloadUrls(data.downloadUrl, data.downloadUrls, manifestBaseUrl, baseUrl);
+        const artifact = Platform.OS === 'android' ? await probeApkUpdateArtifact(downloadUrls) : null;
+        const cacheTarget: ApkCacheTarget = {
+          androidPackage: ANDROID_PACKAGE, versionCode: data.versionCode, version: latestVersion,
+          ...(artifact || {}),
+        };
+        // A transient HEAD failure preserves the cache registry; it cannot
+        // establish that a previously downloaded file is still the same APK.
+        const cachedApk = artifact ? await readCachedApk(cacheTarget).catch(() => null) : null;
+        setCachedApkReady(Boolean(cachedApk));
         setUpdateInfo({
           version: latestVersion,
-          downloadUrls: resolveUpdateDownloadUrls(data.downloadUrl, data.downloadUrls, baseUrl),
+          downloadUrls,
           changelog: changelogText,
-          forceUpdate: data.forceUpdate || false,
+          forceUpdate: data.forceUpdate === true,
+          cacheTarget,
         });
         setUpdateModalVisible(true);
       } else {
         alert.showSuccess(`当前已是最新版本 (${APP_VERSION})`);
       }
     } catch (error) {
-      const errorMessage = getUpdateRequestErrorMessage(error);
-      logger.error('检查更新失败:', errorMessage, error);
-      alert.showError(`检查更新失败：${errorMessage}。请确认网络可访问更新服务器。`);
+      if (error instanceof ApkUpdateManifestError && error.failures.every(failure => failure.reason === 'package')) {
+        alert.showWarning('NAS 上的更新清单不是当前正式版。请先上传包含正确包名的 version.json 和对应 APK，再检查更新。');
+      } else {
+        const errorMessage = getUpdateRequestErrorMessage(error);
+        logger.error('检查更新失败:', errorMessage);
+        alert.showError(`检查更新失败：${errorMessage}。请确认网络可访问更新服务器。`);
+      }
     } finally {
+      checkingUpdateRef.current = false;
       setCheckingUpdate(false);
     }
   };
 
   // 下载并安装更新
   const downloadAndInstall = async () => {
-    if (!updateInfo || downloading) return;
+    if (!updateInfo || downloadingRef.current || checkingUpdateRef.current) return;
 
     // Android 平台检查
     if (Platform.OS !== 'android') {
@@ -723,130 +643,61 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
       return;
     }
 
+    downloadingRef.current = true;
     setDownloading(true);
     setDownloadProgress(0);
+    setApkInstallStage('checking');
 
+    let openingInstaller = false;
     try {
-      // 下载目录：使用应用缓存目录
-      let apkUri: string;
-
-      if (FileSystem.cacheDirectory) {
-        apkUri = FileSystem.cacheDirectory + 'ZhongCangWarehouse_update.apk';
-      } else if (FileSystem.documentDirectory) {
-        apkUri = FileSystem.documentDirectory + 'ZhongCangWarehouse_update.apk';
-      } else {
-        alert.showError('无法获取存储目录');
-        setDownloading(false);
-        return;
-      }
-
-      // 创建下载回调
-      const downloadCallback = (downloadProgressData: {
-        totalBytesWritten: number;
-        totalBytesExpectedToWrite: number;
-      }) => {
-        if (downloadProgressData.totalBytesExpectedToWrite <= 0) {
-          return;
-        }
-
-        const progress =
-          downloadProgressData.totalBytesWritten / downloadProgressData.totalBytesExpectedToWrite;
-        setDownloadProgress(Math.min(99, Math.round(progress * 100)));
+      const artifact = await probeApkUpdateArtifact(updateInfo.downloadUrls);
+      const cacheTarget: ApkCacheTarget = {
+        androidPackage: updateInfo.cacheTarget.androidPackage,
+        versionCode: updateInfo.cacheTarget.versionCode,
+        version: updateInfo.cacheTarget.version,
+        ...(artifact || {}),
       };
-
-      let downloadedApkUri: string | null = null;
-      let lastDownloadErrorMessage = '';
-
-      for (let index = 0; index < updateInfo.downloadUrls.length; index += 1) {
-        const downloadUrl = updateInfo.downloadUrls[index];
-        await FileSystem.deleteAsync(apkUri, { idempotent: true });
-        setDownloadProgress(0);
-
-        // 解析URL中的认证信息
-        const authInfo = parseAuthFromUrl(downloadUrl);
-        const requestDownloadUrl = authInfo?.baseUrl || downloadUrl;
-        const downloadHeaders: Record<string, string> = {};
-
-        if (authInfo) {
-          const authString = `${authInfo.username}:${authInfo.password}`;
-          const authBase64 = base64Encode(authString);
-          downloadHeaders['Authorization'] = `Basic ${authBase64}`;
-        }
-
-        logger.log(
-          `[update] 开始下载安装包线路 ${index + 1}/${updateInfo.downloadUrls.length}:`,
-          requestDownloadUrl
-        );
-
-        // 开始下载
-        const downloadResumable = FileSystem.createDownloadResumable(
-          requestDownloadUrl,
-          apkUri,
-          { headers: downloadHeaders },
-          downloadCallback
-        );
-
-        let result: { uri: string; status: number } | undefined;
-        try {
-          result = await downloadResumable.downloadAsync();
-        } catch (downloadError) {
-          const message =
-            downloadError instanceof Error
-              ? downloadError.message
-              : String(downloadError || '未知错误');
-          lastDownloadErrorMessage = message;
-          logger.warn(
-            `[update] 安装包下载线路 ${index + 1}/${updateInfo.downloadUrls.length} 失败:`,
-            message
-          );
-          continue;
-        }
-
-        if (!result || !result.uri || result.status < 200 || result.status >= 300) {
-          const statusText = result?.status ? `HTTP ${result.status}` : '无下载结果';
-          lastDownloadErrorMessage = statusText;
-          logger.warn(
-            `[update] 安装包下载线路 ${index + 1}/${updateInfo.downloadUrls.length} 状态异常:`,
-            statusText
-          );
-          continue;
-        }
-
-        const apkInfo = await FileSystem.getInfoAsync(result.uri);
-        if (!apkInfo.exists || !('size' in apkInfo) || (apkInfo as { size?: number }).size === 0) {
-          lastDownloadErrorMessage = '文件为空';
-          logger.warn(
-            `[update] 安装包下载线路 ${index + 1}/${updateInfo.downloadUrls.length} 文件为空`
-          );
-          continue;
-        }
-
-        downloadedApkUri = result.uri;
-        break;
-      }
-
+      const cachedApk = artifact ? await readCachedApk(cacheTarget).catch(() => null) : null;
+      setCachedApkReady(Boolean(cachedApk));
+      let downloadedApkUri = cachedApk?.uri;
       if (!downloadedApkUri) {
-        alert.showError(
-          `安装包下载失败：${lastDownloadErrorMessage || '所有下载地址均不可用'}。请检查 version.json 中的 downloadUrl/downloadUrls 或网络后重试。`
-        );
-        setDownloading(false);
-        return;
+        const apkUri = await getApkCacheDownloadUri();
+        setApkInstallStage('downloading');
+        let downloadedArtifact: ReturnType<typeof artifactFromDownload> = null;
+        downloadedApkUri = await downloadApkFromRoutes(updateInfo.downloadUrls, apkUri, {
+          onProgress: fraction => setDownloadProgress(Math.round(fraction * 100)),
+          onDownloaded: result => {
+            const identity = artifactFromDownload(result.headers);
+            downloadedArtifact = identity?.expectedSize === result.size ? identity : null;
+          },
+        });
+        // Register completion before backup/installation so either may be
+        // retried after cancellation or restart without downloading again.
+        // Never assign primary HEAD metadata to a fallback route's bytes.
+        const completedTarget: ApkCacheTarget = {
+          androidPackage: cacheTarget.androidPackage, versionCode: cacheTarget.versionCode, version: cacheTarget.version,
+          ...(downloadedArtifact || {}),
+        };
+        const remembered = await rememberDownloadedApk(completedTarget, downloadedApkUri);
+        setCachedApkReady(remembered.persisted === true);
       }
 
+      setDownloadProgress(100);
+      setApkInstallStage('backup');
       try {
+        // Reusing an APK never reuses a database backup: work may have been
+        // recorded since the last time the user cancelled the installer.
         await backupDatabaseToNasForUpdate('安装前');
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error || '未知错误');
         alert.showError(
           `安装前 NAS 数据库备份失败：${message}。请稍后再试，避免覆盖安装时丢失当前出库数据。`
         );
-        setDownloading(false);
         return;
       }
 
-      // 下载完成
-      setDownloadProgress(100);
-
+      setApkInstallStage('installer');
+      openingInstaller = true;
       const installUri =
         typeof FileSystem.getContentUriAsync === 'function'
           ? await FileSystem.getContentUriAsync(downloadedApkUri)
@@ -857,15 +708,24 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
         type: 'application/vnd.android.package-archive',
         flags: 1,
       });
-
-      alert.showSuccess('安装程序已打开，请按提示完成更新');
-
-      setDownloading(false);
+      // Returning here also includes cancelling/backgrounding the installer.
+      // Retain the APK and show Continue Install; do not announce installation.
     } catch (error) {
-      logger.error('安装程序打开失败:', error);
+      if (error instanceof ApkDownloadError) {
+        alert.showError(error.message);
+        return;
+      }
+      if (!openingInstaller) {
+        logger.warn('[update] 安装包准备或完整性校验失败');
+        alert.showError('安装包准备或完整性校验失败，请重新检查更新后重试，并确认存储空间充足。');
+        return;
+      }
+      logger.error('安装程序打开失败:', getUpdateRequestErrorMessage(error));
       const message = error instanceof Error ? error.message : String(error || '');
       const installHint = message ? `\n原因：${message}` : '';
       alert.showError(`安装程序打开失败，请确认已允许本应用安装未知来源应用${installHint}`);
+    } finally {
+      downloadingRef.current = false;
       setDownloading(false);
     }
   };
@@ -1173,23 +1033,20 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
     };
   }, [connectionStatus, syncTarget, theme.error, theme.primary, theme.success, theme.textMuted]);
 
+  const erpChecking = Object.values(erpConnectionStates).some(item => item.status === 'checking');
   const erpConnectionSummary = useMemo(() => {
     const availableAccounts = ERP_ACCOUNTS.filter(isErpAccountAvailable);
     const connectedCount = availableAccounts.filter(
       (account) => erpConnectionStates[account.key].status === 'connected'
     ).length;
-    const checking = availableAccounts.some(
-      (account) => erpConnectionStates[account.key].status === 'checking'
-    );
-
-    if (checking) {
+    if (erpChecking) {
       return '正在检测ERP后端';
     }
     if (availableAccounts.length === 0) {
       return '尚未开放ERP账套';
     }
     return `${connectedCount}/${availableAccounts.length} 套已就绪`;
-  }, [erpConnectionStates]);
+  }, [erpConnectionStates, erpChecking]);
 
   const erpConnectionGroupColor = useMemo(() => {
     const statuses = Object.values(erpConnectionStates).map((item) => item.status);
@@ -1300,7 +1157,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
     >
       {updatesOnly ? <>
         <UiPageHeader title="应用更新" onBack={() => router.back()} />
-        <KeyboardAwareFormScrollView contentContainerStyle={{ padding: 16 }}>
+        <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" contentContainerStyle={[{ flexGrow: 1 }, { padding: 16 }]}>
           <View style={{ backgroundColor: theme.backgroundDefault, padding: 18, borderRadius: 16, marginBottom: 16 }}>
             <Text style={{ color: theme.textPrimary, fontSize: 18, fontWeight: '700' }}>APK 版本</Text>
             <Text style={{ color: theme.textSecondary, marginVertical: 10 }}>当前安装版本：{APP_VERSION}</Text>
@@ -1309,11 +1166,10 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
             </AnimatedButton>}
           </View>
           <OtaUpdatePanel />
-        </KeyboardAwareFormScrollView>
-      </> :       <KeyboardAwareFormScrollView
+        </ScrollView>
+      </> :       <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
         style={styles.container}
-        contentContainerStyle={styles.scrollContent}
-        bottomOffset={Spacing.xl}
+        contentContainerStyle={[{ flexGrow: 1 }, styles.scrollContent]}
         scrollEventThrottle={16} // 控制滚动事件频率（16ms ≈ 60fps）
         decelerationRate="normal" // 正常减速率，改善滑动手感
         directionalLockEnabled={true} // 锁定滚动方向，提升跟手性
@@ -1379,15 +1235,16 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
                   />
                 );
               })}
-              {renderMenuCard(
-                '重新检测ERP',
-                '仅检查后端配置，不消耗ERP业务接口次数',
-                'refresh-cw',
-                theme.primary,
-                handleManualErpCheck,
-                false,
-                Object.values(erpConnectionStates).some((item) => item.status === 'checking')
-              )}
+              <UiListItem
+                title="重新检测ERP"
+                subtitle="仅检查后端配置，不消耗ERP业务接口次数"
+                icon="refresh-cw"
+                color={theme.primary}
+                onPress={() => { void checkErpConnections({ force: true }); }}
+                disabled={erpChecking}
+                loading={erpChecking}
+                compact
+              />
             </View>
           )}</MotionCollapse>}
 
@@ -1524,7 +1381,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
             {/* App图标和名称 */}
             <View style={styles.aboutAppSection}>
               <View style={styles.aboutLogo}>
-                <Feather name="package" size={rs(16)} color={theme.primary} />
+                <Feather name="package" size={scaleControlSize(16)} color={theme.primary} />
               </View>
               <Text style={styles.aboutAppName}>{APP_NAME}</Text>
               <View style={styles.aboutVersionBadge}>
@@ -1542,7 +1399,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
                 onPress={() => Linking.openURL(COMPANY_WEBSITE)}
               >
                 <View style={styles.aboutDetailIconWrapper}>
-                  <Feather name="briefcase" size={rs(14)} color={theme.textSecondary} />
+                  <Feather name="briefcase" size={scaleControlSize(14)} color={theme.textSecondary} />
                 </View>
                 <Text style={styles.aboutDetailLabel} numberOfLines={1}>
                   公司
@@ -1551,13 +1408,13 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
                   <Text style={styles.aboutDetailValue} numberOfLines={1}>
                     {COMPANY_NAME}
                   </Text>
-                  <Feather name="external-link" size={rs(12)} color={theme.textMuted} />
+                  <Feather name="external-link" size={scaleControlSize(12)} color={theme.textMuted} />
                 </View>
               </AnimatedButton>
 
               <View style={styles.aboutDetailRow}>
                 <View style={styles.aboutDetailIconWrapper}>
-                  <Feather name="user" size={rs(14)} color={theme.textSecondary} />
+                  <Feather name="user" size={scaleControlSize(14)} color={theme.textSecondary} />
                 </View>
                 <Text style={styles.aboutDetailLabel} numberOfLines={1}>
                   作者
@@ -1578,7 +1435,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
                 onPress={() => Linking.openURL(ICP_FILING_URL)}
               >
                 <View style={styles.aboutDetailIconWrapper}>
-                  <Feather name="shield" size={rs(14)} color={theme.textSecondary} />
+                  <Feather name="shield" size={scaleControlSize(14)} color={theme.textSecondary} />
                 </View>
                 <Text style={styles.aboutDetailLabel} numberOfLines={1}>
                   备案号
@@ -1587,7 +1444,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
                   <Text style={styles.aboutDetailValue} numberOfLines={1}>
                     {ICP_FILING_NUMBER}
                   </Text>
-                  <Feather name="external-link" size={rs(12)} color={theme.textMuted} />
+                  <Feather name="external-link" size={scaleControlSize(12)} color={theme.textMuted} />
                 </View>
               </AnimatedButton>
 
@@ -1597,7 +1454,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
                 onPress={() => router.push('/privacy-policy')}
               >
                 <View style={styles.aboutDetailIconWrapper}>
-                  <Feather name="lock" size={rs(14)} color={theme.textSecondary} />
+                  <Feather name="lock" size={scaleControlSize(14)} color={theme.textSecondary} />
                 </View>
                 <Text style={styles.aboutDetailLabel} numberOfLines={1}>
                   隐私政策
@@ -1606,7 +1463,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
                   <Text style={styles.aboutDetailValue} numberOfLines={1}>
                     查看
                   </Text>
-                  <Feather name="chevron-right" size={rs(12)} color={theme.textMuted} />
+                  <Feather name="chevron-right" size={scaleControlSize(12)} color={theme.textMuted} />
                 </View>
               </AnimatedButton>
             </View>
@@ -1622,12 +1479,12 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
               >
                 <Feather
                   name="book-open"
-                  size={rs(14)}
+                  size={scaleControlSize(14)}
                   color={theme.textMuted}
                   style={styles.helpIconWrapper}
                 />
                 <Text style={styles.helpText}>使用说明</Text>
-                <Feather name="chevron-right" size={rs(14)} color={theme.textMuted} />
+                <Feather name="chevron-right" size={scaleControlSize(14)} color={theme.textMuted} />
               </TouchableOpacity>
 
               <TouchableOpacity
@@ -1637,12 +1494,12 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
               >
                 <Feather
                   name="clock"
-                  size={rs(14)}
+                  size={scaleControlSize(14)}
                   color={theme.textMuted}
                   style={styles.changelogIconWrapper}
                 />
                 <Text style={styles.changelogText}>更新日志</Text>
-                <Feather name="chevron-right" size={rs(14)} color={theme.textMuted} />
+                <Feather name="chevron-right" size={scaleControlSize(14)} color={theme.textMuted} />
               </TouchableOpacity>
             </View>
           </View>
@@ -1650,30 +1507,14 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
 
         {/* 底部留白 */}
         <View style={{ height: Spacing['4xl'] }} />
-      </KeyboardAwareFormScrollView>}
+      </ScrollView>}
 
       {/* ==================== 在线更新模态框 ==================== */}
       <Modal visible={draftArchiveModalVisible && isFocused} transparent animationType="fade"
         onRequestClose={() => !restoringDraftArchive && setDraftArchiveModalVisible(false)}>
-        <View style={styles.updateModalOverlay}>
-          <AppModalCard title="恢复前作业副本" size="largeForm" stretchBody
-            subtitle="副本不会自动写回业务记录。请先核对单据和实物，再恢复未完成作业。"
-            onClose={restoringDraftArchive ? undefined : () => setDraftArchiveModalVisible(false)}
-            footer={<AppModalActions primaryLabel={restoringDraftArchive ? '正在恢复' : '恢复副本'}
-              onPrimaryPress={handleRestoreDraftArchive}
-              primaryDisabled={restoringDraftArchive || !selectedDraftArchiveId}
-              secondaryLabel="稍后" secondaryDisabled={restoringDraftArchive}
-              onSecondaryPress={() => setDraftArchiveModalVisible(false)} />}>
-            <FlatList data={draftArchives} keyExtractor={item => item.id}
-              renderItem={({ item }) => <UiListItem
-                title={formatDateTimeExport(item.createdAt)}
-                subtitle={`${item.databaseFileName} · ${new Set([...item.entries, ...item.lateEntries].map(([key]) => key)).size} 项暂存`}
-                icon={selectedDraftArchiveId === item.id ? 'check-circle' : 'archive'}
-                color={selectedDraftArchiveId === item.id ? theme.primary : theme.textMuted}
-                onPress={() => !restoringDraftArchive && setSelectedDraftArchiveId(item.id)}
-              />} />
-          </AppModalCard>
-        </View>
+        <DraftArchiveDialog styles={styles} archives={draftArchives} selectedId={selectedDraftArchiveId}
+          restoring={restoringDraftArchive} onClose={() => setDraftArchiveModalVisible(false)}
+          onSelect={setSelectedDraftArchiveId} onRestore={handleRestoreDraftArchive} />
       </Modal>
       <Modal
         visible={updateModalVisible && (isFocused || downloading)}
@@ -1681,70 +1522,9 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
         animationType="fade"
         onRequestClose={() => !downloading && setUpdateModalVisible(false)}
       >
-        <View style={styles.updateModalOverlay}>
-          <AppModalCard
-            title="发现新版本"
-            subtitle={
-              downloading
-                ? '正在下载安装包，请保持网络稳定并稍候。'
-                : '请确认版本信息与更新内容，再决定是否下载安装。'
-            }
-            onClose={
-              downloading
-                ? undefined
-                : () => {
-                    setUpdateModalVisible(false);
-                  }
-            }
-            style={styles.modalContent}
-            bodyStyle={styles.modalBody}
-            size="largeForm"
-            stretchBody
-            footer={
-              !downloading ? (
-                <View style={styles.updateModalFooter}>
-                  <AppModalActions
-                    containerStyle={styles.modalActions}
-                    secondaryLabel="关闭"
-                    onSecondaryPress={() => {
-                      setUpdateModalVisible(false);
-                    }}
-                    primaryLabel="下载更新"
-                    onPrimaryPress={downloadAndInstall}
-                  />
-                </View>
-              ) : undefined
-            }
-          >
-            <KeyboardAwareFormScrollView
-              style={styles.updateModalBody}
-              contentContainerStyle={styles.updateModalBodyContent}
-              bottomOffset={32}
-              scrollEventThrottle={16}
-            >
-              {updateInfo && (
-                <>
-                  <View style={styles.updateVersionInfo}>
-                    <Text style={styles.updateVersionLabel}>新版本</Text>
-                    <Text style={styles.updateVersionText}>V{updateInfo.version}</Text>
-                  </View>
-
-                  <Text style={styles.updateChangelogTitle}>更新内容</Text>
-                  <Text style={styles.updateChangelogText}>{updateInfo.changelog}</Text>
-
-                  {downloading && (
-                    <View style={styles.downloadProgress}>
-                      <View style={styles.progressBarContainer}>
-                        <View style={[styles.progressBar, { width: `${downloadProgress}%` }]} />
-                      </View>
-                      <Text style={styles.progressText}>下载中... {downloadProgress}%</Text>
-                    </View>
-                  )}
-                </>
-              )}
-            </KeyboardAwareFormScrollView>
-          </AppModalCard>
-        </View>
+        <ApkUpdateDialog styles={styles} downloading={downloading} info={updateInfo} progress={downloadProgress}
+          cachedReady={cachedApkReady} installStage={apkInstallStage}
+          onClose={() => setUpdateModalVisible(false)} onDownload={downloadAndInstall} />
       </Modal>
 
       {(isFocused || showRestartModal) && alert.AlertComponent}
@@ -1760,14 +1540,13 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
           return false;
         }}
       >
-        <View style={styles.restartModalOverlay}>
+        <AppModalViewport style={styles.restartModalOverlay}>
           <AppModalCard
             title="需要重启应用"
             subtitle={restartMessage}
             style={styles.restartModalContent}
             bodyStyle={styles.restartModalBody}
-            size="form"
-            stretchBody
+            size="auto"
             footer={
               <AppModalActions
                 containerStyle={styles.modalActions}
@@ -1795,7 +1574,7 @@ export default function SettingsScreen({ updatesOnly = false }: { updatesOnly?: 
               <Text style={styles.restartModalWarningSub}>未重启可能导致数据错乱</Text>
             </View>
           </AppModalCard>
-        </View>
+        </AppModalViewport>
       </Modal>
     </Screen>
   );

@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionPresence } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
@@ -50,7 +51,7 @@ const getQueryTimeFilter = (filter: TimeFilterType): QueryTimeFilterType =>
 
 export default function OrdersScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
   const alert = useCustomAlert();

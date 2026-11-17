@@ -13,6 +13,10 @@ export const createStyles = (theme: Theme) =>
       flex: 1,
       backgroundColor: theme.backgroundRoot,
     },
+    editorScroll: {
+      flex: 1,
+      minHeight: 0,
+    },
     header: {
       flexDirection: 'row',
       alignItems: 'center',

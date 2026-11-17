@@ -6,12 +6,13 @@ $source = Join-Path $PSScriptRoot 'apk-builder'
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
 $output = Join-Path $repo ('output/build-tools-tests-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $output -Force | Out-Null
-$sources = @('Program.cs','BuildWindow.cs','BuildRunner.cs','BuildSupport.cs','BuildToolsWindow.cs','WebPreviewRunner.cs','SigningStore.cs','SigningWindow.cs','OtaConnectionPanel.cs','OtaConnection.cs') | ForEach-Object { Join-Path $source $_ }
+$sources = @('Program.cs','BrandedForm.cs','BuildWindow.cs','BuildRunner.cs','BuildSupport.cs','BuildToolsWindow.cs','WebPreviewRunner.cs','SigningStore.cs','SigningWindow.cs','OtaConnectionPanel.cs','OtaConnection.cs') | ForEach-Object { Join-Path $source $_ }
+$iconResource = '/resource:' + (Join-Path $PSScriptRoot 'icon.ico') + ',Chipmunks.ApkBuilder.AppIcon.ico'
 $references = @('/reference:System.dll','/reference:System.Core.dll','/reference:System.Windows.Forms.dll','/reference:System.Drawing.dll','/reference:System.Security.dll','/reference:System.Web.Extensions.dll')
 foreach ($suite in $Suites) {
     $exe = Join-Path $output ($suite + '.exe')
     $entry = if ($suite -eq 'SupportTests') { 'Chipmunks.ApkBuilder.SupportTests' } else { $suite }
-    & $compiler /nologo /target:exe /platform:anycpu /utf8output /codepage:65001 /langversion:5 ('/out:' + $exe) ('/main:' + $entry) @references @sources (Join-Path $source ('tests/' + $suite + '.cs'))
+    & $compiler /nologo /target:exe /platform:anycpu /utf8output /codepage:65001 /langversion:5 ('/out:' + $exe) ('/main:' + $entry) $iconResource @references @sources (Join-Path $source ('tests/' + $suite + '.cs'))
     if ($LASTEXITCODE -ne 0) { throw "$suite failed to compile." }
     if ($suite -eq 'WindowTests' -and $WindowCase) { & $exe (Join-Path $output $suite) $WindowCase }
     elseif ($suite -eq 'OtaConnectionTests') { & $exe }

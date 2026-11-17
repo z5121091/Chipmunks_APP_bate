@@ -6,6 +6,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
@@ -62,6 +63,7 @@ internal static class WindowTests
             Run("ota-only-apk-target", OtaOnlyApk);
             Run("ota-publish-directly-in-main-window", OtaDirect);
             Run("idle-buttons-and-branded-layout", Idle);
+            Run("all-application-windows-use-the-embedded-brand-icon", BrandedWindows);
             Run("running-stage-and-success-artifact", Success);
             Run("verified-success-with-log-warning-keeps-artifact-and-history", SuccessWithLogWarning);
             Run("failed-build-with-log-warning-keeps-error-priority", FailureWithLogWarning);
@@ -107,6 +109,63 @@ internal static class WindowTests
     }
 
     private static void Assert(bool value, string message) { if (!value) throw new Exception(message); }
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+
+    private static string IconFingerprint(Icon icon, int size)
+    {
+        using (var scaled = new Icon(icon, size, size))
+        using (var native = Icon.FromHandle(scaled.Handle))
+        using (var bitmap = native.ToBitmap())
+        using (var buffer = new MemoryStream()) {
+            bitmap.Save(buffer, ImageFormat.Png);
+            using (var hash = SHA256.Create()) return Convert.ToBase64String(hash.ComputeHash(buffer.ToArray()));
+        }
+    }
+
+    private static void BrandedWindows()
+    {
+        using (Fixture f = new Fixture("exit 0"))
+        using (Stream resource = typeof(BrandedForm).Assembly.GetManifestResourceStream("Chipmunks.ApkBuilder.AppIcon.ico")) {
+            Assert(resource != null, "Application icon resource was not embedded.");
+            using (var expected = new Icon(resource)) {
+                Assert(IconFingerprint(expected, 32) != IconFingerprint(SystemIcons.Application, 32), "Brand resource is the default Windows icon.");
+                var concrete = typeof(BuildWindow).Assembly.GetTypes().Where(type => !type.IsAbstract && typeof(Form).IsAssignableFrom(type)).ToArray();
+                Assert(concrete.Length == 6, "Review the window inventory when adding another form.");
+                Assert(concrete.All(type => typeof(BrandedForm).IsAssignableFrom(type)), "A window bypasses the shared application icon.");
+                AssertBrandIcon(f.Window, expected);
+                foreach (string mode in new[] { "assessment", "history", "storage" })
+                    using (var dialog = new BuildToolsWindow(f.DirectoryPath, mode)) AssertBrandIcon(dialog, expected);
+                using (var settings = new SigningWindow(new SigningStore(f.DirectoryPath, Path.Combine(f.DirectoryPath, "isolated-signing"))))
+                    AssertBrandIcon(settings, expected);
+                foreach (SigningWindow.SigningSecretMode mode in Enum.GetValues(typeof(SigningWindow.SigningSecretMode)))
+                    using (var secret = new SigningWindow.SigningSecretWindow(mode)) AssertBrandIcon(secret, expected);
+                var closeType = typeof(BuildWindow).GetNestedType("CloseTaskDialog", BindingFlags.NonPublic);
+                using (var close = (Form)Activator.CreateInstance(closeType, true)) AssertBrandIcon(close, expected);
+                var cleanupType = typeof(BuildToolsWindow).GetNestedType("CleanupReview", BindingFlags.NonPublic);
+                using (var cleanup = (Form)Activator.CreateInstance(cleanupType, BindingFlags.NonPublic | BindingFlags.Instance, null,
+                    new object[] { "fixture.txt", 1, 16L }, null)) AssertBrandIcon(cleanup, expected);
+                // Disposing child windows must not dispose the main/tray icon.
+                AssertBrandIcon(f.Window, expected);
+            }
+        }
+    }
+
+    private static void AssertBrandIcon(Form window, Icon expected)
+    {
+        Assert(window.ShowIcon && window.Icon != null, window.GetType().Name + " has no application icon.");
+        EnsureHandles(window);
+        foreach (int size in new[] { 16, 32 })
+            Assert(IconFingerprint(window.Icon, size) == IconFingerprint(expected, size), window.GetType().Name + " has a different icon.");
+        // Inspect actual native title-bar/task-switcher icons, not only the managed property.
+        foreach (int kind in new[] { 0, 1 }) {
+            IntPtr handle = SendMessage(window.Handle, 0x007F, new IntPtr(kind), IntPtr.Zero); // WM_GETICON
+            Assert(handle != IntPtr.Zero, window.GetType().Name + " did not assign a native window icon.");
+            using (Icon actual = Icon.FromHandle(handle))
+                Assert(IconFingerprint(actual, kind == 0 ? 16 : 32) == IconFingerprint(expected, kind == 0 ? 16 : 32),
+                    window.GetType().Name + " native icon does not match the application.");
+        }
+    }
     private static string Quote(string value) { return "'" + value.Replace("'", "''") + "'"; }
     private static void PreviewTarget()
     {

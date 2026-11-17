@@ -3,6 +3,7 @@ import { Animated, StyleProp, StyleSheet, Text, ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { BorderRadius, BorderWidth, Spacing, Typography, withAlpha } from '@/constants/theme';
 import { rf } from '@/utils/responsive';
 import { useMotionPresence, useRetainedValue } from '@/components/AppMotion';
@@ -19,6 +20,7 @@ interface AppPillToastProps {
 
 export function AppPillToast({ text: inputText, type: inputType = 'success', bottom, style, visible = true }: AppPillToastProps) {
   const { theme } = useTheme();
+  const styles = useResponsiveStyles(theme, createStyles);
   const insets = useSafeAreaInsets();
   const { present, progress: anim } = useMotionPresence(visible && Boolean(inputText));
   const value = useMemo(() => ({ text: inputText, type: inputType }), [inputText, inputType]);
@@ -103,7 +105,7 @@ export function AppPillToast({ text: inputText, type: inputType = 'success', bot
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = () => StyleSheet.create({
   wrap: {
     position: 'absolute',
     left: Spacing.md,

@@ -25,7 +25,6 @@ jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
 jest.mock('@/components/AppFormField', () => ({ AppFormField: 'Field' }));
 jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'Actions' }));
 jest.mock('@/components/AppModalCard', () => ({ AppModalCard: 'Card' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'Form' }));
 jest.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
 }));

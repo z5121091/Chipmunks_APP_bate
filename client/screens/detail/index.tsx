@@ -11,9 +11,9 @@ import { useTheme } from '@/hooks/useTheme';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { Screen } from '@/components/Screen';
 import { AppModalCard } from '@/components/AppModalCard';
+import { AppModalViewport } from '@/components/AppModalViewport';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppFormField } from '@/components/AppFormField';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { createStyles } from './styles';
 import {
   getMaterial,
@@ -524,23 +524,21 @@ ${remarksContent ? `备注: ${remarksContent}\n` : ''}原始内容: ${record.raw
       {<Modal transparent visible={Boolean(notesEditorVisible) && (true)} animationType="fade" onRequestClose={() => {
           if (!notesSaving) setNotesEditorVisible(false);
         }}>{notesEditorVisible ? <>
-          <View style={styles.modalOverlay}>
-            <AppModalCard title="补充退货备注" size="form"
+          <AppModalViewport style={styles.modalOverlay}>
+            <AppModalCard title="补充退货备注" size="auto"
               onClose={notesSaving ? undefined : () => setNotesEditorVisible(false)}
               footer={<AppModalActions primaryLabel={notesSaving ? '保存中...' : '保存'}
                 onPrimaryPress={() => { void saveReturnNotes(); }} primaryDisabled={notesSaving}
                 secondaryLabel="关闭" onSecondaryPress={() => setNotesEditorVisible(false)} secondaryDisabled={notesSaving}
                 containerStyle={styles.modalActions} />}>
-              <KeyboardAwareFormScrollView contentContainerStyle={styles.modalBodyContent}>
-                <AppFormField label="补充说明" hint="补充说明可修改，退货来源说明由系统保留。">
-                  <TextInput style={[styles.formInput, { minHeight: 112, textAlignVertical: 'top' }]}
+                <AppFormField label="补充说明" hint="补充说明可修改，退货来源说明由系统保留。" style={{ marginBottom: 0 }}>
+                  <TextInput style={[styles.formInput, { height: 112, textAlignVertical: 'top' }]}
                     value={notesDraft} onChangeText={setNotesDraft} editable={!notesSaving}
                     placeholder="填写本笔退货的补充说明" placeholderTextColor={theme.textMuted} multiline />
                 </AppFormField>
                 {notesSaveError ? <Text style={[styles.fieldValueLong, { color: theme.error }]}>{notesSaveError}</Text> : null}
-              </KeyboardAwareFormScrollView>
             </AppModalCard>
-          </View>
+          </AppModalViewport>
         </> : null}</Modal>}
       
       {/* 自定义弹窗 */}

@@ -50,6 +50,7 @@ type BackendJsonRequestOptions = BackendUrlOptions & {
   erpCacheMode?: 'bypass' | 'default';
   headers?: HeadersInit;
   method?: 'GET' | 'POST';
+  settleOnAbort?: boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
 };
@@ -76,7 +77,7 @@ export class BackendNetworkError extends Error {
   constructor(url: string, cause: unknown) {
     const message =
       typeof window !== 'undefined' &&
-      window.location.protocol === 'https:' &&
+      window.location?.protocol === 'https:' &&
       url.startsWith('http:')
         ? `浏览器拦截了HTTP后端请求：当前页面是HTTPS，后端地址是HTTP。请把后端改成HTTPS，或使用HTTPS代理。后端地址：${url}`
         : `无法连接后端接口：${url}`;
@@ -170,6 +171,7 @@ export const backendJsonRequest = async <T>(
     erpCacheMode,
     headers,
     method = body === undefined ? 'GET' : 'POST',
+    settleOnAbort = false,
     signal,
     timeoutMs = DEFAULT_BACKEND_TIMEOUT_MS,
   } = options;
@@ -186,7 +188,7 @@ export const backendJsonRequest = async <T>(
     signal?.addEventListener('abort', abortFromCaller, { once: true });
   }
 
-  try {
+  const performRequest = async (): Promise<T> => {
     const response = await fetch(url, {
       body: body === undefined ? undefined : JSON.stringify(body),
       headers: {
@@ -217,6 +219,19 @@ export const backendJsonRequest = async <T>(
     }
 
     return payload as T;
+  };
+
+  // A health probe must release its UI and OTA guard even if Android never settles fetch/body after abort.
+  let removeAbortWait: (() => void) | undefined;
+  try {
+    if (!settleOnAbort) return await performRequest();
+    if (requestController.signal.aborted) throw new Error('请求已取消');
+    const aborted = new Promise<never>((_, reject) => {
+      const onAbort = () => reject(new Error('请求已取消'));
+      requestController.signal.addEventListener('abort', onAbort, { once: true });
+      removeAbortWait = () => requestController.signal.removeEventListener('abort', onAbort);
+    });
+    return await Promise.race([performRequest(), aborted]);
   } catch (error) {
     if (error instanceof BackendApiError) {
       throw error;
@@ -229,6 +244,7 @@ export const backendJsonRequest = async <T>(
     throw new BackendNetworkError(url, requestError);
   } finally {
     finishOtaOperation();
+    removeAbortWait?.();
     if (timeoutId) {
       clearTimeout(timeoutId);
     }

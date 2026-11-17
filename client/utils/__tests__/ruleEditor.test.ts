@@ -23,6 +23,17 @@ describe('rule editor diagnostics', () => {
     expect(suggestRuleSeparators('https://example.com/A')).toEqual([]);
   });
 
+  it.each(['', '%'])('recommends percent separators for the ten-segment label with ending %j', ending => {
+    const content = 'NSI6801EB-DSWFR%H20B55%2634%1000%SOW6%NSI2636068%F%NSI2636068X39%S%NSI6801EB-DSWFRC' + ending;
+    expect(suggestRuleSeparators(content)).toEqual([{ value: '%', label: '%', fieldCount: 10 }]);
+    expect(suggestRuleSeparators(content, ['%'])).toEqual([{ value: '%', label: '%', fieldCount: 10 }]);
+  });
+
+  it('keeps empty middle segments in percent-separated recommendations and excludes URL escapes', () => {
+    expect(suggestRuleSeparators('MODEL%%100%')).toEqual([{ value: '%', label: '%', fieldCount: 3 }]);
+    expect(suggestRuleSeparators('https://example.com/MODEL%20LOT%20100')).toEqual([]);
+  });
+
   it('detects generic prefix syntax without relying on field-name presets', () => {
     expect(suggestRuleFieldPrefix('PART NO.:QM4051PW', '/')).toBe('PART NO.:');
     expect(suggestRuleFieldPrefix('QTY:8000 PCS', '/')).toBe('QTY:');

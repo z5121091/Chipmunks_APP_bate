@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionContent } from '@/components/AppMotion';
 import { APP_MOTION } from '@/constants/motion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
@@ -7,7 +8,7 @@ import { View, Text, FlatList, ActivityIndicator, TextInput, AppState, Keyboard,
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from 'expo-router';
 import { usePreventRemove } from 'expo-router/react-navigation';
-import { Gesture, GestureDetector, type Swipeable } from 'react-native-gesture-handler';
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -18,11 +19,14 @@ import Animated, {
 } from 'react-native-reanimated';
 import {
   getAllRules,
+  getAllRuleFolders,
+  moveRulesToFolder,
   addRule,
   updateRule,
   deleteRule,
   setRulesDisplayOrder,
   QRCodeRule,
+  type QRCodeRuleFolder,
   FIELD_LABELS,
   AVAILABLE_FIELDS,
   MatchCondition,
@@ -36,7 +40,6 @@ import { AppEmptyState } from '@/components/AppEmptyState';
 import { AppModalHeader } from '@/components/AppModalHeader';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppSegmentedOptions } from '@/components/AppSegmentedOptions';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { createStyles, RULE_CARD_MIN_HEIGHT } from './styles';
 import { logger } from '@/utils/logger';
 import { Spacing } from '@/constants/theme';
@@ -59,7 +62,9 @@ import {
 import { RuleSamplePanel } from './RuleSamplePanel';
 import { RuleOptionPicker } from './RuleOptionPicker';
 import { moveRuleForDrag } from './ruleListDrag';
-import { RuleCardContent, RuleListItem } from './RuleListItem';
+import { RuleCardContent, RuleListItem, RuleFolderCard } from './RuleListItem';
+import { RuleFolderManager } from './RuleFolderManager';
+import { RuleRowActions } from './RuleRowActions';
 import { SupplierManager } from '@/screens/inventory-binding/SupplierManager';
 
 const SEPARATOR_VALUES: Record<string, string> = {
@@ -86,10 +91,10 @@ const EDITOR_SECTIONS = {
 
 const SORT_LAYOUT_TRANSITION = LinearTransition.springify().damping(APP_MOTION.sortLayout.damping)
   .stiffness(APP_MOTION.sortLayout.stiffness).mass(APP_MOTION.sortLayout.mass);
-const SORT_ROW_GAP = Spacing.sm;
 const INITIAL_RULE_BATCH = 8;
-const renderRuleSeparator = () => <View style={{ height: SORT_ROW_GAP }} />;
-const ruleListKey = (rule: QRCodeRule) => rule.id;
+const renderRuleSeparator = () => <View style={{ height: Spacing.sm }} />;
+type RuleListEntry = QRCodeRule | QRCodeRuleFolder;
+const ruleListKey = (entry: RuleListEntry) => `${'fieldOrder' in entry ? 'rule' : 'folder'}:${entry.id}`;
 
 const CONDITION_MODE_LABELS: Record<RuleConditionMode, string> = {
   all: '全部满足（且）',
@@ -110,7 +115,7 @@ const CONDITION_PICKER_TITLES = {
 
 export default function RulesScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
   const navigation = useNavigation();
@@ -128,10 +133,26 @@ export default function RulesScreen() {
   const { showToast, ToastContainer } = useToast();
 
   const [rules, setRules] = useState<QRCodeRule[]>([]);
+  const [folders, setFolders] = useState<QRCodeRuleFolder[]>([]);
+  const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
+  const [folderDirection, setFolderDirection] = useState<'forward' | 'back'>('forward');
+  const [managerVisible, setManagerVisible] = useState(false);
+  const [ruleMenu, setRuleMenu] = useState<{ rule: QRCodeRule; stage: 'actions' | 'move' } | null>(null);
+  const [ruleMenuBusy, setRuleMenuBusy] = useState(false);
+  const ruleMenuBusyRef = useRef(false);
+  const folderOffsetsRef = useRef(new Map<string, number>());
+  const loadRequestRef = useRef(0);
+  const folderIds = useMemo(() => new Set(folders.map(folder => folder.id)), [folders]);
+  const currentFolder = folders.find(folder => folder.id === currentFolderId);
+  const visibleRules = useMemo(() => rules.filter(rule =>
+    (rule.folderId && folderIds.has(rule.folderId) ? rule.folderId : null) === currentFolderId
+  ), [rules, folderIds, currentFolderId]);
+  const listEntries = useMemo<RuleListEntry[]>(() => currentFolderId ? visibleRules : [...folders, ...visibleRules],
+    [currentFolderId, visibleRules, folders]);
   const [loading, setLoading] = useState(true);
   const [initialRuleCount, setInitialRuleCount] = useState(INITIAL_RULE_BATCH);
   const normalListOffsetRef = useRef({ x: 0, y: 0 });
-  const normalListRef = useRef<FlatList<QRCodeRule>>(null);
+  const normalListRef = useRef<FlatList<RuleListEntry>>(null);
   const sortListOffsetRef = useRef({ x: 0, y: 0 });
   // 调整顺序模式
   const [sortMode, setSortMode] = useState(false);
@@ -147,8 +168,6 @@ export default function RulesScreen() {
   const accumulatedRef = useRef(0);
   const dragY = useSharedValue(0);
   const dragScale = useSharedValue(1);
-  const swipeableRefs = useRef<Map<string, Swipeable | null>>(new Map());
-  const openSwipeableIdRef = useRef<string | null>(null);
   const scrollViewRef = useRef<ElementRef<typeof ScrollView>>(null);
   const scrollOffsetRef = useRef(0);
   const dragStartScrollOffsetRef = useRef(0);
@@ -189,9 +208,14 @@ export default function RulesScreen() {
   };
 
   useHardwareBack(() => {
-    if (!diagnosticEditor) return false;
-    closeEditor();
-    return true;
+    if (diagnosticEditor) {
+      closeEditor();
+      return true;
+    }
+    if (managerVisible || ruleMenu || modalVisible) return false;
+    if (sortMode) { cancelSort(); return true; }
+    if (currentFolderId) { openFolder(null); return true; }
+    return false;
   });
   usePreventRemove(diagnosticEditor && saving, ({ data }) => {
     // Saving has completed when finishEditor requests this pop. Resume that action
@@ -219,6 +243,8 @@ export default function RulesScreen() {
   const [supplierName, setSupplierName] = useState('');
   const [supplierId, setSupplierId] = useState('');
   const [supplierPickerVisible, setSupplierPickerVisible] = useState(false);
+  const [draftFolderId, setDraftFolderId] = useState('');
+  const [folderPickerVisible, setFolderPickerVisible] = useState(false);
   const [packagingFields, setPackagingFields] = useState<string[]>([]);
   const availablePackagingFields = selectedFields.filter(field => AVAILABLE_FIELDS.includes(field) && field !== 'traceNo');
   const selectedPackagingFields = packagingFields.filter(field => availablePackagingFields.includes(field));
@@ -260,6 +286,7 @@ export default function RulesScreen() {
       conditionMode,
       supplierId,
       supplierName,
+      folderId: draftFolderId,
       fieldPrefixes: Object.fromEntries(
         Object.entries(draftPrefixes).filter(([field]) => selectedFields.includes(field))
       ),
@@ -280,21 +307,35 @@ export default function RulesScreen() {
     conditionMode,
     supplierId,
     supplierName,
+    draftFolderId,
     draftPrefixes,
   ]);
 
   // 加载数据
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (propagateFailure = false) => {
+    const request = ++loadRequestRef.current;
     try {
-      const rulesData = await getAllRules();
-      if (mountedRef.current) setRules(rulesData);
+      const [rulesData, folderData] = await Promise.all([getAllRules(), getAllRuleFolders()]);
+      if (mountedRef.current && request === loadRequestRef.current) {
+        setRules(rulesData);
+        setFolders(folderData);
+      }
     } catch (error) {
       logger.error('加载解析规则失败:', error);
-      showRuleLoadError('解析规则加载失败，请重试');
+      if (propagateFailure) throw error;
+      if (mountedRef.current && request === loadRequestRef.current) showRuleLoadError('解析规则加载失败，请重试');
     } finally {
-      if (mountedRef.current) setLoading(false);
+      if (mountedRef.current && request === loadRequestRef.current) setLoading(false);
     }
   }, [showRuleLoadError]);
+  const refreshOrganization = useCallback(() => loadData(true), [loadData]);
+  const moveRuleMembership = useCallback(async (ids: string[], folderId: string | null) => {
+    await moveRulesToFolder(ids, folderId);
+    if (!mountedRef.current) return;
+    // Reflect the committed move even if the background list refresh fails.
+    const movedIds = new Set(ids);
+    setRules(current => current.map(rule => movedIds.has(rule.id) ? { ...rule, folderId: folderId ?? undefined } : rule));
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
@@ -323,6 +364,8 @@ export default function RulesScreen() {
     setSupplierName('');
     setSupplierId('');
     setSupplierPickerVisible(false);
+    setDraftFolderId(currentFolderId ?? '');
+    setFolderPickerVisible(false);
     setMatchConditions([]);
     setPackagingFields([]);
     setConditionMode('all');
@@ -334,6 +377,8 @@ export default function RulesScreen() {
 
   // 打开编辑弹窗
   const handleEditRule = useCallback((rule: QRCodeRule) => {
+    setDraftFolderId(rule.folderId || '');
+    setFolderPickerVisible(false);
     setEditorSection('main');
     setDraftPrefixes(rule.fieldPrefixes || {});
     setSample('');
@@ -558,6 +603,7 @@ export default function RulesScreen() {
       isActive: editingRule?.isActive ?? true,
       supplierName: supplierName.trim(),
       supplierId,
+      folderId: draftFolderId,
       matchConditions: matchConditions.length > 0 ? matchConditions : [],
       packagingFields: selectedPackagingFields,
       conditionMode,
@@ -702,30 +748,49 @@ export default function RulesScreen() {
     );
   }, [loadData, showRuleConfirm, showRuleSuccess, showRuleLoadError]);
 
-  // 右滑删除互斥：同时只允许一个卡片处于滑开状态
-  const closeOpenSwipeable = useCallback(() => {
-    const openId = openSwipeableIdRef.current;
-    if (openId) {
-      swipeableRefs.current.get(openId)?.close();
-      openSwipeableIdRef.current = null;
-    }
-  }, []);
+  const openFolder = useCallback((id: string | null) => {
+    if (sortSavingRef.current || ruleMenuBusyRef.current) return;
+    folderOffsetsRef.current.set(currentFolderId ?? '__root__', scrollOffsetRef.current);
+    const offset = folderOffsetsRef.current.get(id ?? '__root__') ?? 0;
+    normalListOffsetRef.current = { x: 0, y: offset };
+    scrollOffsetRef.current = offset;
+    setInitialRuleCount(offset ? Math.max(INITIAL_RULE_BATCH,
+      Math.ceil((offset + viewportHeightRef.current) / RULE_CARD_MIN_HEIGHT) + 1) : INITIAL_RULE_BATCH);
+    setFolderDirection(id ? 'forward' : 'back');
+    setCurrentFolderId(id);
+  }, [currentFolderId]);
 
-  const registerSwipeable = useCallback((id: string, instance: Swipeable | null) => {
-    if (instance) swipeableRefs.current.set(id, instance);
-    else {
-      swipeableRefs.current.delete(id);
-      if (openSwipeableIdRef.current === id) openSwipeableIdRef.current = null;
+  useEffect(() => {
+    if (!loading && currentFolderId && !folderIds.has(currentFolderId)) openFolder(null);
+  }, [loading, currentFolderId, folderIds, openFolder]);
+
+  const openRuleMenu = useCallback((rule: QRCodeRule) => setRuleMenu({ rule, stage: 'actions' }), []);
+  const closeRuleMenu = () => { if (!ruleMenuBusyRef.current) setRuleMenu(null); };
+  const ruleMenuFolderId = ruleMenu?.rule.folderId && folderIds.has(ruleMenu.rule.folderId) ? ruleMenu.rule.folderId : null;
+  const moveSingleRule = async (folderId: string | null) => {
+    if (!ruleMenu || ruleMenuBusyRef.current || folderId === ruleMenuFolderId) return;
+    ruleMenuBusyRef.current = true;
+    setRuleMenuBusy(true);
+    let committed = false;
+    try {
+      await moveRuleMembership([ruleMenu.rule.id], folderId);
+      committed = true;
+      await refreshOrganization();
+      if (mountedRef.current) {
+        setRuleMenu(null);
+        showToast('规则已移动', 'success');
+      }
+    } catch (error) {
+      if (mountedRef.current) {
+        if (committed) setRuleMenu(null);
+        showRuleLoadError(committed ? '规则已移动，但列表刷新失败，请重新进入解析规则查看。'
+          : error instanceof Error ? error.message : '移动失败，请重试');
+      }
+    } finally {
+      ruleMenuBusyRef.current = false;
+      if (mountedRef.current) setRuleMenuBusy(false);
     }
-  }, []);
-  const openSwipeable = useCallback((id: string) => {
-    const previousId = openSwipeableIdRef.current;
-    if (previousId && previousId !== id) swipeableRefs.current.get(previousId)?.close();
-    openSwipeableIdRef.current = id;
-  }, []);
-  const closedSwipeable = useCallback((id: string) => {
-    if (openSwipeableIdRef.current === id) openSwipeableIdRef.current = null;
-  }, []);
+  };
 
   const prepareNormalList = useCallback(() => {
     const offset = Math.max(0, scrollOffsetRef.current);
@@ -734,17 +799,17 @@ export default function RulesScreen() {
     // Mount a sufficient prefix once to restore that offset without assuming
     // fixed row heights. Ordinary page entry always starts with eight rows.
     setInitialRuleCount(offset > 0
-      ? Math.min(rules.length, Math.max(INITIAL_RULE_BATCH,
+      ? Math.min(listEntries.length, Math.max(INITIAL_RULE_BATCH,
         Math.ceil((offset + viewportHeightRef.current) / RULE_CARD_MIN_HEIGHT) + 1))
       : INITIAL_RULE_BATCH);
-  }, [rules.length]);
+  }, [listEntries.length]);
 
   // 调整顺序模式
   const enterSortMode = useCallback(() => {
-    if (rules.length < 2 || sortSavingRef.current) return;
-    closeOpenSwipeable();
-    sortListOffsetRef.current = { x: 0, y: scrollOffsetRef.current };
-    const ids = rules.map((rule) => rule.id);
+    if (visibleRules.length < 2 || sortSavingRef.current) return;
+    setManagerVisible(false);
+    sortListOffsetRef.current = { x: 0, y: folders.length ? 0 : scrollOffsetRef.current };
+    const ids = visibleRules.map((rule) => rule.id);
     orderRef.current = ids;
     setOrder(ids);
     dragIndexRef.current = -1;
@@ -753,7 +818,7 @@ export default function RulesScreen() {
     draggingIdRef.current = null;
     sortModeRef.current = true;
     setSortMode(true);
-  }, [closeOpenSwipeable, rules]);
+  }, [visibleRules, folders.length]);
 
   const stopAutoScroll = useCallback(() => {
     autoScrollDirectionRef.current = 0;
@@ -791,7 +856,17 @@ export default function RulesScreen() {
     setSortSaving(true);
     resetDrag();
     try {
-      await setRulesDisplayOrder(ids);
+      // 只调整当前分组在全局展示序列中的子序列，其他分组的相对顺序保持不变。
+      const latestRules = await getAllRules();
+      const latestFolderIds = new Set((await getAllRuleFolders()).map(folder => folder.id));
+      const scopedIds = new Set(latestRules.filter(rule =>
+        (rule.folderId && latestFolderIds.has(rule.folderId) ? rule.folderId : null) === currentFolderId
+      ).map(rule => rule.id));
+      if (scopedIds.size !== ids.length || ids.some(id => !scopedIds.has(id))) {
+        throw new Error('规则列表已变化，请取消排序后重新调整');
+      }
+      let cursor = 0;
+      await setRulesDisplayOrder(latestRules.map(rule => scopedIds.has(rule.id) ? ids[cursor++] : rule.id));
       if (!mountedRef.current) return;
       prepareNormalList();
       sortModeRef.current = false;
@@ -809,7 +884,7 @@ export default function RulesScreen() {
       sortSavingRef.current = false;
       if (mountedRef.current) setSortSaving(false);
     }
-  }, [resetDrag, prepareNormalList, loadData, showToast]);
+  }, [resetDrag, prepareNormalList, loadData, showToast, currentFolderId]);
 
   const clearDragState = useCallback((session: number) => {
     if (!mountedRef.current || session !== dragSessionRef.current) return;
@@ -883,7 +958,7 @@ export default function RulesScreen() {
     (effectiveTranslationY: number) => {
       if (!draggingIdRef.current) return;
       const next = moveRuleForDrag(orderRef.current, dragIndexRef.current,
-        accumulatedRef.current, effectiveTranslationY, heightsRef.current, SORT_ROW_GAP);
+        accumulatedRef.current, effectiveTranslationY, heightsRef.current, Spacing.sm);
       dragIndexRef.current = next.index;
       accumulatedRef.current = next.accumulated;
       dragY.value = next.offset;
@@ -970,7 +1045,7 @@ export default function RulesScreen() {
       const cached = gestureCacheRef.current.get(id);
       if (cached) return cached;
       const gesture = Gesture.Pan()
-        .activateAfterLongPress(300)
+        .minDistance(4)
         .runOnJS(true)
         .onStart(() => handleDragStart(id))
         .onUpdate((event) => handleDragUpdate(event.translationY, event.absoluteY))
@@ -1174,12 +1249,16 @@ export default function RulesScreen() {
     );
   };
 
-  const renderNormalRule = useCallback(({ item }: { item: QRCodeRule }) => (
-    <RuleListItem rule={item} onEdit={handleEditRule} onToggle={handleToggleRule}
-      onDelete={handleDeleteRule} onEnterSort={enterSortMode} onRegister={registerSwipeable}
-      onOpen={openSwipeable} onClose={closedSwipeable} />
-  ), [handleEditRule, handleToggleRule, handleDeleteRule, enterSortMode,
-    registerSwipeable, openSwipeable, closedSwipeable]);
+  const renderNormalRule = useCallback(({ item, index }: { item: RuleListEntry; index: number }) => {
+    if (!('fieldOrder' in item)) return <RuleFolderCard folder={item}
+      count={rules.filter(rule => rule.folderId === item.id).length} onOpen={openFolder} />;
+    return <View>
+      {!currentFolderId && folders.length > 0 && index === folders.length &&
+        <Text style={styles.ungroupedHeading}>未分组 · {visibleRules.length} 条规则</Text>}
+      <RuleListItem rule={item} onEdit={handleEditRule} onToggle={handleToggleRule} onMore={openRuleMenu} />
+    </View>;
+  }, [rules, openFolder, currentFolderId, folders.length, styles, visibleRules.length,
+    handleEditRule, handleToggleRule, openRuleMenu]);
   const listContentStyle = useMemo(() => [styles.scrollContent,
     { paddingBottom: 100 + insets.bottom }], [styles, insets.bottom]);
   const normalListEmpty = useMemo(() => loading ? (
@@ -1187,9 +1266,9 @@ export default function RulesScreen() {
       <ActivityIndicator accessibilityLabel="正在加载解析规则" color={theme.primary} />
       <Text style={styles.noFieldsHint}>正在加载解析规则</Text>
     </View>
-  ) : <AppEmptyState icon="sliders" title="暂无解析规则"
-    description="添加后可按不同二维码格式进行识别。" style={styles.emptyContainer} />,
-  [loading, styles, theme.primary]);
+  ) : <AppEmptyState icon={currentFolderId ? 'folder' : 'sliders'} title={currentFolderId ? '文件夹内暂无规则' : '暂无解析规则'}
+    description={currentFolderId ? '可以在这里新增规则，或通过管理移入已有规则。' : '添加后可按不同二维码格式进行识别。'} style={styles.emptyContainer} />,
+  [loading, currentFolderId, styles, theme.primary]);
 
   const editorContent = modalVisible ? (
     <Screen
@@ -1224,12 +1303,10 @@ export default function RulesScreen() {
           </View>
         </View>
 
-        <MotionContent contentKey={editorSection} direction={editorSection === 'main' ? 'back' : 'forward'} style={{ flex: 1 }}><KeyboardAwareFormScrollView
+        <MotionContent contentKey={editorSection} direction={editorSection === 'main' ? 'back' : 'forward'} style={{ flex: 1 }}><ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
           key={editorSection}
           style={styles.ruleEditorBody}
-          contentContainerStyle={styles.ruleEditorBodyContent}
-          bottomOffset={24}
-          extraScrollHeight={18}
+          contentContainerStyle={[{ flexGrow: 1 }, styles.ruleEditorBodyContent]}
           showsVerticalScrollIndicator={true}
         >
           {editorSection === 'main' && (
@@ -1259,6 +1336,16 @@ export default function RulesScreen() {
                   {ruleNameError}
                 </Text>
               )}
+
+              <Text style={styles.inputLabel}>规则文件夹</Text>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="选择规则文件夹"
+                style={[styles.textInput, { flexDirection: 'row', alignItems: 'center', gap: 8 }]}
+                onPress={() => { Keyboard.dismiss(); setFolderPickerVisible(true); }}>
+                <Text style={[styles.fieldSelectText, { flex: 1, flexShrink: 1 }]} numberOfLines={1}>
+                  {folders.find(folder => folder.id === draftFolderId)?.name ?? '未分组'}
+                </Text>
+                <Feather name="chevron-down" size={18} color={theme.textSecondary} />
+              </TouchableOpacity>
 
               <Text style={styles.inputLabel}>规则供应商（可选）</Text>
               <TouchableOpacity
@@ -1823,7 +1910,7 @@ export default function RulesScreen() {
               </View>
             </>
           )}
-        </KeyboardAwareFormScrollView></MotionContent>
+        </ScrollView></MotionContent>
 
         {<RuleOptionPicker
             title={CONDITION_PICKER_TITLES[conditionPicker || 'logic']}
@@ -1876,6 +1963,10 @@ export default function RulesScreen() {
           onDeleted={() => undefined}
           onClose={() => setSupplierPickerVisible(false)}
          visible={Boolean(supplierPickerVisible)} />;
+  const folderPickerContent = folderPickerVisible ? <RuleOptionPicker title="选择规则文件夹"
+    value={draftFolderId} options={[{ value: '', label: '未分组' }, ...folders.map(folder => ({ value: folder.id, label: folder.name }))]}
+    onSelect={id => { setDraftFolderId(id); setFolderPickerVisible(false); }}
+    onClose={() => setFolderPickerVisible(false)} /> : null;
 
   // Diagnosis opens an editor page, so only the stack performs its enter/exit transition.
   // The ordinary settings list retains its existing native Modal editor.
@@ -1895,6 +1986,7 @@ export default function RulesScreen() {
           </Screen>
         )}
         {supplierPickerContent}
+        {folderPickerContent}
         {alert.AlertComponent}
         <ToastContainer />
       </>
@@ -1922,13 +2014,14 @@ export default function RulesScreen() {
             <TouchableOpacity
               style={styles.backButton}
               activeOpacity={0.86}
-              onPress={() => router.back()} accessibilityLabel="返回上一页"
+              onPress={() => currentFolderId ? openFolder(null) : router.back()}
+              accessibilityLabel={currentFolderId ? '返回规则列表' : '返回上一页'}
             >
               <Feather name="arrow-left" size={20} color={theme.textPrimary} />
             </TouchableOpacity>
           )}
           <View style={styles.headerContent}>
-            <Text style={styles.title}>{sortMode ? '调整顺序' : '解析规则'}</Text>
+            <Text style={styles.title} numberOfLines={1}>{sortMode ? '调整顺序' : currentFolder?.name ?? '解析规则'}</Text>
           </View>
           {sortMode ? (
             <TouchableOpacity
@@ -1943,6 +2036,11 @@ export default function RulesScreen() {
               <Text style={styles.addButtonText}>{sortSaving ? '保存中' : '完成'}</Text>
             </TouchableOpacity>
           ) : (
+            <>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel="管理解析规则"
+              onPress={() => setManagerVisible(true)} style={styles.manageButton}>
+              <Feather name="more-horizontal" size={22} color={theme.textPrimary} />
+            </TouchableOpacity>
             <TouchableOpacity
               accessibilityRole="button"
               accessibilityLabel="新增解析规则"
@@ -1953,10 +2051,12 @@ export default function RulesScreen() {
               <Feather name="plus" size={18} color={theme.buttonPrimaryText} />
               <Text style={styles.addButtonText}>新增</Text>
             </TouchableOpacity>
+            </>
           )}
         </View>
 
         {/* 普通浏览只挂载可视批次；排序时保留完整布局及原拖动算法。 */}
+        <MotionContent contentKey={currentFolderId ?? '__root__'} direction={folderDirection} style={{ flex: 1 }}>
         {sortMode ? (
           <ScrollView
             ref={scrollViewRef}
@@ -1974,14 +2074,14 @@ export default function RulesScreen() {
             onContentSizeChange={(_width, height) => { contentHeightRef.current = height; }}
           >
             <View style={{ gap: Spacing.sm }}>
-              <Text style={styles.sortHint}>长按并拖动卡片调整顺序，完成后点右上角完成</Text>
+              <Text style={styles.sortHint}>拖动右侧手柄调整当前列表顺序，完成后点右上角完成</Text>
               {order.map((id) => {
                 const rule = rulesById.get(id);
                 if (!rule) return null;
                 const isDragging = draggingId === id;
                 return (
-                  <GestureDetector key={id} gesture={getDragGesture(id)}>
                     <Animated.View
+                      key={id}
                       onLayout={(event) => { heightsRef.current[id] = event.nativeEvent.layout.height; }}
                       layout={isDragging ? undefined : SORT_LAYOUT_TRANSITION}
                       style={[
@@ -1992,19 +2092,20 @@ export default function RulesScreen() {
                       ]}
                     >
                       <View style={styles.ruleContent}><RuleCardContent rule={rule} styles={styles} /></View>
-                      <View style={styles.dragHandle}>
+                      <GestureDetector gesture={getDragGesture(id)}><View
+                        accessibilityLabel={`拖动排序${rule.name}`} style={styles.dragHandle}>
                         <Feather name="menu" size={20} color={isDragging ? theme.primary : theme.textMuted} />
-                      </View>
+                      </View></GestureDetector>
                     </Animated.View>
-                  </GestureDetector>
                 );
               })}
             </View>
           </ScrollView>
         ) : (
           <FlatList
+            key={currentFolderId ?? '__root__'}
             ref={normalListRef}
-            data={rules}
+            data={listEntries}
             renderItem={renderNormalRule}
             keyExtractor={ruleListKey}
             initialNumToRender={initialRuleCount}
@@ -2019,10 +2120,10 @@ export default function RulesScreen() {
             showsVerticalScrollIndicator={false}
             scrollEventThrottle={16}
             onScroll={handleListScroll}
-            onScrollBeginDrag={closeOpenSwipeable}
             onLayout={(event) => { viewportHeightRef.current = event.nativeEvent.layout.height; }}
           />
         )}
+        </MotionContent>
       </View>
 
       {/* 普通规则列表仍使用原有编辑弹窗。 */}
@@ -2036,6 +2137,25 @@ export default function RulesScreen() {
       </> : null}</Modal>}
 
       {supplierPickerContent}
+      {folderPickerContent}
+      <RuleFolderManager visible={managerVisible} rules={rules} folders={folders} currentFolderId={currentFolderId}
+        onClose={() => setManagerVisible(false)} onMoveRules={moveRuleMembership} onChanged={refreshOrganization} onSortRules={enterSortMode} />
+      <RuleRowActions visible={Boolean(ruleMenu)} title={ruleMenu?.stage === 'move' ? '移动到文件夹' : '管理规则'}
+        detail={ruleMenu?.rule.name} onClose={closeRuleMenu}
+        options={ruleMenu?.stage === 'move' ? [
+          ...(ruleMenuFolderId ? [{ value: '', label: '移回未分组' }] : []),
+          ...folders.filter(folder => folder.id !== ruleMenuFolderId).map(folder => ({ value: folder.id, label: folder.name })),
+        ].map(option => ({ ...option, disabled: ruleMenuBusy, onPress: () => { void moveSingleRule(option.value || null); } }))
+          : [
+            { value: 'move', label: '移动到文件夹', disabled: folders.length === 0,
+              onPress: () => { if (ruleMenu) setRuleMenu({ ...ruleMenu, stage: 'move' }); } },
+            { value: 'delete', label: '删除规则', danger: true, onPress: () => {
+              if (!ruleMenu) return;
+              const target = ruleMenu.rule;
+              setRuleMenu(null);
+              handleDeleteRule(target);
+            } },
+          ]} />
 
       {/* 自定义弹窗 */}
       {alert.AlertComponent}

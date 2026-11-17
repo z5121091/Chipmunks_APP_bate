@@ -6,6 +6,7 @@ import { SafeAreaView, StyleSheet, Text, View, useWindowDimensions } from 'react
 import { Feather } from '@expo/vector-icons';
 import { rf, rs } from '@/utils/responsive';
 import { useTheme } from '@/hooks/useTheme';
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { BorderRadius, BorderWidth, Spacing } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH, getAppModalWidth } from '@/constants/modal';
 import { withAlpha } from '@/utils/colors';
@@ -34,6 +35,7 @@ interface WarehouseGuideProps {
 export function WarehouseGuide({ visible, onSkip, onGoToSettings }: WarehouseGuideProps) {
   const step = STEPS[0];
   const { theme } = useTheme();
+  const styles = useResponsiveStyles(theme, createStyles);
   const { width } = useWindowDimensions();
   const modalWidth = getAppModalWidth(width);
 
@@ -114,7 +116,7 @@ export function shouldShowWarehouseGuide(options: {
   return !options.hasBusinessData && !options.hasWarehouseConfig;
 }
 
-const styles = StyleSheet.create({
+const createStyles = () => StyleSheet.create({
   overlay: {
     flex: 1,
     justifyContent: 'center',

@@ -22,7 +22,6 @@ jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon', FontAwesome6: 'Icon' }
 jest.mock('react-native-safe-area-context', () => ({ useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }) }));
 jest.mock('@react-native-async-storage/async-storage', () => jest.requireActual('@react-native-async-storage/async-storage/jest/async-storage-mock'));
 jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'FormScrollView' }));
 jest.mock('@/components/CustomAlert', () => ({ useCustomAlert: () => ({ showError: jest.fn(), AlertComponent: null }) }));
 jest.mock('@/utils/toast', () => ({ useToast: () => ({ ToastContainer: () => null }) }));
 jest.mock('@/utils/feedback', () => ({ initSoundSetting: jest.fn(), setSoundEnabled: jest.fn() }));

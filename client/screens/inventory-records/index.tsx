@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionPresence } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -93,7 +94,7 @@ export default function InventoryRecordsScreen() {
   const router = useSafeRouter();
   const insets = useSafeAreaInsets();
   const alert = useCustomAlert();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
 
   const [selectedAccountKey, setSelectedAccountKey] = useState<ErpAccountKey | null>(null);
   const selectedAccountRef = useRef(selectedAccountKey);

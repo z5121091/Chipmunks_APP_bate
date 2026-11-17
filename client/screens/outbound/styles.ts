@@ -424,12 +424,14 @@ export const createStyles = (theme: Theme) => {
     paddingBottom: 0,
   },
 
+  modalScroll: { flex: 1, minHeight: 0 },
+
   modalActions: {
     marginTop: 0,
   },
 
   outboundUnpackBodyContent: {
-    paddingBottom: Spacing['2xl'],
+    paddingBottom: Spacing.md,
   },
 
   unpackTextInput: {

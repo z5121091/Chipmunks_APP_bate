@@ -196,8 +196,10 @@ it('focuses on entry, readiness and foreground, but pauses for dialogs and inact
   const onActionPress = jest.fn();
   const remove = jest.fn();
   let onAppState: (state: AppStateStatus) => void = () => undefined;
+  let onWindowBlur: (state: AppStateStatus) => void = () => undefined;
   const subscription = jest.spyOn(AppState, 'addEventListener').mockImplementation((event, handler) => {
     if (event === 'change') onAppState = handler;
+    if (event === 'blur') onWindowBlur = handler;
     return { remove };
   });
   const originalState = AppState.currentState;
@@ -210,7 +212,7 @@ it('focuses on entry, readiness and foreground, but pauses for dialogs and inact
       else root = TestRenderer.create(element, { createNodeMock: node => node.type === TextInput ? { focus, clear, isFocused: () => false } : null });
     });
   };
-  const tick = async () => { await act(async () => { jest.advanceTimersByTime(200); }); };
+  const tick = async () => { await act(async () => { jest.advanceTimersByTime(0); }); };
   try {
     await render({ processing: true });
     await tick();
@@ -248,6 +250,7 @@ it('focuses on entry, readiness and foreground, but pauses for dialogs and inact
     expect(focus).toHaveBeenCalledTimes(1);
 
     focus.mockClear();
+    await act(async () => { onWindowBlur('active'); });
     AppState.currentState = 'background';
     await act(async () => { onAppState('background'); });
     await tick();
@@ -256,6 +259,7 @@ it('focuses on entry, readiness and foreground, but pauses for dialogs and inact
     await act(async () => { onAppState('active'); });
     await tick();
     expect(focus).toHaveBeenCalledTimes(1);
+    await act(async () => { root!.root.findByType(TextInput).props.onFocus({}); });
     focus.mockClear();
     await act(async () => { root!.root.findByType(TextInput).props.onBlur({}); });
     await tick();
@@ -307,6 +311,7 @@ it('coalesces repeated focus requests, keeps the caret on repeated scans, and pa
     inputRef.current!.focus(300);
     await tick();
     expect(focus).toHaveBeenCalledTimes(1);
+    await act(async () => { input().props.onFocus({}); });
     for (let index = 0; index < 10; index++) {
       await act(async () => {
         input().props.onSubmitEditing({ nativeEvent: { text: `QR/${index}` } });
@@ -316,13 +321,16 @@ it('coalesces repeated focus requests, keeps the caret on repeated scans, and pa
       await tick();
     }
     expect(submit).toHaveBeenCalledTimes(10);
+    await tick(1000);
     expect(focus).toHaveBeenCalledTimes(1);
+    expect(blur).not.toHaveBeenCalled();
 
     focused = false;
     await act(async () => { root!.root.findByType(TouchableOpacity).props.onPress(); });
     await tick();
     expect(action).toHaveBeenCalledTimes(1);
     expect(focus).toHaveBeenCalledTimes(2);
+    await act(async () => { input().props.onFocus({}); });
 
     focused = false;
     await act(async () => { event('blur')('active'); input().props.onBlur({}); });
@@ -332,6 +340,7 @@ it('coalesces repeated focus requests, keeps the caret on repeated scans, and pa
     await act(async () => { event('focus')('active'); });
     await tick();
     expect(focus).toHaveBeenCalledTimes(3);
+    await act(async () => { input().props.onFocus({}); });
 
     // A delayed page callback cannot steal focus from a quantity/confirmation dialog.
     focused = false;
@@ -352,6 +361,56 @@ it('coalesces repeated focus requests, keeps the caret on repeated scans, and pa
     await render();
     await tick();
     expect(focus).toHaveBeenCalledTimes(5);
+  } finally {
+    if (root) await act(async () => { root!.unmount(); });
+    subscription.mockRestore();
+    AppState.currentState = originalState;
+    jest.useRealTimers();
+  }
+});
+
+it('retries an unacknowledged Android focus once after the input becomes editable again', async () => {
+  jest.useFakeTimers();
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  jest.mocked(useIsFocused).mockReturnValue(true);
+  const originalState = AppState.currentState;
+  AppState.currentState = 'active';
+  let requestedFocus = false;
+  const focus = jest.fn(() => { requestedFocus = true; });
+  const blur = jest.fn(() => { requestedFocus = false; });
+  // React Native caches the command immediately, even if Android could not focus the view.
+  const native = { focus, blur, isFocused: () => requestedFocus };
+  const subscription = jest.spyOn(AppState, 'addEventListener').mockImplementation(() => ({ remove: jest.fn() }));
+  let root: TestRenderer.ReactTestRenderer | undefined;
+  const render = async (processing: boolean) => {
+    await act(async () => {
+      const element = <WarehouseScanInput processing={processing} actionLabel="Scan" onActionPress={jest.fn()} />;
+      if (root) root.update(element);
+      else root = TestRenderer.create(element, { createNodeMock: node => node.type === TextInput ? native : null });
+    });
+  };
+  const tick = async (ms: number) => { await act(async () => { jest.advanceTimersByTime(ms); }); };
+  try {
+    await render(true);
+    await tick(1000);
+    expect(focus).not.toHaveBeenCalled();
+    await render(false);
+    await tick(0);
+    expect(focus).toHaveBeenCalledTimes(1);
+    expect(blur).not.toHaveBeenCalled();
+    await tick(1000);
+    expect(blur).toHaveBeenCalledTimes(1);
+    expect(focus).toHaveBeenCalledTimes(2);
+    await tick(1000);
+    expect(focus).toHaveBeenCalledTimes(2);
+
+    await render(true);
+    await render(false);
+    await tick(0);
+    expect(focus).toHaveBeenCalledTimes(3);
+    await render(true);
+    await tick(1000);
+    expect(focus).toHaveBeenCalledTimes(3);
   } finally {
     if (root) await act(async () => { root!.unmount(); });
     subscription.mockRestore();
@@ -398,7 +457,7 @@ it('hands scanner focus to a shown modal while the page scanner remains blocked'
       }
     });
   };
-  const tick = async () => { await act(async () => { jest.advanceTimersByTime(200); }); };
+  const tick = async () => { await act(async () => { jest.advanceTimersByTime(0); }); };
 
   try {
     await render(false);
@@ -458,11 +517,12 @@ it('keeps busy hardware scan capture editable and focused only when explicitly e
       if (root) root.update(element);
       else root = TestRenderer.create(element, { createNodeMock: node => node.type === TextInput ? native : null });
     });
-    await act(async () => { jest.advanceTimersByTime(200); });
+    await act(async () => { jest.advanceTimersByTime(0); });
   };
   try {
     await render();
     expect(focus).toHaveBeenCalledTimes(1);
+    await act(async () => { root!.root.findByType(TextInput).props.onFocus({}); });
 
     await render({ processing: true, acceptInputWhileProcessing: true });
     const input = root!.root.findByType(TextInput);

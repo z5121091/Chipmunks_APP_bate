@@ -1,4 +1,5 @@
 from .apm import build_native_apm_label
+from .belling import build_native_belling_label
 from .boya import build_native_boya_label
 from .common import get_excel_cell_text
 from .dongwei import build_native_dongwei_label
@@ -69,6 +70,13 @@ NATIVE_LABEL_TEMPLATE_RENMAO = {
     'builder': build_native_renmao_label,
 }
 
+NATIVE_LABEL_TEMPLATE_BELLING = {
+    'key': 'belling',
+    'name': '上海贝岭',
+    'include_logo': True,
+    'builder': build_native_belling_label,
+}
+
 NATIVE_LABEL_TEMPLATE_INTERNAL = {
     'key': 'internal',
     'name': '内部标签',
@@ -85,6 +93,7 @@ NATIVE_LABEL_TEMPLATE_BY_SUPPLIER = {
     '荣湃半导体(上海)有限公司': NATIVE_LABEL_TEMPLATE_RONGPAI,
     '上海先积集成电路有限公司': NATIVE_LABEL_TEMPLATE_LINEARIN,
     '广东仁懋电子有限公司': NATIVE_LABEL_TEMPLATE_RENMAO,
+    '上海贝岭股份有限公司': NATIVE_LABEL_TEMPLATE_BELLING,
 }
 
 

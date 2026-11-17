@@ -1,42 +1,11 @@
-﻿import { StyleSheet } from 'react-native';
+﻿import { Dimensions, StyleSheet } from 'react-native';
 import { withAlpha } from '@/utils/colors';
 import { Spacing, BorderRadius, Theme, BorderWidth } from '@/constants/theme';
 import { APP_MODAL_MAX_WIDTH } from '@/constants/modal';
-import { rs, rf } from '@/utils/responsive';
+import { scaleControlSize, rf } from '@/utils/responsive';
 
-// 动态计算更新弹窗内容区域的最大高度
-const calculateUpdateModalBodyMaxHeight = (
-  screenHeight: number,
-  insets: { top: number; bottom: number }
-): number => {
-  // 计算各部分高度：
-  // - Header: 约 70px (paddingVertical: 16 + 内容约 38px)
-  // - Footer: 约 120px (padding: 16 + 内容约 104px)
-  // - 弹窗overlay padding: 24 (上下各24 = 48px)
-  // - safeAreaInsets: top + bottom
-  const headerHeight = 70;
-  const footerHeight = 120;
-  const modalPadding = 48;
-  const safeAreaHeight = insets.top + insets.bottom;
-
-  // 计算可用高度
-  const availableHeight =
-    screenHeight - headerHeight - footerHeight - modalPadding - safeAreaHeight;
-
-  // 确保最小高度为 200px
-  return Math.max(availableHeight, 200);
-};
-
-// 模块级缓存：静态样式仅在 theme 变化时重建，不受屏幕尺寸变化影响
-let cachedBaseTheme: Theme | null = null;
-let cachedBaseStyles: ReturnType<typeof StyleSheet.create> | null = null;
-
-const getBaseStyles = (theme: Theme) => {
-  if (cachedBaseTheme === theme && cachedBaseStyles) {
-    return cachedBaseStyles;
-  }
-  cachedBaseTheme = theme;
-  cachedBaseStyles = StyleSheet.create({
+// 两部分均由末尾的完整输入缓存统一管理，避免基底复用旧窗口的 responsive tokens。
+const getBaseStyles = (theme: Theme) => StyleSheet.create({
     container: {
       flex: 1,
       backgroundColor: theme.backgroundRoot,
@@ -214,8 +183,8 @@ const getBaseStyles = (theme: Theme) => {
       elevation: 2,
     },
     exportIcon: {
-      width: rs(38),
-      height: rs(38),
+      width: scaleControlSize(38),
+      height: scaleControlSize(38),
       borderRadius: BorderRadius.md,
       backgroundColor: withAlpha(theme.primary, 0.06),
       justifyContent: 'center',
@@ -374,6 +343,7 @@ const getBaseStyles = (theme: Theme) => {
     modalBody: {
       paddingBottom: 0,
     },
+    modalScrollArea: { flex: 1, minHeight: 0 },
     modalBodyContent: {
       paddingBottom: Spacing['3xl'],
     },
@@ -654,8 +624,8 @@ const getBaseStyles = (theme: Theme) => {
       paddingVertical: Spacing.sm,
     },
     aboutLogo: {
-      width: rs(24),
-      height: rs(24),
+      width: scaleControlSize(24),
+      height: scaleControlSize(24),
       borderRadius: BorderRadius.sm,
       backgroundColor: withAlpha(theme.primary, 0.08),
       justifyContent: 'center',
@@ -705,14 +675,14 @@ const getBaseStyles = (theme: Theme) => {
       paddingVertical: 2,
     },
     aboutDetailIconWrapper: {
-      width: rs(20),
+      width: scaleControlSize(20),
       alignItems: 'center',
       marginRight: Spacing.xs,
     },
     aboutDetailLabel: {
       fontSize: rf(13),
       color: theme.textSecondary,
-      width: rs(64),
+      width: scaleControlSize(64),
     },
     aboutDetailRight: {
       flex: 1,
@@ -729,7 +699,7 @@ const getBaseStyles = (theme: Theme) => {
       textAlign: 'center',
     },
     aboutDetailAccessorySpacer: {
-      width: rs(12),
+      width: scaleControlSize(12),
     },
     // 使用说明和更新日志入口 - 水平排列
     helpRow: {
@@ -940,8 +910,8 @@ const getBaseStyles = (theme: Theme) => {
       borderBottomColor: theme.border,
     },
     syncAssistantIcon: {
-      width: rs(40),
-      height: rs(40),
+      width: scaleControlSize(40),
+      height: scaleControlSize(40),
       borderRadius: BorderRadius.md,
       alignItems: 'center',
       justifyContent: 'center',
@@ -1074,10 +1044,6 @@ const getBaseStyles = (theme: Theme) => {
       fontWeight: '600',
       color: theme.textPrimary,
     },
-    updateModalBody: {
-      maxHeight: 525,
-      paddingTop: 0,
-    },
     updateModalBodyContent: {
       paddingBottom: Spacing.sm,
     },
@@ -1174,6 +1140,7 @@ const getBaseStyles = (theme: Theme) => {
       justifyContent: 'center',
       alignItems: 'center',
       paddingHorizontal: Spacing.xl,
+      paddingVertical: Spacing.md,
     },
     restartModalContent: {
       width: '100%',
@@ -1181,12 +1148,11 @@ const getBaseStyles = (theme: Theme) => {
     },
     restartModalBody: {
       alignItems: 'center',
-      justifyContent: 'center',
     },
     restartModalIcon: {
-      width: rs(80),
-      height: rs(80),
-      borderRadius: rs(40),
+      width: scaleControlSize(80),
+      height: scaleControlSize(80),
+      borderRadius: scaleControlSize(40),
       backgroundColor: withAlpha(theme.accent, 0.1),
       justifyContent: 'center',
       alignItems: 'center',
@@ -1211,7 +1177,6 @@ const getBaseStyles = (theme: Theme) => {
       borderRadius: BorderRadius.md,
       padding: Spacing.md,
       width: '100%',
-      marginBottom: Spacing.xl,
       alignItems: 'center',
     },
     restartModalWarningTitleRow: {
@@ -1234,33 +1199,16 @@ const getBaseStyles = (theme: Theme) => {
       lineHeight: rf(20),
     },
   });
-  return cachedBaseStyles!;
-};
-
-// 模块级缓存：动态样式基于屏幕尺寸缓存，避免每次调用都重建
-interface DynamicStylesCache {
-  screenWidth: number;
-  screenHeight: number;
-  styles: ReturnType<typeof StyleSheet.create>;
-}
-let dynamicCache: DynamicStylesCache | null = null;
 
 const getDynamicStyles = (
-  theme: Theme,
   screenWidth?: number,
-  screenHeight?: number,
-  insets?: { top: number; bottom: number }
+  screenHeight?: number
 ) => {
   const sw = screenWidth ?? 0;
   const sh = screenHeight ?? 0;
 
-  // 屏幕尺寸未变化时复用缓存
-  if (dynamicCache && dynamicCache.screenWidth === sw && dynamicCache.screenHeight === sh) {
-    return dynamicCache.styles;
-  }
-
   const isCompactScreen = sw <= 390 || sh <= 760;
-  const styles = {
+  return {
     scrollContent: {
       paddingHorizontal: isCompactScreen ? Spacing.sm : Spacing.md,
       paddingTop: isCompactScreen ? Spacing.xs : Spacing.sm,
@@ -1275,8 +1223,8 @@ const getDynamicStyles = (
       paddingHorizontal: Spacing.md,
     },
     exportIcon: {
-      width: isCompactScreen ? rs(32) : rs(36),
-      height: isCompactScreen ? rs(32) : rs(36),
+      width: isCompactScreen ? scaleControlSize(32) : scaleControlSize(36),
+      height: isCompactScreen ? scaleControlSize(32) : scaleControlSize(36),
     },
     statsCard: {
       padding: isCompactScreen ? Spacing.lg : Spacing.xl,
@@ -1290,18 +1238,11 @@ const getDynamicStyles = (
       padding: isCompactScreen ? Spacing.sm : Spacing.md,
     },
     syncAssistantIcon: {
-      width: isCompactScreen ? rs(36) : rs(40),
-      height: isCompactScreen ? rs(36) : rs(40),
-    },
-    updateModalBody: {
-      maxHeight:
-        screenHeight && insets ? calculateUpdateModalBodyMaxHeight(screenHeight, insets) : 525,
-      paddingTop: 0,
+      width: isCompactScreen ? scaleControlSize(36) : scaleControlSize(40),
+      height: isCompactScreen ? scaleControlSize(36) : scaleControlSize(40),
     },
   } as const;
 
-  dynamicCache = { screenWidth: sw, screenHeight: sh, styles };
-  return styles;
 };
 
 // 最终合并结果的缓存 key
@@ -1309,6 +1250,9 @@ interface StylesCache {
   theme: Theme;
   sw: number;
   sh: number;
+  windowWidth: number;
+  windowHeight: number;
+  density: number;
   // 这里同时包含容器、文字和图片样式。
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   result: Record<string, any>;
@@ -1318,24 +1262,28 @@ let stylesCache: StylesCache | null = null;
 export const createStyles = (
   theme: Theme,
   screenWidth?: number,
-  screenHeight?: number,
-  insets?: { top: number; bottom: number }
+  screenHeight?: number
 ) => {
   const sw = screenWidth ?? 0;
   const sh = screenHeight ?? 0;
+  const { width: windowWidth, height: windowHeight, scale: density } = Dimensions.get('window');
 
-  // theme + 屏幕尺寸均未变化时直接返回缓存的合并结果，避免对象合并开销
+  // FontScale 由原生文字组件应用，工厂未额外乘该值；密度则会影响像素取整。
+  // 参数尺寸、真实窗口和像素密度都影响结果，只保留这一层缓存，避免旧子缓存覆盖新输入。
   if (
     stylesCache &&
     stylesCache.theme === theme &&
     stylesCache.sw === sw &&
-    stylesCache.sh === sh
+    stylesCache.sh === sh &&
+    stylesCache.windowWidth === windowWidth &&
+    stylesCache.windowHeight === windowHeight &&
+    stylesCache.density === density
   ) {
     return stylesCache.result;
   }
 
   const base = getBaseStyles(theme);
-  const dynamic = getDynamicStyles(theme, screenWidth, screenHeight, insets);
+  const dynamic = getDynamicStyles(screenWidth, screenHeight);
 
   // 保持和 React Native StyleSheet 运行时相同的合并结果。
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1347,6 +1295,6 @@ export const createStyles = (
     }
   }
 
-  stylesCache = { theme, sw, sh, result: merged };
+  stylesCache = { theme, sw, sh, windowWidth, windowHeight, density, result: merged };
   return merged;
 };

@@ -1,6 +1,7 @@
 /* global require, __dirname */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { test } = require('node:test');
@@ -111,6 +112,131 @@ test('native backup keeps remote sequence names separate from per-execution snap
   assert.match(snapshot, /catch \(error: Exception\) \{\s*backupFile\.delete\(\)\s*throw error/);
   assert.match(snapshot, /finally \{[\s\S]*?backupFile\.exists\(\) && !backupFile\.delete\(\)/);
   assert.match(template, /\$\{appName\}_\$\{date\}_\$\{sequence\.toString\(\)\.padStart\(2, '0'\)\}\.db/);
+});
+
+const snapshotSchemaQuery = template.slice(template.indexOf('private fun readDatabaseSchema'),
+  template.indexOf('private fun validateDatabaseSnapshot')).match(/"(SELECT [^"\n]+)"/)?.[1];
+const snapshotIntegrityQuery = template.slice(template.indexOf('private fun validateDatabaseSnapshot'),
+  template.indexOf('private fun createDatabaseSnapshot')).match(/"(PRAGMA [^"\n]+)"/)?.[1];
+
+test('native snapshot validation is read-only and completes before returning a file for upload', () => {
+  assert.equal(snapshotSchemaQuery,
+    "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name, tbl_name");
+  assert.equal(snapshotIntegrityQuery, 'PRAGMA integrity_check');
+  const validation = template.slice(template.indexOf('private fun validateDatabaseSnapshot'),
+    template.indexOf('private fun createDatabaseSnapshot'));
+  assert.match(validation, /openDatabase\(backupFile\.absolutePath, null, SQLiteDatabase\.OPEN_READONLY\)/);
+  assert.match(validation, /!cursor\.moveToFirst\(\)[\s\S]*?!= "ok"[\s\S]*?cursor\.moveToNext\(\)/);
+  assert.match(validation, /readDatabaseSchema\(snapshot\) != expectedSchema/);
+  assert.match(template, /sql = if \(cursor\.isNull\(3\)\) null else cursor\.getString\(3\)/);
+  const snapshot = template.slice(template.indexOf('private fun createDatabaseSnapshot'),
+    template.indexOf('private fun uploadBackup'));
+  assert.ok(snapshot.indexOf('readDatabaseSchema(database)') < snapshot.indexOf('VACUUM INTO'));
+  assert.ok(snapshot.indexOf('VACUUM INTO') < snapshot.indexOf('validateDatabaseSnapshot(backupFile, expectedSchema)'));
+  assert.ok(snapshot.indexOf('validateDatabaseSnapshot(backupFile, expectedSchema)') < snapshot.indexOf('return DatabaseBackupSnapshot'));
+  assert.match(snapshot, /validateDatabaseSnapshot\(backupFile, expectedSchema\)[\s\S]*?catch \(error: Exception\) \{\s*backupFile\.delete\(\)\s*throw error/);
+  assert.doesNotMatch(validation, /OPEN_READWRITE|execSQL|COUNT\(\*\)|rootpage/);
+});
+
+// Execute the native validator's SQL against independent real SQLite files.
+// This verifies snapshot semantics; it is not an Android device/WorkManager test.
+function validatedSnapshot(snapshotPath, expectedSchema) {
+  const snapshot = new DatabaseSync(snapshotPath, { readOnly: true });
+  try {
+    const integrity = snapshot.prepare(snapshotIntegrityQuery).all();
+    assert.deepEqual(integrity.map(row => String(row.integrity_check).trim().toLowerCase()), ['ok']);
+    assert.deepEqual(snapshot.prepare(snapshotSchemaQuery).all(), expectedSchema);
+    return snapshot.prepare('SELECT id, quantity FROM [业务记录] ORDER BY id').all();
+  } finally { snapshot.close(); }
+}
+
+function withSnapshotFixture(run) {
+  const prefix = path.join(os.tmpdir(), 'chipmunks-native-snapshot-');
+  const directory = fs.mkdtempSync(prefix);
+  const sourcePath = path.join(directory, 'source.db');
+  const snapshotPath = path.join(directory, 'snapshot.db');
+  const source = new DatabaseSync(sourcePath);
+  try {
+    source.exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+      CREATE TABLE [业务记录] (id TEXT PRIMARY KEY, quantity INTEGER NOT NULL);
+      CREATE TABLE [审计记录] (entry_id TEXT PRIMARY KEY);
+      CREATE INDEX quantity_lookup ON [业务记录] (quantity);
+      CREATE TRIGGER record_audit AFTER INSERT ON [业务记录]
+        BEGIN INSERT INTO [审计记录] (entry_id) VALUES (new.id); END;
+      CREATE VIEW quantity_view AS SELECT id, quantity FROM [业务记录];
+      INSERT INTO [业务记录] (id, quantity) VALUES ('A', 100), ('B', 200);`);
+    const expectedSchema = source.prepare(snapshotSchemaQuery).all();
+    run({ source, sourcePath, snapshotPath, expectedSchema,
+      create: () => source.exec(`VACUUM INTO '${snapshotPath.replace(/'/g, "''")}'`) });
+  } finally {
+    source.close();
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    assert.ok(path.resolve(directory).startsWith(path.resolve(prefix)), 'Cleanup must stay in the created fixture');
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test('snapshot SQL preserves committed WAL rows, every schema object and a standalone file', () => {
+  withSnapshotFixture(({ sourcePath, snapshotPath, expectedSchema, create }) => {
+    assert.ok(fs.statSync(`${sourcePath}-wal`).size > 0);
+    create();
+    const beforeValidation = fs.readFileSync(snapshotPath);
+    const rows = validatedSnapshot(snapshotPath, expectedSchema);
+    assert.deepEqual(rows.map(row => [row.id, row.quantity]), [['A', 100], ['B', 200]]);
+    assert.ok(expectedSchema.some(row => row.type === 'index'));
+    assert.ok(expectedSchema.some(row => row.type === 'trigger'));
+    assert.ok(expectedSchema.some(row => row.type === 'view'));
+    assert.equal(fs.existsSync(`${snapshotPath}-wal`), false);
+    assert.deepEqual(fs.readFileSync(snapshotPath), beforeValidation, 'Read-only validation must not rewrite the snapshot');
+  });
+});
+
+test('snapshot validation rejects a valid SQLite file that lost a table, index, trigger or view', () => {
+  for (const sql of ['DROP TABLE [审计记录]', 'DROP INDEX quantity_lookup', 'DROP TRIGGER record_audit', 'DROP VIEW quantity_view']) {
+    withSnapshotFixture(({ snapshotPath, expectedSchema, create }) => {
+      create();
+      const modified = new DatabaseSync(snapshotPath);
+      try { modified.exec(sql); } finally { modified.close(); }
+      assert.throws(() => validatedSnapshot(snapshotPath, expectedSchema));
+    });
+  }
+});
+
+test('snapshot validation rejects a nonempty corrupt file before it could be uploaded', () => {
+  withSnapshotFixture(({ snapshotPath, expectedSchema, create }) => {
+    create();
+    const contents = fs.readFileSync(snapshotPath);
+    contents.fill(0, 0, 16);
+    fs.writeFileSync(snapshotPath, contents);
+    assert.ok(fs.statSync(snapshotPath).size > 0);
+    assert.throws(() => validatedSnapshot(snapshotPath, expectedSchema));
+  });
+});
+
+test('snapshot validation rejects actual integrity_check errors when index entries are damaged', () => {
+  withSnapshotFixture(({ snapshotPath, expectedSchema, create }) => {
+    create();
+    const locate = new DatabaseSync(snapshotPath, { readOnly: true });
+    let rootPage;
+    let pageSize;
+    try {
+      rootPage = locate.prepare("SELECT rootpage FROM sqlite_master WHERE name='quantity_lookup'").get().rootpage;
+      pageSize = locate.prepare('PRAGMA page_size').get().page_size;
+    } finally { locate.close(); }
+    // Deliberately damage only this fixture's two-entry leaf index, leaving table rows/schema readable.
+    const contents = fs.readFileSync(snapshotPath);
+    const indexPageOffset = (rootPage - 1) * pageSize;
+    assert.equal(contents[indexPageOffset], 0x0a, 'The tiny fixture index must have one leaf page');
+    contents.writeUInt16BE(0, indexPageOffset + 3);
+    fs.writeFileSync(snapshotPath, contents);
+    const inspect = new DatabaseSync(snapshotPath, { readOnly: true });
+    try {
+      const messages = inspect.prepare(snapshotIntegrityQuery).all().map(row => row.integrity_check);
+      assert.ok(messages.some(message => message !== 'ok'));
+      assert.deepEqual(inspect.prepare(snapshotSchemaQuery).all(), expectedSchema);
+    } finally { inspect.close(); }
+    assert.throws(() => validatedSnapshot(snapshotPath, expectedSchema));
+  });
 });
 
 test('native backup reads the foreground app-private NAS configuration and falls back only before migration', () => {

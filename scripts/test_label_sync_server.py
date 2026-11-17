@@ -336,6 +336,13 @@ class UnpackTimeLabelTest(unittest.TestCase):
 
     def records(self, supplier='珠海极海半导体有限公司'):
         workbook = Workbook()
+        if supplier == '上海贝岭股份有限公司':
+            workbook.active.append(['供应商', '型号', '封装', '标签数量', '生产日期', '批次',
+                                    '箱号', '追溯码', '标签类型', '拆包时间'])
+            for index, (label_type, quantity) in enumerate([('发货标签', 1200), ('剩余标签', 1800)], start=1):
+                workbook.active.append([supplier, 'BL0942', 'SSOP-10L', quantity, '2645', 'D85637ABPP',
+                                        'FPD85004SLC', f'HY111426R00218-{index}', label_type, '2026-09-15 14:30'])
+            return label_sync_server.get_native_label_records(workbook)
         workbook.active.append(['型号', '存货编码', '标签数量', '追溯码', '标签类型', '供应商', '拆包时间'])
         for sequence, (label_type, quantity) in enumerate([('发货标签', 200), ('剩余标签', 2300)], start=1):
             trace_no = f'DEMO-{sequence}' if supplier == '南京沁恒微电子股份有限公司' else ''

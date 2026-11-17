@@ -1,4 +1,5 @@
 from .apm import NATIVE_LABEL_RIGHT_VALUE_X, build_native_apm_label
+from .belling import build_native_belling_label
 from .unpack_time import build_native_unpack_time_label
 from .boya import (
     NATIVE_LABEL_BOYA_HEADER_FONT_SIZE_PIXELS,
@@ -19,6 +20,7 @@ from .common import (
     get_native_label_records,
 )
 from .registry import (
+    NATIVE_LABEL_TEMPLATE_BELLING,
     NATIVE_LABEL_TEMPLATE_BOYA,
     NATIVE_LABEL_TEMPLATE_DONGWEI,
     NATIVE_LABEL_TEMPLATE_RONGPAI,
@@ -39,6 +41,7 @@ __all__ = [
     'NATIVE_LABEL_COPIES',
     'NATIVE_LABEL_FIELD_HEADERS',
     'NATIVE_LABEL_RIGHT_VALUE_X',
+    'NATIVE_LABEL_TEMPLATE_BELLING',
     'NATIVE_LABEL_TEMPLATE_BOYA',
     'NATIVE_LABEL_TEMPLATE_DONGWEI',
     'NATIVE_LABEL_TEMPLATE_RONGPAI',
@@ -50,6 +53,7 @@ __all__ = [
     'NATIVE_LABEL_TEMPLATE_UNION',
     'NATIVE_LABEL_TEMPLATE_WCH',
     'build_native_apm_label',
+    'build_native_belling_label',
     'build_native_boya_label',
     'build_native_union_label',
     'build_native_wch_label',

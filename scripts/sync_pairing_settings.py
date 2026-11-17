@@ -7,10 +7,14 @@ configuration file; saving replaces the complete file atomically.
 import gc
 import json
 import os
-import sys
 import tempfile
 import threading
 from dataclasses import dataclass, field
+
+try:
+    from .sync_window_icon import apply_sync_window_icon
+except ImportError:
+    from sync_window_icon import apply_sync_window_icon
 
 
 PAIRING_ENV = 'PALM_WAREHOUSE_SYNC_PAIRING_KEY'
@@ -139,14 +143,7 @@ class PairingSettingsView:
             initial_error = str(error)
 
         root.title('配对设置 · 掌上仓库同步助手')
-        # The build already bundles icon.ico at the one-file extraction root.
-        # Resolve from this module when running directly, never from the CWD.
-        resource_root = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-        try:
-            root.iconbitmap(default=os.path.join(resource_root, 'icon.ico'))
-        except (OSError, tk.TclError):
-            # A missing decorative asset must not prevent pairing management.
-            pass
+        apply_sync_window_icon(root)
         root.configure(background='#f0f4f8')
         root.minsize(480, 370)
         root.resizable(True, True)

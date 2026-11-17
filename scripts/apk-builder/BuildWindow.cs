@@ -12,7 +12,7 @@ using System.Windows.Forms;
 
 namespace Chipmunks.ApkBuilder
 {
-    public sealed class BuildWindow : Form
+    public sealed class BuildWindow : BrandedForm
     {
         private static readonly Color Navy = Color.FromArgb(25, 59, 96);
         private static readonly Color Ink = Color.FromArgb(16, 35, 59);
@@ -88,8 +88,6 @@ namespace Chipmunks.ApkBuilder
             ClientSize = new Size(960, 760);
             MinimumSize = new Size(830, 690);
             BackColor = Page;
-            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
-            catch { Icon = SystemIcons.Application; }
 
             // Size the parent before anchoring children; a default 200px panel would
             // add its later growth to the right-anchored signing button position.
@@ -784,7 +782,7 @@ namespace Chipmunks.ApkBuilder
             }
         }
 
-        private sealed class CloseTaskDialog : Form
+        private sealed class CloseTaskDialog : BrandedForm
         {
             internal CloseTaskDialog()
             {

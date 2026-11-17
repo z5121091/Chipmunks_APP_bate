@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { useMemo, useRef, useState } from 'react';
 import { Keyboard, ScrollView, Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
@@ -22,7 +23,7 @@ import { createStyles } from './styles';
 
 export default function HelpScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const insets = useSafeAreaInsets();
   const router = useSafeRouter();
   const scrollRef = useRef<ScrollView>(null);

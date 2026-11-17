@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionContent } from '@/components/AppMotion';
 import { MotionChevron } from '@/components/AppMotion';
 import { MotionCollapse } from '@/components/AppMotion';
@@ -57,7 +58,7 @@ type PendingListLoadOptions = {
 
 export default function PurchaseReceiveScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const router = useSafeRouter();
   const requestIdRef = useRef(0);
   const completionRequestIdRef = useRef(0);

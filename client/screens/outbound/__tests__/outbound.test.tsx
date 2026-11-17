@@ -45,7 +45,6 @@ jest.mock('@/components/AggregatedRecordItem', () => ({ AggregatedRecordItem: 'R
 jest.mock('@/components/AppFormField', () => ({ AppFormField: 'Field' }));
 jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'Actions' }));
 jest.mock('@/components/AppModalCard', () => ({ AppModalCard: 'Card' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'Form' }));
 jest.mock('@/components/UiRedesign', () => ({ UiPageHeader: 'Header', UiWorkflowSummary: 'Summary', UiToolbarButton: 'ToolbarButton' }));
 jest.mock('@/components/WarehouseScanInput', () => ({ WarehouseScanInput: 'ScanInput' }));
 jest.mock('@/components/CustomAlert', () => {

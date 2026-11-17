@@ -1,9 +1,10 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionChevron } from '@/components/AppMotion';
 import { MotionCollapse } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
 import { AppModal as Modal } from '@/components/AppModal';
 import { useState, useCallback, useMemo, useRef } from 'react';
-import { View, Text, FlatList, TextInput, Keyboard } from 'react-native';
+import { View, Text, FlatList, TextInput, Keyboard, ScrollView } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
@@ -15,9 +16,9 @@ import { AnimatedButton } from '@/components/AnimatedButton';
 import { Screen } from '@/components/Screen';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
+import { AppModalViewport } from '@/components/AppModalViewport';
 import { AppEmptyState } from '@/components/AppEmptyState';
 import { AppFormField } from '@/components/AppFormField';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
 import { UiInput, UiToolbarButton } from '@/components/UiRedesign';
 import { createStyles } from './styles';
 import { SupplierManager } from './SupplierManager';
@@ -45,7 +46,7 @@ const normalizeBindingMatchKey = (value?: string): string =>
 
 export default function InventoryBindingScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const router = useSafeRouter();
   const alert = useCustomAlert();
   const showBindingConfirm = alert.showConfirm;
@@ -120,6 +121,16 @@ export default function InventoryBindingScreen() {
       }
     }
   }, [showBindingError]);
+
+  const handleSupplierAssigned = useCallback((bindingId: string, supplier: string) => {
+    // A later save of this editor must not restore its old empty supplier value.
+    if (editingBinding?.id === bindingId) {
+      setEditingBinding(current => current?.id === bindingId ? { ...current, supplier } : current);
+      setFormData(current => ({ ...current, supplier }));
+    }
+    const { page, keyword } = bindingQueryRef.current;
+    void loadBindings(page, keyword);
+  }, [editingBinding?.id, loadBindings]);
 
   useFocusEffect(
     useCallback(() => {
@@ -784,7 +795,7 @@ export default function InventoryBindingScreen() {
           if (!saving) setModalVisible(false);
         }}
       >{modalVisible ? <>
-        <View style={[styles.modalOverlay, supplierModalMode ? { display: 'none' } : null]}>
+        <AppModalViewport style={[styles.modalOverlay, supplierModalMode ? { display: 'none' } : null]}>
           <AppModalCard
             title={editingBinding ? '编辑绑定' : '添加绑定'}
             onClose={saving ? undefined : () => setModalVisible(false)}
@@ -792,6 +803,7 @@ export default function InventoryBindingScreen() {
             bodyStyle={styles.modalBody}
             size="largeForm"
             stretchBody
+            scrollMode="body"
             footer={
               <AppModalActions
                 containerStyle={styles.modalActions}
@@ -804,10 +816,8 @@ export default function InventoryBindingScreen() {
               />
             }
           >
-            <KeyboardAwareFormScrollView
+            <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" contentContainerStyle={{ flexGrow: 1 }}
               style={styles.bindingFormScroll}
-              bottomOffset={24}
-              extraScrollHeight={16}
               showsVerticalScrollIndicator
             >
               <AppFormField label="扫描型号" required>
@@ -894,9 +904,9 @@ export default function InventoryBindingScreen() {
                   placeholderTextColor={theme.textMuted}
                 />
               </AppFormField>
-            </KeyboardAwareFormScrollView>
+            </ScrollView>
           </AppModalCard>
-        </View>
+        </AppModalViewport>
         {<SupplierManager
             embedded
             closeRef={supplierCloseRef}
@@ -908,6 +918,7 @@ export default function InventoryBindingScreen() {
             }}
             onDeleted={(supplier) => setFormData(current => normalizeBindingMatchKey(current.supplier) === normalizeBindingMatchKey(supplier) ? { ...current, supplier: '' } : current)}
             onClose={() => setSupplierModalMode(null)}
+            onAssigned={handleSupplierAssigned}
            visible={Boolean(supplierModalMode)} />}
       </> : null}</Modal>}
 
@@ -917,14 +928,14 @@ export default function InventoryBindingScreen() {
         animationType="fade"
         onRequestClose={() => setDataToolsVisible(false)}
       >
-        <View style={styles.modalOverlay}>
+        <AppModalViewport style={styles.modalOverlay}>
           <AppModalCard
             title="物料绑定数据工具"
             subtitle="绑定表的多个版本号在同一格内换行填写。出入库和盘点单显示实际扫描版本。"
             onClose={() => setDataToolsVisible(false)}
             style={styles.modalContent}
             bodyStyle={styles.dataToolsBody}
-            size="compact"
+            size="auto"
           >
             <UiToolbarButton
               label="下载导入模板"
@@ -956,7 +967,7 @@ export default function InventoryBindingScreen() {
               }}
             />
           </AppModalCard>
-        </View>
+        </AppModalViewport>
       </Modal>
 
       {<SupplierManager
@@ -968,6 +979,7 @@ export default function InventoryBindingScreen() {
           }}
           onDeleted={(supplier) => setFormData(current => normalizeBindingMatchKey(current.supplier) === normalizeBindingMatchKey(supplier) ? { ...current, supplier: '' } : current)}
           onClose={() => setSupplierModalMode(null)}
+          onAssigned={handleSupplierAssigned}
          visible={Boolean(supplierModalMode && !modalVisible)} />}
 
       {/* 自定义弹窗 */}

@@ -42,6 +42,14 @@ namespace Chipmunks.ApkBuilder
                     Assert(report.Contains("可尝试发布热更新") && report.Contains("client/screens/new/index.tsx"), "Untracked app source was missed.");
                     Write("scripts/sync_pairing_settings.py", "new pairing");
                     Assert(ChangeAssessment.Read(repo).Contains("需要同步助手 EXE"), "Imported sync module was missed.");
+                    ChangeAssessment.RecordSuccess(repo, BuildTarget.SyncHelper, false);
+                    Write("scripts/sync_window_icon.py", "shared window icon");
+                    Assert(ChangeAssessment.Read(repo).Contains("scripts/sync_window_icon.py"), "Shared sync icon module was missed.");
+                    Write("scripts/sync_assets.py", "embedded asset reader");
+                    Write("scripts/build_sync_embedded_assets.py", "embedded asset generator and verifier");
+                    string syncReport = ChangeAssessment.Read(repo);
+                    Assert(syncReport.Contains("scripts/sync_assets.py") && syncReport.Contains("scripts/build_sync_embedded_assets.py"),
+                        "Embedded resource build inputs were missed.");
                 });
                 Test("publication resets app changes but never overwrites APK native baseline", delegate {
                     ChangeAssessment.RecordSuccess(repo, BuildTarget.Apk, true);

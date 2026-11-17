@@ -1,3 +1,4 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionChevron } from '@/components/AppMotion';
 import { MotionCollapse } from '@/components/AppMotion';
 import { MotionPresence } from '@/components/AppMotion';
@@ -28,7 +29,7 @@ import { AggregatedRecordItem } from '@/components/AggregatedRecordItem';
 import { AppFormField } from '@/components/AppFormField';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalCard } from '@/components/AppModalCard';
-import { KeyboardAwareFormScrollView } from '@/components/KeyboardAwareForm';
+import { AppModalViewport } from '@/components/AppModalViewport';
 import { UiPageHeader, UiWorkflowSummary, UiToolbarButton } from '@/components/UiRedesign';
 import { WarehouseScanInput, type WarehouseScanInputHandle } from '@/components/WarehouseScanInput';
 import { useCustomAlert } from '@/components/CustomAlert';
@@ -658,7 +659,7 @@ const mergeMaterialItemsById = (items: MaterialItem[]) => {
 
 export default function PDAScanScreen() {
   const { theme, isDark } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const router = useSafeRouter();
   const alert = useCustomAlert({ persistentErrors: true });
   // 弹窗与路由 Hook 返回对象会随渲染更新；扫码回调通过 Ref 获取最新实例，避免高频扫码链路反复重建。
@@ -702,10 +703,12 @@ export default function PDAScanScreen() {
   const legacyPromptSessionRef = useRef(-1);
   const printFailureNoticeRef = useRef('');
   const [legacyReviewItems, setLegacyReviewItems] = useState<QueueItem[]>([]);
+  const [legacyReviewBodyHeight, setLegacyReviewBodyHeight] = useState<number>();
   const [legacyReviewError, setLegacyReviewError] = useState<string | null>(null);
   const [showLegacyReview, setShowLegacyReview] = useState(false);
   const [showPrintTasks, setShowPrintTasks] = useState(false);
   const [printTasks, setPrintTasks] = useState<UnpackPrintTask[]>([]);
+  const [printTasksBodyHeight, setPrintTasksBodyHeight] = useState<number>();
   const [retryingPrintTask, setRetryingPrintTask] = useState<string | null>(null);
   const scanAcceptanceOrderRef = useRef('');
   const inputEventSequenceRef = useRef(0);
@@ -3719,10 +3722,12 @@ export default function PDAScanScreen() {
         </View>
 
         {<Modal transparent visible={Boolean(showLegacyReview) && (true)} animationType="fade" onRequestClose={() => setShowLegacyReview(false)}>{showLegacyReview ? <>
-            <View style={styles.modalOverlay}>
+            <AppModalViewport style={styles.modalOverlay}>
               <AppModalCard title="历史扫码待核对" subtitle="先核对原订单，再按当前规则恢复；不会自动补写"
-                size="list" stretchBody={false} onClose={() => setShowLegacyReview(false)}>
-                <ScrollView style={{ maxHeight: 360 }} contentContainerStyle={styles.listContent}>
+                size="list" scrollMode="body" bodyContentHeight={legacyReviewBodyHeight} stretchBody onClose={() => setShowLegacyReview(false)}>
+                <ScrollView style={styles.modalScroll} contentContainerStyle={styles.listContent}
+                  onContentSizeChange={(_width, height) => setLegacyReviewBodyHeight(Math.min(height, 360))}
+                  showsVerticalScrollIndicator keyboardDismissMode="on-drag" keyboardShouldPersistTaps="handled">
                   {legacyReviewError ? (
                     <View style={styles.erpLineDetails}>
                       <Text style={[styles.detailText, { color: theme.warning }]}>{legacyReviewError}</Text>
@@ -3757,14 +3762,16 @@ export default function PDAScanScreen() {
                   {legacyReviewItems.length === 0 && !legacyReviewError ? <AppEmptyState title="暂无待核对扫码" description="历史记录已处理" icon="check-circle" compact /> : null}
                 </ScrollView>
               </AppModalCard>
-            </View>
+            </AppModalViewport>
           </> : null}</Modal>}
 
         {<Modal transparent visible={Boolean(showPrintTasks) && (true)} animationType="fade" onRequestClose={() => setShowPrintTasks(false)}>{showPrintTasks ? <>
-            <View style={styles.modalOverlay}>
+            <AppModalViewport style={styles.modalOverlay}>
               <AppModalCard title="拆包标签任务" subtitle="任务回执由同步助手提供，请核对标签是否实际出纸"
-                size="list" stretchBody={false} onClose={() => setShowPrintTasks(false)}>
-                <ScrollView style={{ maxHeight: 360 }} contentContainerStyle={styles.listContent}>
+                size="list" scrollMode="body" bodyContentHeight={printTasksBodyHeight} stretchBody onClose={() => setShowPrintTasks(false)}>
+                <ScrollView style={styles.modalScroll} contentContainerStyle={styles.listContent}
+                  onContentSizeChange={(_width, height) => setPrintTasksBodyHeight(Math.min(height, 360))}
+                  showsVerticalScrollIndicator keyboardDismissMode="on-drag" keyboardShouldPersistTaps="handled">
                   {printTasks.map((task) => {
                     const label = task.status === 'submitted' ? '已提交同步助手' : task.status === 'skipped' ? '按策略跳过'
                       : task.status === 'failed' ? '失败待处理' : task.status === 'submitting' ? '正在提交' : '待提交';
@@ -3798,7 +3805,7 @@ export default function PDAScanScreen() {
                   {printTasks.length === 0 ? <AppEmptyState title="暂无标签任务" description="本单拆包后会保存标签处理任务" icon="printer" compact /> : null}
                 </ScrollView>
               </AppModalCard>
-            </View>
+            </AppModalViewport>
           </> : null}</Modal>}
 
         {/* 仓库选择器 */}
@@ -3838,7 +3845,7 @@ export default function PDAScanScreen() {
           animationType="fade"
           onRequestClose={closePendingOutboundUnpack}
         >
-          <View style={styles.modalOverlay}>
+          <AppModalViewport style={styles.modalOverlay}>
             <AppModalCard
               title="拆包出库"
               subtitle="按本单剩余数量拆出，并生成剩余标签"
@@ -3847,6 +3854,7 @@ export default function PDAScanScreen() {
               bodyStyle={styles.modalBody}
               size="largeForm"
               stretchBody
+              scrollMode="body"
               footer={
                 <AppModalActions
                   containerStyle={styles.modalActions}
@@ -3858,9 +3866,9 @@ export default function PDAScanScreen() {
                 />
               }
             >
-              <KeyboardAwareFormScrollView
-                contentContainerStyle={styles.outboundUnpackBodyContent}
-                bottomOffset={32}
+              <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
+                style={styles.modalScroll}
+                contentContainerStyle={[{ flexGrow: 1 }, styles.outboundUnpackBodyContent]}
                 showsVerticalScrollIndicator
               >
                 {!pendingOutboundUnpack?.internalPackage ? <AppFormField label="型号">
@@ -3913,7 +3921,7 @@ export default function PDAScanScreen() {
                   </View>
                 </AppFormField>
 
-                <AppFormField label="备注">
+                <AppFormField label="备注" style={{ marginBottom: 0 }}>
                   <TextInput
                     style={[styles.unpackTextInput, styles.unpackNotesInput]}
                     placeholder="可填写拆包原因"
@@ -3923,9 +3931,9 @@ export default function PDAScanScreen() {
                     multiline
                   />
                 </AppFormField>
-              </KeyboardAwareFormScrollView>
+              </ScrollView>
             </AppModalCard>
-          </View>
+          </AppModalViewport>
         </Modal>
         <ToastContainer />
         {alert.AlertComponent}

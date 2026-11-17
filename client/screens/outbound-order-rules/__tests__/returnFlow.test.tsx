@@ -23,7 +23,6 @@ jest.mock('../styles', () => ({ createStyles: () => ({}) }));
 jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
 jest.mock('@/components/AppEmptyState', () => ({ AppEmptyState: 'Empty' }));
 jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'Actions' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'KeyboardForm' }));
 jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon' }));
 jest.mock('@/utils/logger', () => ({ logger: { error: jest.fn() } }));
 jest.mock('@/utils/feedback', () => ({ feedbackClear: jest.fn(), feedbackClearFailed: jest.fn() }));

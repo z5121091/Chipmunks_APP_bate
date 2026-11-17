@@ -1,11 +1,11 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
-import { APP_MOTION } from '@/constants/motion';
-import { memo, useCallback, useMemo } from 'react';
-import { Switch, Text, View } from 'react-native';
+import { memo } from 'react';
+import { Text, View } from 'react-native';
+import { UiSwitch } from '@/components/UiSwitch';
 import { Feather } from '@expo/vector-icons';
-import { Swipeable } from 'react-native-gesture-handler';
 import { useTheme } from '@/hooks/useTheme';
-import { FIELD_LABELS, type QRCodeRule } from '@/utils/database';
+import { FIELD_LABELS, type QRCodeRule, type QRCodeRuleFolder } from '@/utils/database';
 import { isIgnoredRuleField, type RuleConditionMode } from '@/utils/ruleConditions';
 import { displayRuleTerminator } from '@/utils/ruleTerminator';
 import { createStyles } from './styles';
@@ -80,72 +80,54 @@ interface RuleListItemProps {
   rule: QRCodeRule;
   onEdit: (rule: QRCodeRule) => void;
   onToggle: (rule: QRCodeRule) => void;
-  onDelete: (rule: QRCodeRule) => void;
-  onEnterSort: () => void;
-  onRegister: (id: string, instance: Swipeable | null) => void;
-  onOpen: (id: string) => void;
-  onClose: (id: string) => void;
+  onMore: (rule: QRCodeRule) => void;
 }
 
 export const RuleListItem = memo(function RuleListItem({
   rule,
   onEdit,
   onToggle,
-  onDelete,
-  onEnterSort,
-  onRegister,
-  onOpen,
-  onClose,
+  onMore,
 }: RuleListItemProps) {
   const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
-  const register = useCallback(
-    (instance: Swipeable | null) => onRegister(rule.id, instance),
-    [onRegister, rule.id]
-  );
+  const styles = useResponsiveStyles(theme, createStyles);
   return (
-    <Swipeable
-      containerStyle={styles.swipeContainer}
-      ref={register}
-      onSwipeableWillOpen={() => onOpen(rule.id)}
-      onSwipeableClose={() => onClose(rule.id)}
-      renderLeftActions={() => (
-        <TouchableOpacity
-          accessibilityRole="button"
-          accessibilityLabel={`删除规则${rule.name}`}
-          style={styles.deleteAction}
-          activeOpacity={0.86}
-          onPress={() => onDelete(rule)}
-        >
-          <Feather name="trash-2" size={18} color={theme.buttonPrimaryText} />
-          <Text style={styles.deleteActionText}>删除</Text>
-        </TouchableOpacity>
-      )}
-      overshootLeft={false}
-      leftThreshold={48}
-      failOffsetY={[-18, 18]}
-      friction={2}
-      animationOptions={APP_MOTION.swipe}
-    >
       <View style={styles.ruleItem}>
         <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel={`编辑规则${rule.name}`}
           style={styles.ruleContent}
           activeOpacity={0.86}
           onPress={() => onEdit(rule)}
-          onLongPress={onEnterSort}
-          delayLongPress={500}
         >
           <RuleCardContent rule={rule} styles={styles} />
         </TouchableOpacity>
         <View style={styles.ruleSwitch}>
-          <Switch
+          <UiSwitch
+            size="compact"
+            accessibilityLabel={`启用规则${rule.name}`}
             value={rule.isActive}
             onValueChange={() => onToggle(rule)}
-            trackColor={{ false: theme.border, true: theme.primary }}
-            thumbColor={theme.buttonPrimaryText}
           />
         </View>
+        <TouchableOpacity accessibilityRole="button" accessibilityLabel={`管理规则${rule.name}`}
+          style={styles.ruleMore} onPress={() => onMore(rule)}>
+          <Feather name="more-horizontal" size={20} color={theme.textSecondary} />
+        </TouchableOpacity>
       </View>
-    </Swipeable>
   );
+});
+
+export const RuleFolderCard = memo(function RuleFolderCard({ folder, count, onOpen }: {
+  folder: QRCodeRuleFolder; count: number; onOpen: (id: string) => void;
+}) {
+  const { theme } = useTheme();
+  const styles = useResponsiveStyles(theme, createStyles);
+  return <TouchableOpacity accessibilityRole="button" accessibilityLabel={`打开文件夹${folder.name}`}
+    onPress={() => onOpen(folder.id)} style={styles.folderCard}>
+    <Feather name="folder" size={22} color={theme.primary} />
+    <Text style={styles.folderName} numberOfLines={1}>{folder.name}</Text>
+    <Text style={styles.folderCount}>{count} 条规则</Text>
+    <Feather name="chevron-right" size={18} color={theme.textMuted} />
+  </TouchableOpacity>;
 });

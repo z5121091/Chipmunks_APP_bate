@@ -1,11 +1,13 @@
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { MotionChevron } from '@/components/AppMotion';
 import { AppPressable as TouchableOpacity } from '@/components/AppPressable';
-import React, { useMemo } from 'react';
+import React from 'react';
 import { ActivityIndicator, Platform, Pressable, StyleProp, StyleSheet, Text, TextInput, TextInputProps, View, ViewStyle } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AnimatedButton } from '@/components/AnimatedButton';
 import { UiAssetIcon, type UiAssetIconName } from '@/components/UiAssetIcon';
+import { UiSwitchVisual } from '@/components/UiSwitch';
 import { useTheme } from '@/hooks/useTheme';
 import { BorderWidth, Spacing, type Theme } from '@/constants/theme';
 import {
@@ -107,7 +109,7 @@ interface UiPageHeaderProps {
 
 export function UiListSection({ children, style }: UiListSectionProps) {
   const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
 
   return <View style={[styles.section, style]}>{children}</View>;
 }
@@ -139,7 +141,7 @@ export function UiPageHeader({
   style,
 }: UiPageHeaderProps) {
   const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
 
   return (
     <View style={[styles.pageHeader, style]}>
@@ -197,7 +199,7 @@ export function UiListItem({
   onSwitchChange,
 }: UiListItemProps) {
   const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const isSwitch = typeof switchValue === 'boolean' && onSwitchChange;
   const isDisabled = disabled || loading;
   const handlePress = () => {
@@ -242,16 +244,7 @@ export function UiListItem({
       </View>
 
       {isSwitch ? (
-        <View style={styles.switchHitArea} pointerEvents="none">
-          <View testID="ui-switch-track" style={[styles.switchTrack, {
-            backgroundColor: switchValue ? theme.success : theme.tagGray,
-            alignItems: switchValue ? 'flex-end' : 'flex-start',
-          }]}>
-            <View testID="ui-switch-thumb" style={[styles.switchThumb, {
-              backgroundColor: theme.white, shadowColor: theme.shadowColor,
-            }]} />
-          </View>
-        </View>
+        <UiSwitchVisual value={switchValue} />
       ) : rightText ? (
         <Text style={[styles.rightText, { color }]} numberOfLines={1}>
           {rightText}
@@ -266,6 +259,7 @@ export function UiListItem({
   // nesting a switch inside a button, which can dispatch the same tap twice.
   if (isSwitch) return <Pressable style={itemStyle} onPress={handlePress} disabled={Boolean(isDisabled)}
     accessibilityRole="switch" accessibilityLabel={title}
+    aria-checked={switchValue} aria-disabled={Boolean(isDisabled)}
     accessibilityState={{ checked: switchValue, disabled: Boolean(isDisabled) }}>
     {content}
   </Pressable>;
@@ -292,7 +286,7 @@ export function UiToolbarButton({
   containerStyle,
 }: UiToolbarButtonProps) {
   const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const resolvedVariant: UiButtonVariant =
     variant ?? (danger ? 'danger' : primary ? 'primary' : 'secondary');
   const isCompact = compact || size === 'compact';
@@ -362,7 +356,7 @@ export function UiToolbarButton({
 
 export function UiTag({ label, color, icon, tone = 'soft', style }: UiTagProps) {
   const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
   const isSolid = tone === 'solid';
 
   return (
@@ -394,7 +388,7 @@ export function UiInput({
   ...props
 }: UiInputProps) {
   const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
 
   return (
     <View style={[styles.inputShell, active && styles.inputShellActive, containerStyle]}>
@@ -411,7 +405,7 @@ export function UiInput({
 
 export function UiWorkflowSummary({ items, style }: UiWorkflowSummaryProps) {
   const { theme } = useTheme();
-  const styles = useMemo(() => createStyles(theme), [theme]);
+  const styles = useResponsiveStyles(theme, createStyles);
 
   return (
     <View style={[styles.workflowSummary, style]}>
@@ -516,10 +510,6 @@ const createStyles = (theme: Theme) =>
     itemDisabled: {
       opacity: 0.5,
     },
-    switchHitArea: { width: 64, height: 48, flexShrink: 0, alignItems: 'center', justifyContent: 'center' },
-    switchTrack: { width: 60, height: 34, borderRadius: 17, padding: 3, justifyContent: 'center' },
-    switchThumb: { width: 28, height: 28, borderRadius: 14,
-      shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.16, shadowRadius: 2, elevation: 1 },
     toolbarButton: {
       flexDirection: 'row',
       alignItems: 'center',
@@ -531,7 +521,7 @@ const createStyles = (theme: Theme) =>
     toolbarButtonDefault: {
       height: UI_REDESIGN_TOKENS.size.buttonHeight,
       minHeight: UI_REDESIGN_TOKENS.size.buttonHeight,
-      paddingHorizontal: Spacing.md,
+      paddingHorizontal: Math.min(16, Spacing.md),
     },
     toolbarButtonCompact: {
       height:

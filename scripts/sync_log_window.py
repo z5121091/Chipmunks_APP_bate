@@ -5,6 +5,11 @@ import gc
 from itertools import islice
 import threading
 
+try:
+    from .sync_window_icon import apply_sync_window_icon
+except ImportError:
+    from sync_window_icon import apply_sync_window_icon
+
 
 class RuntimeLogBuffer:
     def __init__(self, max_entries=1000, max_message_length=2048):
@@ -37,7 +42,7 @@ class RuntimeLogBuffer:
 
 
 class RuntimeLogView:
-    def __init__(self, root, buffer, icon_path=None):
+    def __init__(self, root, buffer):
         import tkinter as tk
         from tkinter import ttk
 
@@ -49,11 +54,7 @@ class RuntimeLogView:
         root.title('运行日志 · 掌上仓库同步助手')
         root.geometry('780x470')
         root.minsize(460, 270)
-        if icon_path:
-            try:
-                root.iconbitmap(default=icon_path)
-            except (OSError, tk.TclError):
-                pass
+        apply_sync_window_icon(root)
 
         content = ttk.Frame(root, padding=(14, 12))
         content.pack(fill='both', expand=True)
@@ -107,9 +108,8 @@ class RuntimeLogView:
 class LogWindow:
     """One Tk window per tray, with Tk accessed only by its owning thread."""
 
-    def __init__(self, buffer, icon_path=None, on_error=None):
+    def __init__(self, buffer, on_error=None):
         self.buffer = buffer
-        self.icon_path = icon_path
         self.on_error = on_error or (lambda _message: None)
         self._lock = threading.Lock()
         self._thread = None
@@ -140,7 +140,7 @@ class LogWindow:
 
             root = tk.Tk()
             root.withdraw()
-            view = RuntimeLogView(root, self.buffer, self.icon_path)
+            view = RuntimeLogView(root, self.buffer)
 
             def poll():
                 if self._stop.is_set():

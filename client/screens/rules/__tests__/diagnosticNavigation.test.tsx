@@ -44,7 +44,6 @@ jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
 jest.mock('@/components/AppEmptyState', () => ({ AppEmptyState: 'Empty' }));
 jest.mock('@/components/AppModalHeader', () => ({ AppModalHeader: 'Header' }));
 jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'Actions' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'Scroll' }));
 jest.mock('../RuleSamplePanel', () => ({ RuleSamplePanel: 'Sample' }));
 jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon' }));
 jest.mock('@/utils/logger', () => ({ logger: { error: jest.fn() } }));
@@ -63,7 +62,8 @@ jest.mock('@/components/CustomAlert', () => {
 });
 jest.mock('@/utils/database', () => ({
   ...jest.requireActual('@/utils/database'),
-  getAllRules: jest.fn(), addRule: jest.fn(), updateRule: jest.fn(), deleteRule: jest.fn(), setRulesDisplayOrder: jest.fn(),
+  getAllRules: jest.fn(), getAllRuleFolders: jest.fn().mockResolvedValue([]),
+  addRule: jest.fn(), updateRule: jest.fn(), deleteRule: jest.fn(), setRulesDisplayOrder: jest.fn(),
 }));
 
 function LocalStackNavigator({ children }: { children: ReactNode }) {

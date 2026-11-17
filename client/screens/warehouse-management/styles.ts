@@ -155,17 +155,14 @@ export const createStyles = (theme: Theme) => {
       backgroundColor: theme.overlay,
       justifyContent: 'center',
       alignItems: 'center',
+      padding: Spacing.md,
     },
     modalContent: {
       width: '100%',
       maxWidth: APP_MODAL_MAX_WIDTH,
     },
-    modalCardFrame: {
-      width: '100%',
-      maxWidth: APP_MODAL_MAX_WIDTH,
-      alignSelf: 'center',
-    },
     modalBody: {
+      minHeight: 0,
       paddingBottom: Spacing.md,
     },
     modalActions: {

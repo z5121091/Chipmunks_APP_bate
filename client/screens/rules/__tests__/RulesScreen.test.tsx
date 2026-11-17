@@ -1,13 +1,16 @@
 import TestRenderer, { act } from 'react-test-renderer';
 import { AppState, BackHandler, FlatList, Modal, ScrollView, Text, TextInput, TouchableOpacity, UIManager } from 'react-native';
 import { usePreventRemove } from 'expo-router/react-navigation';
-import { Gesture, GestureDetector, PointerType, State, Swipeable } from 'react-native-gesture-handler';
+import { Gesture, GestureDetector, PointerType, State } from 'react-native-gesture-handler';
 import RulesScreen from '../index';
 import { RuleSamplePanel } from '../RuleSamplePanel';
 import { RuleOptionPicker } from '../RuleOptionPicker';
+import { RuleFolderManager } from '../RuleFolderManager';
+import { RuleRowActions } from '../RuleRowActions';
 import { SupplierManager } from '@/screens/inventory-binding/SupplierManager';
 import { AppModalActions } from '@/components/AppModalActions';
 import { AppModalHeader } from '@/components/AppModalHeader';
+import { UiSwitch } from '@/components/UiSwitch';
 import * as database from '@/utils/database';
 
 const mockScrollTo = jest.fn();
@@ -38,8 +41,8 @@ jest.mock('@/components/Screen', () => ({ Screen: 'Screen' }));
 jest.mock('@/components/AppEmptyState', () => ({ AppEmptyState: 'Empty' }));
 jest.mock('@/components/AppModalHeader', () => ({ AppModalHeader: 'Header' }));
 jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'Actions' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'Scroll' }));
 jest.mock('../RuleSamplePanel', () => ({ RuleSamplePanel: 'Sample' }));
+jest.mock('../RuleFolderManager', () => ({ RuleFolderManager: 'FolderManager' }));
 jest.mock('@expo/vector-icons', () => ({ Feather: 'Icon' }));
 jest.mock('@/utils/toast', () => {
   const toast = { showToast: jest.fn(), ToastContainer: () => null };
@@ -50,7 +53,8 @@ jest.mock('@/components/CustomAlert', () => {
   return { useCustomAlert: () => alert };
 });
 jest.mock('@/utils/database', () => ({ ...jest.requireActual('@/utils/database'),
-  getAllRules: jest.fn(), addRule: jest.fn(), updateRule: jest.fn(), deleteRule: jest.fn(), setRulesDisplayOrder: jest.fn(),
+  getAllRules: jest.fn(), getAllRuleFolders: jest.fn(), moveRulesToFolder: jest.fn(),
+  addRule: jest.fn(), updateRule: jest.fn(), deleteRule: jest.fn(), setRulesDisplayOrder: jest.fn(),
 }));
 let root: TestRenderer.ReactTestRenderer;
 const originalMeasure = Object.getOwnPropertyDescriptor(UIManager, 'measureInWindow');
@@ -76,6 +80,7 @@ beforeEach(async () => {
   });
   jest.spyOn(require('react-native'), 'findNodeHandle').mockReturnValue(1);
   jest.mocked(database.getAllRules).mockResolvedValue([]);
+  jest.mocked(database.getAllRuleFolders).mockResolvedValue([]);
   jest.mocked(database.addRule).mockResolvedValue('new');
   await act(async () => { root = TestRenderer.create(<RulesScreen />); });
 });
@@ -97,9 +102,8 @@ const beginSorting = async () => {
     root.unmount();
     root = TestRenderer.create(<RulesScreen />);
   });
-  await act(async () => {
-    root.root.findAllByType(TouchableOpacity).find(item => item.props.onLongPress)!.props.onLongPress();
-  });
+  await press('管理解析规则');
+  await act(async () => { root.root.findByType(RuleFolderManager).props.onSortRules(); });
   return root.root.findAllByType(GestureDetector)[0].props.gesture as ReturnType<typeof Gesture.Pan>;
 };
 
@@ -291,6 +295,34 @@ it('automatically fills recognized prefixes while assigning sample fields', asyn
   await act(async () => { sample().props.onAssign(0, 'model', 2, 'PART NO.:QM4051PW'); });
   await act(async () => { sample().props.onAssign(1, 'quantity', 2, 'QTY:8000 PCS'); });
   expect(sample().props.rule.fieldPrefixes).toEqual({ model: 'PART NO.:', quantity: 'QTY:' });
+});
+
+it('saves a recommended percent separator as a custom value and restores it when editing', async () => {
+  const content = 'NSI6801EB-DSWFR%H20B55%2634%1000%SOW6%NSI2636068%F%NSI2636068X39%S%NSI6801EB-DSWFRC%';
+  await press('新增解析规则');
+  await input('规则名称', '百分号分段测试');
+  await act(async () => {
+    sample().props.onSampleChange(content);
+    sample().props.onSeparatorSelect('%');
+  });
+  await act(async () => { sample().props.onAssign(0, 'model', 10, 'NSI6801EB-DSWFR'); });
+  await act(async () => { sample().props.onAssign(3, 'quantity', 10, '1000'); });
+  expect(sample().props.rule.separator).toBe('%');
+  expect(database.inspectQRCodeRule(content, sample().props.rule)).toMatchObject({ matched: true });
+  await act(async () => { await root.root.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(database.addRule).toHaveBeenCalledWith(expect.objectContaining({ separator: '%' }));
+
+  const saved: database.QRCodeRule = {
+    ...jest.mocked(database.addRule).mock.calls[0][0],
+    id: 'percent-rule', created_at: '', updated_at: '',
+  };
+  jest.mocked(database.getAllRules).mockResolvedValue([saved]);
+  mockRouteParams = { editRuleId: saved.id };
+  await act(async () => { root.unmount(); root = TestRenderer.create(<RulesScreen />); });
+  expect(sample().props.rule.separator).toBe('%');
+  expect(sample().props.rule.fieldOrder).toEqual(saved.fieldOrder);
+  await act(async () => { await root.root.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(database.updateRule).toHaveBeenCalledWith(saved.id, expect.objectContaining({ separator: '%' }));
 });
 
 it('keeps the rule draft while choosing a supplier and can clear the formal association', async () => {
@@ -734,25 +766,26 @@ it.each([26, 260])('mounts only the first visible batch with %i configured rules
   await reloadScreenWithRules(manyRules(count));
   const list = root.root.findByType(FlatList);
   expect(list.props.data).toHaveLength(count);
-  expect(root.root.findAllByType(Swipeable)).toHaveLength(8);
+  expect(root.root.findAllByType(TouchableOpacity).filter(item =>
+    String(item.props.accessibilityLabel).startsWith('编辑规则Rule '))).toHaveLength(8);
   expect(list.props.getItemLayout).toBeUndefined();
   expect(root.root.findAllByType(GestureDetector)).toHaveLength(0);
   await act(async () => { jest.advanceTimersByTime(220); });
   expect(root.root.findAllByType(RuleSamplePanel)).toHaveLength(0);
 });
 
-it('does not repaint rule swipe controls while opening or typing in the editor', async () => {
+it('keeps normal rule cards free of drag gestures while opening or typing in the editor', async () => {
   jest.useFakeTimers();
   await reloadScreenWithRules(manyRules(26));
-  const swipeRender = jest.spyOn(Swipeable.prototype, 'render');
+  const firstRule = button('编辑规则Rule 0');
   await press('新增解析规则');
-  expect(swipeRender).not.toHaveBeenCalled();
+  expect(button('编辑规则Rule 0')).toBe(firstRule);
   await input('规则名称', 'New rule');
-  expect(swipeRender).not.toHaveBeenCalled();
+  expect(root.root.findAllByType(GestureDetector)).toHaveLength(0);
   await act(async () => { root.root.findByType(AppModalActions).props.onSecondaryPress(); });
   await act(async () => { jest.advanceTimersByTime(220); });
   expect(root.root.findAllByType(RuleSamplePanel)).toHaveLength(0);
-  expect(swipeRender).not.toHaveBeenCalled();
+  expect(root.root.findAllByType(TouchableOpacity).some(item => item.props.onLongPress)).toBe(false);
 });
 
 it('keeps sort gestures separate and restores the scrolled position when cancelling', async () => {
@@ -763,7 +796,8 @@ it('keeps sort gestures separate and restores the scrolled position when cancell
     list.props.onLayout({ nativeEvent: { layout: { height: 600 } } });
     list.props.onScroll({ nativeEvent: { contentOffset: { y: 1200 } } });
   });
-  await act(async () => { root.root.findAllByType(TouchableOpacity).find(item => item.props.onLongPress)!.props.onLongPress(); });
+  await press('管理解析规则');
+  await act(async () => { root.root.findByType(RuleFolderManager).props.onSortRules(); });
   expect(root.root.findAllByType(FlatList)).toHaveLength(0);
   expect(root.root.findAllByType(GestureDetector)).toHaveLength(26);
   const sortingList = root.root.findAllByType(ScrollView)[0];
@@ -785,4 +819,136 @@ it('shows a loading indicator instead of an empty-rule message while reading rul
   await act(async () => { resolve([]); });
   expect(root.root.findAllByProps({ accessibilityLabel: '正在加载解析规则' })).toHaveLength(0);
   expect(root.root.findByType(FlatList).props.ListEmptyComponent.props.title).toBe('暂无解析规则');
+});
+
+const folderFixture: database.QRCodeRuleFolder = {
+  id: 'dongwei-folder', name: '东微常用标签', created_at: '', updated_at: '', displayOrder: 1,
+};
+const groupedRules = (): database.QRCodeRule[] => ['A', 'B', 'C', 'D'].map((id, index) => ({
+  id, name: id, description: '', separator: '/', fieldOrder: ['model', 'quantity'],
+  folderId: index % 2 ? folderFixture.id : undefined,
+  isActive: true, created_at: '', updated_at: '',
+}));
+const loadFolders = async () => {
+  jest.mocked(database.getAllRuleFolders).mockResolvedValue([folderFixture]);
+  await reloadScreenWithRules(groupedRules());
+};
+
+it('uses the compact switch to toggle the selected rule once without opening its editor or management menu', async () => {
+  const rule = groupedRules()[0];
+  await reloadScreenWithRules([rule]);
+  expect(root.root.findByType(UiSwitch).props).toMatchObject({ size: 'compact', value: true });
+  jest.mocked(database.updateRule).mockImplementationOnce(async () => {
+    jest.mocked(database.getAllRules).mockResolvedValue([{ ...rule, isActive: false }]);
+  });
+  const control = () => root.root.findAll(node => node.props.accessibilityRole === 'switch' &&
+    node.props.accessibilityLabel === '启用规则A' && typeof node.props.onPress === 'function').at(-1)!;
+  await act(async () => { control().props.onPress(); });
+  expect(database.updateRule).toHaveBeenCalledTimes(1);
+  expect(database.updateRule).toHaveBeenLastCalledWith('A', { isActive: false });
+  expect(root.root.findByType(UiSwitch).props.value).toBe(false);
+  expect(root.root.findAllByType(RuleSamplePanel)).toHaveLength(0);
+  expect(root.root.findByType(RuleRowActions).props.visible).toBe(false);
+  await act(async () => { control().props.onPress(); });
+  expect(database.updateRule).toHaveBeenCalledTimes(2);
+  expect(database.updateRule).toHaveBeenLastCalledWith('A', { isActive: true });
+});
+
+it('opens only the selected folder, restores the root scroll position, and handles Android back one level at a time', async () => {
+  await loadFolders();
+  const list = () => root.root.findByType(FlatList);
+  expect(list().props.data.map((entry: { id: string }) => entry.id)).toEqual([folderFixture.id, 'A', 'C']);
+  await act(async () => { list().props.onScroll({ nativeEvent: { contentOffset: { y: 120 } } }); });
+  await press(`打开文件夹${folderFixture.name}`);
+  expect(list().props.data.map((entry: { id: string }) => entry.id)).toEqual(['B', 'D']);
+  expect(button('返回规则列表')).toBeDefined();
+  await act(async () => { expect(hardwareBack()).toBe(true); });
+  expect(list().props.data.map((entry: { id: string }) => entry.id)).toEqual([folderFixture.id, 'A', 'C']);
+  expect(list().props.contentOffset).toEqual({ x: 0, y: 120 });
+  expect(mockRouter.back).not.toHaveBeenCalled();
+  await act(async () => { expect(hardwareBack()).toBe(false); });
+});
+
+it('defaults a new rule to the current folder and keeps folder selection independent of supplier association', async () => {
+  await loadFolders();
+  await press(`打开文件夹${folderFixture.name}`);
+  await press('新增解析规则');
+  expect(sample().props.rule.folderId).toBe(folderFixture.id);
+  await input('规则名称', '文件夹内新增');
+  await act(async () => { sample().props.onAssign(0, 'model', 2); });
+  await act(async () => { sample().props.onAssign(1, 'quantity', 2); });
+  await press('选择规则文件夹');
+  await act(async () => { root.root.findAllByType(RuleOptionPicker).find(picker =>
+    picker.props.title === '选择规则文件夹')!.props.onSelect(''); });
+  expect(sample().props.rule).toMatchObject({ folderId: '', supplierId: '', supplierName: '' });
+  await act(async () => { await root.root.findByType(AppModalActions).props.onPrimaryPress(); });
+  expect(database.addRule).toHaveBeenCalledWith(expect.objectContaining({ name: '文件夹内新增', folderId: '' }));
+});
+
+it('sorts only the current folder and merges its order into the complete rule order', async () => {
+  await loadFolders();
+  await press(`打开文件夹${folderFixture.name}`);
+  await press('管理解析规则');
+  expect(root.root.findByType(RuleFolderManager).props.currentFolderId).toBe(folderFixture.id);
+  await act(async () => { root.root.findByType(RuleFolderManager).props.onSortRules(); });
+  expect(root.root.findAllByType(GestureDetector)).toHaveLength(2);
+  const gesture = root.root.findAllByType(GestureDetector)[0].props.gesture as ReturnType<typeof Gesture.Pan>;
+  await act(async () => {
+    gesture.handlers.onStart?.(panEvent);
+    gesture.handlers.onUpdate?.({ ...panEvent, translationY: 180 });
+    gesture.handlers.onFinalize?.({ ...panEvent, state: State.CANCELLED }, false);
+  });
+  await press('完成排序');
+  expect(database.setRulesDisplayOrder).toHaveBeenCalledWith(['A', 'D', 'C', 'B']);
+  expect(root.root.findByType(FlatList).props.data.map((rule: database.QRCodeRule) => rule.id)).toEqual(['B', 'D']);
+});
+
+it('moves a rule from inside a folder and can return it to the ungrouped list', async () => {
+  const secondFolder = { ...folderFixture, id: 'sea-folder', name: '极海', displayOrder: 2 };
+  jest.mocked(database.getAllRuleFolders).mockResolvedValue([folderFixture, secondFolder]);
+  await reloadScreenWithRules(groupedRules());
+  const displayedIds = () => root.root.findByType(FlatList).props.data.map((item: { id: string }) => item.id);
+  await press(`打开文件夹${folderFixture.name}`);
+  await press('管理规则B');
+  await press('移动到文件夹');
+  const actions = () => root.root.findByType(RuleRowActions);
+  expect(actions().props.options.map((item: { value: string }) => item.value)).toEqual(['', secondFolder.id]);
+  const choose = (value: string) => act(async () => {
+    await actions().props.options.find((item: { value: string }) => item.value === value).onPress();
+  });
+  jest.mocked(database.moveRulesToFolder).mockRejectedValueOnce(new Error('移动失败测试'));
+  await choose(secondFolder.id);
+  expect(database.moveRulesToFolder).toHaveBeenCalledWith(['B'], secondFolder.id);
+  expect(displayedIds()).toEqual(['B', 'D']);
+  expect(actions().props.visible).toBe(true);
+  expect(require('@/components/CustomAlert').useCustomAlert().showError).toHaveBeenCalledWith('移动失败测试');
+  jest.mocked(database.moveRulesToFolder).mockResolvedValueOnce();
+  jest.mocked(database.getAllRules).mockResolvedValue(groupedRules().map(rule => rule.id === 'B' ? { ...rule, folderId: secondFolder.id } : rule));
+  await choose(secondFolder.id);
+  expect(displayedIds()).toEqual(['D']);
+  await press('返回规则列表');
+  await press(`打开文件夹${secondFolder.name}`);
+  expect(displayedIds()).toEqual(['B']);
+  await press('管理规则B');
+  await press('移动到文件夹');
+  expect(actions().props.options[0]).toMatchObject({ value: '', label: '移回未分组' });
+  jest.mocked(database.moveRulesToFolder).mockResolvedValueOnce();
+  jest.mocked(database.getAllRules).mockRejectedValueOnce(new Error('列表刷新失败'));
+  await choose('');
+  expect(database.moveRulesToFolder).toHaveBeenLastCalledWith(['B'], null);
+  expect(actions().props.visible).toBe(false);
+  expect(displayedIds()).toEqual([]);
+  await press('返回规则列表');
+  expect(displayedIds()).toEqual([folderFixture.id, secondFolder.id, 'A', 'B', 'C']);
+});
+
+it('requires a separate confirmation before deleting a rule through its menu', async () => {
+  await loadFolders();
+  await press('管理规则A');
+  await press('删除规则');
+  expect(database.deleteRule).not.toHaveBeenCalled();
+  const confirm = require('@/components/CustomAlert').useCustomAlert().showConfirm;
+  expect(confirm).toHaveBeenCalledWith('确认删除', expect.stringContaining('A'), expect.any(Function), true);
+  await act(async () => { await confirm.mock.calls[0][2](); });
+  expect(database.deleteRule).toHaveBeenCalledWith('A');
 });

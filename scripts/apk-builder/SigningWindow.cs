@@ -7,7 +7,7 @@ using System.Windows.Forms;
 
 namespace Chipmunks.ApkBuilder
 {
-    public sealed class SigningWindow : Form
+    public sealed class SigningWindow : BrandedForm
     {
         private static readonly Color Navy = Color.FromArgb(25, 59, 96);
         private static readonly Color Ink = Color.FromArgb(16, 35, 59);
@@ -47,7 +47,6 @@ namespace Chipmunks.ApkBuilder
             MinimumSize = new Size(620, 710);
             MaximizeBox = false;
             BackColor = Color.FromArgb(238, 243, 248);
-            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { Icon = SystemIcons.Application; }
 
             var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(20) };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -217,7 +216,7 @@ namespace Chipmunks.ApkBuilder
 
         internal enum SigningSecretMode { BackupExport, BackupRestore, KeyFile }
 
-        internal sealed class SigningSecretWindow : Form
+        internal sealed class SigningSecretWindow : BrandedForm
         {
             private readonly TextBox secret = new TextBox();
             private readonly TextBox second = new TextBox();
@@ -229,7 +228,6 @@ namespace Chipmunks.ApkBuilder
             {
                 Text = mode == SigningSecretMode.KeyFile ? "导入 PKCS#12 签名" : mode == SigningSecretMode.BackupExport ? "设置备份密码" : "输入备份密码";
                 Name = "SigningSecretWindow"; StartPosition = FormStartPosition.CenterParent; FormBorderStyle = FormBorderStyle.FixedDialog;
-                try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { Icon = SystemIcons.Application; }
                 MaximizeBox = MinimizeBox = false; Font = new Font("Microsoft YaHei UI", 9F); ClientSize = new Size(465, mode == SigningSecretMode.BackupRestore ? 223 : 295);
                 BackColor = Color.White; AutoScaleMode = AutoScaleMode.Dpi; AutoScaleDimensions = new SizeF(96F, 96F);
                 var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(20), RowCount = mode == SigningSecretMode.BackupRestore ? 5 : 7 };

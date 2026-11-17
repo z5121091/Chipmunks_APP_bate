@@ -11,6 +11,12 @@ const rule = (fieldOrder: string[], separator = '/', extra: Partial<QRCodeRule> 
 const apmFields = ['model', 'batch', 'package', 'version', 'quantity', 'productionDate', 'traceNo', 'sourceNo'];
 const vendors = [
   {
+    name: '百分号十段样本（仅测试数量映射）',
+    raw: 'NSI6801EB-DSWFR%H20B55%2634%1000%SOW6%NSI2636068%F%NSI2636068X39%S%NSI6801EB-DSWFRC%',
+    rule: rule(['model', 'ignore:1', 'ignore:2', 'quantity', 'ignore:3', 'ignore:4', 'ignore:5', 'ignore:6', 'ignore:7', 'ignore:8'], '%'),
+    expected: 'NSI6801EB-DSWFR%H20B55%2634%123%SOW6%NSI2636068%F%NSI2636068X39%S%NSI6801EB-DSWFRC%', trace: '',
+  },
+  {
     name: '沁恒',
     raw: 'CH334U,31317.TB,---,QSOP28,313174G25,2500,20260923,China,W52609160004006-1',
     rule: rule(['model', 'version', 'ignore:1', 'package', 'batch', 'quantity', 'productionDate', 'ignore:2', 'traceNo'], ','),

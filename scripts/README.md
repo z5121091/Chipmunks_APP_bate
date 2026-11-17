@@ -111,7 +111,7 @@ set PALM_WAREHOUSE_PRINTER_NAME=你的实际打印机名称
   - 其他供应商或未填写供应商：仍保存 `标签打印.xlsx`，但不自动打印，后续可手动打印。
 - 二维码分隔符由供应商模板决定。极海、领芯和珠海博雅使用 `/`，盈力使用 `;`，南京沁恒使用英文逗号 `,`。极海和领芯按固定八字段写入：型号、批次、封装、版本或 APM 料号、数量、生产周次、追溯码、箱号。珠海博雅按固定六字段写入：型号、封装、数量、批次、生产日期、箱号。
 - 标签正文统一使用 Arial 8 磅；`COO:CN`、`RoHS`、`MSL3` 使用 Arial 粗体 8 磅。博雅顶部 `BOYA MICROELECTRONICS` 使用 Arial 14 磅并在纸张宽度内居中。
-- Geehy 与珠海博雅品牌区域分别使用 `assets/geehy-logo.png` 和 `assets/boya-logo.png`；构建 EXE 时会自动打包整个 `assets` 目录。
+- 极海与珠海博雅品牌区域分别使用 `assets/geehy-logo.png` 和 `assets/boya-logo.png`。构建时会把标签 PNG 和窗口图标嵌入 EXE，运行时直接在内存中读取图片。PyInstaller 仍会把 Python、窗口和打印运行库解包到临时目录。
 - 博雅标签的 `PART NO.`、`PACKAGE`、`QUANTITY`、`LOT ID`、`DATE CODE`、`Track ID` 分别关联 Excel 中的型号、封装、标签数量、批次、生产日期、箱号；不使用追溯码。`MSL3` 为固定文字。
 - 二维码使用自动版本、自动编码、L 级纠错与 `Model 2 / S7`。极海、领芯和博雅的二维码单元均约 `0.75 mm`，且与相邻内容保留独立白边。
 - 按 BarTender 参数换算：型号使用 1 点宽（约 `0.13 mm`）；`BOX ID`、`LOT NO`、`PKG`、`P/N`、`QTY`、`DATE`、`T/C` 使用 2 点宽（约 `0.25 mm`）；全部高度为 32 点（`4.0 mm`）。

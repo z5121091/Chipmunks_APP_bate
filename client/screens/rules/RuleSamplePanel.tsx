@@ -12,8 +12,18 @@ import {
 import { isIgnoredRuleField, suggestRuleFieldPrefix, suggestRuleSeparators } from '@/utils/ruleConditions';
 import { parseQuantity } from '@/utils/quantity';
 import { useTheme } from '@/hooks/useTheme';
+import { useResponsiveStyles } from '@/hooks/useResponsiveStyles';
 import { RuleOptionPicker } from './RuleOptionPicker';
 import { Typography } from '@/constants/theme';
+
+const inspectSample = (sample: string, rule: QRCodeRule) => {
+  const inspection = inspectQRCodeRule(sample, rule);
+  if (rule.fieldOrder.length) return inspection;
+  // 未分配字段时，尾部分隔符不生成空白字段；已有配置则保留规则要求的空字段。
+  const parts = [...inspection.parts];
+  while (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
+  return { ...inspection, parts, values: inspection.values.slice(0, parts.length) };
+};
 
 export function RuleSamplePanel({ sample, onSampleChange, rule, rules, configurationError, fieldLabel, onAssign, onSeparatorSelect }: {
   sample: string; onSampleChange: (value: string) => void; rule: QRCodeRule; rules: QRCodeRule[];
@@ -22,11 +32,12 @@ export function RuleSamplePanel({ sample, onSampleChange, rule, rules, configura
   onSeparatorSelect: (separator: string) => void;
 }) {
   const { theme } = useTheme();
+  const styles = useResponsiveStyles(theme, createStyles);
   const [mappingIndex, setMappingIndex] = useState<number | null>(null);
   const [separatorPicker, setSeparatorPicker] = useState(false);
   const [continuousMapping, setContinuousMapping] = useState(false);
   const suggestions = useMemo(() => suggestRuleSeparators(sample, [rule.separator, ...rules.map(item => item.separator)]), [sample, rules, rule.separator]);
-  const inspection = useMemo(() => sample && !configurationError ? inspectQRCodeRule(sample, rule) : null,
+  const inspection = useMemo(() => sample && !configurationError ? inspectSample(sample, rule) : null,
     [sample, rule, configurationError]);
   const detection = useMemo(() => {
     if (!sample || configurationError || !rule.isActive) return null;
@@ -154,7 +165,7 @@ export function RuleSamplePanel({ sample, onSampleChange, rule, rules, configura
           ? () => setMappingIndex(index => Math.max(0, (index ?? 0) - 1)) : undefined}
         onClose={closePicker} onSelect={value => {
           if (separatorPicker) {
-            const count = inspectQRCodeRule(sample, { ...rule, separator: value }).parts.length;
+            const count = inspectSample(sample, { ...rule, separator: value }).parts.length;
             onSeparatorSelect(value);
             setSeparatorPicker(false);
             setMappingIndex(count >= 2 && count <= 128 ? 0 : null);
@@ -173,7 +184,7 @@ export function RuleSamplePanel({ sample, onSampleChange, rule, rules, configura
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = () => StyleSheet.create({
   section: { marginTop: 12, gap: 8 },
   heading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
   noticeRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 6 },

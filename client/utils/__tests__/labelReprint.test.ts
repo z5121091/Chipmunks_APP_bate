@@ -79,10 +79,16 @@ describe('label reprint reads and original content', () => {
   it('preserves the original QR and existing model-only template selection for a consistent linked rule', async () => {
     jest.mocked(detectRule).mockResolvedValueOnce({ ...rule, supplierId: 'linked' });
     jest.mocked(getInventorySupplierById).mockResolvedValueOnce({ id: 'linked', name: supplier, created_at: '' });
+    jest.mocked(getAllInventoryBindings).mockResolvedValueOnce([
+      { ...binding(''), inventory_code: 'IC.DEFAULT' },
+      { ...binding('V1'), versions: ['V1', '31317.TB'], inventory_code: 'IC.MATCH' },
+    ]);
     const task = await prepareLabelReprint(raw);
     expect(task.supplier).toBe(supplier);
+    expect(task.inventoryCode).toBe('IC.MATCH');
     expect(task.sourceQr).toBe(raw);
     expect(task.record).toMatchObject({ quantity: 250, supplier });
+    expect(task.record).not.toHaveProperty('inventory_code');
   });
 
   it('matches model across all binding versions and preserves the QR verbatim', async () => {

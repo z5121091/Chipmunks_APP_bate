@@ -32,7 +32,6 @@ jest.mock('@/components/AggregatedRecordItem', () => ({ AggregatedRecordItem: 'R
 jest.mock('@/components/AppFormField', () => ({ AppFormField: 'Field' }));
 jest.mock('@/components/AppModalActions', () => ({ AppModalActions: 'Actions' }));
 jest.mock('@/components/AppModalCard', () => ({ AppModalCard: 'Card' }));
-jest.mock('@/components/KeyboardAwareForm', () => ({ KeyboardAwareFormScrollView: 'Form' }));
 jest.mock('@/components/UiRedesign', () => ({ UiPageHeader: 'Header', UiWorkflowSummary: 'Summary', UiToolbarButton: 'ToolbarButton' }));
 // WarehouseScanInput intentionally stays real: all events below enter its native TextInput handlers.
 jest.mock('@/components/CustomAlert', () => {

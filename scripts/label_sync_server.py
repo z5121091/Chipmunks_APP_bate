@@ -188,14 +188,6 @@ NATIVE_PRINT_LOCK = threading.Lock()
 BUSINESS_NOTIFICATIONS = BusinessNotificationDispatcher()
 # ==================== 配置结束 ====================
 
-# 获取程序所在目录
-if getattr(sys, 'frozen', False):
-    # 打包后的exe路径
-    APP_DIR = os.path.dirname(sys.executable)
-else:
-    # 脚本路径
-    APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
 RUNTIME_LOGS = RuntimeLogBuffer()
 
 def log(message):
@@ -843,6 +835,10 @@ def get_safe_reprint_template_error(error):
             r'仁懋标签' + fields + r'(?:含二维码分隔符空格，无法完整打印|含无法安全完整打印的字符|内容超过1000字符，无法完整打印|文字超出模板宽度，请核对该字段内容和解析规则)',
             r'仁懋标签缺少' + fields,
             r'仁懋原始二维码' + fields + r'与解析结果不一致，请核对该字段和解析规则',
+            r'贝岭标签' + fields + r'(?:含无法安全完整打印的字符|内容超过1000字符，无法完整打印)',
+            r'贝岭标签(?:批次和箱号|' + fields + r')文字超出模板宽度，请核对该字段内容和解析规则',
+            r'贝岭标签缺少' + fields,
+            r'贝岭原始二维码' + fields + r'与解析结果不一致，请核对该字段和解析规则',
             r'内部标签(?:存货编码|存货名称|规格型号|数量)内容过长，无法完整打印',
         )
         if any(re.fullmatch(pattern, message) for pattern in patterns):
@@ -875,6 +871,9 @@ def get_safe_reprint_template_error(error):
             '仁懋原始二维码须包含完整的八个空格分隔字段',
             '仁懋原始二维码第1段固定标识应为B',
             '仁懋标签数量须为有效的正整数',
+            '贝岭原始二维码须包含完整的七个双竖线分隔字段',
+            '贝岭标签数量须为有效的正整数',
+            '贝岭标签生产周须为有效的 YYWW 格式，请核对二维码生产日期',
         }
         if message in known_messages or re.fullmatch(
             r'原始二维码内容过长：当前\d+个字符，本模板最多支持\d+个字符，无法完整打印', message,
@@ -1109,13 +1108,6 @@ def submit_native_label_reprint(payload):
             )
             receipt['jobId'] = job_id
         return remember(receipt)
-
-
-def resource_path(relative_path):
-    """获取资源文件路径，兼容 PyInstaller onefile 打包"""
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(APP_DIR, relative_path)
 
 
 def sanitize_file_name(file_name):
@@ -1786,8 +1778,7 @@ class TrayIcon:
             lambda message: self.notify('连接二维码', message),
         )
         self.log_window = LogWindow(
-            RUNTIME_LOGS, resource_path('icon.ico'),
-            lambda message: self.notify('运行日志', message),
+            RUNTIME_LOGS, on_error=lambda message: self.notify('运行日志', message),
         )
         
     def create_icon_image(self):
