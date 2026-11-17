@@ -1,0 +1,44 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.chipmunks.ocrlab'
+    compileSdk 36
+    defaultConfig {
+        applicationId 'com.chipmunks.ocrlab'
+        minSdk 23
+        targetSdk 36
+        versionCode 3
+        versionName '0.1.2-test'
+    }
+    signingConfigs {
+        labTest {
+            storeFile rootProject.file('.keys/ocr-lab-test.jks')
+            storePassword 'ocr-lab-only'
+            keyAlias 'ocr-lab-test'
+            keyPassword 'ocr-lab-only'
+            storeType 'JKS'
+        }
+    }
+    buildTypes {
+        debug { signingConfig signingConfigs.labTest }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.1'
+    implementation 'androidx.exifinterface:exifinterface:1.4.2'
+    implementation 'androidx.camera:camera-core:1.6.0'
+    implementation 'androidx.camera:camera-camera2:1.6.0'
+    implementation 'androidx.camera:camera-lifecycle:1.6.0'
+    implementation 'androidx.camera:camera-view:1.6.0'
+    // CameraX exposes ListenableFuture. Match the Guava already selected at runtime.
+    implementation 'com.google.guava:guava:33.3.1-android'
+    // Bundled model: no Play Services model download and no photo upload.
+    implementation 'com.google.mlkit:text-recognition-chinese:16.0.1'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+}
